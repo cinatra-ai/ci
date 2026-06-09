@@ -17,7 +17,8 @@ import { fileURLToPath } from "node:url";
 
 const GATE_VERSION = "0.1.0";
 const VALID_FORMATS = ["text", "json"];
-const KNOWN_FLAGS = new Set(["root", "format", "quiet"]);
+const VALUE_FLAGS = new Set(["root", "format"]);
+const BOOLEAN_FLAGS = new Set(["quiet"]);
 const BASELINE_HINT =
   "seed it from the org baseline: https://github.com/cinatra-ai/ci/blob/main/config/baseline.gitignore";
 
@@ -28,19 +29,27 @@ const STATUS_REASONS = {
   "whitespace-only": "the .gitignore at the repo root contains only whitespace",
 };
 
+// Strict usage with explicit flag arity: unknown flags, stray operands, values
+// on boolean flags, and missing/empty values on value flags all exit 2 loud —
+// a typo must never run a weaker check silently.
 function parseArgs(argv) {
-  const args = { _: [] };
+  const args = {};
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
-    if (!tok.startsWith("--")) { args._.push(tok); continue; }
+    if (!tok.startsWith("--")) return fail(`unexpected argument: ${tok}`);
     const eq = tok.indexOf("=");
-    if (eq !== -1) {
-      args[tok.slice(2, eq)] = tok.slice(eq + 1);
+    const key = eq !== -1 ? tok.slice(2, eq) : tok.slice(2);
+    if (BOOLEAN_FLAGS.has(key)) {
+      if (eq !== -1) return fail(`--${key} takes no value`);
+      args[key] = true;
+    } else if (VALUE_FLAGS.has(key)) {
+      const value = eq !== -1 ? tok.slice(eq + 1) : argv[++i];
+      if (value === undefined || value.trim() === "" || (eq === -1 && value.startsWith("--"))) {
+        return fail(`--${key} requires a value`);
+      }
+      args[key] = value;
     } else {
-      const key = tok.slice(2);
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--")) { args[key] = next; i++; }
-      else args[key] = true;
+      return fail(`unknown flag --${key} (valid: --root, --format, --quiet)`);
     }
   }
   return args;
@@ -79,17 +88,11 @@ function checkGitignore(root) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  // Strict usage: a typo must exit 2 loud, never run a weaker check silently.
-  if (args._.length) fail(`unexpected argument(s): ${args._.join(" ")}`);
-  for (const key of Object.keys(args)) {
-    if (key !== "_" && !KNOWN_FLAGS.has(key)) fail(`unknown flag --${key} (valid: ${[...KNOWN_FLAGS].map((f) => `--${f}`).join(", ")})`);
-  }
-  if ("root" in args && (args.root === true || String(args.root).trim() === "")) fail("--root requires a directory path");
-  const root = "root" in args ? path.resolve(String(args.root)) : process.cwd();
+  const root = "root" in args ? path.resolve(args.root) : process.cwd();
   let rootStat;
   try { rootStat = fs.statSync(root); } catch { rootStat = null; }
   if (!rootStat || !rootStat.isDirectory()) fail(`--root is not a directory: ${root}`);
-  const format = args.format || "text";
+  const format = "format" in args ? args.format : "text";
   if (!VALID_FORMATS.includes(format)) fail(`unknown --format '${format}' (valid: ${VALID_FORMATS.join(", ")})`);
   const quiet = Boolean(args.quiet);
 

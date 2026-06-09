@@ -93,9 +93,14 @@ test("invalid usage fails loud (exit 2), never a silently weaker run", () => {
   try {
     fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules/\n");
     assert.equal(runGate(["--root", dir, "--format", "yaml"]).status, 2, "unknown --format");
+    assert.equal(runGate(["--root", dir, "--format="]).status, 2, "empty --format value");
+    assert.equal(runGate(["--root", dir, "--format"]).status, 2, "bare --format without a value");
     assert.equal(runGate(["--root"]).status, 2, "bare --root without a value");
     assert.equal(runGate(["--root="]).status, 2, "empty --root value");
+    assert.equal(runGate(["--root", "--quiet"]).status, 2, "--root consuming a flag as value");
     assert.equal(runGate(["--root", dir, "--frmat", "json"]).status, 2, "unknown flag");
+    assert.equal(runGate(["--quiet", dir]).status, 2, "operand after a boolean flag");
+    assert.equal(runGate(["--quiet=1", "--root", dir]).status, 2, "value on a boolean flag");
     assert.equal(runGate([dir]).status, 2, "positional argument");
   } finally { rm(dir); }
 });
