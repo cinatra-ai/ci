@@ -23,9 +23,21 @@ import { fileURLToPath } from "node:url";
 import { resolveBaseRef, buildRenameMap, getAddedLineNumbers } from "./lib/touch-ratchet.mjs";
 
 const SCANNER_VERSION = "1.0.0";
-const SELF_PATH = "scripts/source-leak-gate.mjs";
-const FIXTURE_PATH = "scripts/__fixtures__/source-leak.fixture.txt";
 const DEFAULT_DIFF_BASE_ENV = "SOURCE_LEAK_DIFF_BASE";
+
+// Exemptions are keyed to the ACTUAL running gate file (and its sibling fixture)
+// by real path — never by a relative path a scanned (caller) repo could also
+// have. So the sentinel/fixture carve-outs apply only to this gate's own files.
+const SCANNER_REAL = (() => {
+  try { return fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return ""; }
+})();
+const FIXTURE_REAL = (() => {
+  try { return fs.realpathSync(path.join(path.dirname(SCANNER_REAL), "__fixtures__", "source-leak.fixture.txt")); }
+  catch { return ""; }
+})();
+function realPathOf(p) {
+  try { return fs.realpathSync(path.resolve(p)); } catch { return ""; }
+}
 const VALID_PROFILES = ["default", "ts-monorepo", "php-wp-plugin", "drupal-module", "ops-docs"];
 const VALID_RATCHET_MODES = ["line", "file", "baseline", "off"];
 
@@ -356,7 +368,7 @@ function scanFile(relPath, rules) {
   let text;
   try { text = fs.readFileSync(relPath, "utf8"); } catch { return []; }
   if (text.includes("\0")) return [];
-  const isSelf = relPath === SELF_PATH;
+  const isSelf = SCANNER_REAL !== "" && realPathOf(relPath) === SCANNER_REAL;
   const defRange = isSelf ? readRuleDefRange(text) : { start: -1, end: -1 };
   const lines = text.split(/\r?\n/);
   const findings = [];
@@ -491,9 +503,9 @@ function main() {
   let files = listTrackedFiles();
   files = applyManifest(files, args.manifest);
   const candidates = files.filter((p) => {
-    if (p === SELF_PATH) return true; // scanned, but its rule-def region is sentinel-exempt
-    if (p === FIXTURE_PATH) return false; // dedicated marker fixture
-    if (p.startsWith("scripts/__fixtures__/")) return false; // any dedicated fixture asset
+    const real = realPathOf(p);
+    if (real && real === SCANNER_REAL) return true; // the running gate (rule-def region is sentinel-exempt)
+    if (real && FIXTURE_REAL && real === FIXTURE_REAL) return false; // this gate's own marker fixture
     if (isPrivate(p)) return false;
     if (!includeTests && /(^|\/)(__tests__|\.test\.|\.spec\.)/.test(p)) return false;
     return shouldScan(p, scanExtensions, skipDirs, skipDirPrefixes, skipFilePatterns);

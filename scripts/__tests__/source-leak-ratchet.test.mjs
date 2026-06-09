@@ -123,6 +123,23 @@ test("baseline mode tolerates accepted counts and blocks increases", () => {
   } finally { rm(dir); }
 });
 
+test("caller files at the gate's own paths are NOT exempt", () => {
+  const dir = setupRepo();
+  try {
+    fs.mkdirSync(path.join(dir, "scripts/__fixtures__"), { recursive: true });
+    // A caller file at the gate's own relative path, even with a sentinel block,
+    // must still be scanned (exemption is keyed to the real running gate file).
+    fs.writeFileSync(
+      path.join(dir, "scripts/source-leak-gate.mjs"),
+      "// " + "SOURCE_LEAK_RULES" + "_BEGIN\n" + MARKER + "\n// " + "SOURCE_LEAK_RULES" + "_END\n",
+    );
+    fs.writeFileSync(path.join(dir, "scripts/__fixtures__/caller.fixture.txt"), MARKER + "\n");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "caller files");
+    assert.equal(runGate(dir, "", ["--ratchet-mode", "off"]), 1);
+  } finally { rm(dir); }
+});
+
 test("manifest include/negation scopes the scan", () => {
   const dir = setupRepo();
   try {
