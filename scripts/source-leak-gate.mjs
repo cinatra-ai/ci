@@ -20,7 +20,7 @@ import { execFileSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveBaseRef, buildRenameMap, getAddedLineNumbers } from "./lib/touch-ratchet.mjs";
+import { resolveBaseRef, buildRenameMap, getAddedLineNumbers, getIntroducedPaths } from "./lib/touch-ratchet.mjs";
 
 const SCANNER_VERSION = "0.1.0";
 const DEFAULT_DIFF_BASE_ENV = "SOURCE_LEAK_DIFF_BASE";
@@ -78,6 +78,7 @@ const RULES = [
     id: "SLG_MILESTONE_NUMBER",
     description: "Numbered planning milestone reference",
     re: /\bphase[\s:=\-_]+(?:[A-Z]?\d{2,4}(?:\.\d+)*[a-z]?)\b/gi,
+    pathScan: true, // e.g. a dir `phase-553/`
     contextExclude(line) {
       if (line.includes("NEXT_PHASE=phase-production-build")) return true;
       if (/\bphased rollout\b/i.test(line)) return true;
@@ -99,6 +100,7 @@ const RULES = [
     id: "SLG_VERSIONED_MILESTONE",
     description: "Versioned milestone reference",
     re: /\bv\d+\.\d+(?:\.\d+)?[\s:_/-]+(?:Phase|P)[\s:_#-]*\d{2,4}\b/gi,
+    pathScan: true, // per-segment scan avoids matching across a real `/` (e.g. api/v1.2/P12)
   },
   {
     id: "SLG_MILESTONE_REF",
@@ -122,6 +124,7 @@ const RULES = [
     id: "SLG_PLANNING_DOC_VERSIONED",
     description: "Milestone-prefixed planning doc name",
     re: /\bv\d+\.\d+(?:\.\d+){0,2}[\s.-]+(?:MILESTONE(?:-AUDIT)?|PLAN|ROADMAP|PHASE|REQUIREMENTS|RESEARCH|REVIEW|VALIDATION|VERIFICATION|SECURITY|LEARNINGS|NYQUIST|PATTERNS)(?:\.md)?\b/g,
+    pathScan: true, // e.g. a file `v6.13-ROADMAP.md` (the bare unversioned SLG_PLANNING_DOC is NOT path-scanned: legit OSS PLAN.md/ROADMAP.md)
   },
   {
     id: "SLG_PLANNING_PATH",
@@ -140,6 +143,7 @@ const RULES = [
     id: "SLG_WORKSTREAM_NUMERIC",
     description: "Numeric workstream ID",
     re: /\bGSD-?\d{3,4}\b/g,
+    pathScan: true, // e.g. a file/dir `GSD-001-notes/`
   },
   {
     id: "SLG_WORKSTREAM_SLUG",
@@ -391,6 +395,32 @@ function scanFile(relPath, rules) {
   return findings;
 }
 
+// File-name (path) scan: a leaky FILE or DIRECTORY name is a leak even when the
+// file's content is clean (or unscanned, e.g. a binary). Scans the path
+// PER-SEGMENT with the rule subset flagged `pathScan` — per-segment so one
+// benign segment's contextExclude (e.g. ECC `P-256`) can't suppress a leaky
+// sibling segment, and so segment-spanning regex separators (`/`) don't create
+// cross-directory false positives. Path findings carry line:0 (the marker that
+// routes them through the path ratchet, never the line ratchet).
+function scanPath(relPath, pathRules) {
+  if (!pathRules.length) return [];
+  const segments = relPath.split("/");
+  const findings = [];
+  for (const rule of pathRules) {
+    for (const seg of segments) {
+      const localRe = new RegExp(rule.re.source, rule.re.flags);
+      let m;
+      while ((m = localRe.exec(seg)) !== null) {
+        if (rule.contextExclude && rule.contextExclude(seg)) break;
+        findings.push({ rule: rule.id, file: relPath, line: 0, column: 0, match: m[0], snippet: `path: ${relPath}` });
+        if (!localRe.global) break;
+        if (m.index === localRe.lastIndex) localRe.lastIndex++;
+      }
+    }
+  }
+  return findings;
+}
+
 function applyLineRatchet(findings, diffBaseEnv) {
   const base = resolveBaseRef(diffBaseEnv);
   if (!base) return findings;
@@ -404,6 +434,18 @@ function applyLineRatchet(findings, diffBaseEnv) {
   });
 }
 
+// Ratchet for path (line:0) findings: block only on paths the PR ADDED, RENAMED-
+// to, or COPIED-to; tolerate pre-existing leaky paths. Strict / fail-closed
+// (block all) when there is no base or the diff cannot be computed — never
+// silently tolerate a rename into a leaky name.
+function applyPathRatchet(pathFindings, diffBaseEnv) {
+  if (!pathFindings.length) return [];
+  const base = resolveBaseRef(diffBaseEnv);
+  const introduced = getIntroducedPaths(base);
+  if (introduced === null) return pathFindings; // strict / fail-closed
+  return pathFindings.filter((f) => introduced.has(f.file));
+}
+
 function resolveTouchedFiles(diffBaseEnv) {
   const base = resolveBaseRef(diffBaseEnv);
   if (!base) return null;
@@ -413,7 +455,7 @@ function resolveTouchedFiles(diffBaseEnv) {
     });
     return new Set(out.split("\n").map((s) => s.trim()).filter(Boolean));
   } catch {
-    return new Set();
+    return null; // fail closed: file ratchet treats null as strict (all allowlisted entries block)
   }
 }
 
@@ -500,12 +542,20 @@ function main() {
   const exemptDirs = [...EXEMPT_DIR_PREFIXES, ...((config.exemptDirPrefixes) || [])];
   const exemptFiles = new Set([...EXEMPT_FILE_BASENAMES, ...((config.exemptFileBasenames) || [])]);
 
+  // The gate's own config / legacy-allowlist / baseline artifacts necessarily
+  // contain the very tokens (and leaky path strings) they describe — never scan
+  // them, or a regenerated allowlist would flag itself.
+  const gateArtifacts = new Set(
+    [args.config, args["legacy-allowlist"], args["gate-baseline"]].filter(Boolean).map((p) => realPathOf(p)).filter(Boolean),
+  );
+
   let files = listTrackedFiles();
   files = applyManifest(files, args.manifest);
   const candidates = files.filter((p) => {
     const real = realPathOf(p);
     if (real && real === SCANNER_REAL) return true; // the running gate (rule-def region is sentinel-exempt)
     if (real && FIXTURE_REAL && real === FIXTURE_REAL) return false; // this gate's own marker fixture
+    if (real && gateArtifacts.has(real)) return false; // gate's own config/allowlist/baseline
     if (isPrivate(p)) return false;
     if (!includeTests && /(^|\/)(__tests__|\.test\.|\.spec\.)/.test(p)) return false;
     return shouldScan(p, scanExtensions, skipDirs, skipDirPrefixes, skipFilePatterns);
@@ -520,10 +570,33 @@ function main() {
     findings.push(...fileFindings);
   }
 
+  // File-name (path) scan: extension-INDEPENDENT candidate set (a leaky-named
+  // binary counts), re-applying every exclusion (private/skip/exempt/gate-own)
+  // up front. Path findings (line:0) merge into `findings` so file/baseline
+  // ratchets key on path consistently.
+  const pathRules = rules.filter((r) => r.pathScan);
+  if (pathRules.length) {
+    for (const p of files) {
+      const real = realPathOf(p);
+      if (real && (real === SCANNER_REAL || (FIXTURE_REAL && real === FIXTURE_REAL) || gateArtifacts.has(real))) continue;
+      if (isPrivate(p)) continue;
+      if (!includeTests && /(^|\/)(__tests__|\.test\.|\.spec\.)/.test(p)) continue;
+      if (p.split("/").some((seg) => skipDirs.has(seg))) continue;
+      if (skipDirPrefixes.some((pre) => p === pre.replace(/\/$/, "") || p.startsWith(pre))) continue;
+      const base = p.split("/").pop();
+      if (exemptFiles.has(base) || exemptDirs.some((pre) => p.startsWith(pre))) continue;
+      findings.push(...scanPath(p, pathRules));
+    }
+  }
+
   let gateFindings = findings;
   let ratchetNote = "";
   if (ratchetMode === "line") {
-    gateFindings = applyLineRatchet(findings, diffBaseEnv);
+    // Content findings (line>0) ride the line ratchet; path findings (line:0)
+    // ride the path ratchet (a rename into a leaky name has no "added line").
+    const contentFindings = findings.filter((f) => f.line > 0);
+    const pathFindings = findings.filter((f) => f.line === 0);
+    gateFindings = [...applyLineRatchet(contentFindings, diffBaseEnv), ...applyPathRatchet(pathFindings, diffBaseEnv)];
     ratchetNote = `line ratchet: ${findings.length - gateFindings.length} pre-existing finding(s) tolerated`;
   } else if (ratchetMode === "file") {
     const r = applyFileRatchet(findings, args, diffBaseEnv);

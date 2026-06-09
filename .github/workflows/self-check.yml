@@ -31,4 +31,5 @@ jobs:
         run: |
           node --test \
             scripts/__tests__/source-leak-gate.test.mjs \
-            scripts/__tests__/source-leak-ratchet.test.mjs
+            scripts/__tests__/source-leak-ratchet.test.mjs \
+            scripts/__tests__/source-leak-pathscan.test.mjs

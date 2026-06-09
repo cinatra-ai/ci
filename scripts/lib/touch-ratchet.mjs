@@ -68,6 +68,53 @@ export function resolveBaseRef(envVarName) {
   return null;
 }
 
+/**
+ * Return the set of new-side paths the PR ADDED, RENAMED-to, or COPIED-to vs
+ * `base` — i.e. paths whose NAME is introduced by the PR. Used by the file-name
+ * (path) ratchet: a pre-existing leaky path is tolerated, but a newly
+ * added/renamed/copied leaky path blocks.
+ *   null  -> no base (strict: caller treats EVERY path finding as introduced),
+ *            also returned on diff failure with a valid base (fail closed — a
+ *            security gate must not silently tolerate an unscannable rename).
+ * Uses `--name-status -z --find-renames --find-copies` and three-dot
+ * (`base...HEAD` = "what did the PR write?"), consistent with the other helpers.
+ */
+export function getIntroducedPaths(base) {
+  if (!base) return null;
+  let out;
+  try {
+    out = execFileSync(
+      "git",
+      [
+        "--literal-pathspecs", "diff", "--name-status", "-z",
+        "--find-renames", "--find-copies", "--end-of-options", `${base}...HEAD`,
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+  } catch {
+    return null; // fail closed
+  }
+  const parts = out.split("\0");
+  const introduced = new Set();
+  let i = 0;
+  while (i < parts.length) {
+    const status = parts[i];
+    if (!status) { i += 1; continue; }
+    if (status.startsWith("R") || status.startsWith("C")) {
+      const newPath = parts[i + 2]; // status\0old\0new
+      if (newPath) introduced.add(newPath);
+      i += 3;
+    } else if (status.startsWith("A")) {
+      const p = parts[i + 1];
+      if (p) introduced.add(p);
+      i += 2;
+    } else {
+      i += 2; // M / D / T — not an introduced NAME
+    }
+  }
+  return introduced;
+}
+
 /** Map current-path -> base-path (pre-rename) for files renamed/copied between base and HEAD. */
 export function buildRenameMap(base) {
   const map = new Map();

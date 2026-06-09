@@ -55,10 +55,25 @@ Suggested per-repo profiles: `cinatra` → `ts-monorepo`, `wordpress-plugin` →
 | `gate_baseline` | _(none)_ | JSON baseline for `baseline` mode. |
 | `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
 
+### File-name (path) scanning
+
+In addition to file **content**, the gate scans each file's **path** so a leaky
+file or directory name (e.g. `phase-553/`, `v6.13-ROADMAP.md`, `GSD-001-notes/`)
+is caught even when the content is clean or the file is binary. Paths are scanned
+**per-segment** (split on `/`) with a curated, low-false-positive rule subset
+(numbered milestones, versioned milestone/planning-doc names, numeric workstream
+IDs); broad/ambiguous rules are deliberately excluded from path scanning to avoid
+false positives on `api/v2/`, ECC `P-256/`, hashed/date slugs, and locale codes.
+Path findings report `line: 0` and are ratcheted by **introduced path** (added /
+renamed-to / copied-to vs the base) in `line` mode, and by the legacy allowlist
+in `file` mode — so pre-existing leaky names are tolerated and only newly
+introduced ones block.
+
 ### Ratchet modes
 
-- **line** (default): only findings on lines the PR added block the merge;
-  pre-existing findings are tolerated. Needs full history (`fetch-depth: 0`).
+- **line** (default): only findings on lines the PR added (and paths the PR
+  introduced) block the merge; pre-existing findings are tolerated. Needs full
+  history (`fetch-depth: 0`).
 - **file**: findings block unless the file is in a committed legacy allowlist
   and untouched by the PR; touched allowlisted files must be scrubbed; stale
   allowlist entries block.
