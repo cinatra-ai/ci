@@ -109,4 +109,65 @@ clean on this repository and that the test suite passes.
 node --test scripts/__tests__/source-leak-gate.test.mjs scripts/__tests__/source-leak-ratchet.test.mjs
 ```
 
+## gitignore-gate
+
+A reusable GitHub Actions workflow + check that fails CI when a repo's root
+`.gitignore` is **missing, empty, or whitespace-only** (or not a regular file —
+git ≥ 2.32 does not follow a symlinked `.gitignore`). A comment-only
+`.gitignore` passes (presence is the contract); the text output reports the
+effective entry count so a hollow file stays visible.
+
+### Baseline template
+
+[`config/baseline.gitignore`](config/baseline.gitignore) is the org-wide
+baseline: node/pnpm dependencies, monorepo build output, logs/caches, OS cruft,
+editor dirs, and env files/secrets. To adopt it in a repo without a
+`.gitignore`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/cinatra-ai/ci/main/config/baseline.gitignore -o .gitignore
+```
+
+then append project-specific entries below the baseline block. Repos that
+already have a `.gitignore` should merge the baseline entries into it rather
+than replace the file (and drop any baseline entry they deliberately commit,
+e.g. `.vscode/`).
+
+### Use it from another repo
+
+Add a thin caller workflow:
+
+```yaml
+name: gitignore-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  gitignore-gate:
+    # In production pin BOTH to the same commit SHA: the workflow ref (`@<sha>`)
+    # and the `ref` input below — otherwise the gate code is still pulled from
+    # mutable `main`.
+    uses: cinatra-ai/ci/.github/workflows/gitignore-gate.yml@main  # @<sha> in prod
+    with:
+      ref: main  # set to the same <sha> in production
+```
+
+### Run locally
+
+```sh
+node scripts/gitignore-gate.mjs
+```
+
+Add `--root <dir>` to check another checkout, `--format json` for machine
+output. Exit codes: `0` pass, `1` gate failure, `2` usage/internal error.
+
+### Develop
+
+```sh
+node --test scripts/__tests__/gitignore-gate.test.mjs
+```
+
 Zero runtime dependencies (Node built-ins only); requires Node 24+.

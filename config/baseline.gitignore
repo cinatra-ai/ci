@@ -1,0 +1,43 @@
+# cinatra-ai baseline .gitignore
+# Copy into a repo's root .gitignore (or merge into an existing one) and append
+# project-specific entries below. Enforced by the gitignore-gate workflow.
+
+# Dependencies (node / pnpm)
+node_modules/
+.pnpm-store/
+
+# Build output (monorepo-typical)
+dist/
+build/
+out/
+.next/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# Logs and caches
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+.cache/
+.eslintcache
+
+# OS cruft
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Env files and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
