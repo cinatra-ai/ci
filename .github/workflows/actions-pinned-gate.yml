@@ -1,0 +1,41 @@
+name: actions-pinned-gate
+
+# Reusable workflow. A consuming repo calls it from its own thin caller, e.g.:
+#
+#   jobs:
+#     actions-pinned-gate:
+#       uses: cinatra-ai/ci/.github/workflows/actions-pinned-gate.yml@<sha>  # vX.Y.Z
+#
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  actions-pinned-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .actions-pinned-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        run: node .actions-pinned-gate/scripts/actions-pinned-gate.mjs

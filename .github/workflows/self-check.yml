@@ -24,8 +24,13 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Gate runs clean on its own repository
-        run: node scripts/source-leak-gate.mjs --profile default --ratchet-mode off --exit-on-match
+      - name: source-leak-gate runs clean on its own repository
+        # config/self-check.json exempts the actions-pinned-gate source + tests,
+        # which necessarily contain the version-comment markers they enforce.
+        run: node scripts/source-leak-gate.mjs --profile default --ratchet-mode off --config config/self-check.json --exit-on-match
+
+      - name: actions-pinned-gate runs clean on its own repository
+        run: node scripts/actions-pinned-gate.mjs
 
       - name: Gitignore gate runs clean on its own repository
         run: node scripts/gitignore-gate.mjs
@@ -36,4 +41,5 @@ jobs:
             scripts/__tests__/source-leak-gate.test.mjs \
             scripts/__tests__/source-leak-ratchet.test.mjs \
             scripts/__tests__/source-leak-pathscan.test.mjs \
-            scripts/__tests__/gitignore-gate.test.mjs
+            scripts/__tests__/gitignore-gate.test.mjs \
+            scripts/__tests__/actions-pinned-gate.test.mjs

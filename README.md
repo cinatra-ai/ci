@@ -99,7 +99,11 @@ Add `--exit-on-match` to make it a gate, `--format json` for machine output.
 
 The scanner's rule definitions necessarily contain the markers they detect, so
 that region is bracketed by sentinel comments and skipped when the gate scans
-its own source. Dedicated test fixtures and baselines are path-exempt. The
+its own source. Dedicated test fixtures and baselines are path-exempt. For the
+same reason, the `actions-pinned-gate` source and tests contain the version
+comments they enforce, so this repo's own self-check passes
+[`config/self-check.json`](config/self-check.json) to exempt those two files
+from its scan — consuming repos never receive that config. The
 [`self-check`](.github/workflows/self-check.yml) workflow proves the gate runs
 clean on this repository and that the test suite passes.
 
@@ -171,3 +175,67 @@ node --test scripts/__tests__/gitignore-gate.test.mjs
 ```
 
 Zero runtime dependencies (Node built-ins only); requires Node 24+.
+
+## actions-pinned-gate
+
+A reusable GitHub Actions workflow + scanner that fails CI when any **remote
+`uses:` ref** in the caller repo's GitHub Actions YAML (`.github/workflows/**`
+workflows and `.github/actions/**` local composite actions) is not pinned to an
+immutable 40-char commit SHA carrying a `# vX.Y.Z` version comment. A moved
+upstream tag (`@v6`) can silently run new code against the caller's
+`GITHUB_TOKEN`; an immutable SHA cannot.
+
+It is a purely-offline **format** check: it does not resolve SHAs upstream, and
+it deliberately exempts local `./` and `docker://` refs. The parser is hardened
+against the realistic bypass/false-positive vectors (quoted/space-before-colon
+`uses` keys, single-line flow mappings, `run: |` block-scalar bodies) and is
+fail-closed: a `uses:`-bearing construct it cannot verify is flagged loudly
+rather than skipped.
+
+### Use it from another repo
+
+Add a thin caller workflow:
+
+```yaml
+name: actions-pinned-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  actions-pinned-gate:
+    # In production pin BOTH to the same commit SHA: the workflow ref (`@<sha>`)
+    # and the `ref` input below — otherwise the scanner code is still pulled from
+    # mutable `main`.
+    uses: cinatra-ai/ci/.github/workflows/actions-pinned-gate.yml@main  # @<sha> in prod
+    with:
+      ref: main  # set to the same <sha> in production
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
+
+### Run locally
+
+```sh
+node scripts/actions-pinned-gate.mjs
+```
+
+Exits non-zero listing every offending `file:line` when a remote ref is
+unpinned or missing its version comment.
+
+### Develop
+
+```sh
+node --test scripts/__tests__/actions-pinned-gate.test.mjs
+```
+
+Zero runtime dependencies (Node built-ins only); requires Node 24+. The
+fail-closed behavior (a deliberately unpinned ref fails the gate) is exercised
+by unit fixtures in the test suite, and the [`self-check`](.github/workflows/self-check.yml)
+workflow dogfoods the gate against this repository's own workflows.
