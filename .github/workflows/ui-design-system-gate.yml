@@ -1,0 +1,96 @@
+name: ui-design-system-gate
+
+# Reusable workflow. A consuming repo spreads config/ui-design-system.flat.mjs
+# into its OWN eslint.config (so local dev and CI agree), then calls this
+# workflow from a thin caller, e.g.:
+#
+#   jobs:
+#     ui-design-system-gate:
+#       uses: cinatra-ai/ci/.github/workflows/ui-design-system-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         strictness: warn
+#
+# The gate installs the caller's dependencies and runs plain ESLint against
+# the repo's own flat config — it never runs a separate generated/overriding
+# config. The typed inputs are forwarded as UI_DESIGN_SYSTEM_* environment
+# variables, which the preset reads as defaults (explicit factory options in
+# the repo's config take precedence; see the preset docblock).
+#
+on:
+  workflow_call:
+    inputs:
+      ui_globs:
+        description: "Comma-separated shadcn-primitive dir globs (Radix re-allowed, raw-JSX rules off)."
+        type: string
+        default: "**/components/ui/**,**/src/ui/**"
+      drizzle_cube_globs:
+        description: "Comma-separated dir globs where drizzle-cube/client* and react-grid-layout are re-allowed."
+        type: string
+        default: "**/packages/dashboards/src/components/**"
+      strictness:
+        description: "Severity of the raw-JSX block: warn | error."
+        type: string
+        default: "warn"
+      install_command:
+        description: "Dependency install command. Empty = auto-detect from the caller's lockfile. Trusted caller workflow code — same trust domain as the caller's own workflow file."
+        type: string
+        default: ""
+      lint_command:
+        description: "ESLint invocation; must load the caller repo's own flat config. Trusted caller workflow code."
+        type: string
+        default: "npx eslint ."
+
+permissions:
+  contents: read
+
+jobs:
+  ui-design-system-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Inputs are referenced via `env`, never interpolated into script text,
+      # so a crafted input value cannot rewrite the shell snippet. The two
+      # *_command inputs ARE executed by design (they come from the caller's
+      # pinned workflow file, the same trust domain as a `run:` step there).
+      - name: Validate inputs
+        env:
+          STRICTNESS: ${{ inputs.strictness }}
+        run: |
+          case "$STRICTNESS" in
+            warn|error) ;;
+            *) echo "strictness must be 'warn' or 'error', got '$STRICTNESS'" >&2; exit 1 ;;
+          esac
+
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        env:
+          INSTALL_COMMAND: ${{ inputs.install_command }}
+        run: |
+          if [ -n "$INSTALL_COMMAND" ]; then
+            bash -c "$INSTALL_COMMAND"
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            corepack pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            corepack yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run gate (ESLint with the caller's own flat config)
+        env:
+          UI_DESIGN_SYSTEM_UI_GLOBS: ${{ inputs.ui_globs }}
+          UI_DESIGN_SYSTEM_DRIZZLE_CUBE_GLOBS: ${{ inputs.drizzle_cube_globs }}
+          UI_DESIGN_SYSTEM_STRICTNESS: ${{ inputs.strictness }}
+          LINT_COMMAND: ${{ inputs.lint_command }}
+        run: bash -c "$LINT_COMMAND"
