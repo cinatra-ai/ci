@@ -22,7 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveBaseRef, buildRenameMap, getAddedLineNumbers } from "./lib/touch-ratchet.mjs";
 
-const SCANNER_VERSION = "1.0.0";
+const SCANNER_VERSION = "0.1.0";
 const DEFAULT_DIFF_BASE_ENV = "SOURCE_LEAK_DIFF_BASE";
 
 // Exemptions are keyed to the ACTUAL running gate file (and its sibling fixture)
