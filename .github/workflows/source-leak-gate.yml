@@ -1,0 +1,101 @@
+name: source-leak-gate
+
+# Reusable workflow. A consuming repo calls it from its own thin caller, e.g.:
+#
+#   jobs:
+#     source-leak-gate:
+#       uses: cinatra-ai/ci/.github/workflows/source-leak-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         profile: php-wp-plugin
+#
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Rule profile (default | ts-monorepo | php-wp-plugin | drupal-module | ops-docs)."
+        type: string
+        default: "default"
+      manifest:
+        description: "Optional path to an include/negation manifest to scope the scan."
+        type: string
+        default: ""
+      config:
+        description: "Optional path (in the caller repo) to a per-repo JSON config."
+        type: string
+        default: ""
+      rules:
+        description: "Optional comma-separated rule-ID allowlist."
+        type: string
+        default: ""
+      ratchet_mode:
+        description: "line | file | baseline | off."
+        type: string
+        default: "line"
+      legacy_allowlist:
+        description: "Optional path to a file-ratchet legacy allowlist JSON."
+        type: string
+        default: ""
+      gate_baseline:
+        description: "Optional path to a baseline-ratchet JSON."
+        type: string
+        default: ""
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  source-leak-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .source-leak-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Fetch base ref
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin \
+            "${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+
+      - name: Compute diff base
+        id: base
+        run: |
+          if [ -n "${{ github.event.pull_request.base.ref }}" ]; then
+            echo "ref=origin/${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "ref=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run gate
+        env:
+          SOURCE_LEAK_DIFF_BASE: ${{ steps.base.outputs.ref }}
+        run: |
+          node .source-leak-gate/scripts/source-leak-gate.mjs \
+            --profile "${{ inputs.profile }}" \
+            --manifest "${{ inputs.manifest }}" \
+            --config "${{ inputs.config }}" \
+            --rules "${{ inputs.rules }}" \
+            --ratchet-mode "${{ inputs.ratchet_mode }}" \
+            --legacy-allowlist "${{ inputs.legacy_allowlist }}" \
+            --gate-baseline "${{ inputs.gate_baseline }}" \
+            --exit-on-match

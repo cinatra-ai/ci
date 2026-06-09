@@ -1,0 +1,5 @@
+{
+  "$comment": "The default ruleset is built into scripts/source-leak-gate.mjs and needs no config. This file is a placeholder default config (a no-op when passed via --config). Per-repo extensions belong in your own config file; see example-config.json. Default ratchet mode is 'line'.",
+  "reqIdSinglePrefixes": [],
+  "extraRules": []
+}

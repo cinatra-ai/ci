@@ -1,0 +1,25 @@
+This fixture is a self-referencing test asset: it deliberately contains marker
+examples so the test suite can prove each rule matches. It is path-exempt and in
+SELF_REFERENCING_FILES, so the gate never scans it on a repo walk.
+
+Each positive line is "HIT:<RULE_ID>:<payload>". The payload after the second
+colon must produce at least one match for the named rule.
+
+HIT:SLG_MILESTONE_NUMBER:see Phase 530 for context
+HIT:SLG_MILESTONE_SHORTHAND:tracked under P441 now
+HIT:SLG_VERSIONED_MILESTONE:landed in v6.13 Phase 530
+HIT:SLG_MILESTONE_REF:target milestone v6.13.1 here
+HIT:SLG_METHODOLOGY:follows the GSD workflow
+HIT:SLG_PLANNING_DOC:see PLAN.md for the steps
+HIT:SLG_PLANNING_DOC_VERSIONED:archived as v6.13.1-PLAN.md
+HIT:SLG_PLANNING_PATH:notes in .planning/active dir
+HIT:SLG_REQ_ID_BROAD:owner of MKT131-AUTH-02 task
+HIT:SLG_WORKSTREAM_NUMERIC:completed GSD-001 already
+HIT:SLG_WORKSTREAM_SLUG:branch 123456-abc work
+HIT:SLG_REVIEW_LABEL:per Codex r1 feedback
+HIT:SLG_PR_ROUND:follow up on PR #607 r3
+HIT:SLG_PROVENANCE:added in Phase 5 of the rollout
+HIT:SLG_HISTORICAL:renamed from the older name
+HIT:SLG_DECISION_RECORD:see ADR 0045 for rationale
+HIT:SLG_AGENT_MEMORY:pointer [[feedback_some-note]] saved
+HIT:SLG_MILESTONE_VERSION:ship the v6.13 milestone work

@@ -1,0 +1,16 @@
+{
+  "$comment": "Example per-repo config. Each consuming repo owns its own config and may name repo-specific tokens there. Keep this file in the consuming repo, not in this shared repo.",
+  "reqIdSinglePrefixes": ["ABC", "PROJ", "SKILL"],
+  "scanExtensions": [".env.example"],
+  "skipDirs": ["generated"],
+  "exemptDirPrefixes": ["docs/"],
+  "lineExcludes": ["source-leak-allow"],
+  "extraRules": [
+    {
+      "id": "REPO_INTERNAL_HOST",
+      "description": "Reference to an internal host",
+      "regex": "\\b[a-z0-9-]+\\.internal\\.example\\b",
+      "flags": "gi"
+    }
+  ]
+}
