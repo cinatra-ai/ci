@@ -16,6 +16,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const GATE_VERSION = "0.1.0";
+const VALID_FORMATS = ["text", "json"];
+const KNOWN_FLAGS = new Set(["root", "format", "quiet"]);
 const BASELINE_HINT =
   "seed it from the org baseline: https://github.com/cinatra-ai/ci/blob/main/config/baseline.gitignore";
 
@@ -27,10 +29,10 @@ const STATUS_REASONS = {
 };
 
 function parseArgs(argv) {
-  const args = {};
+  const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
-    if (!tok.startsWith("--")) continue;
+    if (!tok.startsWith("--")) { args._.push(tok); continue; }
     const eq = tok.indexOf("=");
     if (eq !== -1) {
       args[tok.slice(2, eq)] = tok.slice(eq + 1);
@@ -77,11 +79,18 @@ function checkGitignore(root) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const root = args.root && args.root !== true ? path.resolve(String(args.root)) : process.cwd();
+  // Strict usage: a typo must exit 2 loud, never run a weaker check silently.
+  if (args._.length) fail(`unexpected argument(s): ${args._.join(" ")}`);
+  for (const key of Object.keys(args)) {
+    if (key !== "_" && !KNOWN_FLAGS.has(key)) fail(`unknown flag --${key} (valid: ${[...KNOWN_FLAGS].map((f) => `--${f}`).join(", ")})`);
+  }
+  if ("root" in args && (args.root === true || String(args.root).trim() === "")) fail("--root requires a directory path");
+  const root = "root" in args ? path.resolve(String(args.root)) : process.cwd();
   let rootStat;
   try { rootStat = fs.statSync(root); } catch { rootStat = null; }
   if (!rootStat || !rootStat.isDirectory()) fail(`--root is not a directory: ${root}`);
   const format = args.format || "text";
+  if (!VALID_FORMATS.includes(format)) fail(`unknown --format '${format}' (valid: ${VALID_FORMATS.join(", ")})`);
   const quiet = Boolean(args.quiet);
 
   const result = checkGitignore(root);

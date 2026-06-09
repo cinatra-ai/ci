@@ -88,6 +88,18 @@ test("nonexistent --root fails loud (exit 2)", () => {
   assert.equal(runGate(["--root", path.join(os.tmpdir(), "gig-does-not-exist"), "--quiet"]).status, 2);
 });
 
+test("invalid usage fails loud (exit 2), never a silently weaker run", () => {
+  const dir = tmpDir();
+  try {
+    fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules/\n");
+    assert.equal(runGate(["--root", dir, "--format", "yaml"]).status, 2, "unknown --format");
+    assert.equal(runGate(["--root"]).status, 2, "bare --root without a value");
+    assert.equal(runGate(["--root="]).status, 2, "empty --root value");
+    assert.equal(runGate(["--root", dir, "--frmat", "json"]).status, 2, "unknown flag");
+    assert.equal(runGate([dir]).status, 2, "positional argument");
+  } finally { rm(dir); }
+});
+
 test("json format reports gate version, status, and entry count", () => {
   const dir = tmpDir();
   try {
