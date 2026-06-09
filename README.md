@@ -29,11 +29,14 @@ permissions:
   contents: read
 jobs:
   source-leak-gate:
-    # Pin @ to a commit SHA in production (e.g. @<40-char-sha> # v1.0.0).
-    uses: cinatra-ai/ci/.github/workflows/source-leak-gate.yml@main
+    # In production pin BOTH to the same commit SHA: the workflow ref (`@<sha>`)
+    # and the `ref` input below — otherwise the scanner code is still pulled from
+    # mutable `main`.
+    uses: cinatra-ai/ci/.github/workflows/source-leak-gate.yml@main  # @<sha> in prod
     with:
       profile: default
       ratchet_mode: line
+      ref: main  # set to the same <sha> in production
 ```
 
 Suggested per-repo profiles: `cinatra` → `ts-monorepo`, `wordpress-plugin` →

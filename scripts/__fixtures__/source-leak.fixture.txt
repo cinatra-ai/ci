@@ -1,9 +1,12 @@
 This fixture is a self-referencing test asset: it deliberately contains marker
-examples so the test suite can prove each rule matches. It is path-exempt and in
-SELF_REFERENCING_FILES, so the gate never scans it on a repo walk.
+examples so the test suite can prove each rule matches (and that look-alikes do
+not). It is path-exempt (scripts/__fixtures__/), so the gate never scans it on a
+repo walk. Keeping these examples here is what lets the test source stay free of
+intact marker literals.
 
-Each positive line is "HIT:<RULE_ID>:<payload>". The payload after the second
-colon must produce at least one match for the named rule.
+Positive lines are "HIT:<RULE_ID>:<payload>" (the named rule must match the
+payload). Negative lines are "MISS:<RULE_ID>:<payload>" (the named rule must NOT
+match the payload).
 
 HIT:SLG_MILESTONE_NUMBER:see Phase 530 for context
 HIT:SLG_MILESTONE_SHORTHAND:tracked under P441 now
@@ -17,9 +20,19 @@ HIT:SLG_REQ_ID_BROAD:owner of MKT131-AUTH-02 task
 HIT:SLG_WORKSTREAM_NUMERIC:completed GSD-001 already
 HIT:SLG_WORKSTREAM_SLUG:branch 123456-abc work
 HIT:SLG_REVIEW_LABEL:per Codex r1 feedback
-HIT:SLG_PR_ROUND:follow up on PR #607 r3
+HIT:SLG_PULL_REQUEST_ROUND:follow up on PR #607 r3
 HIT:SLG_PROVENANCE:added in Phase 5 of the rollout
 HIT:SLG_HISTORICAL:renamed from the older name
 HIT:SLG_DECISION_RECORD:see ADR 0045 for rationale
 HIT:SLG_AGENT_MEMORY:pointer [[feedback_some-note]] saved
 HIT:SLG_MILESTONE_VERSION:ship the v6.13 milestone work
+
+MISS:SLG_MILESTONE_NUMBER:Phase 1 of the project
+MISS:SLG_MILESTONE_NUMBER:phased rollout is enabled
+MISS:SLG_MILESTONE_NUMBER:if (NEXT_PHASE=phase-production-build) return;
+MISS:SLG_MILESTONE_VERSION:  "version": "6.13.0",
+MISS:SLG_MILESTONE_VERSION:deprecated in v2.0 of the OpenAPI spec
+MISS:SLG_MILESTONE_SHORTHAND:padding P256 with p-4 grid
+MISS:SLG_HISTORICAL:the cache used to be invalidated on write
+MISS:SLG_PLANNING_DOC:see AGENTS.md#section for details
+MISS:SLG_PROVENANCE:deprecated in v2.0 of the spec

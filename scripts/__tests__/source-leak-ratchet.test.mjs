@@ -98,3 +98,38 @@ test("bad explicit diff base fails loud (exit 2)", () => {
     assert.equal(runGate(dir, "does-not-exist", ["--ratchet-mode", "line"]), 2);
   } finally { rm(dir); }
 });
+
+test("empty diff base is strict (does not silently tolerate)", () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "b.md": MARKER + "\n" }, "init");
+    // A local origin/main at HEAD would tolerate everything under a naive
+    // fallback; an explicitly-empty base must instead gate strictly.
+    git(dir, "update-ref", "refs/remotes/origin/main", "HEAD");
+    assert.equal(runGate(dir, "", ["--ratchet-mode", "line"]), 1);
+  } finally { rm(dir); }
+});
+
+test("baseline mode tolerates accepted counts and blocks increases", () => {
+  const dir = setupRepo();
+  const MARKER2 = "see " + "Phase " + "531 here";
+  try {
+    commit(dir, { "a.md": MARKER + "\n" }, "init");
+    fs.writeFileSync(path.join(dir, "baseline.json"),
+      JSON.stringify({ perRuleFile: { ["SLG_MILESTONE_NUMBER\ta.md"]: 1 } }));
+    assert.equal(runGate(dir, "", ["--ratchet-mode", "baseline", "--gate-baseline", "baseline.json"]), 0);
+    fs.writeFileSync(path.join(dir, "a.md"), MARKER + "\n" + MARKER2 + "\n");
+    assert.equal(runGate(dir, "", ["--ratchet-mode", "baseline", "--gate-baseline", "baseline.json"]), 1);
+  } finally { rm(dir); }
+});
+
+test("manifest include/negation scopes the scan", () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "a.md": "clean\n", "b.md": MARKER + "\n" }, "init");
+    fs.writeFileSync(path.join(dir, "m-all.txt"), "a.md\nb.md\n");
+    fs.writeFileSync(path.join(dir, "m-neg.txt"), "a.md\nb.md\n!b.md\n");
+    assert.equal(runGate(dir, "", ["--ratchet-mode", "off", "--manifest", "m-all.txt"]), 1);
+    assert.equal(runGate(dir, "", ["--ratchet-mode", "off", "--manifest", "m-neg.txt"]), 0);
+  } finally { rm(dir); }
+});

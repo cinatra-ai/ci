@@ -41,8 +41,13 @@ export function verifyGitRef(ref) {
  * - none resolvable: return null (strict mode — caller treats all as added).
  */
 export function resolveBaseRef(envVarName) {
-  const explicit = process.env[envVarName];
-  if (explicit) {
+  // Distinguish "env var present" from "env var absent". A present-but-empty
+  // value (e.g. a first push with no base) means strict mode (null) so all
+  // findings gate — never silently fall back to a local branch that may equal
+  // HEAD and tolerate everything.
+  if (Object.prototype.hasOwnProperty.call(process.env, envVarName)) {
+    const explicit = process.env[envVarName];
+    if (!explicit) return null;
     try {
       verifyGitRef(explicit);
       return explicit;

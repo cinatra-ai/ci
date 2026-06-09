@@ -29,17 +29,6 @@ const DEFAULT_DIFF_BASE_ENV = "SOURCE_LEAK_DIFF_BASE";
 const VALID_PROFILES = ["default", "ts-monorepo", "php-wp-plugin", "drupal-module", "ops-docs"];
 const VALID_RATCHET_MODES = ["line", "file", "baseline", "off"];
 
-// Files that legitimately contain marker examples (this gate, its tests,
-// fixtures and workflows). Always skipped on a repo walk.
-const SELF_REFERENCING_FILES = new Set([
-  SELF_PATH,
-  FIXTURE_PATH,
-  "scripts/__tests__/source-leak-gate.test.mjs",
-  "scripts/__tests__/source-leak-ratchet.test.mjs",
-  ".github/workflows/source-leak-gate.yml",
-  ".github/workflows/self-check.yml",
-]);
-
 const DEFAULT_SKIP_DIRS = new Set([
   ".git", ".next", ".turbo", "node_modules", "dist", "build", "coverage",
   "public", ".cache", ".vercel", ".pnpm-store", "vendor",
@@ -151,8 +140,8 @@ const RULES = [
     re: /\b(?:[Cc]odex\s+[Rr]\d+|owner\s+note|review\s+round\s*\d+)\b/g,
   },
   {
-    id: "SLG_PR_ROUND",
-    description: "PR + review-round reference",
+    id: "SLG_PULL_REQUEST_ROUND",
+    description: "Pull-request + review-round reference",
     re: /\bPR\s+#?\d{3,5}\s+[Rr]\d+\b/g,
   },
   {
@@ -193,6 +182,7 @@ const RULES = [
       if (/\b[A-Z][A-Z0-9_]*_(REF|VERSION|TAG)\s*[:=]\s*['"]?v?\d+\.\d+/.test(line)) return true;
       if (/\.(toBe|toEqual|toContain|toMatch)\(['"`]v?\d+\.\d+/i.test(line)) return true;
       if (/v\d+\.\d+\.\d+/.test(line) && /(github\.com|@v\d+|ref\s*:\s*['"]v\d+|git\+|\.git)/i.test(line)) return true;
+      if (/@[0-9a-f]{7,40}\b[^\n]*#\s*v?\d+\.\d+/.test(line)) return true; // SHA-pinned action with version comment
       if (/--save-(dev|exact)/.test(line)) return true;
       if (/\b(release|tag|ship(?:ped)?|target|require|min(?:imum)?)\b/i.test(line)) {
         return !/(milestone|phase|roadmap)/i.test(line);
@@ -501,9 +491,9 @@ function main() {
   let files = listTrackedFiles();
   files = applyManifest(files, args.manifest);
   const candidates = files.filter((p) => {
-    if (p === SELF_PATH) return true;
-    if (SELF_REFERENCING_FILES.has(p)) return false;
-    if (p === FIXTURE_PATH) return false;
+    if (p === SELF_PATH) return true; // scanned, but its rule-def region is sentinel-exempt
+    if (p === FIXTURE_PATH) return false; // dedicated marker fixture
+    if (p.startsWith("scripts/__fixtures__/")) return false; // any dedicated fixture asset
     if (isPrivate(p)) return false;
     if (!includeTests && /(^|\/)(__tests__|\.test\.|\.spec\.)/.test(p)) return false;
     return shouldScan(p, scanExtensions, skipDirs, skipDirPrefixes, skipFilePatterns);

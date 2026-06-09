@@ -21,37 +21,33 @@ function matchRule(rule, line) {
 const active = buildRules({}, "default", null);
 const byId = new Map(active.map((r) => [r.id, r]));
 
-test("every fixture HIT line matches its named rule", () => {
+function fixtureLines(tag) {
   const fixture = fs.readFileSync(path.join(import.meta.dirname, "..", "__fixtures__", "source-leak.fixture.txt"), "utf8");
-  let checked = 0;
+  const out = [];
   for (const line of fixture.split("\n")) {
-    const m = line.match(/^HIT:([A-Z_]+):([\s\S]*)$/);
-    if (!m) continue;
-    const [, ruleId, payload] = m;
+    const m = line.match(new RegExp(`^${tag}:([A-Z_]+):([\\s\\S]*)$`));
+    if (m) out.push([m[1], m[2]]);
+  }
+  return out;
+}
+
+test("every fixture HIT line matches its named rule", () => {
+  const hits = fixtureLines("HIT");
+  for (const [ruleId, payload] of hits) {
     const rule = byId.get(ruleId);
     assert.ok(rule, `fixture references unknown rule ${ruleId}`);
     assert.ok(matchRule(rule, payload) >= 1, `${ruleId} did not match payload: ${JSON.stringify(payload)}`);
-    checked++;
   }
-  assert.ok(checked >= 15, `expected >=15 fixture HIT lines, got ${checked}`);
+  assert.ok(hits.length >= 15, `expected >=15 fixture HIT lines, got ${hits.length}`);
 });
 
-test("negative cases do not match", () => {
-  const negatives = [
-    ["SLG_MILESTONE_NUMBER", "Phase 1 of the project"],
-    ["SLG_MILESTONE_NUMBER", "phased rollout is enabled"],
-    ["SLG_MILESTONE_NUMBER", "if (NEXT_PHASE=phase-production-build) {}"],
-    ["SLG_MILESTONE_VERSION", '  "version": "6.13.0",'],
-    ["SLG_MILESTONE_VERSION", "deprecated in v2.0 of the OpenAPI spec"],
-    ["SLG_MILESTONE_SHORTHAND", "padding P256 with p-4 grid"],
-    ["SLG_HISTORICAL", "the cache used to be invalidated on write"],
-    ["SLG_PLANNING_DOC", "see AGENTS.md#section for details"],
-    ["SLG_PROVENANCE", "deprecated in v2.0 of the spec"],
-  ];
-  for (const [ruleId, line] of negatives) {
+test("every fixture MISS line does not match its named rule", () => {
+  const misses = fixtureLines("MISS");
+  assert.ok(misses.length >= 8, `expected >=8 fixture MISS lines, got ${misses.length}`);
+  for (const [ruleId, payload] of misses) {
     const rule = byId.get(ruleId);
     assert.ok(rule, `unknown rule ${ruleId}`);
-    assert.equal(matchRule(rule, line), 0, `${ruleId} should NOT match: ${JSON.stringify(line)}`);
+    assert.equal(matchRule(rule, payload), 0, `${ruleId} should NOT match: ${JSON.stringify(payload)}`);
   }
 });
 
@@ -64,7 +60,8 @@ test("the gate is clean on its own source (sentinel self-exemption)", () => {
 test("self-exemption does not mask a normal file", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slg-"));
   const f = path.join(dir, "note.md");
-  fs.writeFileSync(f, "context: see Phase 530 here\n");
+  // Assemble the marker so this test file carries no intact example.
+  fs.writeFileSync(f, "context: see " + "Phase " + "530 here\n");
   try {
     const findings = scanFile(f, active);
     assert.ok(findings.some((x) => x.rule === "SLG_MILESTONE_NUMBER"), "should flag a normal file");
