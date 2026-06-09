@@ -239,3 +239,75 @@ Zero runtime dependencies (Node built-ins only); requires Node 24+. The
 fail-closed behavior (a deliberately unpinned ref fails the gate) is exercised
 by unit fixtures in the test suite, and the [`self-check`](.github/workflows/self-check.yml)
 workflow dogfoods the gate against this repository's own workflows.
+
+## ui-design-system-gate
+
+A reusable GitHub Actions workflow + shareable ESLint flat-config preset
+([`config/ui-design-system.flat.mjs`](config/ui-design-system.flat.mjs)) that
+enforces "UI work uses shadcn":
+
+- **Imports (`error`)**: bans Radix (`@radix-ui/*`, `radix-ui`) and non-shadcn
+  UI libraries (MUI, Chakra, antd, Mantine, Emotion, styled-components,
+  HeadlessUI) plus the Drizzle Cube client surface (`drizzle-cube/client*`,
+  `react-grid-layout`) outside their carve-outs.
+- **Raw JSX (`warn`, configurable)**: flags raw `<button>`, `<input>`,
+  `<select>`, `<textarea>`, `<a>` in favor of the shadcn wrappers.
+- **Carve-outs as `files` globs (never inline `eslint-disable`)**: the
+  vendored shadcn primitive dirs re-allow Radix; the Drizzle Cube
+  dashboard-components dirs re-allow `drizzle-cube/client*` and
+  `react-grid-layout` only; `__tests__/fixtures/` dirs are exempt.
+- `recharts` is the allowed shadcn chart primitive — never banned, never
+  Drizzle-scoped.
+
+Lint prohibits non-shadcn UI; it cannot prove a rendered component is shadcn.
+
+### Use it from another repo
+
+Spread the preset into the repo's **own** `eslint.config.mjs` (vendor the
+preset file or restate its blocks — local dev and CI must agree), then add a
+thin caller:
+
+```yaml
+name: ui-design-system-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  ui-design-system-gate:
+    # In production pin to a commit SHA.
+    uses: cinatra-ai/ci/.github/workflows/ui-design-system-gate.yml@main  # @<sha> in prod
+    with:
+      strictness: warn
+```
+
+The gate installs the caller's dependencies (lockfile auto-detected) and runs
+plain ESLint against the repo's own flat config — never a generated one. The
+typed inputs are forwarded as `UI_DESIGN_SYSTEM_*` environment variables which
+the preset reads as defaults (explicit options in the repo's config win).
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `ui_globs` | `**/components/ui/**,**/src/ui/**` | shadcn primitive dirs: Radix re-allowed, raw-JSX rules off. |
+| `drizzle_cube_globs` | `**/packages/dashboards/src/components/**` | Dirs where `drizzle-cube/client*` and `react-grid-layout` are re-allowed. |
+| `strictness` | `warn` | Severity of the raw-JSX rules: `warn` \| `error`. |
+| `install_command` | _(auto-detect)_ | Override the dependency install command. |
+| `lint_command` | `npx eslint .` | ESLint invocation loading the repo's own config. |
+
+### Develop
+
+```sh
+npm ci
+npx eslint .   # dogfood: the preset runs clean on this repo
+node --test scripts/__tests__/ui-design-system-gate.test.mjs
+```
+
+The test harness asserts the preset's outcome on a fixture tree: negative
+fixtures (raw `<button>`, Radix outside `ui/`, banned UI libraries,
+out-of-carve-out Drizzle Cube imports) must be flagged; positive controls
+(shadcn primitives, the Drizzle Cube carve-out, `recharts`, wrapper usage)
+must be clean.

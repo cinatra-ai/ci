@@ -1,0 +1,19 @@
+{
+  "name": "@cinatra-ai/ci",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared, reusable CI for the cinatra-ai organization.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test scripts/__tests__/*.test.mjs"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.59.3",
+    "eslint": "^10.4.0",
+    "typescript": "^5.9.3"
+  }
+}
