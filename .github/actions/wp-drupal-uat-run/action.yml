@@ -3,18 +3,25 @@ description: >-
   Run the WordPress/Drupal assistant Playwright UAT suite inside a
   cinatra-ai/cinatra checkout (the checkout must be the workspace the caller
   runs this action from — every step below operates on the caller's working
-  directory). Configure the read-only clone key, bring up the docker WP/Drupal
-  stack, run `cinatra setup dev` (clones the plugin/module + provisions the
-  DB), then run the Playwright UAT suite (which boots its own dev server with
-  the deterministic scripted provider). Requires a Docker-capable runner that
-  also provides the app-service env (SUPABASE_DB_URL, BETTER_AUTH_SECRET,
-  REDIS_URL, …) — typically a provisioned self-hosted runner. See
-  tests/e2e/wp-drupal-uat/README.md in cinatra-ai/cinatra.
+  directory). Bring up the docker WP/Drupal stack, run `cinatra setup dev`
+  (clones the plugin/module + provisions the DB), then run the Playwright UAT
+  suite (which boots its own dev server with the deterministic scripted
+  provider). The companion devApp repos (wordpress-plugin, drupal-module,
+  a2a-servers-dev) are PUBLIC, so the default anonymous-HTTPS clone needs no
+  credential; pass `deploy-key` only if a devApp repo goes private again.
+  Requires a Docker-capable runner that also provides the app-service env
+  (SUPABASE_DB_URL, BETTER_AUTH_SECRET, REDIS_URL, …) — typically a
+  provisioned self-hosted runner. See tests/e2e/wp-drupal-uat/README.md in
+  cinatra-ai/cinatra.
 
 inputs:
   deploy-key:
-    description: Read-only SSH deploy key with access to the companion repos.
-    required: true
+    description: >-
+      OPTIONAL read-only SSH deploy key for the companion devApp repos. The
+      devApps are public, so this is normally empty (anonymous HTTPS clone);
+      provide it to clone over SSH instead (e.g. if a repo goes private).
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -27,6 +34,14 @@ runs:
         cache: "pnpm"
 
     - name: Configure read-only clone key (SSH)
+      # Only when a deploy key is provided. The devApps are PUBLIC, so the
+      # default path is `cinatra setup dev` cloning the package.json
+      # `cinatra.devApps` URLs anonymously over HTTPS — no key material, no
+      # GIT_SSH_COMMAND, no CINATRA_*_REPO_URL overrides. The SSH path below
+      # stays fully functional for a future private repo: syncDevApps picks the
+      # overrides up (HTTPS↔SSH origin-normalized) and clones each devApp over
+      # the read-only key instead.
+      if: inputs.deploy-key != ''
       shell: bash
       env:
         DEPLOY_KEY: ${{ inputs.deploy-key }}
@@ -38,9 +53,6 @@ runs:
         ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
         {
           echo "GIT_SSH_COMMAND=ssh -i ~/.ssh/uat_deploy_key -o IdentitiesOnly=yes"
-          # syncDevApps picks these up (HTTPS↔SSH origin-normalized). All three
-          # devApps are private pre-launch, so override each to the SSH URL the
-          # read-only key can reach (a plain HTTPS clone would 404 without a token).
           echo "CINATRA_WORDPRESS_PLUGIN_REPO_URL=git@github.com:cinatra-ai/wordpress-plugin.git"
           echo "CINATRA_DRUPAL_MODULE_REPO_URL=git@github.com:cinatra-ai/drupal-module.git"
           echo "CINATRA_A2A_SERVERS_DEV_REPO_URL=git@github.com:cinatra-ai/a2a-servers-dev.git"
@@ -51,8 +63,8 @@ runs:
       # extensions/ before install. Direct `node` invocation (not the caller
       # repo's clone-extensions composite action) — a composite action calling
       # another action is brittle.
-      # The companion repos are PUBLIC (plain HTTPS); the SSH deploy key above is
-      # only for the private devApps.
+      # These extension repos are PUBLIC (plain HTTPS), unaffected by the
+      # optional deploy key (which only redirects the devApp clones to SSH).
       shell: bash
       run: node scripts/ci/sync-dev-extensions.mjs
 
