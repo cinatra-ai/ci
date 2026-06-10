@@ -181,9 +181,13 @@ Zero runtime dependencies (Node built-ins only); requires Node 24+.
 A reusable GitHub Actions workflow + scanner that fails CI when any **remote
 `uses:` ref** in the caller repo's GitHub Actions YAML (`.github/workflows/**`
 workflows and `.github/actions/**` local composite actions) is not pinned to an
-immutable 40-char commit SHA carrying a `# vX.Y.Z` version comment. A moved
-upstream tag (`@v6`) can silently run new code against the caller's
-`GITHUB_TOKEN`; an immutable SHA cannot.
+immutable 40-char commit SHA carrying a version comment that matches the
+upstream tag (`# vX.Y.Z`, or `# X.Y.Z` for upstreams that tag without a `v`
+prefix, e.g. `shivammathur/setup-php` tags `2.37.2`). A moved upstream tag
+(`@v6`) can silently run new code against the caller's `GITHUB_TOKEN`; an
+immutable SHA cannot. The SHA pin is the security control; the comment is the
+version-of-record that Renovate uses to keep the pin fresh, so it must equal a
+real upstream tag.
 
 It is a purely-offline **format** check: it does not resolve SHAs upstream, and
 it deliberately exempts local `./` and `docker://` refs. The parser is hardened
