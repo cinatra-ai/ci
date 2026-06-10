@@ -60,9 +60,9 @@ runs:
 
     - name: Clone companion extension repos
       # Clone the companion extension repos back into
-      # extensions/ before install. Direct `node` invocation (not the caller
-      # repo's clone-extensions composite action) — a composite action calling
-      # another action is brittle.
+      # extensions/ before install. Direct `node` invocation rather than the
+      # caller repo's local clone-extensions composite action — referencing a
+      # caller-local action from this shared action is brittle.
       # These extension repos are PUBLIC (plain HTTPS), unaffected by the
       # optional deploy key (which only redirects the devApp clones to SSH).
       shell: bash
