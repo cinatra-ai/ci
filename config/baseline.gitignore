@@ -41,3 +41,6 @@ Desktop.ini
 !.env.example
 *.pem
 *.key
+
+# Internal planning notes (local only)
+.planning/
