@@ -6,3 +6,42 @@ node_modules/
 
 # Internal planning notes (local only)
 .planning/
+
+# --- cinatra-ai org baseline (union-merged from cinatra-ai/ci config/baseline.gitignore) ---
+
+# Dependencies (node / pnpm)
+.pnpm-store/
+
+# Build output (monorepo-typical)
+dist/
+build/
+out/
+.next/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# Logs and caches
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+.cache/
+.eslintcache
+
+# OS cruft
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Env files and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
