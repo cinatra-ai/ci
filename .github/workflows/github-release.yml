@@ -1,0 +1,34 @@
+# GitHub Release decoration for this repo's v* tags.
+#
+# On a pushed annotated semver `v*` tag, the org reusable workflow creates
+# (or backfills, when the Release body is empty) the tag's GitHub Release page
+# with auto-generated "What's Changed" PR-list notes — so any tag maps to the
+# exact set of shipped PRs. Enforced inside the reusable workflow: non-semver
+# `v*` marker tags are a NO-OP, lightweight tags FAIL (annotated tags only),
+# tags are never created (--verify-tag), authored notes never overwritten.
+#
+# The workflow_dispatch path backfills an EXISTING tag (old tags don't contain
+# this workflow file, so backfills run from the default branch and pass the
+# tag explicitly). Backfilling historical tags is an owner decision.
+#
+# GITHUB_TOKEN only — no secrets are passed.
+name: github-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to decorate (backfill). This never creates tags."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    uses: cinatra-ai/.github/.github/workflows/reusable-release-notes.yml@05a7dd58e0aa05528db4644562ac2c6064d9cc5d # v0.0.0-main.05a7dd5
+    with:
+      tag: ${{ inputs.tag }}
