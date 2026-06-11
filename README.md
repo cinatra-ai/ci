@@ -2,6 +2,15 @@
 
 Shared, reusable CI for the cinatra-ai organization.
 
+Org-wide conventions documented here:
+
+- **[The release contract](docs/release-contract.md)** — what a tagged release
+  is and carries per repo type (PR-list notes, archives, npm tarballs), the
+  packlist gate, the `files`-allowlist and `.gitattributes export-ignore`
+  conventions, and how to wire a repo's thin caller. The reusable release
+  workflows themselves live in
+  [`cinatra-ai/.github`](https://github.com/cinatra-ai/.github).
+
 ## source-leak-gate
 
 A reusable GitHub Actions workflow + scanner that fails CI when **internal
