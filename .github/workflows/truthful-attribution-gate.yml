@@ -1,0 +1,173 @@
+name: truthful-attribution-gate
+
+# Reusable workflow_call gate — the truthful verification-record model
+# (cinatra-engineering#119; re-scopes/supersedes the paused #116 no-AI-attribution
+# gate). It does NOT ban AI records — it REQUIRES truthful ones and verifies them:
+#   - presence: a §1 trailer block (Assisted-by mandatory; a verification arm);
+#   - anti-fabrication: a Reviewed-by must match a real, non-self, non-stale PR
+#     approval at the reviewed head by a login whose repo permission meets the
+#     claimed tier; a Gate-suite must match the committed .github/gate-suite.json
+#     at the merged SHA AND every required context must have concluded green;
+#   - high-risk paths (§3, fail-closed config) require a tier=maintainer human.
+#
+# Two arms run from one workflow:
+#   - pre-merge  (pull_request): truth-checks the claims that exist before merge
+#     (branch-commit Assisted-by, approvals, contexts, high-risk mapping). The
+#     synthesized squash message itself is NOT readable pre-merge (detection
+#     limit, §5) — that is the post-merge arm's job.
+#   - post-merge (push to default branch): validates the squash RECORD itself.
+# A third ORG WATCHDOG (scheduled, outside any target repo) is a separate
+# workflow; it is not part of this reusable gate.
+#
+# ============================ STAGE 2 — WARN MODE ============================
+# Default mode is `warn`: the gate COMPUTES every finding and emits GitHub
+# annotations + a step summary, but ALWAYS exits 0 — no PR is ever failed. The
+# job is also wrapped so a script-level error cannot turn the check red in warn.
+# The ENFORCE flip is NOT a property of this workflow file — per spec §7 it is
+# gated on the dedicated machine identity for agent-opened PRs ([owner] issue,
+# §8.5). Flip via `mode: enforce` only after that gate is satisfied.
+#
+# A consuming repo calls it from its own thin caller, e.g.:
+#
+#   jobs:
+#     truthful-attribution-gate:                 # <- stable caller JOB name
+#       uses: cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         mode: warn
+#         ref: <sha>
+#
+# The reusable workflow_call surfaces its required-check CONTEXT under the
+# caller's job name as "<caller-job> / <reusable-job>". Pin BOTH the caller job
+# and the reusable job (below) to `truthful-attribution-gate` so the required
+# status check context is "truthful-attribution-gate / truthful-attribution-gate".
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "warn (Stage 2 — annotates, never fails) | enforce (gates an error-severity finding). Enforce is gated on the machine-identity [owner] issue (spec §8.5)."
+        type: string
+        default: "warn"
+      config:
+        description: "Optional path (in the caller repo) to a per-repo JSON config (e.g. internalAgentTokens for private agent codenames)."
+        type: string
+        default: ""
+      gate_suite:
+        description: "Optional path to the repo's gate-suite definition (default .github/gate-suite.json)."
+        type: string
+        default: ""
+      ref:
+        description: "Git ref of this gate repo (cinatra-ai/ci) to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  # pull-requests:read is needed so `gh` can list PR reviews for anti-fabrication.
+  pull-requests: read
+  checks: read
+
+jobs:
+  truthful-attribution-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # WARN: even an infra hiccup (checkout/setup) must not redden the required
+      # check while we tune false positives (spec §7 step 4). All infra steps
+      # carry continue-on-error in warn; in enforce a real infra failure surfaces.
+      - name: Checkout caller repository
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Checkout gate (cinatra-ai/ci)
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .truthful-attribution-gate
+
+      - name: Set up Node.js
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      # Branch names / base refs are attacker-influenceable, so every value is
+      # passed through an env var and never interpolated into a shell line.
+      # continue-on-error in WARN so a fetch/base-ref hiccup can NEVER turn the
+      # required check red while we tune false positives (spec §7 step 4:
+      # "WARN mode: annotations, never fails"). In enforce mode a fetch failure
+      # is a real CI problem and is allowed to surface.
+      - name: Fetch base ref (pre-merge)
+        if: github.event_name == 'pull_request'
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+
+      - name: Compute diff base (pre-merge)
+        id: base
+        if: github.event_name == 'pull_request'
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+
+      # WARN-mode safety net: continue-on-error so even a script crash cannot
+      # turn the check red while we are tuning false positives. In enforce mode
+      # this is still set, but the explicit gate step (below) re-asserts the exit
+      # code so a real finding fails. (Two steps keep "warn never fails" literal.)
+      - name: Run truthful-attribution-gate (pre-merge)
+        if: github.event_name == 'pull_request'
+        id: premerge
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        env:
+          TRUTHFUL_ATTR_DIFF_BASE: ${{ steps.base.outputs.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          CONFIG: ${{ inputs.config }}
+          GATE_SUITE: ${{ inputs.gate_suite }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          args=( --arm pre-merge --mode "$MODE" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" )
+          [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
+          [ -n "$GATE_SUITE" ] && args+=( --gate-suite "$GATE_SUITE" )
+          node .truthful-attribution-gate/scripts/truthful-attribution-gate.mjs "${args[@]}"
+
+      - name: Run truthful-attribution-gate (post-merge)
+        if: github.event_name == 'push'
+        id: postmerge
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          CONFIG: ${{ inputs.config }}
+          GATE_SUITE: ${{ inputs.gate_suite }}
+        run: |
+          # Resolve the PR this push merged (if any) so anti-fabrication +
+          # tree-identity can bind to the reviewed head. Best-effort: a direct
+          # push with no associated PR runs grammar/structure-only (honest about
+          # its own limit; the script annotates that anti-fabrication was skipped).
+          MERGE_SHA="${GITHUB_SHA:-HEAD}"
+          PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --search "$MERGE_SHA" --json number --jq '.[0].number' 2>/dev/null || true)"
+          args=( --arm post-merge --mode "$MODE" --repo "$GITHUB_REPOSITORY" --commit "$MERGE_SHA" )
+          [ -n "$PR_NUMBER" ] && args+=( --pr "$PR_NUMBER" )
+          [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
+          [ -n "$GATE_SUITE" ] && args+=( --gate-suite "$GATE_SUITE" )
+          node .truthful-attribution-gate/scripts/truthful-attribution-gate.mjs "${args[@]}"
+
+      # In WARN mode the previous step's continue-on-error swallowed any failure;
+      # this step makes the job's success explicit and documents the mode in the
+      # log. In ENFORCE mode, a failing gate step already failed the job.
+      - name: WARN-mode notice
+        if: ${{ inputs.mode == 'warn' }}
+        run: |
+          echo "truthful-attribution-gate ran in WARN mode (spec §7 step 4): findings are advisory; the check is green. ENFORCE is gated on the machine-identity [owner] issue (spec §8.5)."
