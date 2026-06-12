@@ -324,3 +324,120 @@ fixtures (raw `<button>`, Radix outside `ui/`, banned UI libraries,
 out-of-carve-out Drizzle Cube imports) must be flagged; positive controls
 (shadcn primitives, the Drizzle Cube carve-out, `recharts`, wrapper usage)
 must be clean.
+
+## skills-drift-gate
+
+A reusable GitHub Actions workflow + scanner that flags when a **cinatra** PR
+changes a surface an [`assistant-skills`](https://github.com/cinatra-ai/assistant-skills)
+`SKILL.md` depends on — an MCP **primitive** name (e.g. `agent_run`,
+`agent_run_get`), an `@cinatra-ai/*` **package** name, or a **route** string —
+so the impacted skill is reviewed before it silently goes stale.
+
+> **Scope: cinatra only.** This gate is wired into the `cinatra` repo and
+> nothing else. It is **not** part of the org-wide min-repo-config rollout — no
+> other repo calls it, because cinatra is the only repo whose changes can drift
+> the `assistant-skills` knowledge.
+
+### Stage 1 — warn mode (heuristic match)
+
+It ships in **warn** mode first: it extracts identifiers from the cinatra PR
+diff (both **added and removed** lines across `merge-base…head`, so a rename —
+whose effect lands on the removed-identifier line — is caught), intersects them
+with the identifiers that appear verbatim in any `SKILL.md`, and reports which
+surfaces changed and which skills reference them as a **non-failing** warning
+(workflow annotations + a step summary; the check stays green). The documented
+graduation path is **skill-declared watches** for `enforce` mode (a skill
+declares the surfaces — including source-path globs — it depends on, lowering
+false positives), available via `mode: enforce`.
+
+Identifier classes are shaped to keep prose out: primitives must be
+`lower_snake_case` with at least one underscore (a bare English word never
+matches); packages must carry the canonical `@cinatra-ai/` scope; routes must
+sit under a known root (`api`, `app`, `agents`, …) with a sub-segment.
+
+### Acknowledgement / override
+
+A flagged PR resolves the warning by one of (mirroring `source-leak-gate`'s
+override ergonomics):
+
+- **(a)** link an `assistant-skills` PR that updates the impacted skill(s); or
+- **(b)** a recorded **`Skills-reviewed: <note>`** trailer (checked + updated); or
+- **(c)** an explicit **`Skills-unaffected: <reason>`** trailer (recorded override).
+
+The caller concatenates the PR body + commit messages into an ack file; the gate
+parses these trailers and reports them. In `warn` mode they never change the
+exit code; in `enforce` mode an unacknowledged finding gates and any recorded
+ack clears it.
+
+### Use it from cinatra
+
+```yaml
+name: skills-drift-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  # The JOB name is the required-check context prefix (see below) — keep it
+  # stable as `skills-drift-gate`.
+  skills-drift-gate:
+    uses: cinatra-ai/ci/.github/workflows/skills-drift-gate.yml@main  # @<sha> in prod
+    with:
+      # Pin to the assistant-skills SHA cinatra already records in
+      # cinatra-required-extensions.lock.json (the @cinatra-ai/assistant-skills
+      # entry's resolvedSha) — keep this in lockstep so the gate reads the same
+      # skills the product ships.
+      skills_ref: <assistant-skills SHA>
+      mode: warn
+      ref: main  # set to the same <sha> as the workflow @ref in production
+```
+
+### Required-check context
+
+A reusable `workflow_call` does **not** produce a check context under its own
+name — the context is surfaced under the **caller's job name**, formatted
+`<caller-job> / <reusable-job>`. With both named `skills-drift-gate`, register
+**`skills-drift-gate / skills-drift-gate`** as the required status check on
+cinatra (same convention as `source-leak-gate / source-leak-gate`).
+
+### The assistant-skills pin (fail-loud)
+
+The gate checks out `assistant-skills` at `skills_ref` and **fails loud** if the
+pin cannot be resolved or yields no `SKILL.md` — a stale or broken pin must
+never silently pass. The resolved SHA is echoed in the report. The pin should
+track the `@cinatra-ai/assistant-skills` `resolvedSha` in cinatra's
+`cinatra-required-extensions.lock.json`, and a release-closeout sweep (per
+cinatra#188) should re-pin to the release-current ref before reconciling the
+whole release diff.
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `skills_ref` | _(default branch)_ | `assistant-skills` git ref to check out — pin to the SHA in cinatra's required-extensions lock. |
+| `skills_repo` | `cinatra-ai/assistant-skills` | The skills repository. |
+| `mode` | `warn` | `warn` (Stage 1, non-failing) or `enforce` (gates an unacknowledged finding). |
+| `config` | _(none)_ | Per-repo JSON config (e.g. `primitiveStopwords` to tune the primitive matcher). |
+| `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
+
+### Run locally
+
+```sh
+node scripts/skills-drift-gate.mjs \
+  --skills-dir ../assistant-skills/skills \
+  --diff-base origin/main --mode warn --format json
+```
+
+### Develop
+
+```sh
+node --test scripts/__tests__/skills-drift-gate.test.mjs
+```
+
+The test harness covers the three matcher cases on fixture `SKILL.md`s — a true
+primitive/route/package hit, the prose false-positive guard (English prose flags
+nothing), and a multi-skill hit (one identifier referenced by two skills surfaces
+both) — plus a real-git-diff rename catching the removed-side identifier, warn
+vs enforce exit codes, ack clearing, and fail-loud on a bad pin.

@@ -1,0 +1,156 @@
+name: skills-drift-gate
+
+# Reusable workflow (cinatra#188). WARN mode (Stage 1).
+#
+# Flags when a cinatra PR change touches a surface an `assistant-skills`
+# SKILL.md depends on (MCP primitive name / @cinatra-ai/* package name / route
+# string), so the impacted skill is reviewed before it silently goes stale.
+#
+# SCOPE: wired ONLY into the `cinatra` repo. NOT part of the org-wide
+# min-repo-config rollout — no other repo calls it (cinatra is the only repo
+# whose changes can drift the assistant-skills knowledge).
+#
+# A consuming repo (only cinatra) calls it from a thin caller, e.g.:
+#
+#   jobs:
+#     skills-drift-gate:                       # <- stable caller JOB name
+#       uses: cinatra-ai/ci/.github/workflows/skills-drift-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         skills_ref: <assistant-skills SHA pinned in cinatra's lock>
+#         mode: warn
+#         ref: <sha>
+#
+# A reusable workflow_call surfaces its required-check CONTEXT under the
+# caller's job name, formatted "<caller-job> / <reusable-job>". Pin the caller
+# job to `skills-drift-gate` and the reusable job (below) to `skills-drift-gate`
+# so the required status check is "skills-drift-gate / skills-drift-gate".
+
+on:
+  workflow_call:
+    inputs:
+      skills_ref:
+        description: "assistant-skills git ref to check out — REQUIRED. Pin to the SHA in cinatra's required-extensions lock (@cinatra-ai/assistant-skills resolvedSha). An empty value fails loud: the gate must read a pinned snapshot, never a moving default branch."
+        type: string
+        required: true
+      skills_repo:
+        description: "assistant-skills repository (owner/name)."
+        type: string
+        default: "cinatra-ai/assistant-skills"
+      mode:
+        description: "warn (Stage 1, non-failing) | enforce (gates an unacknowledged finding)."
+        type: string
+        default: "warn"
+      config:
+        description: "Optional path (in the caller repo) to a per-repo JSON config (e.g. primitiveStopwords)."
+        type: string
+        default: ""
+      ref:
+        description: "Git ref of this gate repo (cinatra-ai/ci) to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  skills-drift-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a pinned assistant-skills ref (fail loud on empty)
+        env:
+          SKILLS_REF: ${{ inputs.skills_ref }}
+        run: |
+          if [ -z "$SKILLS_REF" ]; then
+            echo "::error::skills_ref is empty. The skills-drift-gate must read a PINNED assistant-skills snapshot (the @cinatra-ai/assistant-skills resolvedSha in cinatra-required-extensions.lock.json), never a moving default branch." >&2
+            exit 1
+          fi
+
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Checkout gate (cinatra-ai/ci)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .skills-drift-gate
+
+      - name: Checkout assistant-skills (pinned)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.skills_repo }}
+          ref: ${{ inputs.skills_ref }}
+          path: .assistant-skills
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      # Branch names, PR bodies, and config paths are attacker-influenceable, so
+      # every value below is passed through an env var and never interpolated
+      # directly into a shell line (no command injection via a crafted ref).
+      - name: Fetch base ref
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+
+      - name: Compute diff base
+        id: base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+          elif [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            echo "ref=$EVENT_BEFORE" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve pinned assistant-skills SHA (fail loud if unresolvable)
+        id: pin
+        env:
+          SKILLS_REF: ${{ inputs.skills_ref }}
+        run: |
+          SHA="$(git -C .assistant-skills rev-parse HEAD)"
+          if [ -z "$SHA" ]; then
+            echo "::error::could not resolve the assistant-skills pin (skills_ref='$SKILLS_REF')." >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "assistant-skills pinned at $SHA"
+
+      - name: Collect acknowledgements (PR body + commit trailers)
+        id: acks
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # Concatenate the PR body and every commit message in the range so the
+          # gate can read Skills-reviewed: / Skills-unaffected: markers from either.
+          {
+            printf '%s\n' "$PR_BODY"
+            git log --format='%B' "origin/$BASE_REF...HEAD" 2>/dev/null || true
+          } > "$RUNNER_TEMP/skills-acks.txt"
+          echo "file=$RUNNER_TEMP/skills-acks.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Run skills-drift-gate (WARN)
+        env:
+          SKILLS_DRIFT_DIFF_BASE: ${{ steps.base.outputs.ref }}
+          SKILLS_DRIFT_PINNED_REF: ${{ steps.pin.outputs.sha }}
+          MODE: ${{ inputs.mode }}
+          CONFIG: ${{ inputs.config }}
+          ACK_FILE: ${{ steps.acks.outputs.file }}
+        run: |
+          args=( --skills-dir .assistant-skills/skills --mode "$MODE" )
+          [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
+          [ -n "$ACK_FILE" ] && args+=( --ack-file "$ACK_FILE" )
+          node .skills-drift-gate/scripts/skills-drift-gate.mjs "${args[@]}"
