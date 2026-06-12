@@ -1,0 +1,6 @@
+{
+  "$comment": "EXPLICIT repo inventory for the org-wide gate-suite audit index (cinatra-engineering#119 §4). This names the repos the truthful-attribution-gate rollout EXPECTS to carry a committed .github/gate-suite.json, so the generated index (config/gate-suite-index.json) is honest: a repo listed here with no suite is reported `no-suite` (the rollout has not reached its enforce-bootstrap yet), never silently omitted. cinatra is the first warn-mode repo; its .github/gate-suite.json is intentionally DEFERRED to the enforce-bootstrap owner-reviewed PR (spec §7 step 3 — the gate cannot bless its own birth), so it is inventoried here but will scan as `no-suite` until that PR lands. Add a repo here when its warn-mode caller ships; the gate-suite.json itself follows at that repo's enforce-bootstrap. The monthly audit regenerates the index from this inventory.",
+  "repos": [
+    { "repo": "cinatra-ai/cinatra", "defaultBranch": "main" }
+  ]
+}

@@ -541,6 +541,42 @@ export function commitMessage(commit, cwd = process.cwd()) {
   });
 }
 
+/**
+ * Read a file's contents at a git ref as a loadJsonSafe-shaped result. Used by
+ * the §4 version-bump rule to obtain the PARENT gate-suite.json (the suite as it
+ * stood on the base the PR's changed-file range was computed against — NOT a
+ * remote registry, so no TOCTOU).
+ *
+ * It DISTINGUISHES (codex round-2 HIGH — must not collapse to "absent" and fail
+ * open):
+ *  - genuine absence: the ref resolves but the path is not in its tree (a NEW
+ *    suite on this PR) => { ok:false, reason:"absent-at-ref", absent:true }.
+ *    The bump rule treats this as vacuously satisfied (nothing to bump against).
+ *  - operational failure: the ref does not resolve (base not fetched / bad ref),
+ *    or the blob is not valid JSON => { ok:false, reason, operational:true }.
+ *    The bump rule must FAIL CLOSED on these, never pass.
+ * Never throws.
+ */
+export function jsonFileAtRef(ref, filePath, cwd = process.cwd()) {
+  if (!ref) return { ok: false, reason: "no ref", operational: true };
+  // 1. Does the ref resolve at all? An unresolvable ref is operational, not absence.
+  try {
+    execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], { stdio: "ignore", cwd });
+  } catch { return { ok: false, reason: `base ref '${ref}' does not resolve (not fetched?) — cannot read the parent suite`, operational: true }; }
+  // 2. Is the path present in that ref's tree? If not, it is genuinely a NEW file.
+  try {
+    execFileSync("git", ["--literal-pathspecs", "cat-file", "-e", "--end-of-options", `${ref}:${filePath}`], { stdio: "ignore", cwd });
+  } catch { return { ok: false, reason: "absent-at-ref", absent: true }; }
+  // 3. Read + parse. A present-but-unparseable parent is operational (fail closed).
+  let raw;
+  try {
+    raw = execFileSync("git", ["--literal-pathspecs", "show", "--end-of-options", `${ref}:${filePath}`], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch (e) { return { ok: false, reason: `could not read ${filePath} at ${ref}: ${e.message}`, operational: true }; }
+  try { return { ok: true, value: JSON.parse(raw) }; } catch (e) { return { ok: false, reason: `invalid JSON at ${ref}: ${e.message}`, operational: true }; }
+}
+
 /** tree object id of a commit (for the tree-identity bridge, §5). */
 export function treeOf(commitish, cwd = process.cwd()) {
   try {
@@ -686,12 +722,26 @@ export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, r
  * @param parsed.accountable { login, name, email }
  * @param suiteFile          parsed .github/gate-suite.json at the merged SHA
  * @param checkRuns          array of check-run objects for reviewedHeadSha
+ * @param now                injectable epoch-ms "current time" (default Date.now()),
+ *                           so the §4 staleness window is deterministic in tests.
+ *
+ * Returns { ok, reasons, warnings }. `warnings` carries the §4 35-day staleness
+ * NOTICE — a gate-arm merge with a 35–65-day-old audit is still verifiable (ok),
+ * but the audit is going stale and the engineer is being told. `reasons` carries
+ * hard gate-arm failures (incl. the §4 65-day lapse and a missing audit record).
+ * Staleness applies to the GATE ARM ONLY: a lapsed audit stops machine
+ * verification, never a human-arm merge (the human arm doesn't call this).
  */
-export function verifyGateArm(parsed, { suiteFile, checkRuns }) {
+export const AUDIT_STALE_WARN_DAYS = 35;
+export const AUDIT_STALE_FAIL_DAYS = 65;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now() }) {
   const reasons = [];
+  const warnings = [];
   if (!suiteFile || !suiteFile.ok) {
     reasons.push(`cannot read .github/gate-suite.json at the merged SHA (${suiteFile?.reason || "missing"}) — gate arm cannot be verified`);
-    return { ok: false, reasons };
+    return { ok: false, reasons, warnings };
   }
   const suite = suiteFile.value;
   if (parsed.gateSuite.suite !== suite.suiteId || parsed.gateSuite.version !== suite.version) {
@@ -706,7 +756,7 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns }) {
   const acc = suite.accountable || {};
   if (acc.github === undefined || acc.name === undefined || acc.email === undefined) {
     reasons.push(`gate-suite.json accountable is incomplete (needs github + name + email) — cannot verify the Accountable trailer (fail closed)`);
-    return { ok: false, reasons };
+    return { ok: false, reasons, warnings };
   }
   if (parsed.accountable.login !== acc.github) {
     reasons.push(`Accountable @${parsed.accountable.login} != gate-suite.json accountable @${acc.github}`);
@@ -722,7 +772,7 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns }) {
   // closed: an empty suite is not "machine verification").
   if (!Array.isArray(suite.requiredContexts) || suite.requiredContexts.length === 0) {
     reasons.push(`gate-suite.json declares no requiredContexts — an empty gate suite is not machine verification (fail closed)`);
-    return { ok: false, reasons };
+    return { ok: false, reasons, warnings };
   }
   // Required-context resolution. A context name alone is spoofable (any check
   // run can claim that display name), so when the suite pins an app/workflow
@@ -761,7 +811,131 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns }) {
       reasons.push(`required context '${ctx.context}' did not conclude success (status=${bad.status}, conclusion=${bad.conclusion || "n/a"}; skipped/neutral/cancelled/in-progress/queued count as failure)`);
     }
   }
-  return { ok: reasons.length === 0, reasons };
+  // §4 audit RECORD shape — gate-arm ONLY. A gate-arm record must carry BOTH a
+  // recent `lastAuditedAt` AND an `auditEvidence` pointer (§4: "bumps
+  // lastAuditedAt AND auditEvidence in the same commit"). A fresh lastAuditedAt
+  // with no evidence is exactly the half-fabrication the coupling exists to
+  // catch, so a missing/empty auditEvidence fails the gate arm closed (the
+  // version-bump arm separately enforces the lastAuditedAt→auditEvidence COUPLING
+  // on change; this is the presence floor at verification time). `lastAuditedAt`
+  // is self-asserted (an honesty limit, §5-class), but a MISSING or STALE record
+  // cannot bless a gate-arm merge. A human-arm merge is unaffected — staleness
+  // stops machine verification, not the org.
+  // auditEvidence must be a NON-EMPTY STRING (a URL pointer per §4). A non-string
+  // (object/array) must NOT pass via String() coercion (codex round-3 HIGH:
+  // `String({})` is "[object Object]", non-empty).
+  if (typeof suite.auditEvidence !== "string" || suite.auditEvidence.trim() === "") {
+    reasons.push(`gate-suite.json auditEvidence must be a non-empty string URL pointer — §4 requires recorded evidence alongside lastAuditedAt (a fresh audit date with no/invalid evidence is not an audit); the gate arm fails closed. The human arm (tier=maintainer Reviewed-by) stays available.`);
+  }
+  const staleErr = checkAuditStaleness(suite.lastAuditedAt, now);
+  if (staleErr.fail) reasons.push(staleErr.message);
+  else if (staleErr.warn) warnings.push(staleErr.message);
+  return { ok: reasons.length === 0, reasons, warnings };
+}
+
+/**
+ * §4 staleness classification for a gate suite's `lastAuditedAt`. Pure.
+ * Returns { fail, warn, message }:
+ *  - missing/unparseable lastAuditedAt  => fail (no audit record; fail closed)
+ *  - age > 65 days                      => fail (gate-arm merges blocked)
+ *  - age > 35 days                      => warn (audit going stale)
+ *  - otherwise                          => clean
+ * `lastAuditedAt` is an ISO date (YYYY-MM-DD) or full ISO timestamp. A FUTURE
+ * date (beyond a small clock-skew tolerance) FAILS CLOSED — a fabricated future
+ * date would otherwise suppress both the WARN and FAIL windows indefinitely
+ * (codex round-2 HIGH); "the audit happens tomorrow" is not "the audit happened".
+ */
+const AUDIT_FUTURE_SKEW_DAYS = 1;
+export function checkAuditStaleness(lastAuditedAt, now = Date.now()) {
+  if (lastAuditedAt === undefined || lastAuditedAt === null || lastAuditedAt === "") {
+    return { fail: true, warn: false, message: `gate-suite.json has no lastAuditedAt — the monthly audit obligation (§4) is unmet; a gate suite with no recorded audit cannot machine-verify a merge (fail closed)` };
+  }
+  const t = new Date(lastAuditedAt).getTime();
+  if (!Number.isFinite(t)) {
+    return { fail: true, warn: false, message: `gate-suite.json lastAuditedAt '${lastAuditedAt}' is not a valid date — cannot establish audit recency (fail closed)` };
+  }
+  const ageDays = (now - t) / DAY_MS;
+  if (ageDays < -AUDIT_FUTURE_SKEW_DAYS) {
+    return { fail: true, warn: false, message: `gate-suite.json lastAuditedAt '${lastAuditedAt}' is in the FUTURE (${Math.ceil(-ageDays)} days ahead) — a future audit date cannot certify a completed audit; failing closed so a fabricated date cannot suppress the staleness window. The human arm (tier=maintainer Reviewed-by) stays available.` };
+  }
+  if (ageDays > AUDIT_STALE_FAIL_DAYS) {
+    return { fail: true, warn: false, message: `gate-suite audit is ${Math.floor(ageDays)} days old (> ${AUDIT_STALE_FAIL_DAYS}) — the audit has lapsed; gate-arm merges are blocked until the Accountable engineer re-audits and bumps lastAuditedAt + auditEvidence (§4). The human arm (tier=maintainer Reviewed-by) stays available.` };
+  }
+  if (ageDays > AUDIT_STALE_WARN_DAYS) {
+    return { fail: false, warn: true, message: `gate-suite audit is ${Math.floor(ageDays)} days old (> ${AUDIT_STALE_WARN_DAYS}) — going stale; the Accountable engineer should re-audit before day ${AUDIT_STALE_FAIL_DAYS} (§4) or gate-arm merges will block.` };
+  }
+  return { fail: false, warn: false, message: "" };
+}
+
+/**
+ * §4 version-bump + audit-coupling rule (gate-checked). On any PR that changes
+ * `.github/gate-suite.json`:
+ *  - if `requiredContexts` (incl. any context `pinned` SHA) or `highRiskPaths`
+ *    changed against the PARENT (base-ref) suite and `version` did NOT bump =>
+ *    finding (defeats the "which suite version applied" audit);
+ *  - if `lastAuditedAt` changed but `auditEvidence` did NOT change => finding
+ *    (§4: lastAuditedAt and auditEvidence are bumped IN THE SAME COMMIT — a new
+ *    audit date with stale evidence is the half-fabrication the coupling exists
+ *    to catch).
+ * Pure; the caller supplies the parsed parent and head suites.
+ *
+ * @param parentSuite  jsonFileAtRef-shaped result of the base-ref blob.
+ *                     A GENUINELY ABSENT parent (`absent:true` — a NEW suite on
+ *                     this PR) is vacuously OK (nothing to bump against). An
+ *                     OPERATIONAL failure (`operational:true` — base not
+ *                     fetched / unparseable parent) FAILS CLOSED: the gate
+ *                     cannot prove the change was non-material, so it must not
+ *                     pass it (codex round-2 HIGH — no fail-open).
+ * @param headSuite    { ok, value } of the head blob.
+ * Returns { ok, reason }.
+ */
+export function checkSuiteVersionBump(parentSuite, headSuite) {
+  // Head must be parseable to even reason about it; an unparseable head suite is
+  // already fail-closed via classifyHighRisk, so here we only guard the diff.
+  if (!headSuite || !headSuite.ok) return { ok: true, reason: null };
+  // A genuinely NEW suite (ref resolved, path absent) has nothing to bump against.
+  if (parentSuite && parentSuite.absent) return { ok: true, reason: null };
+  // Any other non-ok parent is an OPERATIONAL failure — fail closed.
+  if (!parentSuite || !parentSuite.ok) {
+    return { ok: false, reason: `cannot read the parent .github/gate-suite.json to verify the §4 version-bump/audit-coupling rule (${parentSuite?.reason || "unavailable"}) — failing closed (a material suite change must not pass unverified)` };
+  }
+  const a = parentSuite.value || {};
+  const b = headSuite.value || {};
+  // Normalize the version-relevant fields so an order-only or whitespace diff is
+  // not mistaken for a material change (codex round-1 LOW).
+  const norm = (v) => JSON.stringify(canonicalizeForBump(v));
+  const materialChanged =
+    norm(a.requiredContexts) !== norm(b.requiredContexts) ||
+    norm(a.highRiskPaths) !== norm(b.highRiskPaths);
+  if (materialChanged && a.version === b.version) {
+    return { ok: false, reason: `gate-suite.json requiredContexts/pinned/highRiskPaths changed but version did not bump (still '${b.version}') — a material suite change must bump version (CalVer YYYY.MM[.N]) so the audit can tell which suite applied (§4)` };
+  }
+  // §4 audit coupling: a changed lastAuditedAt with unchanged auditEvidence is
+  // an uncoupled audit-date bump. Compare by canonical VALUE (not `===`, which
+  // is reference-equality for structured evidence — codex round-3 HIGH) so a
+  // changed date paired with an unchanged object/array pointer is still caught.
+  if (norm(a.lastAuditedAt) !== norm(b.lastAuditedAt) && norm(a.auditEvidence) === norm(b.auditEvidence)) {
+    return { ok: false, reason: `gate-suite.json lastAuditedAt changed ('${a.lastAuditedAt}' → '${b.lastAuditedAt}') but auditEvidence did not — §4 requires both to be bumped in the same commit (a new audit date must point at new evidence)` };
+  }
+  return { ok: true, reason: null };
+}
+
+// Canonicalize a requiredContexts/highRiskPaths value for order-insensitive,
+// whitespace-insensitive comparison: sort arrays of strings; sort arrays of
+// context objects by a stable key (context+workflow+pinned+appSlug); recurse.
+function canonicalizeForBump(v) {
+  if (Array.isArray(v)) {
+    const items = v.map(canonicalizeForBump);
+    const keyed = items.map((it) => [JSON.stringify(it), it]);
+    keyed.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    return keyed.map((k) => k[1]);
+  }
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = canonicalizeForBump(v[k]);
+    return out;
+  }
+  return v;
 }
 
 // ===========================================================================
@@ -879,9 +1053,19 @@ export function analyzePreMerge(ctx) {
     if (!ctx.apiBound || !ctx.checkRuns) {
       findings.push({ code: "gate-suite-unverifiable", severity: "error", message: `the PR declares a Gate-suite claim but suite/check-run data isn't available to verify it — failing closed` });
     } else {
-      const v = verifyGateArm(ctx.declaredGateArm, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json" }, checkRuns: ctx.checkRuns });
+      const v = verifyGateArm(ctx.declaredGateArm, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json" }, checkRuns: ctx.checkRuns, now: ctx.now });
       if (!v.ok) findings.push({ code: "gate-suite-fabricated", severity: "error", message: `Gate-suite arm fails verification: ${v.reasons.join("; ")}` });
+      for (const w of v.warnings || []) findings.push({ code: "gate-suite-audit-stale", severity: "warning", message: w });
     }
+  }
+
+  // §4 version-bump rule: when this PR changes .github/gate-suite.json, a
+  // material change (requiredContexts/pinned/highRiskPaths) must bump version.
+  // The parent (base-ref) suite is supplied by main() when the API is bound;
+  // a NEW suite has no parent, so the rule is vacuous (handled in the function).
+  if ((ctx.changedFiles || []).some((f) => f === ".github/gate-suite.json" || f.endsWith("/.github/gate-suite.json"))) {
+    const vb = checkSuiteVersionBump(ctx.parentSuiteFile, ctx.repoSuite);
+    if (!vb.ok) findings.push({ code: "gate-suite-version-not-bumped", severity: "error", message: vb.reason });
   }
 
   return { findings, highRisk: hr.highRisk, highRiskMatched: hr.matched };
@@ -968,8 +1152,9 @@ export function analyzePostMerge(ctx) {
     } else if (!ctx.checkRuns) {
       findings.push({ code: "gate-suite-unverifiable", severity: "error", message: `record asserts a gate arm but the check-runs for the reviewed head could not be fetched — failing closed` });
     } else {
-      const v = verifyGateArm(parsed, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json at the merged SHA" }, checkRuns: ctx.checkRuns });
+      const v = verifyGateArm(parsed, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json at the merged SHA" }, checkRuns: ctx.checkRuns, now: ctx.now });
       if (!v.ok) findings.push({ code: "gate-suite-fabricated", severity: "error", message: `Gate-suite arm fails verification: ${v.reasons.join("; ")}` });
+      for (const w of v.warnings || []) findings.push({ code: "gate-suite-audit-stale", severity: "warning", message: w });
     }
   }
 
@@ -1069,6 +1254,10 @@ function main() {
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
       defaults, repoSuite,
     };
+    // §4 version-bump rule: the PARENT gate-suite.json is the file as it stood at
+    // the diff base the changed-file range was computed against (local git, no
+    // TOCTOU). Absent at the base => a NEW suite, bump rule is vacuous.
+    ctx.parentSuiteFile = base ? jsonFileAtRef(base, ".github/gate-suite.json") : { ok: false, reason: "no diff base" };
     // Per-commit message lookup by SHA (so check 5 reads the right commit body).
     ctx.messageBySha = {};
     if (base) for (const id of rangeIdentities) { try { ctx.messageBySha[id.sha] = commitMessage(id.sha); } catch { /* skip */ } }
