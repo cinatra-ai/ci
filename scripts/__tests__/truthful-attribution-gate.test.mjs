@@ -488,10 +488,25 @@ test("§5 check5: a plain human identity is not an agent", () => {
   assert.ok(!looksLikeAgent({ name: "Sandro Groganz", email: "sandro@cinatra.ai" }));
 });
 
+test("§5 check5: the dedicated agent identity (cinatra-agent-bot[bot]) is detected", () => {
+  // eng#119 §5/§8.5, eng#137: the bot that authors every agent-opened PR must
+  // be recognized as an agent so an Assisted-by omission on its commits is
+  // caught. Its identity carries no vendor token, so the public "cinatra-agent"
+  // default is what keys check 5 on it.
+  assert.ok(looksLikeAgent({
+    name: "cinatra-agent-bot[bot]",
+    email: "293224031+cinatra-agent-bot[bot]@users.noreply.github.com",
+  }), "the dedicated agent identity must be flagged as an agent");
+  // A future cinatra-agent-* identity is also covered by the substring token.
+  assert.ok(looksLikeAgent({ name: "cinatra-agent-ci[bot]", email: "x@y.z" }));
+});
+
 test("§5 check5: internal codename tokens are NOT in the public default", () => {
-  // Sanity: the default list is the public AI-vendor tokens only.
+  // Sanity: the default list is the public AI-vendor tokens + the public bot
+  // login token only — never internal codenames.
   for (const t of DEFAULT_AGENT_NAME_TOKENS) assert.equal(typeof t, "string");
   assert.ok(DEFAULT_AGENT_NAME_TOKENS.includes("claude"));
+  assert.ok(DEFAULT_AGENT_NAME_TOKENS.includes("cinatra-agent")); // the public dedicated-agent login token
   assert.ok(!DEFAULT_AGENT_NAME_TOKENS.includes("fable")); // a codename would live in private config
 });
 
