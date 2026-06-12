@@ -10,16 +10,57 @@
  * renames or re-params one of those surfaces, the dependent skill silently goes
  * stale. Nothing today links a cinatra change to the skills that depend on it.
  *
- * STAGE 1 — WARN MODE (this build): heuristic match. Extract identifiers from
- * the cinatra PR diff (added/changed lines, new side), intersect them with the
- * identifiers that appear verbatim in any SKILL.md, and emit a clear report as
- * a NON-FAILING warning (neutral/success with annotations). The documented
- * graduation path is skill-declared watches for enforcement (cinatra#188 §2).
+ * ── v2 — WATCHES-FIRST WITH HEURISTIC FALLBACK (cinatra#188 §2 graduation) ──
  *
- * Acknowledgement markers (`Skills-reviewed:` / `Skills-unaffected: <reason>`)
- * are parsed and reported when present, but in warn mode they never change the
- * exit code — they exist so the enforce-mode upgrade is a one-flag change and so
- * the warn report already tells authors how to resolve a flag.
+ * Two-tier matching:
+ *
+ *  1. DECLARED WATCHES (preferred, low false-positive). A SKILL.md MAY declare a
+ *     `cinatra-watches:` block in its YAML frontmatter naming the cinatra
+ *     surfaces it actually depends on:
+ *
+ *         cinatra-watches:
+ *           primitives: [agent_run, agent_run_get]
+ *           packages: ["@cinatra-ai/trigger-agent"]
+ *           routes: ["/api/agents/passthrough"]
+ *           paths: ["packages/agents/src/a2a-actions.ts"]
+ *
+ *     `primitives|packages|routes` are EXACT-STRING watches intersected against
+ *     the diff-extracted identifiers (same three classes as the heuristic).
+ *     `paths` are source-path GLOBS matched against the PR's touched file paths
+ *     (both rename sides) — this catches the documented v1 false-negative where a
+ *     param-shape change leaves the watched STRING (`agent_run`) untouched but
+ *     edits a watched SOURCE FILE. A skill that declares ANY non-empty watch
+ *     class is "declared": only its declared surfaces flag it (heuristic noise is
+ *     SUPPRESSED for that skill). Findings carry `source: "watch"`.
+ *
+ *  2. HEURISTIC FALLBACK (zero skill-side work, noisier). A skill with NO
+ *     `cinatra-watches` block (or a present-but-EMPTY one) is matched the v1 way:
+ *     identifiers that appear verbatim in the SKILL.md, intersected with the diff.
+ *     Findings carry `source: "heuristic"`. So adoption is incremental — undeclared
+ *     skills keep coverage until they add watches.
+ *
+ * ENFORCEMENT (cinatra#188: "graduate to declared watches FOR enforcement"):
+ *   - warn mode: exit 0 always; report watch + heuristic findings + acks + gaps.
+ *   - enforce mode: exit 1 IFF there is at least one unacknowledged `source:watch`
+ *     finding. `source:heuristic` findings are ADVISORY in EVERY mode — they are
+ *     reported but NEVER gate, so the warn→enforce flip can never hard-fail on
+ *     heuristic noise from an undeclared skill.
+ *   - fail-loud (exit 2) — bad/unresolvable assistant-skills pin, zero SKILL.md,
+ *     unresolvable diff base, or a MALFORMED `cinatra-watches` block — runs BEFORE
+ *     the mode decision and exits 2 regardless of warn|enforce.
+ *
+ * ACKNOWLEDGEMENT / OVERRIDE (cinatra#188 §Acknowledgement) — a flagged PR clears
+ * an enforce finding with ONE of:
+ *   (a) `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked
+ *       assistant-skills PR that NAMES the impacted skill(s) it updates. A bare PR
+ *       link with no `covers:` list satisfies nothing (coverage can't be verified
+ *       offline; documented honest-limitation — only the recorded decision is
+ *       enforced, never content correctness). This ack is PER-SKILL.
+ *   (b) `Skills-reviewed: <note>` — a recorded "checked + updated" assertion over
+ *       the whole PR (covers all impacted skills).
+ *   (c) `Skills-unaffected: <reason>` — a recorded override; REASON REQUIRED (the
+ *       issue: "not `Skills-unaffected:` only"). A bare/empty reason satisfies
+ *       nothing. Covers all impacted skills.
  *
  * Scope: this gate is wired ONLY into the cinatra repo. It is NOT part of the
  * org-wide min-repo-config rollout; no other repo calls it (cinatra#188 §Scope).
@@ -31,7 +72,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const GATE_VERSION = "0.1.0";
+const GATE_VERSION = "0.2.0";
 const DEFAULT_DIFF_BASE_ENV = "SKILLS_DRIFT_DIFF_BASE";
 const VALID_FORMATS = ["text", "json"];
 const VALID_MODES = ["warn", "enforce"];
@@ -94,16 +135,19 @@ export function extractIdentifiers(text, opts = {}) {
   const packages = new Set();
   const routes = new Set();
 
-  // Collect packages first, then STRIP their spans before the primitive pass so
-  // a slug's underscore tail (e.g. `@cinatra-ai/foo_bar`) is never re-read as a
-  // phantom primitive `foo_bar`.
-  for (const m of text.matchAll(PACKAGE_RE)) packages.add(m[0]);
-  const working = text.replace(PACKAGE_RE, " ");
-
   for (const m of text.matchAll(ROUTE_RE)) {
     // Trim a trailing punctuation a sentence might append (`/api/agents/run.`).
     routes.add(m[0].replace(/[.,:;)]+$/, ""));
   }
+
+  // Collect packages, then STRIP BOTH package AND route spans before the
+  // primitive pass: a slug's underscore tail (`@cinatra-ai/foo_bar`) or a route
+  // segment that happens to be snake_case (`/api/agents/agent_run`) must NOT be
+  // re-read as a phantom primitive (codex r4 MED — a route-only change otherwise
+  // falsely matches a `primitives: [agent_run]` watch). Mask routes first, then
+  // packages, so neither leaks into the primitive scan.
+  for (const m of text.matchAll(PACKAGE_RE)) packages.add(m[0]);
+  const working = text.replace(ROUTE_RE, " ").replace(PACKAGE_RE, " ");
 
   for (const m of working.matchAll(PRIMITIVE_RE)) {
     const tok = m[0];
@@ -281,17 +325,26 @@ export function listSkillFiles(skillsDir) {
 }
 
 /**
- * Build an index: identifier -> Set(skill relative paths) that reference it,
- * keyed by class. Reads every SKILL.md once and extracts the same identifier
- * classes used on the diff, so matching is symmetric.
+ * Build the HEURISTIC index: identifier -> Set(skill relpaths) that reference it
+ * verbatim, keyed by class. Reads every SKILL.md once and extracts the same
+ * identifier classes used on the diff, so matching is symmetric.
+ *
+ * v2: a skill that DECLARES a non-empty `cinatra-watches` block is EXCLUDED from
+ * the heuristic index (its declared watches are authoritative; the verbatim
+ * heuristic would only re-introduce the noise the watches exist to silence). The
+ * caller passes `declaredSkills` (a Set of rel paths) so the exclusion is decided
+ * once, centrally, in main(). Undeclared skills (no block, or an empty block) are
+ * indexed exactly as v1.
  */
 export function buildSkillIndex(skillsDir, opts = {}) {
+  const declared = opts.declaredSkills instanceof Set ? opts.declaredSkills : null;
   const files = listSkillFiles(skillsDir);
   const index = { primitives: new Map(), packages: new Map(), routes: new Map() };
   for (const file of files) {
+    const rel = path.relative(skillsDir, file);
+    if (declared && declared.has(rel)) continue; // declared => watches-only, no heuristic
     let text;
     try { text = fs.readFileSync(file, "utf8"); } catch { continue; }
-    const rel = path.relative(skillsDir, file);
     const { primitives, packages, routes } = extractIdentifiers(text, opts);
     for (const [cls, set] of [["primitives", primitives], ["packages", packages], ["routes", routes]]) {
       for (const id of set) {
@@ -304,13 +357,322 @@ export function buildSkillIndex(skillsDir, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Skill-declared watches (cinatra#188 §2 — preferred, low false-positive)
+//
+// A SKILL.md MAY declare, in its YAML frontmatter, the cinatra surfaces it
+// depends on. We do NOT pull in a YAML library (zero-dep contract). The block
+// is shallow and shaped exactly — `cinatra-watches:` with up to four list-of-
+// string keys — so a tiny, STRICT, fail-loud parser is both sufficient and
+// safer than a permissive YAML load (a typo'd key must break, not silently parse
+// to "no watches" and create a false negative).
+// ---------------------------------------------------------------------------
+
+const WATCH_KEYS = ["primitives", "packages", "routes", "paths"];
+
+export class WatchParseError extends Error {}
+
+/**
+ * Extract the raw frontmatter block (between the first two `---` fences) from a
+ * SKILL.md. Returns the inner text, or null if there is no frontmatter.
+ */
+export function extractFrontmatter(text) {
+  // Frontmatter must start at the very top of the file.
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/.exec(text);
+  return m ? m[1] : null;
+}
+
+/**
+ * Parse a `cinatra-watches:` block from a SKILL.md's frontmatter. STRICT and
+ * fail-loud (throws WatchParseError) on anything malformed, so a typo can never
+ * silently disable a watch (HIGH-2). Recognizes two list syntaxes under each
+ * watch key: a flow array (`primitives: [a, b]`) and a YAML block sequence
+ * (`primitives:` then `  - a`). Both yield a list of trimmed, unquoted strings.
+ *
+ * Returns:
+ *   - null            => no `cinatra-watches:` key at all (skill is UNDECLARED).
+ *   - { primitives, packages, routes, paths } (each a string[]; possibly empty)
+ *
+ * An all-empty result is returned as-is; main() treats "declared but all classes
+ * empty" as UNDECLARED (falls back to heuristic — HIGH-2), but a block with at
+ * least one non-empty class makes the skill "declared".
+ */
+export function parseWatches(text, { skillLabel = "SKILL.md" } = {}) {
+  const fm = extractFrontmatter(text);
+  if (fm == null) return null;
+  const lines = fm.split(/\r?\n/);
+
+  // Find the `cinatra-watches:` line (top-level, no indentation).
+  let i = 0;
+  for (; i < lines.length; i++) {
+    if (/^cinatra-watches:\s*$/.test(lines[i])) break;
+    if (/^cinatra-watches:\s*\S/.test(lines[i])) {
+      throw new WatchParseError(`${skillLabel}: \`cinatra-watches:\` must be a mapping (a block of indented keys), not an inline value`);
+    }
+  }
+  if (i >= lines.length) return null; // no cinatra-watches key
+
+  const watches = { primitives: [], packages: [], routes: [], paths: [] };
+  const seen = new Set();
+  let seenAny = false;
+  i += 1;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === "") { i += 1; continue; }
+    // A non-indented line ends the cinatra-watches mapping.
+    if (!/^\s/.test(line)) break;
+    // A watch key, indented exactly under cinatra-watches. Capture the key and
+    // either an inline flow array or the following block sequence.
+    const keyMatch = /^(\s+)([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (!keyMatch) {
+      throw new WatchParseError(`${skillLabel}: cannot parse \`cinatra-watches\` line: ${JSON.stringify(line)}`);
+    }
+    const key = keyMatch[2];
+    const inline = keyMatch[3];
+    if (!WATCH_KEYS.includes(key)) {
+      throw new WatchParseError(`${skillLabel}: unknown cinatra-watches key \`${key}\` (allowed: ${WATCH_KEYS.join(", ")})`);
+    }
+    if (seen.has(key)) throw new WatchParseError(`${skillLabel}: cinatra-watches \`${key}\` declared more than once`);
+    seen.add(key);
+    seenAny = true;
+    let values;
+    if (inline !== "") {
+      // Inline flow array: `[a, "b", 'c']`. Anything else is malformed.
+      const fa = /^\[(.*)\]$/.exec(inline.trim());
+      if (!fa) {
+        throw new WatchParseError(`${skillLabel}: cinatra-watches \`${key}\` must be a list (a flow array \`[...]\` or a block sequence of \`- item\` lines), got: ${JSON.stringify(inline)}`);
+      }
+      values = fa[1].trim() === "" ? [] : fa[1].split(",").map((s) => unquoteScalar(s, key, skillLabel));
+      i += 1;
+    } else {
+      // Block sequence: subsequent more-indented `- item` lines.
+      values = [];
+      i += 1;
+      const itemIndent = keyMatch[1].length;
+      while (i < lines.length) {
+        const l = lines[i];
+        if (l.trim() === "") { i += 1; continue; }
+        const im = /^(\s+)-\s+(.*)$/.exec(l);
+        if (!im || im[1].length <= itemIndent) break;
+        values.push(unquoteScalar(im[2], key, skillLabel));
+        i += 1;
+      }
+    }
+    // A PRESENT watch key with ZERO items is MALFORMED — fail loud (HIGH-1). If
+    // you declared `paths:` you must list at least one glob; an empty key must
+    // never silently collapse a real (e.g. path-only) watch to "no watches" and
+    // fall back to the heuristic. The only "undeclared" case is the COMPLETE
+    // ABSENCE of a `cinatra-watches:` block.
+    if (values.length === 0) {
+      throw new WatchParseError(`${skillLabel}: cinatra-watches \`${key}\` is present but empty — list at least one item or remove the key (an empty watch class is a silent false-negative)`);
+    }
+    for (const v of values) {
+      if (v === "") throw new WatchParseError(`${skillLabel}: cinatra-watches \`${key}\` has an empty list item`);
+      watches[key].push(v);
+    }
+  }
+
+  if (!seenAny) {
+    // `cinatra-watches:` present but with NO recognized child keys — malformed.
+    throw new WatchParseError(`watches block under \`cinatra-watches:\` has no recognized keys (allowed: ${WATCH_KEYS.join(", ")})`);
+  }
+  return watches;
+}
+
+/**
+ * Parse a single scalar list item into its string value. STRICT — rejects
+ * anything that is not a plain (optionally quoted) scalar so a structured YAML
+ * item can never be silently swallowed as a literal (HIGH-2) and a quoted item
+ * with a trailing comment is read correctly (MED-1). Throws WatchParseError on a
+ * malformed item rather than guessing.
+ */
+function unquoteScalar(raw, key, skillLabel) {
+  const s = raw.trim();
+  const bad = () => new WatchParseError(`${skillLabel}: cinatra-watches \`${key}\` has a malformed list item: ${JSON.stringify(raw)} (expected a plain string, optionally quoted)`);
+
+  if (s === "") return "";
+  // Quoted scalar: `"value"` or `'value'`, optionally followed by an inline
+  // `# comment`. Read the quoted body; reject any non-comment trailing text.
+  if (s[0] === '"' || s[0] === "'") {
+    const q = s[0];
+    const m = new RegExp(`^${q}((?:[^${q}\\\\]|\\\\.)*)${q}\\s*(?:#.*)?$`).exec(s);
+    if (!m) throw bad();
+    return m[1].replace(/\\(["'\\])/g, "$1");
+  }
+  // Unquoted scalar. Strip a trailing ` # comment`, then validate. A nested
+  // mapping (`glob: foo`), a flow collection (`[`, `{`), or any YAML structure
+  // is NOT a scalar — fail loud (HIGH-2) rather than index a bogus literal.
+  let v = s;
+  const hash = v.indexOf(" #");
+  if (hash !== -1) v = v.slice(0, hash).trim();
+  if (v === "") throw bad();
+  // A `key: value` shape (a nested mapping) or a leading flow char is structured.
+  if (/[[\]{}]/.test(v) || /^[A-Za-z0-9_.@/*?-]+:\s/.test(v) || /:\s*$/.test(v)) throw bad();
+  return v;
+}
+
+/** True iff a parsed watches object has at least one non-empty watch class. */
+export function hasDeclaredWatches(watches) {
+  return Boolean(watches) && WATCH_KEYS.some((k) => watches[k] && watches[k].length > 0);
+}
+
+/**
+ * Validate a declared watch value for the string classes (primitives / packages
+ * / routes) against the SAME grammar `extractIdentifiers` uses, by round-trip:
+ * the value must extract back out as exactly itself in its class. A value the
+ * extractor can NEVER produce (e.g. `agent-run` with a hyphen, `cinatra-ai/foo`
+ * without the `@` scope, `api/foo` without the leading `/`) would parse fine but
+ * silently never match the diff — and because the skill is "declared" it would
+ * also lose heuristic fallback, fully disabling its coverage. So such a value is
+ * MALFORMED: throw (codex r2 HIGH). `paths` are globs (a different grammar) and
+ * are validated separately (non-empty, no `paths`-specific round-trip).
+ */
+export function validateWatchSurface(cls, value, skillLabel, extractOpts = {}) {
+  // Use the SAME extractOpts (e.g. config primitiveStopwords) the diff extractor
+  // uses (codex r3 MED): if a configured stopword would suppress this primitive
+  // on the diff side, the value can never match — so it must fail validation here
+  // too (the round-trip below extracts to empty and throws).
+  const { primitives, packages, routes } = extractIdentifiers(value, extractOpts);
+  const set = cls === "primitives" ? primitives : cls === "packages" ? packages : routes;
+  if (!(set.size === 1 && set.has(value))) {
+    throw new WatchParseError(`${skillLabel}: cinatra-watches \`${cls}\` value ${JSON.stringify(value)} is not a valid ${cls.replace(/s$/, "")} surface the gate can match — it can never match the diff (a typo, or a configured primitiveStopword, would silently disable this skill's drift coverage). Use an exact ${cls === "packages" ? "@cinatra-ai/<slug> package name" : cls === "routes" ? "/<root>/<segment> route string" : "lower_snake_case primitive name (and not a configured stopword)"}.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Path globs (the `paths:` watch class) — matched against the PR's touched files
+// ---------------------------------------------------------------------------
+
+/**
+ * Compile a single path glob into a RegExp. Supports:
+ *   - `**` => any number of path segments (including zero) / any chars across `/`
+ *   - `*`  => any chars within a single path segment (does not cross `/`)
+ *   - `?`  => a single non-`/` char
+ *   - everything else is a literal (regex-escaped)
+ * Globs and paths are normalized to repo-root-relative POSIX (leading `./`
+ * stripped) before matching.
+ */
+export function globToRegExp(glob) {
+  const g = glob.replace(/^\.\//, "");
+  let re = "";
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === "*") {
+      if (g[i + 1] === "*") {
+        // `**` — optionally followed by `/` to mean "any depth, or nothing".
+        if (g[i + 2] === "/") { re += "(?:.*/)?"; i += 2; }
+        else { re += ".*"; i += 1; }
+      } else {
+        re += "[^/]*";
+      }
+    } else if (c === "?") {
+      re += "[^/]";
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/**
+ * Given a list of `paths` globs and the PR's touched file paths (both rename
+ * sides — touchedPaths already returns old+new), return the SET of globs that
+ * matched at least one touched path. Returned per-glob so the report can name
+ * exactly which declared path surface changed.
+ */
+export function matchPathGlobs(globs, touched) {
+  const norm = touched.map((p) => p.replace(/^\.\//, ""));
+  const hits = new Set();
+  for (const glob of globs) {
+    const re = globToRegExp(glob);
+    if (norm.some((p) => re.test(p))) hits.add(glob);
+  }
+  return hits;
+}
+
+// ---------------------------------------------------------------------------
+// Watch index: declared surface -> skills, across all skills with watches
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the WATCH index from every SKILL.md that declares a non-empty
+ * `cinatra-watches` block. Returns:
+ *   - watchIndex: { primitives, packages, routes, paths } each a Map(surface ->
+ *     Set(skill relpaths)) — string classes for exact intersect, `paths` for glob
+ *     matching against touched files.
+ *   - declaredSkills: Set(rel) of skills that are "declared" (suppress heuristic).
+ *
+ * FAIL-LOUD: a malformed `cinatra-watches` block throws (caller exits 2).
+ */
+export function buildWatchIndex(skillsDir, extractOpts = {}) {
+  const files = listSkillFiles(skillsDir);
+  const watchIndex = { primitives: new Map(), packages: new Map(), routes: new Map(), paths: new Map() };
+  const declaredSkills = new Set();
+  for (const file of files) {
+    const rel = path.relative(skillsDir, file);
+    let text;
+    try { text = fs.readFileSync(file, "utf8"); } catch { continue; }
+    let watches;
+    try { watches = parseWatches(text, { skillLabel: rel }); }
+    catch (e) {
+      // Re-throw with the skill path so main() can fail loud with a clear pointer.
+      throw new WatchParseError(`${rel}: ${e.message}`);
+    }
+    if (!hasDeclaredWatches(watches)) continue; // undeclared / empty => heuristic
+    declaredSkills.add(rel);
+    for (const cls of WATCH_KEYS) {
+      for (const surface of watches[cls]) {
+        // Validate string-class surfaces against the extractor grammar (with the
+        // SAME extractOpts the diff side uses) — a value the extractor can never
+        // produce would silently never match (codex r2 HIGH / r3 MED). `paths`
+        // are globs (validated by non-emptiness in parseWatches).
+        if (cls !== "paths") validateWatchSurface(cls, surface, rel, extractOpts);
+        if (!watchIndex[cls].has(surface)) watchIndex[cls].set(surface, new Set());
+        watchIndex[cls].get(surface).add(rel);
+      }
+    }
+  }
+  return { watchIndex, declaredSkills };
+}
+
+/**
+ * Intersect the PR-diff identifiers AND touched paths with the watch index.
+ * Returns watch findings: { class, identifier, skills, source: "watch" }.
+ * `primitives|packages|routes` intersect exact strings; `paths` glob-matches the
+ * touched file list. Pure given (diffIds, touched, watchIndex).
+ */
+export function intersectWatches(diffIds, touched, watchIndex) {
+  const findings = [];
+  for (const cls of ["primitives", "packages", "routes"]) {
+    const idx = watchIndex[cls];
+    if (!idx || idx.size === 0) continue;
+    for (const id of diffIds[cls]) {
+      const skills = idx.get(id);
+      if (skills && skills.size) {
+        findings.push({ class: cls, identifier: id, skills: [...skills].sort(), source: "watch" });
+      }
+    }
+  }
+  if (watchIndex.paths && watchIndex.paths.size) {
+    const globs = [...watchIndex.paths.keys()];
+    const matched = matchPathGlobs(globs, touched);
+    for (const glob of matched) {
+      const skills = watchIndex.paths.get(glob);
+      findings.push({ class: "path", identifier: glob, skills: [...skills].sort(), source: "watch" });
+    }
+  }
+  findings.sort((a, b) => (a.class === b.class ? a.identifier.localeCompare(b.identifier) : a.class.localeCompare(b.class)));
+  return findings;
+}
+
+// ---------------------------------------------------------------------------
 // Core: intersect PR-diff identifiers with the skill index
 // ---------------------------------------------------------------------------
 
 /**
- * Given identifiers extracted from the PR diff and a skill index, return the
- * findings: each is { class, identifier, skills: [relpaths] }. Pure — no git,
- * no fs — so it is unit-testable from fixtures.
+ * Given identifiers extracted from the PR diff and the HEURISTIC skill index,
+ * return findings: { class, identifier, skills: [relpaths], source: "heuristic" }.
+ * Pure — no git, no fs — so it is unit-testable from fixtures. Heuristic findings
+ * are ADVISORY only: they are reported in every mode but never gate enforce.
  */
 export function intersect(diffIds, skillIndex) {
   const findings = [];
@@ -319,7 +681,7 @@ export function intersect(diffIds, skillIndex) {
     for (const id of diffIds[cls]) {
       const skills = idx.get(id);
       if (skills && skills.size) {
-        findings.push({ class: cls, identifier: id, skills: [...skills].sort() });
+        findings.push({ class: cls, identifier: id, skills: [...skills].sort(), source: "heuristic" });
       }
     }
   }
@@ -332,18 +694,88 @@ export function intersect(diffIds, skillIndex) {
 // Acknowledgements (parsed, reported; do not gate in warn mode)
 // ---------------------------------------------------------------------------
 
-const SKILLS_REVIEWED_RE = /^Skills-reviewed:\s*(.+)$/im;
-const SKILLS_UNAFFECTED_RE = /^Skills-unaffected:\s*(.+)$/im;
+// `[^\S\r\n]*` = horizontal whitespace ONLY. A plain `\s*` would consume the
+// newline, so `Skills-unaffected:\n<next line>` would wrongly parse <next line>
+// as the reason and clear the gate (codex r3 MED). The value is the REST OF THE
+// SAME LINE only.
+const SKILLS_REVIEWED_RE = /^Skills-reviewed:[^\S\r\n]*(.+)$/im;
+const SKILLS_UNAFFECTED_RE = /^Skills-unaffected:[^\S\r\n]*(.+)$/im;
+// Linked assistant-skills PR ack. Format (the `covers:` list is REQUIRED for it
+// to satisfy anything — HIGH-3): `Skills-PR: <url-or-#n> covers: <slug>[, <slug>]`.
+// Multiple `Skills-PR:` lines are allowed (one per linked PR).
+const SKILLS_PR_RE = /^Skills-PR:[^\S\r\n]*(.+)$/gim;
+const COVERS_RE = /\bcovers:\s*(.+)$/i;
+// A Skills-PR ref must be a REAL assistant-skills PR reference, not arbitrary
+// text — `#123`, `123`, `GH-123`, or an assistant-skills PR URL. Otherwise
+// `Skills-PR: nonsense covers: <skill>` would clear the gate (codex LOW).
+const SKILLS_PR_REF_RE = /^(?:#\d+|gh-\d+|\d+|https?:\/\/github\.com\/[^/\s]+\/assistant-skills\/pull\/\d+)$/i;
 
-/** Parse ack markers from a text blob (PR body / commit messages / ack file). */
+/**
+ * Normalize a skill reference (a slug or a SKILL.md relpath) to its slug — the
+ * directory name. `chat-agent-dispatch/SKILL.md` -> `chat-agent-dispatch`;
+ * `chat-agent-dispatch` -> `chat-agent-dispatch`. Used to match `covers:` slugs
+ * against impacted-skill relpaths.
+ */
+export function skillSlug(ref) {
+  let s = String(ref).trim().replace(/^\.\//, "");
+  s = s.replace(/\/SKILL\.md$/i, "");
+  const parts = s.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : s;
+}
+
+/**
+ * Parse ack markers from a text blob (PR body / commit messages / ack file).
+ * Returns:
+ *   - reviewed:   string|null  — non-empty note asserting checked+updated.
+ *   - unaffected: string|null  — recorded override; only a NON-EMPTY reason counts
+ *                                (the issue: not `Skills-unaffected:` only).
+ *   - linkedPRs:  [{ ref, covers: Set<slug> }]  — linked assistant-skills PRs and
+ *                 the skill slugs each declares it covers (empty covers => covers
+ *                 nothing; recorded but satisfies no finding).
+ */
 export function parseAcks(text) {
-  if (!text) return { reviewed: null, unaffected: null };
+  if (!text) return { reviewed: null, unaffected: null, linkedPRs: [] };
   const r = text.match(SKILLS_REVIEWED_RE);
   const u = text.match(SKILLS_UNAFFECTED_RE);
-  return {
-    reviewed: r ? r[1].trim() : null,
-    unaffected: u ? u[1].trim() : null,
-  };
+  const reviewed = r && r[1].trim() ? r[1].trim() : null;
+  const unaffected = u && u[1].trim() ? u[1].trim() : null;
+
+  const linkedPRs = [];
+  for (const m of text.matchAll(SKILLS_PR_RE)) {
+    const value = m[1].trim();
+    const cm = COVERS_RE.exec(value);
+    const ref = (cm ? value.slice(0, cm.index) : value).trim();
+    const covers = new Set();
+    if (cm) {
+      for (const part of cm[1].split(",")) {
+        const slug = skillSlug(part);
+        if (slug) covers.add(slug);
+      }
+    }
+    // Only record a linked PR whose ref is a REAL assistant-skills PR reference;
+    // arbitrary text must not be able to satisfy a finding (codex LOW). An
+    // invalid ref is dropped (reported as no linked PR) so the finding stays open.
+    if (ref && SKILLS_PR_REF_RE.test(ref)) linkedPRs.push({ ref, covers });
+  }
+  return { reviewed, unaffected, linkedPRs };
+}
+
+/**
+ * Decide whether a single WATCH finding is satisfied by the parsed acks:
+ *   (b) Skills-reviewed (non-empty) OR (c) Skills-unaffected (non-empty reason)
+ *       cover ALL impacted skills (explicit human assertions over the whole PR);
+ *   (a) a Skills-PR whose `covers:` set includes EVERY impacted skill of this
+ *       finding (per-skill coverage — HIGH-3). A finding can touch multiple
+ *       skills; ALL must be covered for the linked-PR ack to clear it.
+ * Returns true iff satisfied.
+ */
+export function findingSatisfied(finding, acks) {
+  if (acks.reviewed || acks.unaffected) return true;
+  // Union the `covers:` sets across ALL linked Skills-PR lines (MED-2): a
+  // multi-skill finding can be covered by several PRs, one per skill.
+  const covered = new Set();
+  for (const pr of acks.linkedPRs) for (const slug of pr.covers) covered.add(slug);
+  return finding.skills.map(skillSlug).every((slug) => covered.has(slug));
 }
 
 // ---------------------------------------------------------------------------
@@ -398,19 +830,29 @@ function emitStepSummary(lines) {
   try { fs.appendFileSync(f, lines.join("\n") + "\n"); } catch { /* non-fatal */ }
 }
 
-function buildReport(findings, { mode, skillCount, acks, skillsRef }) {
+function buildReport({ watchFindings, heuristicFindings, mode, skillCount, declaredCount, acks, skillsRef }) {
+  const allFindings = [...watchFindings, ...heuristicFindings];
   const bySkill = new Map();
-  for (const f of findings) for (const s of f.skills) {
+  for (const f of allFindings) for (const s of f.skills) {
     if (!bySkill.has(s)) bySkill.set(s, []);
-    bySkill.get(s).push(`${f.identifier} (${f.class})`);
+    bySkill.get(s).push(`${f.identifier} (${f.class}, ${f.source})`);
   }
+  // Per-watch-finding satisfaction (only watch findings can gate enforce).
+  const watchFindingsAnnotated = watchFindings.map((f) => ({ ...f, satisfied: findingSatisfied(f, acks) }));
+  const unacknowledgedWatchFindings = watchFindingsAnnotated.filter((f) => !f.satisfied);
   return {
     gateVersion: GATE_VERSION,
     mode,
     skillsRef: skillsRef || null,
     skillsScanned: skillCount,
-    findingCount: findings.length,
-    findings,
+    skillsWithWatches: declaredCount,
+    findingCount: allFindings.length,
+    watchFindingCount: watchFindings.length,
+    heuristicFindingCount: heuristicFindings.length,
+    unacknowledgedWatchFindingCount: unacknowledgedWatchFindings.length,
+    findings: [...watchFindingsAnnotated, ...heuristicFindings],
+    watchFindings: watchFindingsAnnotated,
+    heuristicFindings,
     impactedSkills: [...bySkill.entries()].map(([skill, surfaces]) => ({ skill, surfaces })).sort((a, b) => a.skill.localeCompare(b.skill)),
     acknowledgements: acks,
   };
@@ -439,7 +881,18 @@ function main() {
     ? { primitiveStopwords: new Set([...DEFAULT_PRIMITIVE_STOPWORDS, ...config.primitiveStopwords]) }
     : {};
 
-  const { files: skillFiles, index } = buildSkillIndex(skillsDir, extractOpts);
+  // 1) DECLARED WATCHES (preferred). Fail loud on a malformed `cinatra-watches`
+  //    block — a typo must break the gate, never silently disable a watch.
+  let watchIndex, declaredSkills;
+  try { ({ watchIndex, declaredSkills } = buildWatchIndex(skillsDir, extractOpts)); }
+  catch (e) {
+    if (e instanceof WatchParseError) fail(`malformed cinatra-watches block — ${e.message} (fix the watch declaration; the gate will not run on an ambiguous watch)`);
+    throw e;
+  }
+
+  // 2) HEURISTIC FALLBACK for UNDECLARED skills only (declared skills are
+  //    watches-only — passing declaredSkills suppresses their heuristic noise).
+  const { files: skillFiles, index } = buildSkillIndex(skillsDir, { ...extractOpts, declaredSkills });
   if (skillFiles.length === 0) {
     fail(`no SKILL.md found under ${skillsDir} — assistant-skills pin looks wrong (fail loud, not a silent pass)`);
   }
@@ -448,12 +901,18 @@ function main() {
   // Content diff (added + removed lines) PLUS routes derived from touched/renamed
   // Next.js route file paths — so a pure route-file rename (string only in the
   // path) is still flagged. changedDiffText fail-louds on a diff error.
-  const diffText = changedDiffText(base) + "\n" + pathDerivedRoutes(touchedPaths(base));
+  const touched = touchedPaths(base);
+  const diffText = changedDiffText(base) + "\n" + pathDerivedRoutes(touched);
   const diffIds = extractIdentifiers(diffText, extractOpts);
-  const findings = intersect(diffIds, index);
+
+  // Watch findings (string classes intersect diff ids; `path` class glob-matches
+  // touched files — catches param-shape changes that leave the string untouched).
+  const watchFindings = intersectWatches(diffIds, touched, watchIndex);
+  // Heuristic findings (undeclared skills) — advisory only, never gate.
+  const heuristicFindings = intersect(diffIds, index);
 
   // Acknowledgements: parse from an optional ack-file (PR body + commit trailers
-  // concatenated by the caller). Reported; never gates in warn mode.
+  // concatenated by the caller). Reported; gate ONLY unacknowledged WATCH findings.
   let ackText = "";
   if (args["ack-file"]) {
     try { ackText = fs.readFileSync(args["ack-file"], "utf8"); } catch { ackText = ""; }
@@ -461,48 +920,81 @@ function main() {
   const acks = parseAcks(ackText);
 
   const skillsRef = process.env.SKILLS_DRIFT_PINNED_REF || null;
-  const report = buildReport(findings, { mode, skillCount: skillFiles.length, acks, skillsRef });
+  const report = buildReport({ watchFindings, heuristicFindings, mode, skillCount: skillFiles.length, declaredCount: declaredSkills.size, acks, skillsRef });
+
+  const MODE_LABEL = mode.toUpperCase();
+  const allFindings = report.findings;
+  const unackWatch = report.unacknowledgedWatchFindingCount;
+  const scannedNote = `${skillFiles.length} SKILL.md scanned, ${report.skillsWithWatches} with declared watches${skillsRef ? `, pin ${skillsRef}` : ""}`;
+  // In enforce mode an UNACKNOWLEDGED watch finding is what gates; heuristic
+  // findings (and acknowledged watch findings) never gate — they are advisory.
+  const willFail = mode === "enforce" && unackWatch > 0;
 
   if (format === "json") {
     process.stdout.write(JSON.stringify(report, null, 2) + "\n");
   } else if (!quiet) {
-    if (findings.length === 0) {
-      process.stderr.write(`skills-drift-gate: clean — no cinatra change touched an assistant-skills surface (${skillFiles.length} SKILL.md scanned${skillsRef ? `, pin ${skillsRef}` : ""}).\n`);
+    if (allFindings.length === 0) {
+      process.stderr.write(`skills-drift-gate: clean — no cinatra change touched an assistant-skills surface (${scannedNote}).\n`);
     } else {
-      process.stderr.write(`skills-drift-gate [${mode}]: ${findings.length} watched surface(s) changed; ${report.impactedSkills.length} skill(s) may be stale (${skillFiles.length} SKILL.md scanned${skillsRef ? `, pin ${skillsRef}` : ""}).\n`);
-      for (const f of findings) {
-        process.stderr.write(`  ${f.class}: ${f.identifier}  ->  ${f.skills.join(", ")}\n`);
+      process.stderr.write(`skills-drift-gate [${mode}]: ${report.watchFindingCount} declared-watch + ${report.heuristicFindingCount} heuristic surface(s) changed; ${report.impactedSkills.length} skill(s) may be stale (${scannedNote}).\n`);
+      for (const f of report.watchFindings) {
+        process.stderr.write(`  [watch${f.satisfied ? ", acknowledged" : ""}] ${f.class}: ${f.identifier}  ->  ${f.skills.join(", ")}\n`);
       }
-      process.stderr.write("\nResolve by one of:\n");
-      process.stderr.write("  (a) link an assistant-skills PR that updates the impacted skill(s); or\n");
-      process.stderr.write("  (b) add a 'Skills-reviewed: <note>' trailer (skills checked + updated); or\n");
-      process.stderr.write("  (c) add a 'Skills-unaffected: <reason>' trailer (recorded override).\n");
+      for (const f of report.heuristicFindings) {
+        process.stderr.write(`  [heuristic, advisory] ${f.class}: ${f.identifier}  ->  ${f.skills.join(", ")}\n`);
+      }
+      process.stderr.write("\nResolve a declared-watch finding by one of:\n");
+      process.stderr.write("  (a) 'Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]' — a linked assistant-skills PR naming the impacted skill(s); or\n");
+      process.stderr.write("  (b) 'Skills-reviewed: <note>' — recorded checked + updated assertion; or\n");
+      process.stderr.write("  (c) 'Skills-unaffected: <reason>' — recorded override (reason REQUIRED).\n");
       if (acks.reviewed) process.stderr.write(`  [ack] Skills-reviewed: ${acks.reviewed}\n`);
       if (acks.unaffected) process.stderr.write(`  [ack] Skills-unaffected: ${acks.unaffected}\n`);
+      for (const pr of acks.linkedPRs) process.stderr.write(`  [ack] Skills-PR: ${pr.ref} covers: ${[...pr.covers].join(", ") || "(none — covers nothing)"}\n`);
+      if (mode === "enforce") {
+        process.stderr.write(unackWatch > 0
+          ? `\nenforce: ${unackWatch} unacknowledged declared-watch finding(s) — FAILING. Heuristic findings are advisory and do not gate.\n`
+          : `\nenforce: all declared-watch findings acknowledged — passing. Heuristic findings are advisory and do not gate.\n`);
+      }
     }
   }
 
-  // GitHub annotations + step summary (warn level keeps the check green).
-  if (findings.length > 0) {
-    for (const s of report.impactedSkills) {
-      annotate("warning", `skills-drift: ${s.skill} may be stale — changed surfaces: ${s.surfaces.join(", ")}. Resolve via linked assistant-skills PR, 'Skills-reviewed:', or 'Skills-unaffected: <reason>'.`);
+  // GitHub annotations + step summary. Warn-level annotations keep the check
+  // green; in enforce mode an unacknowledged watch finding is an ERROR annotation
+  // and the process exits 1. Annotations write `::level::` lines to STDOUT — in
+  // `--format json` mode the JSON report already owns stdout, so suppress the
+  // stdout annotations there to avoid corrupting the machine-readable stream
+  // (codex r4 MED). The step summary (a separate file) is always safe to emit.
+  const emitAnnotations = format !== "json";
+  if (allFindings.length > 0) {
+    if (emitAnnotations) for (const f of report.watchFindings) {
+      const level = (mode === "enforce" && !f.satisfied) ? "error" : "warning";
+      annotate(level, `skills-drift [watch]: ${f.skills.join(", ")} depends on changed surface ${f.identifier} (${f.class})${f.satisfied ? " — acknowledged" : ""}. Resolve via 'Skills-PR: <pr> covers: <skill>', 'Skills-reviewed:', or 'Skills-unaffected: <reason>'.`);
     }
-    const summary = ["## skills-drift-gate (WARN)", "", `Mode: \`${mode}\`${skillsRef ? ` · assistant-skills pin: \`${skillsRef}\`` : ""}`, "", `${findings.length} watched surface(s) changed; ${report.impactedSkills.length} skill(s) may be stale.`, "", "| Skill | Changed surface(s) |", "| --- | --- |"];
-    for (const s of report.impactedSkills) summary.push(`| \`${s.skill}\` | ${s.surfaces.map((x) => `\`${x}\``).join(", ")} |`);
-    summary.push("", "Resolve by: linked `assistant-skills` PR, a `Skills-reviewed:` trailer, or a `Skills-unaffected: <reason>` trailer.");
+    if (emitAnnotations) for (const f of report.heuristicFindings) {
+      annotate("warning", `skills-drift [heuristic, advisory]: ${f.skills.join(", ")} mentions changed identifier ${f.identifier} (${f.class}). Advisory only — does not gate. Add a cinatra-watches block to the skill to make this precise.`);
+    }
+    const summary = [`## skills-drift-gate (${MODE_LABEL})`, "", `Mode: \`${mode}\`${skillsRef ? ` · assistant-skills pin: \`${skillsRef}\`` : ""} · ${scannedNote}`, "", `${report.watchFindingCount} declared-watch + ${report.heuristicFindingCount} heuristic surface(s) changed; ${report.impactedSkills.length} skill(s) may be stale.`];
+    if (report.watchFindings.length) {
+      summary.push("", "### Declared-watch findings" + (mode === "enforce" ? " (gating)" : ""), "", "| Surface | Class | Skill(s) | Status |", "| --- | --- | --- | --- |");
+      for (const f of report.watchFindings) summary.push(`| \`${f.identifier}\` | ${f.class} | ${f.skills.map((s) => `\`${s}\``).join(", ")} | ${f.satisfied ? "acknowledged" : (mode === "enforce" ? "**unacknowledged — failing**" : "unacknowledged")} |`);
+    }
+    if (report.heuristicFindings.length) {
+      summary.push("", "### Heuristic findings (advisory — never gate)", "", "| Identifier | Class | Skill(s) |", "| --- | --- | --- |");
+      for (const f of report.heuristicFindings) summary.push(`| \`${f.identifier}\` | ${f.class} | ${f.skills.map((s) => `\`${s}\``).join(", ")} |`);
+    }
+    summary.push("", "Resolve a declared-watch finding by: a linked `Skills-PR: <pr> covers: <skill>`, a `Skills-reviewed:` trailer, or a `Skills-unaffected: <reason>` trailer.");
     if (acks.reviewed) summary.push("", `Acknowledged: \`Skills-reviewed: ${acks.reviewed}\``);
     if (acks.unaffected) summary.push("", `Acknowledged: \`Skills-unaffected: ${acks.unaffected}\``);
+    for (const pr of acks.linkedPRs) summary.push("", `Acknowledged: \`Skills-PR: ${pr.ref}\` covers ${[...pr.covers].map((s) => `\`${s}\``).join(", ") || "(none)"}`);
     emitStepSummary(summary);
   } else {
-    emitStepSummary(["## skills-drift-gate (WARN)", "", `Clean — no cinatra change touched an assistant-skills surface. ${skillFiles.length} SKILL.md scanned.`]);
+    emitStepSummary([`## skills-drift-gate (${MODE_LABEL})`, "", `Clean — no cinatra change touched an assistant-skills surface. ${scannedNote}.`]);
   }
 
-  // WARN mode: always exit 0 (neutral/success). enforce mode would gate on an
-  // unacknowledged finding — wired but intentionally unused in Stage 1.
-  if (mode === "enforce") {
-    const acked = Boolean(acks.reviewed || acks.unaffected);
-    if (findings.length > 0 && !acked) process.exit(1);
-  }
+  // Exit. Fail-loud (exit 2) paths already ran above. enforce gates ONLY on an
+  // unacknowledged declared-watch finding; warn (and heuristic findings in any
+  // mode) never change the exit code.
+  if (willFail) process.exit(1);
   process.exit(0);
 }
 
@@ -519,4 +1011,5 @@ if (isMainModule()) {
 export {
   GATE_VERSION,
   DEFAULT_PRIMITIVE_STOPWORDS,
+  WATCH_KEYS,
 };

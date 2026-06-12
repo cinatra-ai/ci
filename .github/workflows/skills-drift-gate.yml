@@ -1,10 +1,25 @@
 name: skills-drift-gate
 
-# Reusable workflow (cinatra#188). WARN mode (Stage 1).
+# Reusable workflow (cinatra#188). v2 — watches-first with heuristic fallback.
 #
 # Flags when a cinatra PR change touches a surface an `assistant-skills`
-# SKILL.md depends on (MCP primitive name / @cinatra-ai/* package name / route
-# string), so the impacted skill is reviewed before it silently goes stale.
+# SKILL.md depends on, so the impacted skill is reviewed before it silently goes
+# stale. Two-tier matching:
+#   - DECLARED WATCHES (preferred, low false-positive): a SKILL.md declares a
+#     `cinatra-watches:` block (primitives / packages / routes / source-path
+#     globs); the gate matches those precise surfaces. In `enforce` mode an
+#     UNACKNOWLEDGED declared-watch finding gates (exit 1).
+#   - HEURISTIC FALLBACK (for skills with no watch block): verbatim identifier
+#     match (MCP primitive / @cinatra-ai/* package / route string). Heuristic
+#     findings are ADVISORY in every mode — reported, never gating.
+# Fail-loud (exit 2): bad/unresolvable assistant-skills pin, zero SKILL.md,
+# unresolvable diff base, or a malformed `cinatra-watches` block.
+#
+# Acknowledge a declared-watch finding with ONE of (cinatra#188 §Acknowledgement):
+#   - `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked
+#     assistant-skills PR naming the impacted skill(s); or
+#   - `Skills-reviewed: <note>`; or
+#   - `Skills-unaffected: <reason>` (reason REQUIRED — not `Skills-unaffected:` only).
 #
 # SCOPE: wired ONLY into the `cinatra` repo. NOT part of the org-wide
 # min-repo-config rollout — no other repo calls it (cinatra is the only repo
@@ -17,7 +32,7 @@ name: skills-drift-gate
 #       uses: cinatra-ai/ci/.github/workflows/skills-drift-gate.yml@<sha>  # vX.Y.Z
 #       with:
 #         skills_ref: <assistant-skills SHA pinned in cinatra's lock>
-#         mode: warn
+#         mode: enforce                        # warn (advisory) | enforce (gates)
 #         ref: <sha>
 #
 # A reusable workflow_call surfaces its required-check CONTEXT under the
@@ -37,7 +52,7 @@ on:
         type: string
         default: "cinatra-ai/assistant-skills"
       mode:
-        description: "warn (Stage 1, non-failing) | enforce (gates an unacknowledged finding)."
+        description: "warn (non-failing; reports watch + heuristic findings) | enforce (gates an UNACKNOWLEDGED declared-watch finding; heuristic findings stay advisory)."
         type: string
         default: "warn"
       config:
