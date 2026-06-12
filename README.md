@@ -338,36 +338,78 @@ so the impacted skill is reviewed before it silently goes stale.
 > other repo calls it, because cinatra is the only repo whose changes can drift
 > the `assistant-skills` knowledge.
 
-### Stage 1 — warn mode (heuristic match)
+### How it matches — watches-first with heuristic fallback
 
-It ships in **warn** mode first: it extracts identifiers from the cinatra PR
-diff (both **added and removed** lines across `merge-base…head`, so a rename —
-whose effect lands on the removed-identifier line — is caught), intersects them
-with the identifiers that appear verbatim in any `SKILL.md`, and reports which
-surfaces changed and which skills reference them as a **non-failing** warning
-(workflow annotations + a step summary; the check stays green). The documented
-graduation path is **skill-declared watches** for `enforce` mode (a skill
-declares the surfaces — including source-path globs — it depends on, lowering
-false positives), available via `mode: enforce`.
+The gate uses two tiers, applied per skill:
 
-Identifier classes are shaped to keep prose out: primitives must be
-`lower_snake_case` with at least one underscore (a bare English word never
-matches); packages must carry the canonical `@cinatra-ai/` scope; routes must
-sit under a known root (`api`, `app`, `agents`, …) with a sub-segment.
+1. **Declared watches (preferred — low false-positive).** A `SKILL.md` MAY
+   declare, in its YAML frontmatter, the cinatra surfaces it depends on:
+
+   ```yaml
+   cinatra-watches:
+     primitives: [agent_run, agent_run_get]      # exact MCP primitive names
+     packages: ["@cinatra-ai/trigger-agent"]     # exact @cinatra-ai/* package names
+     routes: ["/api/agents/passthrough"]         # exact route strings
+     paths:                                       # source-path GLOBS (* / ** / ?)
+       - packages/agents/src/a2a-actions.ts
+       - packages/agents/src/**
+   ```
+
+   `primitives` / `packages` / `routes` are matched against identifiers extracted
+   from the PR diff (both **added and removed** lines across `merge-base…head`, so
+   a rename — whose effect lands on the removed-identifier line — is caught).
+   `paths` globs are matched against the PR's **touched file paths** (both rename
+   sides), so a **param-shape change** that edits a watched source file but leaves
+   the watched string (`agent_run`) untouched is still flagged — the documented
+   v1 false-negative, closed by the `paths` class. A skill that declares **any**
+   non-empty watch class is matched **only** by its declared surfaces (the
+   verbatim heuristic is suppressed for it, silencing noise).
+
+2. **Heuristic fallback (zero skill-side work).** A skill with **no**
+   `cinatra-watches` block (or a present-but-**empty** one) is matched the v1 way:
+   identifiers that appear verbatim in its `SKILL.md`, intersected with the diff.
+   Identifier classes are shaped to keep prose out — primitives are
+   `lower_snake_case` with ≥1 underscore, packages carry the `@cinatra-ai/` scope,
+   routes sit under a known root with a sub-segment. So adoption is incremental:
+   undeclared skills keep coverage until they add watches.
+
+Every finding is tagged `source: "watch"` or `source: "heuristic"`.
+
+### warn vs enforce
+
+- **warn** — exit 0 always. Reports watch + heuristic findings as workflow
+  annotations + a step summary (the check stays green).
+- **enforce** — exit 1 **iff** there is an **unacknowledged `source: "watch"`
+  finding**. `source: "heuristic"` findings are **advisory in every mode** — they
+  are reported but **never gate**, so the warn→enforce flip can never hard-fail on
+  heuristic noise from an undeclared skill. (This is the issue's "graduate to
+  declared watches *for enforcement*".)
+- **fail-loud (exit 2)** — a bad/unresolvable `assistant-skills` pin, zero
+  `SKILL.md`, an unresolvable diff base, or a **malformed `cinatra-watches`
+  block** (a typo must break the gate, never silently disable a watch). Fail-loud
+  runs **before** the mode decision, so it exits 2 regardless of `warn`/`enforce`.
 
 ### Acknowledgement / override
 
-A flagged PR resolves the warning by one of (mirroring `source-leak-gate`'s
-override ergonomics):
+A flagged **declared-watch** finding resolves by one of (mirroring
+`source-leak-gate`'s override ergonomics):
 
-- **(a)** link an `assistant-skills` PR that updates the impacted skill(s); or
-- **(b)** a recorded **`Skills-reviewed: <note>`** trailer (checked + updated); or
-- **(c)** an explicit **`Skills-unaffected: <reason>`** trailer (recorded override).
+- **(a)** `Skills-PR: <url-or-#n> covers: <skill-slug>[, …]` — a linked
+  `assistant-skills` PR that **names** the impacted skill(s) it updates. A bare PR
+  link with no `covers:` list satisfies nothing (coverage can't be verified
+  offline — only the recorded decision is enforced, never content correctness).
+  This ack is **per-skill**; a finding touching multiple skills needs all of them
+  named.
+- **(b)** `Skills-reviewed: <note>` — a recorded "checked + updated" assertion
+  (covers all impacted skills); or
+- **(c)** `Skills-unaffected: <reason>` — a recorded override. The **reason is
+  required**: a bare `Skills-unaffected:` satisfies nothing (the issue: "not
+  `Skills-unaffected:` only").
 
 The caller concatenates the PR body + commit messages into an ack file; the gate
-parses these trailers and reports them. In `warn` mode they never change the
-exit code; in `enforce` mode an unacknowledged finding gates and any recorded
-ack clears it.
+parses these trailers and reports them. In `warn` mode they never change the exit
+code; in `enforce` mode an unacknowledged watch finding gates and a matching
+recorded ack clears it.
 
 ### Use it from cinatra
 
@@ -416,9 +458,9 @@ whole release diff.
 
 | Input | Default | Meaning |
 |-------|---------|---------|
-| `skills_ref` | _(default branch)_ | `assistant-skills` git ref to check out — pin to the SHA in cinatra's required-extensions lock. |
+| `skills_ref` | _(required)_ | `assistant-skills` git ref to check out — pin to the SHA in cinatra's required-extensions lock. Empty fails loud. |
 | `skills_repo` | `cinatra-ai/assistant-skills` | The skills repository. |
-| `mode` | `warn` | `warn` (Stage 1, non-failing) or `enforce` (gates an unacknowledged finding). |
+| `mode` | `warn` | `warn` (non-failing) or `enforce` (gates an unacknowledged **declared-watch** finding; heuristic findings stay advisory). |
 | `config` | _(none)_ | Per-repo JSON config (e.g. `primitiveStopwords` to tune the primitive matcher). |
 | `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
 
@@ -436,8 +478,14 @@ node scripts/skills-drift-gate.mjs \
 node --test scripts/__tests__/skills-drift-gate.test.mjs
 ```
 
-The test harness covers the three matcher cases on fixture `SKILL.md`s — a true
-primitive/route/package hit, the prose false-positive guard (English prose flags
-nothing), and a multi-skill hit (one identifier referenced by two skills surfaces
-both) — plus a real-git-diff rename catching the removed-side identifier, warn
-vs enforce exit codes, ack clearing, and fail-loud on a bad pin.
+The test harness covers the heuristic matcher cases on fixture `SKILL.md`s — a
+true primitive/route/package hit, the prose false-positive guard, a multi-skill
+hit, a real-git-diff rename catching the removed-side identifier — **plus the v2
+declared-watches surface**: watch parsing (block + flow arrays), fail-loud on a
+malformed/unknown-key/scalar watch block, path-glob semantics (`*` within a
+segment, `**` across segments), watches suppressing the heuristic for a declared
+skill, an empty watch block falling back to the heuristic, a **path-only** finding
+(a watched source file edited with no watched string), enforce gating only
+unacknowledged watch findings (heuristic findings advisory), the `Skills-PR:
+covers:` per-skill ack, a reasonless `Skills-unaffected:` not clearing the gate,
+and fail-loud on a bad pin / diff base.
