@@ -50,4 +50,5 @@ jobs:
             scripts/__tests__/gitignore-gate.test.mjs \
             scripts/__tests__/actions-pinned-gate.test.mjs \
             scripts/__tests__/ui-design-system-gate.test.mjs \
-            scripts/__tests__/skills-drift-gate.test.mjs
+            scripts/__tests__/skills-drift-gate.test.mjs \
+            scripts/__tests__/truthful-attribution-gate.test.mjs
