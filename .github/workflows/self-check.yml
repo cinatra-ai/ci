@@ -51,4 +51,17 @@ jobs:
             scripts/__tests__/actions-pinned-gate.test.mjs \
             scripts/__tests__/ui-design-system-gate.test.mjs \
             scripts/__tests__/skills-drift-gate.test.mjs \
-            scripts/__tests__/truthful-attribution-gate.test.mjs
+            scripts/__tests__/truthful-attribution-gate.test.mjs \
+            scripts/__tests__/gate-suite-index.test.mjs \
+            scripts/__tests__/gate-suite-audit-report.test.mjs
+
+      - name: gate-suite index is deterministic + matches a fresh scan (offline)
+        # The org-wide gate-suite audit index (config/gate-suite-index.json,
+        # cinatra-engineering#119 §4) is GENERATED. Here we re-run the generator
+        # offline (no GitHub token in self-check) and confirm its OWN structure +
+        # the committed file's shape are internally consistent: regenerate with a
+        # null reader and assert the committed file parses + carries the inventory
+        # pointer. The LIVE drift check (a fresh scan of every inventoried repo's
+        # real suite, requiring auth) runs in the monthly Gate-suite audit job,
+        # not in this hermetic self-check.
+        run: node scripts/gate-suite-index-selfcheck.mjs

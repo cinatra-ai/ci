@@ -489,3 +489,95 @@ skill, an empty watch block falling back to the heuristic, a **path-only** findi
 unacknowledged watch findings (heuristic findings advisory), the `Skills-PR:
 covers:` per-skill ack, a reasonless `Skills-unaffected:` not clearing the gate,
 and fail-loud on a bad pin / diff base.
+
+## truthful-attribution-gate
+
+The org-wide gate for the **truthful verification-record model** ratified in
+[cinatra-engineering#119](https://github.com/cinatra-ai/cinatra-engineering/issues/119)
+(it re-scopes and supersedes the old no-AI-attribution gate, #116). Every merge
+carries a truthful record: an `Assisted-by:` transparency trailer (what produced
+the change) plus one verification arm — a human `Reviewed-by:` (a real,
+non-self, non-stale GitHub PR approval by a login whose repo permission meets the
+claimed tier) **or** a `Gate-suite:`+`Accountable:` machine arm (the named,
+versioned required-check set ran green, owned by a named accountable engineer).
+"We never put a human's name on a change they did not read." The gate's core job
+is anti-fabrication of the **verification** claim — that is where a lie does
+damage.
+
+Three arms: **pre-merge** (PR claims), **post-merge** (the synthesized squash
+record itself), and a scheduled **org watchdog**. It currently runs in **WARN**
+mode (computes + annotates every finding, always green); the ENFORCE flip is
+gated on the dedicated machine identity for agent-opened PRs (spec §8.5), tracked
+as an `[owner]` issue — it is **not** a gate-config change.
+
+### High-risk classification (§3)
+
+A change whose files match **any** glob in `config/high-risk-defaults.json` (the
+central, **extend-only** five-class defaults: auth/security, migrations,
+release/CI infra, org governance, extension-system architecture) **or** a repo's
+`.github/gate-suite.json` `highRiskPaths` (which must be a **superset** of the
+defaults) **requires** the human arm at `tier=maintainer`; the gate arm alone is
+rejected. A parse failure of either config => the whole change is treated
+high-risk (fail closed). Removing a default means editing this repo's config —
+itself a high-risk path, so maintainer-reviewed by construction.
+
+### Gate suite — registry, versioning, audit (§4)
+
+The named, versioned set of required checks that constitutes machine verification
+for one repo. Hybrid storage:
+
+- **Per-repo `.github/gate-suite.json` is authoritative for enforcement** — the
+  gate reads it **at the merged SHA** (deterministic; no TOCTOU against a remote
+  registry). Shape: `suiteId`, CalVer `version` (`YYYY.MM[.N]`),
+  `accountable{github,name,email}` (all three required), non-empty
+  `requiredContexts[{context, workflow?, pinned?, appSlug?}]`, `highRiskPaths`
+  (superset of the central defaults), `lastAuditedAt`, `auditEvidence`.
+- **`config/gate-suite-index.json`** in this repo is a **generated, read-only**
+  org-wide audit index — *nothing reads it at merge time*, so it can never weaken
+  enforcement. It is regenerated from the **explicit** `config/gate-suite-inventory.json`
+  by `node scripts/gate-suite-index.mjs`. A `no-suite` row never means "nothing
+  to audit" — it means that inventoried repo has not committed a suite yet
+  (cinatra's is deferred to its enforce-bootstrap owner-reviewed PR per §7 step
+  3). The self-check enforces the index is in generator canonical form and lists
+  exactly the inventoried repos (`scripts/gate-suite-index-selfcheck.mjs`).
+
+**Version-bump rule (gate-checked):** on a PR that changes
+`.github/gate-suite.json`, if `requiredContexts`, a context `pinned` SHA, or
+`highRiskPaths` changed versus the base and `version` did **not** bump, that is a
+finding — a material suite change must bump CalVer so the audit can tell which
+suite applied.
+
+**Continuous-audit + staleness (gate-checked):** monthly, the `Accountable`
+engineer reviews the suite + a 10% sample of gate-arm merges (min 5), records
+evidence as a closing comment on the recurring `Gate-suite audit YYYY-MM` issue
+in cinatra-engineering, then bumps `lastAuditedAt` **and** `auditEvidence` in the
+same commit. Staleness is mechanical and **gate-arm-only**: the gate **warns**
+when `lastAuditedAt` > 35 days and **fails the gate arm** when > 65 days (or when
+there is no audit record at all — fail closed). A lapsed audit stops *machine*
+verification, never a `tier=maintainer` human-arm merge. The monthly
+`gate-suite-audit` workflow runs the **live** index drift check + a staleness
+sweep across the inventory, so a lapse is visible before a PR discovers it. The
+job only reports — it never edits a `gate-suite.json` or closes the audit issue
+(those are the human's acts; the gate never fabricates a record).
+
+### Run locally
+
+```sh
+# pre-merge claim check on a PR (anti-fabrication needs a token + --pr)
+node scripts/truthful-attribution-gate.mjs --arm pre-merge --mode warn --pr <n>
+# post-merge record check on the squash commit
+node scripts/truthful-attribution-gate.mjs --arm post-merge --mode warn --pr <n>
+# regenerate / drift-check the org-wide audit index
+node scripts/gate-suite-index.mjs              # write
+node scripts/gate-suite-index.mjs --check      # fail on drift (live scan; needs auth)
+node scripts/gate-suite-index-selfcheck.mjs    # offline structural + canonical-form check
+node scripts/gate-suite-audit-report.mjs       # staleness sweep across the inventory
+```
+
+### Develop
+
+```sh
+node --test scripts/__tests__/truthful-attribution-gate.test.mjs \
+            scripts/__tests__/gate-suite-index.test.mjs \
+            scripts/__tests__/gate-suite-audit-report.test.mjs
+```

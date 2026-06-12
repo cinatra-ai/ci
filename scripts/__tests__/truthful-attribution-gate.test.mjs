@@ -19,6 +19,10 @@ import {
   parseNameStatusZ,
   DEFAULT_AGENT_NAME_TOKENS,
   GATE_VERSION,
+  checkAuditStaleness,
+  checkSuiteVersionBump,
+  AUDIT_STALE_WARN_DAYS,
+  AUDIT_STALE_FAIL_DAYS,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -395,6 +399,11 @@ test("§5 check2: a login that never reviewed is rejected", () => {
 // §5 check3 — gate arm anti-fabrication
 // =========================================================================
 
+// A FRESH audit date so the §4 staleness check (added with the registry work)
+// does not make this canonical "valid suite" fixture fail in the existing
+// gate-arm tests that don't inject `now`. "Today" keeps it < 35 days old under
+// the real clock; the dedicated staleness tests below inject explicit `now`.
+const TODAY_ISO = new Date().toISOString().slice(0, 10);
 const SUITE_FILE = {
   ok: true,
   value: {
@@ -405,6 +414,8 @@ const SUITE_FILE = {
       { context: "source-leak-gate / source-leak-gate" },
       { context: "ci / build-test" },
     ],
+    lastAuditedAt: TODAY_ISO,
+    auditEvidence: "https://github.com/cinatra-ai/cinatra-engineering/issues/200#issuecomment-1",
   },
 };
 
@@ -881,4 +892,192 @@ test("CLI rejects an unknown --arm", () => {
   const res = spawnSync("node", [GATE, "--arm", "sideways"], { encoding: "utf8" });
   assert.equal(res.status, 2);
   assert.match(res.stderr, /unknown --arm/);
+});
+
+// =========================================================================
+// §4 — continuous-audit staleness (gate-arm only) + version-bump rule
+// =========================================================================
+
+const DAY = 24 * 60 * 60 * 1000;
+const NOW = Date.parse("2026-06-12T00:00:00Z");
+function daysAgo(n) { return new Date(NOW - n * DAY).toISOString().slice(0, 10); }
+
+test("§4 staleness: a fresh audit (< 35d) is clean", () => {
+  const r = checkAuditStaleness(daysAgo(10), NOW);
+  assert.ok(!r.fail && !r.warn);
+});
+
+test("§4 staleness: missing lastAuditedAt fails closed (no audit record)", () => {
+  for (const v of [undefined, null, ""]) {
+    const r = checkAuditStaleness(v, NOW);
+    assert.ok(r.fail, `expected fail for ${JSON.stringify(v)}`);
+    assert.match(r.message, /no lastAuditedAt|audit obligation/);
+  }
+});
+
+test("§4 staleness: an unparseable lastAuditedAt fails closed", () => {
+  const r = checkAuditStaleness("not-a-date", NOW);
+  assert.ok(r.fail);
+  assert.match(r.message, /not a valid date/);
+});
+
+test(`§4 staleness: > ${AUDIT_STALE_WARN_DAYS}d warns (not fail)`, () => {
+  const r = checkAuditStaleness(daysAgo(AUDIT_STALE_WARN_DAYS + 1), NOW);
+  assert.ok(r.warn && !r.fail);
+  assert.match(r.message, /going stale/);
+});
+
+test(`§4 staleness: > ${AUDIT_STALE_FAIL_DAYS}d fails (gate-arm blocked)`, () => {
+  const r = checkAuditStaleness(daysAgo(AUDIT_STALE_FAIL_DAYS + 1), NOW);
+  assert.ok(r.fail && !r.warn);
+  assert.match(r.message, /lapsed|blocked/);
+});
+
+test("§4 staleness: boundary at exactly 35d/65d does not trip (strict >)", () => {
+  assert.ok(!checkAuditStaleness(daysAgo(AUDIT_STALE_WARN_DAYS), NOW).warn);
+  assert.ok(!checkAuditStaleness(daysAgo(AUDIT_STALE_FAIL_DAYS), NOW).fail);
+});
+
+
+test("§4 verifyGateArm: a stale (> 65d) suite fails the gate arm via reasons", () => {
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const staleSuite = { ok: true, value: { ...SUITE_FILE.value, lastAuditedAt: daysAgo(AUDIT_STALE_FAIL_DAYS + 5) } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: staleSuite, checkRuns, now: NOW });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /lapsed|blocked/.test(r)));
+});
+
+test("§4 verifyGateArm: a going-stale (35–65d) suite still verifies but warns", () => {
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const agingSuite = { ok: true, value: { ...SUITE_FILE.value, lastAuditedAt: daysAgo(AUDIT_STALE_WARN_DAYS + 5) } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: agingSuite, checkRuns, now: NOW });
+  assert.ok(v.ok, v.reasons.join("; "));
+  assert.ok((v.warnings || []).some((w) => /going stale/.test(w)));
+});
+
+test("§4 verifyGateArm: a suite with NO lastAuditedAt fails closed on the gate arm", () => {
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  // include auditEvidence so the failure isolates the missing lastAuditedAt
+  const noAudit = { ok: true, value: { suiteId: "cinatra-core", version: "2026.06", accountable: SUITE_FILE.value.accountable, requiredContexts: SUITE_FILE.value.requiredContexts, auditEvidence: "https://e/x#1" } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: noAudit, checkRuns, now: NOW });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /no lastAuditedAt|audit obligation/.test(r)));
+});
+
+test("§4 verifyGateArm: a suite with a fresh lastAuditedAt but NO auditEvidence fails closed (coupling floor)", () => {
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const noEvidence = { ok: true, value: { ...SUITE_FILE.value, lastAuditedAt: daysAgo(2), auditEvidence: undefined } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: noEvidence, checkRuns, now: NOW });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /auditEvidence must be a non-empty string/.test(r)));
+});
+
+test("§4 verifyGateArm: a NON-STRING auditEvidence (object) fails closed (no String() bypass)", () => {
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const objEvidence = { ok: true, value: { ...SUITE_FILE.value, lastAuditedAt: daysAgo(2), auditEvidence: {} } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: objEvidence, checkRuns, now: NOW });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /auditEvidence must be a non-empty string/.test(r)));
+});
+
+test("§4 version-bump: changed date with unchanged STRUCTURED evidence fails (value compare, not ===)", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [], lastAuditedAt: "2026-05-01", auditEvidence: ["u1"] } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [], lastAuditedAt: "2026-06-01", auditEvidence: ["u1"] } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(!r.ok);
+  assert.match(r.reason, /auditEvidence did not/);
+});
+
+test("§4 verifyGateArm: a FUTURE lastAuditedAt fails closed (cannot suppress staleness)", () => {
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const future = { ok: true, value: { ...SUITE_FILE.value, lastAuditedAt: new Date(NOW + 30 * DAY).toISOString().slice(0, 10) } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: future, checkRuns, now: NOW });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /FUTURE/.test(r)));
+});
+
+test("§4 staleness: a far-future date fails closed (not treated as fresh)", () => {
+  const r = checkAuditStaleness(new Date(NOW + 30 * DAY).toISOString().slice(0, 10), NOW);
+  assert.ok(r.fail);
+  assert.match(r.message, /FUTURE/);
+});
+
+test("§4 staleness: a within-skew future date (< 1d) is tolerated as fresh", () => {
+  const r = checkAuditStaleness(new Date(NOW + 6 * 60 * 60 * 1000).toISOString(), NOW);
+  assert.ok(!r.fail && !r.warn);
+});
+
+test("§4 version-bump: a GENUINELY NEW suite (absent parent) is vacuously OK", () => {
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "x" }], highRiskPaths: [] } };
+  const r = checkSuiteVersionBump({ ok: false, reason: "absent-at-ref", absent: true }, head);
+  assert.ok(r.ok);
+});
+
+test("§4 version-bump: an OPERATIONAL parent failure FAILS CLOSED (no fail-open)", () => {
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "x" }], highRiskPaths: [] } };
+  for (const parent of [
+    { ok: false, reason: "base ref 'origin/main' does not resolve", operational: true },
+    { ok: false, reason: "invalid JSON at origin/main: boom", operational: true },
+    null,
+  ]) {
+    const r = checkSuiteVersionBump(parent, head);
+    assert.ok(!r.ok, `expected fail-closed for ${JSON.stringify(parent)}`);
+    assert.match(r.reason, /failing closed|cannot read the parent/);
+  }
+});
+
+test("§4 version-bump: changed lastAuditedAt with unchanged auditEvidence fails (coupling)", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [], lastAuditedAt: "2026-05-01", auditEvidence: "https://e/x#1" } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [], lastAuditedAt: "2026-06-01", auditEvidence: "https://e/x#1" } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(!r.ok);
+  assert.match(r.reason, /auditEvidence did not/);
+});
+
+test("§4 version-bump: a coupled audit bump (both lastAuditedAt + auditEvidence) is OK", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [], lastAuditedAt: "2026-05-01", auditEvidence: "https://e/x#1" } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [], lastAuditedAt: "2026-06-01", auditEvidence: "https://e/x#2" } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(r.ok);
+});
+
+test("§4 version-bump: changing requiredContexts without a version bump fails", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [] } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }, { context: "b" }], highRiskPaths: [] } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(!r.ok);
+  assert.match(r.reason, /did not bump/);
+});
+
+test("§4 version-bump: changing a pinned SHA without a version bump fails", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a", pinned: "aaa" }], highRiskPaths: [] } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a", pinned: "bbb" }], highRiskPaths: [] } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(!r.ok);
+});
+
+test("§4 version-bump: changing highRiskPaths without a version bump fails", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: ["**/x/**"] } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: ["**/x/**", "**/y/**"] } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(!r.ok);
+});
+
+test("§4 version-bump: a material change WITH a version bump is OK", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }], highRiskPaths: [] } };
+  const head = { ok: true, value: { version: "2026.07", requiredContexts: [{ context: "a" }, { context: "b" }], highRiskPaths: [] } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(r.ok);
+});
+
+test("§4 version-bump: a pure reorder (no material change) needs no bump", () => {
+  const parent = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "a" }, { context: "b" }], highRiskPaths: ["**/x/**", "**/y/**"] } };
+  const head = { ok: true, value: { version: "2026.06", requiredContexts: [{ context: "b" }, { context: "a" }], highRiskPaths: ["**/y/**", "**/x/**"] } };
+  const r = checkSuiteVersionBump(parent, head);
+  assert.ok(r.ok);
+});
+
+test("§4 version-bump: an unparseable head suite is left to classifyHighRisk (vacuous here)", () => {
+  const r = checkSuiteVersionBump({ ok: true, value: {} }, { ok: false, reason: "invalid JSON" });
+  assert.ok(r.ok);
 });
