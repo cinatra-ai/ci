@@ -25,6 +25,7 @@ import {
   checkSuiteVersionBump,
   AUDIT_STALE_WARN_DAYS,
   AUDIT_STALE_FAIL_DAYS,
+  makeRunWorkflowResolver,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -1158,4 +1159,399 @@ test("rangeCommitIdentities/Messages exclude the synthetic PR merge commit (chec
   assert.ok(!msgs.some((m) => m.startsWith("Merge feature into main")), "the synthetic merge message is excluded");
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// =========================================================================
+// §5 check3 — REUSABLE-WORKFLOW identity resolution (the machine-arm repair).
+//
+// A reusable-workflow check-run's html_url/details_url is
+// .../actions/runs/<RUN_ID>/job/<JOB_ID> and NEVER contains the reusable
+// workflow path, so the old html_url-substring match could never satisfy a
+// workflow-pinned context — forcing a human approval on every loop merge. The
+// fix resolves the check-run to its Actions RUN and verifies, fail-closed, that
+// the run referenced the pinned reusable workflow at the pinned SHA, binding the
+// (App-controllable) check-run url to the real Actions run via head_sha +
+// check_suite_id. This is STRICTLY STRONGER than the old check (it verifies the
+// pinned commit, which the old code never did) and must never fail OPEN.
+// =========================================================================
+
+// A gate suite whose two required contexts are workflow-pinned exactly like the
+// real cinatra .github/gate-suite.json (workflow path + 40-hex pinned SHA).
+const SLG = "4c903fe9ca71ad47752a2bc92b72893e5f7c9814";
+const TAG = "31570d9c772d24ae3f629d7e84483f53d4e10214";
+const REVIEWED = "fc579a2a41a53d9e9891dee20872d0ef87f33613";
+const WF_SUITE = {
+  ok: true,
+  value: {
+    suiteId: "cinatra-core",
+    version: "2026.06",
+    accountable: { name: "Sandro Groganz", email: "sandro@cinatra.ai", github: "groganz" },
+    requiredContexts: [
+      { context: "source-leak-gate / source-leak-gate", workflow: "cinatra-ai/ci/.github/workflows/source-leak-gate.yml", pinned: SLG },
+      { context: "truthful-attribution-gate / truthful-attribution-gate", workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml", pinned: TAG },
+    ],
+    lastAuditedAt: new Date().toISOString().slice(0, 10),
+    auditEvidence: "https://github.com/cinatra-ai/cinatra-engineering/issues/119#issuecomment-1",
+  },
+};
+
+// Real-shaped github-actions check-runs for the two contexts on REVIEWED.
+function wfCheckRuns({ slgRunId = "27457420463", tagRunId = "27457420458", slgSuite = 73878390034, tagSuite = 73878390023, conclusion = "success" } = {}) {
+  return [
+    { name: "source-leak-gate / source-leak-gate", status: "completed", conclusion, app: { slug: "github-actions" }, check_suite: { id: slgSuite }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${slgRunId}/job/81164436609`, completed_at: "2026-06-13T05:09:00Z" },
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion, app: { slug: "github-actions" }, check_suite: { id: tagSuite }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${tagRunId}/job/81164436636`, completed_at: "2026-06-13T05:09:00Z" },
+  ];
+}
+// A resolver that returns the correct, fully-referencing run for each run id.
+function wfResolverOk({ slgRunId = "27457420463", tagRunId = "27457420458", slgSuite = 73878390034, tagSuite = 73878390023, head = REVIEWED, slgSha = SLG, tagSha = TAG } = {}) {
+  const map = {
+    [slgRunId]: { headSha: head, checkSuiteId: slgSuite, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/source-leak-gate.yml@${slgSha}`, sha: slgSha }] },
+    [tagRunId]: { headSha: head, checkSuiteId: tagSuite, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${tagSha}`, sha: tagSha }] },
+  };
+  return (runId) => map[String(runId)] || null;
+}
+
+test("WF-id: a reusable-workflow check-run that correctly resolves to the pinned SHA PASSES (machine arm restored)", () => {
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), reviewedHeadSha: REVIEWED, runWorkflow: wfResolverOk() });
+  assert.ok(v.ok, v.reasons.join("; "));
+});
+
+test("WF-id: the OLD html_url-substring match would have failed here (regression witness — html_url has no workflow path)", () => {
+  // The check-run url is .../actions/runs/<id>/job/<id>; it never contains the
+  // workflow path, so without the run resolution this context cannot be matched.
+  const runs = wfCheckRuns();
+  assert.ok(!runs[0].html_url.includes("cinatra-ai/ci/.github/workflows/source-leak-gate.yml"));
+  // And with NO resolver the workflow-pinned context fails CLOSED (not open).
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: null });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /no workflow-run resolver is available/.test(r)));
+});
+
+test("WF-id: a WRONG-SHA referenced workflow FAILS (the run referenced a different commit than pinned)", () => {
+  const wrongSha = "deadbeef".repeat(5); // 40 hex, != pinned
+  const resolver = wfResolverOk({ tagSha: wrongSha });
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /did not reference the pinned reusable workflow/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a SPOOFED check-run with the right name but NO/!matching referenced workflow FAILS", () => {
+  // The resolved run exists and binds (head + check_suite ok) but references a
+  // DIFFERENT reusable workflow — a forged claim of the pinned identity.
+  const resolver = (runId) => ({
+    headSha: REVIEWED,
+    checkSuiteId: String(runId) === "27457420458" ? 73878390023 : 73878390034,
+    referencedWorkflows: [{ path: "evil-org/evil/.github/workflows/totally-different.yml@" + TAG, sha: TAG }],
+  });
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /did not reference the pinned reusable workflow/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: the RUN FETCH FAILURE case FAILS CLOSED (resolver returns null)", () => {
+  const resolver = () => null; // every run fetch fails
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /could not resolve Actions run/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a resolver that THROWS fails closed (never propagates / never passes)", () => {
+  const resolver = () => { throw new Error("403 actions read not granted"); };
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /could not resolve Actions run/.test(r)));
+});
+
+test("WF-id: a non-github-actions check-run (third-party App) with the right name is NOT this context (fail closed)", () => {
+  // codex-converge finding 1/A: details_url is App-controllable; a forged
+  // check-run from another App must not be a candidate for a workflow context.
+  const runs = wfCheckRuns();
+  runs[1].app = { slug: "malicious-app" };
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: wfResolverOk() });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /has no matching check-run/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: check_suite mismatch FAILS — the check-run does not belong to the resolved run (anti-spoof bind)", () => {
+  // codex-converge finding 1/2: a forged check-run pointing its url at a real
+  // run cannot make its own check_suite.id equal that run's check_suite_id.
+  const resolver = (runId) => ({
+    headSha: REVIEWED,
+    checkSuiteId: 999999999, // != the check-run's check_suite.id
+    referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }],
+  });
+  const runs = wfCheckRuns();
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [runs[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /check_suite mismatch/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: head_sha mismatch FAILS — the resolved run is for a different head (cross-run confusion)", () => {
+  const otherHead = "a".repeat(40);
+  const resolver = (runId) => ({
+    headSha: otherHead, // run is for a different commit than the reviewed head
+    checkSuiteId: 73878390023,
+    referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }],
+  });
+  const runs = wfCheckRuns();
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [runs[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /not the reviewed head/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a check-run with NO resolvable run id in its url FAILS CLOSED", () => {
+  const runs = wfCheckRuns();
+  runs[1].html_url = "https://example.com/no-run-here";
+  runs[1].details_url = "";
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [runs[1]], reviewedHeadSha: REVIEWED, runWorkflow: wfResolverOk() });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /no resolvable Actions run id/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: details_url is used when html_url is absent (run id fallback)", () => {
+  const runs = wfCheckRuns();
+  runs[0].details_url = runs[0].html_url; runs[0].html_url = undefined;
+  runs[1].details_url = runs[1].html_url; runs[1].html_url = undefined;
+  const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: wfResolverOk() });
+  assert.ok(v.ok, v.reasons.join("; "));
+});
+
+test("WF-id: a workflow-pinned context with NO valid 'pinned' SHA in the suite FAILS CLOSED (no path-only fallback)", () => {
+  const noPinSuite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [{ context: "truthful-attribution-gate / truthful-attribution-gate", workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml" }] } };
+  const runs = wfCheckRuns();
+  const v = verifyGateArm(gateParsed(), { suiteFile: noPinSuite, checkRuns: [runs[1]], reviewedHeadSha: REVIEWED, runWorkflow: wfResolverOk() });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /no valid 40-hex 'pinned' SHA/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a path-PREFIX collision does not match (anchored at the @ separator)", () => {
+  // ctx.workflow = ".../truthful-attribution-gate.yml"; an evil run referencing
+  // ".../truthful-attribution-gate.yml.evil@<pinned>" must NOT satisfy it.
+  const resolver = (runId) => ({
+    headSha: REVIEWED,
+    checkSuiteId: 73878390023,
+    referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml.evil@${TAG}`, sha: TAG }],
+  });
+  const runs = wfCheckRuns();
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [runs[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /did not reference the pinned reusable workflow/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a FRESHER unverifiable run is NOT masked by an older verified success (candidate-ordering fail-open closed)", () => {
+  // codex-converge finding 5/G: an older real success for the context plus a
+  // NEWER run that fails workflow-identity verification must FAIL the context —
+  // the freshest run is selected first, then verified.
+  const old = { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/27457420458/job/1", completed_at: "2026-06-13T05:00:00Z" };
+  const newer = { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/99999999999/job/2", completed_at: "2026-06-13T06:00:00Z" };
+  const resolver = (runId) => {
+    if (String(runId) === "27457420458") return { headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] };
+    return null; // the NEWER run cannot be resolved -> must fail the context
+  };
+  const oneCtx = { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: [old, newer], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok, "a newer unverifiable run must not be masked by an older verified success");
+  assert.ok(v.reasons.some((r) => /could not resolve Actions run 99999999999/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a fresher FAILING run still beats an older success (status check unchanged)", () => {
+  const old = { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/27457420458/job/1", completed_at: "2026-06-13T05:00:00Z" };
+  const newer = { name: "truthful-attribution-gate / truthful-attribution-gate", status: "in_progress", conclusion: null, app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/27457420458/job/2", started_at: "2026-06-13T06:00:00Z" };
+  const oneCtx = { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } };
+  const v = verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: [old, newer], reviewedHeadSha: REVIEWED, runWorkflow: wfResolverOk() });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /did not conclude success/.test(r)));
+});
+
+test("WF-id: a NULL/invalid reviewedHeadSha FAILS CLOSED for a workflow-pinned context (cannot bind to a commit)", () => {
+  // codex-converge round 2 HIGH: a workflow-pinned context cannot be verified
+  // without a valid reviewed head to bind the Actions run to — fail closed, even
+  // though every other identity field (app/check_suite/referenced) is perfect.
+  for (const bad of [null, undefined, "", "not-a-sha", "abc123" /* short */]) {
+    const v = verifyGateArm(gateParsed(), { suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), reviewedHeadSha: bad, runWorkflow: wfResolverOk() });
+    assert.ok(!v.ok, `expected fail-closed for reviewedHeadSha=${JSON.stringify(bad)}`);
+    assert.ok(v.reasons.some((r) => /no valid reviewed head SHA/.test(r)), v.reasons.join("; "));
+  }
+});
+
+test("WF-id: pinned SHA compare is case-insensitive on the 40-hex but exact (no short/substring)", () => {
+  // referenced sha in upper-case still matches a lower-case pinned (git hex).
+  const resolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG.toUpperCase()}`, sha: TAG.toUpperCase() }] });
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [wfCheckRuns()[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(v.ok, v.reasons.join("; "));
+  // a short-sha prefix must NOT match (exact full-40-hex only)
+  const shortResolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG.slice(0, 8)}`, sha: TAG.slice(0, 8) }] });
+  const v2 = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [wfCheckRuns()[1]], reviewedHeadSha: REVIEWED, runWorkflow: shortResolver });
+  assert.ok(!v2.ok);
+});
+
+test("WF-id: a run with referencedWorkflows == null (missing) FAILS CLOSED", () => {
+  const resolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: null });
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [wfCheckRuns()[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /no referenced_workflows/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: the workflow PATH match is case-SENSITIVE (a same-pinned-commit file at a different case does NOT satisfy)", () => {
+  // codex-converge round 2 MEDIUM: GitHub paths are case-sensitive. A run that
+  // referenced ".../Truthful-Attribution-Gate.yml@<pinned>" must NOT satisfy a
+  // ctx.workflow of ".../truthful-attribution-gate.yml" even at the SAME pinned
+  // commit — they are different files.
+  const resolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/TRUTHFUL-attribution-gate.yml@${TAG}`, sha: TAG }] });
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [wfCheckRuns()[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /did not reference the pinned reusable workflow/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a referenced path with no '@' separator does not match (malformed entry, fail closed)", () => {
+  const resolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml", sha: TAG }] });
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [wfCheckRuns()[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+});
+
+test("WF-id: a @branch / @tag ref (not the 40-hex pinned) does NOT match even if the resolved sha agrees (SHA-pin is the security property)", () => {
+  // codex-converge round 1 finding 3/E: the caller must SHA-pin. A run that
+  // referenced ".../truthful-attribution-gate.yml@main" must not satisfy a
+  // pinned-SHA context, even if main currently resolves to the pinned sha —
+  // because the ref in the path is the literal @-ref the caller used, and only a
+  // 40-hex pin is immutable. (Our exact path match requires the @<40-hex-pinned>.)
+  const resolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@main", sha: TAG }] });
+  const v = verifyGateArm(gateParsed(), { suiteFile: { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } }, checkRuns: [wfCheckRuns()[1]], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => /did not reference the pinned reusable workflow/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a same-name DECOY check-run alongside the genuine one does not help an attacker (both verify against the same real run)", () => {
+  // codex-converge round 2 (job-collision concern): a malicious caller could add
+  // a LOCAL job named exactly like the reusable context. But to get the run's
+  // referenced_workflows to carry the pinned reusable workflow, the run MUST have
+  // actually INVOKED that reusable workflow (which itself produces a genuine green
+  // check-run). A decoy adds nothing it cannot already obtain by really running
+  // the pin, AND the caller workflow (.github/**) is a high-risk path requiring
+  // the maintainer human arm to change. Concretely: two same-named, same-run
+  // (same check_suite) success check-runs both verify -> the context passes
+  // BECAUSE the pin really ran; a decoy in a run that did NOT reference the pin
+  // has no referenced_workflows entry and fails.
+  const runs = [
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/27457420458/job/1", completed_at: "2026-06-13T05:00:00Z" },
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/27457420458/job/2", completed_at: "2026-06-13T05:00:00Z" },
+  ];
+  const oneCtx = { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } };
+  // The run genuinely referenced the pin -> both check-runs verify -> pass.
+  const okResolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] });
+  assert.ok(verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: okResolver }).ok);
+  // A run that did NOT reference the pin (decoy-only) -> fails closed.
+  const noRefResolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [] });
+  assert.ok(!verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: noRefResolver }).ok);
+});
+
+test("WF-id: a SAME-RUN decoy success must NOT mask the genuine reusable job's FAILURE (codex-converge round 3 HIGH)", () => {
+  // The sharp F2 attack: the run DID invoke the pinned reusable workflow but that
+  // genuine job FAILED; a local same-name decoy job in the SAME run succeeds
+  // LATER (fresher). A per-check-run freshest pick would bless the decoy. We
+  // group by RUN id: a same-run context with ANY non-passing member fails.
+  const sameRun = "27457420458";
+  const runs = [
+    // genuine reusable job: FAILED, earlier
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "failure", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${sameRun}/job/1`, completed_at: "2026-06-13T05:00:00Z" },
+    // local decoy job: SUCCESS, later (fresher) — must NOT rescue the context
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 73878390023 }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${sameRun}/job/2`, completed_at: "2026-06-13T06:00:00Z" },
+  ];
+  const oneCtx = { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } };
+  // The run genuinely referenced the pin (via the failed real job), so identity
+  // verification of the decoy would pass — but the FAILED sibling in the same run
+  // must fail the context.
+  const okResolver = (runId) => ({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] });
+  const v = verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: okResolver });
+  assert.ok(!v.ok, "a same-run decoy success must not mask the genuine reusable job's failure");
+  assert.ok(v.reasons.some((r) => /did not conclude success/.test(r)), v.reasons.join("; "));
+});
+
+test("WF-id: a legitimate cross-run RE-RUN supersedes an older FAILED run (new run all-green passes)", () => {
+  // The legitimate counterpart: an OLDER Actions run failed, a NEWER run (new run
+  // id + check_suite) re-ran the reusable workflow all-green. The freshest RUN
+  // group wins; the older failed run does not block the merge.
+  const oldRun = "27457420400"; const newRun = "27457420458";
+  const runs = [
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "failure", app: { slug: "github-actions" }, check_suite: { id: 11111 }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${oldRun}/job/1`, completed_at: "2026-06-13T04:00:00Z" },
+    { name: "truthful-attribution-gate / truthful-attribution-gate", status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 22222 }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${newRun}/job/1`, completed_at: "2026-06-13T06:00:00Z" },
+  ];
+  const oneCtx = { ...WF_SUITE, value: { ...WF_SUITE.value, requiredContexts: [WF_SUITE.value.requiredContexts[1]] } };
+  const resolver = (runId) => {
+    if (String(runId) === newRun) return { headSha: REVIEWED, checkSuiteId: 22222, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] };
+    return { headSha: REVIEWED, checkSuiteId: 11111, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] };
+  };
+  const v = verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(v.ok, "the freshest all-green run must supersede an older failed run: " + v.reasons.join("; "));
+});
+
+test("makeGhClient.checkRunsFor uses filter=all (server must not pre-filter to latest, codex-converge round 2 HIGH)", () => {
+  // A stub gh that records the endpoint it was asked for. The client must request
+  // `?filter=all` so a newer queued/in-progress rerun is not hidden by the API's
+  // default `filter=latest` before the gate's own freshness logic runs.
+  const seen = [];
+  // Re-bind the module's execFileSync is not possible here, so assert via the
+  // public client by intercepting through a fake `gh` is overkill; instead verify
+  // the endpoint string the client builds is exercised by checking the README of
+  // behavior: we reconstruct the expectation by string match on the source.
+  const src = fs.readFileSync(GATE, "utf8");
+  assert.match(src, /commits\/\$\{sha\}\/check-runs\?filter=all/, "checkRunsFor must request ?filter=all");
+  void seen;
+});
+
+test("makeRunWorkflowResolver: memoizes by runId and caches a null (fetch failure) without retrying", () => {
+  let calls = 0;
+  const client = { workflowRun: (runId) => { calls++; return String(runId) === "1" ? { headSha: REVIEWED, checkSuiteId: 5, referencedWorkflows: [] } : null; } };
+  const resolve = makeRunWorkflowResolver(client);
+  assert.equal(resolve("1").checkSuiteId, 5);
+  assert.equal(resolve("1").checkSuiteId, 5); // cached, no second call
+  assert.equal(resolve("2"), null);
+  assert.equal(resolve("2"), null); // cached null, no retry
+  assert.equal(calls, 2, "each distinct runId fetched exactly once");
+});
+
+test("makeRunWorkflowResolver: a throwing client is swallowed to null (fail closed) and cached", () => {
+  let calls = 0;
+  const client = { workflowRun: () => { calls++; throw new Error("boom"); } };
+  const resolve = makeRunWorkflowResolver(client);
+  assert.equal(resolve("9"), null);
+  assert.equal(resolve("9"), null);
+  assert.equal(calls, 1);
+});
+
+test("makeRunWorkflowResolver: returns null when no client / no workflowRun method (API unbound)", () => {
+  assert.equal(makeRunWorkflowResolver(null), null);
+  assert.equal(makeRunWorkflowResolver({}), null);
+});
+
+test("WF-id end-to-end: analyzePostMerge with a gate-arm record + resolving workflow contexts is finding-free", () => {
+  const message = [
+    "chore: loop change", "",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "Gate-suite: cinatra-core@2026.06",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+  ].join("\n");
+  const r = analyzePostMerge({
+    message, changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: WF_SUITE,
+    apiBound: true, treeMatch: true,
+    reviews: [], prAuthorLogin: "cinatra-agent-bot", reviewedHeadSha: REVIEWED, permissionByLogin: {},
+    suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), runWorkflow: wfResolverOk(),
+  });
+  assert.ok(!r.findings.some((f) => f.code === "gate-suite-fabricated"), JSON.stringify(r.findings));
+});
+
+test("WF-id end-to-end: analyzePostMerge gate-arm record where a context references a wrong SHA is fabricated", () => {
+  const message = [
+    "chore: loop change", "",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "Gate-suite: cinatra-core@2026.06",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+  ].join("\n");
+  const r = analyzePostMerge({
+    message, changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: WF_SUITE,
+    apiBound: true, treeMatch: true,
+    reviews: [], prAuthorLogin: "cinatra-agent-bot", reviewedHeadSha: REVIEWED, permissionByLogin: {},
+    suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), runWorkflow: wfResolverOk({ tagSha: "0".repeat(40) }),
+  });
+  assert.ok(r.findings.some((f) => f.code === "gate-suite-fabricated"), JSON.stringify(r.findings));
 });

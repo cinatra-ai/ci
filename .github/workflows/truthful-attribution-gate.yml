@@ -66,6 +66,15 @@ permissions:
   # pull-requests:read is needed so `gh` can list PR reviews for anti-fabrication.
   pull-requests: read
   checks: read
+  # actions:read lets the §5 check-3 gate-arm verification resolve a reusable-
+  # workflow check-run to its Actions RUN (GET /actions/runs/{id}) and confirm
+  # the run referenced the pinned reusable workflow at the pinned SHA. A
+  # reusable-workflow check-run's url carries no workflow path, so the run must
+  # be resolved to read referenced_workflows[] + the head_sha/check_suite_id
+  # binding. GitHub sets every unspecified permission to `none` once a
+  # `permissions:` block is present, so WITHOUT this the workflow-pinned gate
+  # arm fails closed (the run fetch 403s). Read-only; no write scope is added.
+  actions: read
 
 jobs:
   truthful-attribution-gate:
