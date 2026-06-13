@@ -17,6 +17,8 @@ import {
   analyzePreMerge,
   analyzePostMerge,
   parseNameStatusZ,
+  rangeCommitIdentities,
+  rangeCommitMessages,
   DEFAULT_AGENT_NAME_TOKENS,
   GATE_VERSION,
   checkAuditStaleness,
@@ -1095,4 +1097,65 @@ test("§4 version-bump: a pure reorder (no material change) needs no bump", () =
 test("§4 version-bump: an unparseable head suite is left to classifyHighRisk (vacuous here)", () => {
   const r = checkSuiteVersionBump({ ok: true, value: {} }, { ok: false, reason: "invalid JSON" });
   assert.ok(r.ok);
+});
+
+// =========================================================================
+// check 5 / pre-merge: the synthetic GitHub PR merge commit (refs/pull/N/merge)
+// is authored by the acting App identity (a known agent) yet carries no
+// Assisted-by. The pre-merge range walk must EXCLUDE merge commits (--no-merges)
+// so an enforce PR from the dedicated agent identity does not self-trip check 5
+// on its own integration merge ref (eng#119 enforce-bootstrap; cinatra#206).
+// =========================================================================
+
+function tmpGitRepo() {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tag-merge-")));
+  const g = (...a) => spawnSync("git", a, { cwd: dir, encoding: "utf8" });
+  g("init", "-q", "-b", "main");
+  g("config", "user.email", "sandro@cinatra.ai");
+  g("config", "user.name", "Sandro Groganz");
+  g("config", "core.hooksPath", "/dev/null");
+  return { dir, g };
+}
+
+test("rangeCommitIdentities/Messages exclude the synthetic PR merge commit (check 5 must not see refs/pull/N/merge)", () => {
+  const { dir, g } = tmpGitRepo();
+  // base on main
+  fs.writeFileSync(path.join(dir, "base.txt"), "base");
+  g("add", "-A");
+  g("commit", "-q", "-m", "base commit");
+  const base = g("rev-parse", "HEAD").stdout.trim();
+  // a real branch commit by the agent identity, WITH an Assisted-by (legitimate)
+  g("checkout", "-q", "-b", "feature");
+  fs.writeFileSync(path.join(dir, "feat.txt"), "feat");
+  g("add", "-A");
+  g(
+    "-c", "user.name=cinatra-agent-bot[bot]",
+    "-c", "user.email=293224031+cinatra-agent-bot[bot]@users.noreply.github.com",
+    "commit", "-q", "-m", "feat: real branch work\n\nAssisted-by: Claude Code (claude-opus-4-8), implementation",
+  );
+  // simulate GitHub's refs/pull/N/merge: a 2-parent merge commit authored by the
+  // acting App identity (cinatra-agent-bot[bot]) with NO trailers.
+  g("checkout", "-q", "main");
+  const mergeRes = g(
+    "-c", "user.name=cinatra-agent-bot[bot]",
+    "-c", "user.email=293224031+cinatra-agent-bot[bot]@users.noreply.github.com",
+    "merge", "-q", "--no-ff", "feature", "-m", "Merge feature into main",
+  );
+  assert.equal(mergeRes.status, 0, mergeRes.stderr);
+
+  const ids = rangeCommitIdentities(base, dir);
+  const shas = ids.map((i) => i.sha);
+  // the real branch commit is present; the synthetic merge commit is excluded.
+  const headSha = g("rev-parse", "HEAD").stdout.trim();
+  assert.ok(!shas.includes(headSha), `merge commit ${headSha} must be excluded; got ${JSON.stringify(shas)}`);
+  assert.equal(ids.length, 1, `only the real branch commit should remain; got ${JSON.stringify(ids)}`);
+  assert.ok(ids[0].authorName.includes("cinatra-agent"), "the surviving commit is the agent's real branch commit");
+
+  // and the messages walk likewise excludes the merge commit's message.
+  const msgs = rangeCommitMessages(base, dir);
+  assert.equal(msgs.length, 1);
+  assert.ok(msgs[0].includes("Assisted-by:"), "the surviving commit carries its Assisted-by");
+  assert.ok(!msgs.some((m) => m.startsWith("Merge feature into main")), "the synthetic merge message is excluded");
+
+  fs.rmSync(dir, { recursive: true, force: true });
 });

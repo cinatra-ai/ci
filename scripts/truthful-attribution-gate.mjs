@@ -503,6 +503,14 @@ export function parseNameStatusZ(out) {
   return [...paths];
 }
 
+// `--no-merges`: the pre-merge arm runs on the GitHub-generated PR merge ref
+// (refs/pull/N/merge), so HEAD is a synthetic 2-parent merge commit that GitHub
+// authors as the acting App/actor identity (cinatra-agent-bot[bot]) with no
+// trailers. That commit is integration machinery, not authored branch content —
+// it must NOT be subjected to check 5 (`agent-commit-no-assisted`), or every
+// enforce PR from the dedicated agent identity would self-trip on its own merge
+// ref now that the bot is a recognized agent (eng#119 §5). Check 5 cares about
+// the real branch commits' attribution; merge commits carry no authored change.
 /** Commit messages (full %B) for the PR range base..HEAD, newest-first. */
 export function rangeCommitMessages(base, cwd = process.cwd()) {
   if (!base) return [];
@@ -510,7 +518,7 @@ export function rangeCommitMessages(base, cwd = process.cwd()) {
   try {
     out = execFileSync(
       "git",
-      ["--literal-pathspecs", "log", "--format=%B%x00", "--end-of-options", `${base}..HEAD`],
+      ["--literal-pathspecs", "log", "--no-merges", "--format=%B%x00", "--end-of-options", `${base}..HEAD`],
       { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"] },
     );
   } catch { return []; }
@@ -524,7 +532,7 @@ export function rangeCommitIdentities(base, cwd = process.cwd()) {
   try {
     out = execFileSync(
       "git",
-      ["--literal-pathspecs", "log", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x00", "--end-of-options", `${base}..HEAD`],
+      ["--literal-pathspecs", "log", "--no-merges", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x00", "--end-of-options", `${base}..HEAD`],
       { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"] },
     );
   } catch { return []; }
