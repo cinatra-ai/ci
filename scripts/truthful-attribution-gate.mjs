@@ -700,20 +700,57 @@ export function makeGhClient({ repo } = {}) {
     // resolved commit) plus the binding fields (`head_sha`, `check_suite_id`)
     // that prove the run produced THIS check-run on THIS reviewed head.
     //
+    // Also reads the LATEST-ATTEMPT job set (GET /actions/runs/{id}/jobs, default
+    // filter=latest = the most recent execution). The job `id` EQUALS the
+    // check-run `id` (a github-actions check-run's url is .../runs/<run>/job/<job>
+    // and that job id == check_run.id). This is the AUTHORITATIVE discriminator
+    // between "a later run-ATTEMPT of a job" (supersedes earlier attempts) and a
+    // "concurrent decoy sibling job in the SAME attempt" (must all pass): on a
+    // "Re-run failed jobs", `filter=all` check-runs return BOTH the stale
+    // attempt-1 (failure) and attempt-2 (success) under one run_id; restricting
+    // candidates to the LATEST attempt's job ids drops the stale failure (closing
+    // the false-negative that re-created human-approval-on-every-merge) while a
+    // genuine concurrent decoy — which lives in the SAME latest attempt — stays
+    // in the set and is still required to pass. This holds regardless of whether
+    // a re-run mints a new check_suite per attempt (undocumented) or updates the
+    // check-run in place. The jobs list is PAGINATED (arrayField) so a failed
+    // current job on a later page can never be silently omitted, then excluded as
+    // "stale", and a same-name success rescued (codex-converge HIGH).
+    //
     // CRITICAL: the run id is the only thing taken from the (App-controllable)
     // check-run URL; the GET is bound to THIS gate's `repo` (never an owner/repo
     // parsed from the URL), so a foreign run id simply 404s -> fail closed.
     // Requires `actions: read` on the workflow token. Returns a narrow,
-    // resolver-shaped object; null on any failure so the caller fails CLOSED.
+    // resolver-shaped object; null on any failure (run OR jobs fetch) so the
+    // caller fails CLOSED.
     workflowRun(runId) {
       let data;
       try { data = ghApi(`/repos/${repo}/actions/runs/${encodeURIComponent(runId)}`); }
       catch { return null; }
       if (!data || typeof data !== "object") return null;
+      let jobs;
+      try { jobs = ghApi(`/repos/${repo}/actions/runs/${encodeURIComponent(runId)}/jobs`, { arrayField: "jobs" }); }
+      catch { return null; }
+      if (!Array.isArray(jobs)) return null;
+      const latestAttemptJobIds = new Set(jobs.map((j) => String(j.id)));
       return {
         headSha: data.head_sha || null,
         checkSuiteId: data.check_suite_id ?? null,
         referencedWorkflows: Array.isArray(data.referenced_workflows) ? data.referenced_workflows : null,
+        runAttempt: data.run_attempt ?? null,
+        path: typeof data.path === "string" ? data.path : null,
+        event: typeof data.event === "string" ? data.event : null,
+        workflowId: data.workflow_id ?? null,
+        // The run's OVERALL status/conclusion (latest attempt aggregate). A run is
+        // conclusion=success ONLY if EVERY job (incl. the genuine reusable job)
+        // succeeded — so re-running ONLY a same-name LOCAL DECOY job while the
+        // genuine reusable job stays failed leaves conclusion != success. This is
+        // the authoritative all-jobs-passed gate that the latest-attempt job-id
+        // restriction alone cannot provide (referenced_workflows is run-level, so a
+        // surviving decoy would otherwise inherit the pin) — codex-converge HIGH.
+        status: typeof data.status === "string" ? data.status : null,
+        conclusion: typeof data.conclusion === "string" ? data.conclusion : null,
+        latestAttemptJobIds,
       };
     },
     // The PR's source commits (the real branch range a squash collapsed) — the
@@ -874,7 +911,11 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   // Verify a workflow-pinned context against the resolved Actions run. Pure given
   // the injected `runWorkflow` resolver. Returns { ok, reason } — fail closed on
   // every gap. `runWorkflow(runId)` must return
-  // { headSha, checkSuiteId, referencedWorkflows:[{path,sha},...] } or null.
+  // { headSha, checkSuiteId, referencedWorkflows:[{path,sha},...],
+  //   runAttempt, path, event, workflowId, latestAttemptJobIds:Set<string> }
+  // or null. (latestAttemptJobIds is consumed by the grouping/attempt-restriction
+  // in the per-context loop, not here; here we use headSha/checkSuiteId/
+  // referencedWorkflows + the optional caller fields path/event.)
   function verifyWorkflowIdentity(run, ctx) {
     if (!ctx.pinned || !PINNED_RE.test(String(ctx.pinned))) {
       return { ok: false, reason: `required context '${ctx.context}' pins workflow '${ctx.workflow}' but gate-suite.json has no valid 40-hex 'pinned' SHA — cannot verify the workflow commit (fail closed)` };
@@ -930,20 +971,72 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     if (!matched) {
       return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} did not reference the pinned reusable workflow '${ctx.workflow}@${ctx.pinned}' (no referenced_workflows entry with that exact path AND sha) (fail closed)` };
     }
+    // OPTIONAL CALLER verification (F1, backward-compatible). The referenced_workflows
+    // check proves the CALLEE (the pinned reusable workflow ran at the pinned
+    // commit) but NOT the CALLER — any workflow run on the reviewed head that
+    // referenced the pin satisfies it. If — and only if — the required context
+    // DECLARES an expected caller, also verify it, fail closed:
+    //   - callerPath: the caller workflow file the run executed (GET
+    //     /actions/runs/{id}.path). GitHub returns either a BARE path
+    //     ".github/workflows/x.yml" or a "<path>@<ref>" form; we compare the PATH
+    //     portion case-sensitively (paths are case-sensitive) and ignore a
+    //     trailing @ref (the ref is not part of the caller identity here — the
+    //     CALLEE pin already binds the executed reusable-workflow commit).
+    //   - allowedEvents: the trigger events the caller may have run under
+    //     (GET .../{id}.event), e.g. ["pull_request","push"].
+    // A context that OMITS a key (undefined) is unchanged (backward compatible —
+    // repos that have not adopted a caller declaration must not start failing).
+    // But a key that is PRESENT-but-MALFORMED must FAIL CLOSED, never silently
+    // behave like "undeclared" (codex-converge MEDIUM: e.g. `allowedEvents:
+    // "pull_request"` (a string, not an array) or `callerPath: []` would
+    // otherwise disable the check the engineer intended to add).
+    if (ctx.callerPath !== undefined) {
+      if (typeof ctx.callerPath !== "string" || ctx.callerPath === "") {
+        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'callerPath' (must be a non-empty string) — failing closed rather than skipping the caller check it was meant to add` };
+      }
+      const wrPath = typeof wr.path === "string" ? wr.path : "";
+      const at = wrPath.lastIndexOf("@");
+      const wrPathBare = at > 0 ? wrPath.slice(0, at) : wrPath;
+      if (wrPathBare !== ctx.callerPath) {
+        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} caller workflow '${wrPathBare || "?"}' != the declared callerPath '${ctx.callerPath}' (fail closed)` };
+      }
+    }
+    if (ctx.allowedEvents !== undefined) {
+      if (!Array.isArray(ctx.allowedEvents) || ctx.allowedEvents.length === 0 || !ctx.allowedEvents.every((e) => typeof e === "string" && e !== "")) {
+        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'allowedEvents' (must be a non-empty array of non-empty strings) — failing closed rather than skipping the caller-event check it was meant to add` };
+      }
+      if (typeof wr.event !== "string" || !ctx.allowedEvents.includes(wr.event)) {
+        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} event '${wr.event || "?"}' is not in the declared allowedEvents [${ctx.allowedEvents.join(", ")}] (fail closed)` };
+      }
+    }
     return { ok: true, reason: null };
   }
   // Latest run per context by the freshest available timestamp. A newer
   // queued/in-progress rerun (which may have only created_at/updated_at, no
   // started_at/completed_at) must NOT be masked by an older success — so the
   // timestamp considers all of started_at/completed_at/updated_at/created_at.
+  // Returns -Infinity (NEVER NaN, and NEVER a coerced epoch-0) when no timestamp
+  // is usable. Two fail-open traps this closes (F4):
+  //   - NaN compares false against everything (NaN > maxTs === false), so a newer
+  //     candidate with a MALFORMED timestamp would be silently dropped so an
+  //     OLDER success wins; and
+  //   - `new Date(field || 0)` coerces an ABSENT/null/empty field to epoch 0
+  //     (finite!), so a candidate with ALL timestamp fields missing would order as
+  //     1970 — older than any real run — and again be dropped in favour of an
+  //     older success (codex-converge HIGH).
+  // So we only consider fields that are actually PRESENT and parse to a finite
+  // epoch; if NONE do, the candidate is unorderable (-Infinity) and the caller
+  // fails the context closed (see runTsUsable).
   function runTs(r) {
-    return Math.max(
-      new Date(r.started_at || 0).getTime(),
-      new Date(r.completed_at || 0).getTime(),
-      new Date(r.updated_at || 0).getTime(),
-      new Date(r.created_at || 0).getTime(),
-    );
+    let max = -Infinity;
+    for (const f of [r.started_at, r.completed_at, r.updated_at, r.created_at]) {
+      if (f === undefined || f === null || f === "") continue;
+      const t = new Date(f).getTime();
+      if (Number.isFinite(t) && t > max) max = t;
+    }
+    return max;
   }
+  function runTsUsable(r) { return Number.isFinite(runTs(r)); }
   // Evaluate the freshest set of candidates for a context. Every member must
   // conclude success, and (for a workflow-pinned context) verify workflow
   // identity. Any failure pushes a reason and returns true ("failed"). A single
@@ -962,41 +1055,136 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     }
     return false;
   }
+  // For a workflow-pinned context, take the selected freshest run group(s) and,
+  // per group, restrict its check-run members to the run's LATEST-attempt job set
+  // (so a "Re-run failed jobs" stale-attempt failure is superseded, F2), then
+  // evaluate the union of current-attempt members (all must pass + verify). Fails
+  // CLOSED if a selected run cannot be resolved (no resolver, no run id, fetch
+  // failure) or if, after restriction, a selected run has ZERO current-attempt
+  // members for the context (the freshest run no longer carries this context in
+  // its latest attempt — cannot confirm a current pass). Returns true if a reason
+  // was pushed (the context failed), false if the restricted set passed.
+  function restrictAndEvaluateRunGroups(ctx, selectedGroups) {
+    const currentMembers = [];
+    for (const g of selectedGroups) {
+      // All members of a group share one runId (grouped by extractRunId); a
+      // `__norun__` group has no resolvable run id -> fail closed.
+      const runId = extractRunId(g.members[0]);
+      if (!runId) {
+        reasons.push(`required context '${ctx.context}' check-run has no resolvable Actions run id in its url — cannot verify the pinned workflow '${ctx.workflow}@${ctx.pinned}' (fail closed)`);
+        return true;
+      }
+      if (typeof runWorkflow !== "function") {
+        reasons.push(`required context '${ctx.context}' pins workflow '${ctx.workflow}@${ctx.pinned}' but no workflow-run resolver is available to verify it (fail closed)`);
+        return true;
+      }
+      let wr;
+      try { wr = runWorkflow(runId); } catch { wr = null; }
+      if (!wr || !(wr.latestAttemptJobIds instanceof Set)) {
+        reasons.push(`required context '${ctx.context}' — could not resolve Actions run ${runId} (incl. its latest-attempt job set) to verify the pinned workflow '${ctx.workflow}@${ctx.pinned}' (fail closed)`);
+        return true;
+      }
+      // RUN-LEVEL all-jobs-passed gate (codex-converge HIGH — closes the partial-
+      // rerun decoy false-positive): the resolved run must itself be completed and
+      // conclusion=success. A run where the genuine reusable job FAILED (and only a
+      // same-name local DECOY job was re-run to green in the latest attempt) is
+      // conclusion != success, even though the decoy check-run survives the
+      // latest-attempt restriction and would otherwise inherit the run-level
+      // referenced_workflows pin. Conversely a genuine "Re-run failed jobs" that
+      // turns the run green (F2) has conclusion=success and PASSES. An in-flight
+      // rerun has status != completed (or conclusion null) -> fail closed.
+      //
+      // KNOWN LIMITATION (out of MACHINE-ARM scope, codex-converge accepted): the
+      // run conclusion is GitHub's authoritative all-jobs-passed signal in every
+      // ordinary case, but `jobs.<job_id>.continue-on-error: true` in the CALLER
+      // workflow lets a run conclude success even though that job failed (GitHub
+      // reports the job as success too). There is NO API signal that separates a
+      // legit "re-run the failed genuine job to green" from "re-run only a decoy
+      // while the genuine job stays failed" — GitHub exposes no stable per-attempt
+      // job identity and no per-job "this is the reusable-workflow call" marker
+      // (referenced_workflows is run-level), so any stale-failure heuristic would
+      // re-introduce the F2 false-negative (human approval on every rerun-to-green).
+      // This residual is NOT machine-arm-reachable: making the gate job
+      // continue-on-error requires editing .github/** — a HIGH-RISK path that
+      // requires the MAINTAINER HUMAN ARM (a real Reviewed-by), never this machine
+      // arm; a maintainer who approves a non-blocking gate owns that configuration.
+      // A repo that wants to additionally pin the trusted caller can declare the
+      // optional callerPath/allowedEvents on the required context (see
+      // verifyWorkflowIdentity), which bounds which caller workflow/events satisfy it.
+      if (wr.status !== "completed" || wr.conclusion !== "success") {
+        reasons.push(`required context '${ctx.context}' — Actions run ${runId} did not conclude success overall (run status=${wr.status || "n/a"}, conclusion=${wr.conclusion || "n/a"}) — a same-run job (e.g. the genuine reusable job) is non-passing, so a surviving same-name success cannot bless the context (fail closed)`);
+        return true;
+      }
+      // Restrict to the run's LATEST attempt: check-run id == job id. Stale
+      // prior-attempt check-runs (id NOT in the latest job set) are superseded.
+      const current = g.members.filter((r) => wr.latestAttemptJobIds.has(String(r.id)));
+      if (current.length === 0) {
+        reasons.push(`required context '${ctx.context}' — Actions run ${runId} has no check-run for this context in its LATEST attempt (the freshest run's current attempt does not carry this context) (fail closed)`);
+        return true;
+      }
+      for (const r of current) currentMembers.push(r);
+    }
+    // Every current-attempt member across the selected run group(s) must pass +
+    // verify identity (verifyWorkflowIdentity re-resolves via the memoized
+    // resolver — same wr — and binds head + check_suite + referenced_workflows).
+    return evaluateFreshest(ctx, currentMembers);
+  }
   for (const ctx of suite.requiredContexts) {
     const candidates = checkRuns.filter((r) => runIsCandidate(r, ctx));
     if (candidates.length === 0) { reasons.push(`required context '${ctx.context}' has no matching check-run on the reviewed head`); continue; }
+    // F4: a candidate with a non-finite timestamp (no usable started/completed/
+    // updated/created_at) is an ORDERING AMBIGUITY — runTs returns -Infinity, so
+    // it can never be "freshest" and would be silently dropped, letting an OLDER
+    // success win (fail-open). The fail-open only EXISTS when there is something
+    // to order against (>= 2 candidates): with a single candidate there is no
+    // freshness decision, so a missing timestamp is harmless and the candidate is
+    // evaluated directly. With multiple candidates, fail the context CLOSED if ANY
+    // is unorderable rather than dropping it (real github-actions check-runs
+    // always carry valid timestamps, so this never fires in production; a
+    // malformed one routes to the human arm instead of being silently ignored).
+    if (candidates.length > 1 && candidates.some((r) => !runTsUsable(r))) {
+      reasons.push(`required context '${ctx.context}' has multiple matching check-runs and at least one has no usable timestamp — cannot order them to pick the freshest; failing closed rather than letting an older success win (fail closed). The human arm stays available.`);
+      continue;
+    }
     if (ctx.workflow) {
-      // SAME-RUN job-collision defense (codex-converge round 2/3 HIGH): a
-      // legitimate RE-RUN of the reusable workflow is a NEW Actions run (new
-      // run id + check_suite), but a malicious caller could add a LOCAL decoy
-      // job in the SAME run as the genuine reusable job and name it identically;
-      // a freshest-check-run pick would then let the decoy's success MASK the
-      // genuine reusable job's FAILURE (they share one run). So for a workflow-
-      // pinned context we group candidates by their resolved Actions RUN id, take
-      // the freshest GROUP, and require EVERY check-run in that group to pass +
-      // verify — a failed sibling in the freshest run fails the context. Across
-      // DIFFERENT runs the freshest run wins (legitimate reruns supersede older
-      // failed runs). A candidate with no extractable run id is its own group and
-      // fails identity verification anyway (fail closed).
+      // RE-RUN / job-collision selection (codex-converge round 2/3 HIGH + F2):
+      // a legitimate cross-run RE-RUN is a NEW Actions run (new run id), and a
+      // "Re-run failed jobs" is the SAME run id with an incremented run_attempt
+      // (filter=all then returns BOTH the stale attempt's failure check-run AND
+      // the new attempt's success check-run under one run id). We must:
+      //   - across DIFFERENT runs: the freshest run supersedes older failed runs;
+      //   - within ONE run: the genuine LATEST attempt supersedes stale earlier
+      //     attempts (F2 — requiring EVERY check-run incl. the stale failure
+      //     re-created human-approval-on-every-merge), WHILE a concurrent decoy
+      //     job in the SAME (latest) attempt must still all-pass (round-3 HIGH).
+      // Mechanism: group by resolved Actions run id, take the freshest GROUP(s),
+      // then within the selected runs RESTRICT to check-runs whose id is in that
+      // run's LATEST-attempt job set (resolver's latestAttemptJobIds; check-run
+      // id == job id for github-actions). Stale prior-attempt check-runs are
+      // superseded (dropped); current-attempt members (incl. any genuine decoy,
+      // and incl. a current FAILURE or in-flight job — which stay in the latest
+      // job set and so are never hidden) are ALL required to pass + verify.
       const groups = new Map(); // runId -> { members:[], maxTs }
       for (const r of candidates) {
         const key = extractRunId(r) || `__norun__${groups.size}`;
         let g = groups.get(key);
-        if (!g) { g = { members: [], maxTs: -1 }; groups.set(key, g); }
+        if (!g) { g = { members: [], maxTs: -Infinity }; groups.set(key, g); }
         g.members.push(r);
         g.maxTs = Math.max(g.maxTs, runTs(r));
       }
       let freshestGroup = null;
       for (const g of groups.values()) if (!freshestGroup || g.maxTs > freshestGroup.maxTs) freshestGroup = g;
-      // Tie on timestamp across DIFFERENT runs: be strict — fail if any tied
-      // group has a non-passing member (cannot prefer one run over another).
+      // Tie on timestamp across DIFFERENT runs: be strict — evaluate every tied
+      // group's members (cannot prefer one run over another). Each group is
+      // restricted to its OWN run's latest-attempt job set (codex: never share
+      // one resolved run across tied groups).
       const tied = [...groups.values()].filter((g) => g.maxTs === freshestGroup.maxTs);
-      const members = tied.length > 1 ? tied.flatMap((g) => g.members) : freshestGroup.members;
-      evaluateFreshest(ctx, members);
+      const selectedGroups = tied.length > 1 ? tied : [freshestGroup];
+      if (restrictAndEvaluateRunGroups(ctx, selectedGroups)) continue;
       continue;
     }
     // Non-workflow context: freshest check-run(s) by timestamp; any-fail tie-break.
-    let maxTs = -1;
+    let maxTs = -Infinity;
     for (const r of candidates) maxTs = Math.max(maxTs, runTs(r));
     const freshest = candidates.filter((r) => runTs(r) === maxTs);
     evaluateFreshest(ctx, freshest);
