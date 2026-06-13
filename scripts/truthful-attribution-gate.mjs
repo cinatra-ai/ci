@@ -598,6 +598,19 @@ export function treeOf(commitish, cwd = process.cwd()) {
 export const DEFAULT_AGENT_NAME_TOKENS = [
   "claude", "anthropic", "copilot", "cursor", "devin", "gemini",
   "gpt", "codex", "openai", "ossgtm",
+  // The org's dedicated agent identity that authors all agent-opened PRs
+  // (cinatra-agent-bot[bot], App 4040322; eng#119 §5/§8.5, eng#137). Its
+  // name/email contain none of the vendor tokens above, so without this the
+  // gate's check 5 would NOT recognize the exact identity that authors every
+  // agent PR — an Assisted-by omission on a bot-authored commit would slip
+  // past. The bot login is PUBLIC (visible on every PR it opens), the same
+  // category as dependabot/renovate, so it belongs in the public source
+  // default (not private internalAgentTokens, which is for internal codenames
+  // that must not appear in public source). The substring "cinatra-agent"
+  // matches the current bot AND any future cinatra-agent-* identity while
+  // being specific enough not to false-positive on humans, and covers all org
+  // repos automatically during the §7 step 6 rollout (no per-repo config).
+  "cinatra-agent",
 ];
 export const DEFAULT_NONAI_BOT_ALLOW = [
   "dependabot[bot]", "renovate[bot]", "github-actions[bot]",
