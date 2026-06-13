@@ -53,7 +53,8 @@ jobs:
             scripts/__tests__/skills-drift-gate.test.mjs \
             scripts/__tests__/truthful-attribution-gate.test.mjs \
             scripts/__tests__/gate-suite-index.test.mjs \
-            scripts/__tests__/gate-suite-audit-report.test.mjs
+            scripts/__tests__/gate-suite-audit-report.test.mjs \
+            scripts/__tests__/doc-code-value-gate.test.mjs
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,

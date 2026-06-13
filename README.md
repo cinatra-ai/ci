@@ -185,6 +185,87 @@ node --test scripts/__tests__/gitignore-gate.test.mjs
 
 Zero runtime dependencies (Node built-ins only); requires Node 24+.
 
+## doc-code-value-gate
+
+A reusable GitHub Actions workflow + engine for the **"a doc asserts a code
+value"** drift class: it fails CI when the value a documentation file claims
+drifts from the value the source-of-truth file actually carries. The recurring
+failure mode of version/ABI constants is a README that quietly diverges from the
+`const` it documents (cinatra-engineering#152); this gate pins that mechanically
+and is the org template for every doc-asserts-a-code-value case.
+
+Each assertion pairs a `doc` side with a `code` side. A side names a `file` and
+either a regex `pattern` (exactly one capture group — the captured value is the
+comparison key) or, for JSON files, `type: "json"` + a dot-path `pointer`. The
+gate fails closed by construction:
+
+- a pattern must match **exactly once** — zero matches means the line moved or
+  was deleted (drift); more than one match means the pattern is ambiguous (it
+  could be silently reading a changelog line, a comment, or a fenced example);
+- documentation files (`*.md`, or `type: "doc"`) are scanned with fenced code
+  blocks stripped, so an example inside ``` … ``` cannot shadow the canonical
+  statement (set `stripFences: false` to opt out);
+- JSON sides are parsed and read by `pointer`, never regex-scanned.
+
+Anchor patterns to the canonical line (e.g. with `^…$`) so the gate reads the
+live value and not a near-miss elsewhere in the file.
+
+### Use it from another repo
+
+Add a thin caller workflow plus a config JSON listing the assertions:
+
+```yaml
+name: doc-code-value-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  doc-code-value-gate:
+    # Pin BOTH to the SAME 40-char commit SHA: the workflow ref (`@<sha>`) and the
+    # `ref` input below. `ref` is REQUIRED and is rejected unless it is a SHA —
+    # otherwise the gate engine could change under a caller that pinned only the
+    # workflow ref.
+    uses: cinatra-ai/ci/.github/workflows/doc-code-value-gate.yml@<sha>  # vX.Y.Z
+    with:
+      config: .github/doc-code-value-gate.config.json
+      ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+```
+
+```jsonc
+// .github/doc-code-value-gate.config.json
+[
+  {
+    "label": "sdk-abi-readme==register",
+    "doc":  { "file": "packages/sdk-extensions/README.md",
+              "pattern": "The SDK ABI is \\*\\*`(\\d+\\.\\d+\\.\\d+)`\\*\\*" },
+    "code": { "file": "packages/sdk-extensions/src/register.ts",
+              "pattern": "^export const SDK_EXTENSIONS_ABI_VERSION = \"(\\d+\\.\\d+\\.\\d+)\"" }
+  }
+]
+```
+
+### Run locally
+
+```sh
+node scripts/doc-code-value-gate.mjs --config <path/to/config.json>
+```
+
+Single assertions can skip the config file with
+`--doc-file --doc-pattern --code-file --code-pattern` (and `--label`). Add
+`--root <dir>` to check another checkout. Exit codes: `0` pass, `1` gate failure
+(drift, no-match, or ambiguous-match), `2` usage/internal error.
+
+### Develop
+
+```sh
+node --test scripts/__tests__/doc-code-value-gate.test.mjs
+```
+
+Zero runtime dependencies (Node built-ins only); requires Node 24+.
+
 ## actions-pinned-gate
 
 A reusable GitHub Actions workflow + scanner that fails CI when any **remote

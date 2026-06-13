@@ -1,0 +1,77 @@
+name: doc-code-value-gate
+
+# Reusable workflow for the "a doc asserts a code value" drift class
+# (cinatra-engineering#152): fails when the value a documentation file claims
+# drifts from the value the source-of-truth file actually carries. The template
+# for every doc-asserts-a-code-value case across the org.
+#
+# A consuming repo calls it from its own thin caller, pinning BOTH the workflow
+# ref (@<sha>) and the `ref` input to the SAME 40-char cinatra-ai/ci commit:
+#
+#   jobs:
+#     doc-code-value-gate:
+#       uses: cinatra-ai/ci/.github/workflows/doc-code-value-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         config: .github/doc-code-value-gate.config.json
+#         ref: <same-sha>
+#
+# The `config` JSON is a non-empty array of assertions (or { "assertions": [...] }):
+#   [
+#     {
+#       "label": "sdk-abi-readme==register",
+#       "doc":  { "file": "packages/sdk-extensions/README.md",
+#                 "pattern": "The SDK ABI is \\*\\*`(\\d+\\.\\d+\\.\\d+)`\\*\\*" },
+#       "code": { "file": "packages/sdk-extensions/src/register.ts",
+#                 "pattern": "^export const SDK_EXTENSIONS_ABI_VERSION = \"(\\d+\\.\\d+\\.\\d+)\"" }
+#     }
+#   ]
+# Each pattern needs exactly one capture group and must match EXACTLY ONCE
+# (zero = drift, >1 = ambiguous → both fail closed). JSON sides
+# (type:"json" + "pointer") are parsed, not regex-scanned.
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: "Path (in the caller repo) to a JSON file listing the doc==code assertions."
+        type: string
+        required: true
+      ref:
+        description: "40-char commit SHA of this gate repo to check out. REQUIRED and must be an immutable SHA — a tag/branch (e.g. main) would let the gate engine change under a caller that pinned only the workflow ref."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  doc-code-value-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require an immutable SHA ref
+        env:
+          GATE_REF: ${{ inputs.ref }}
+        run: |
+          if ! printf '%s' "$GATE_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::doc-code-value-gate: 'ref' must be a 40-char commit SHA (got '$GATE_REF'). Pin the gate engine to an immutable SHA — never a branch/tag." >&2
+            exit 1
+          fi
+
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .doc-code-value-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        run: node .doc-code-value-gate/scripts/doc-code-value-gate.mjs --config "${{ inputs.config }}"
