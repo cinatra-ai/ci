@@ -691,6 +691,54 @@ function resolveRelativeInSources(fromRel, spec, sources) {
 /** The set of source files REACHABLE from `serverEntryRel` via relative imports
  * (the serverEntry graph). Mirrors the cinatra host-peer-value-import-ban graph
  * trace so a `.test.`-named helper pulled in by the serverEntry is still scanned. */
+/** The specifiers of `src` that are VALUE module edges (matching cinatra's
+ * value-edge BFS): bare imports, default/namespace/named non-type imports,
+ * `export … from` (non `export type`), dynamic `import()`/`require()` (excluding a
+ * TS type-query). A DECLARATION `import type`/`export type` and an inline-only
+ * `import { type X }`... NOTE under verbatim semantics an inline-`type` named
+ * import STILL loads the module at runtime, so it IS a value edge — consistent
+ * with sdkValueImports. Only a DECLARATION `import type`/`export type` is erased. */
+export function valueEdgeSpecifiers(src) {
+  const { skeleton, strings } = tokenizeSource(src);
+  const out = new Set();
+  let m;
+  // static `import <clause> from <sentinel>` — value unless declaration `import type`.
+  const impRe = new RegExp(`\\bimport\\b([^;]*?)\\bfrom\\s*${SENTINEL_TOKEN}`, "g");
+  while ((m = impRe.exec(skeleton)) !== null) {
+    if (/^\s*type\b/.test(m[1])) continue; // declaration import type — erased
+    const spec = strings[Number(m[2])];
+    if (spec) out.add(spec);
+  }
+  // bare side-effect `import <sentinel>` (always a value edge).
+  const bareRe = new RegExp(`\\bimport\\s*${SENTINEL_TOKEN}`, "g");
+  while ((m = bareRe.exec(skeleton)) !== null) { const spec = strings[Number(m[1])]; if (spec) out.add(spec); }
+  // `export <clause> from <sentinel>` — value unless declaration `export type`.
+  const expRe = new RegExp(`\\bexport\\b([^;]*?)\\bfrom\\s*${SENTINEL_TOKEN}`, "g");
+  while ((m = expRe.exec(skeleton)) !== null) {
+    if (/^\s*type\b/.test(m[1])) continue; // declaration export type — erased
+    const spec = strings[Number(m[2])];
+    if (spec) out.add(spec);
+  }
+  // dynamic import()/require() — value unless a TS type-query import().
+  const dynRe = new RegExp(`(?:\\.\\s*)?\\b(import|require)\\s*\\??\\.?\\s*\\(\\s*${SENTINEL_TOKEN}`, "g");
+  while ((m = dynRe.exec(skeleton)) !== null) {
+    if (m[1] === "import") {
+      const close = closeParenAfter(skeleton, dynRe.lastIndex);
+      // Exclude ONLY a PROVEN type-position import (`type X = import(...).Member`,
+      // `: import(...).Member`) from the runtime GRAPH — a type query is not a
+      // runtime edge (cinatra parser emits no node for import-type). We do NOT
+      // exclude on a bare `.Member` alone: `import("x").then` / `.default` are
+      // RUNTIME promise accesses, and dropping their edge would HIDE a host-peer
+      // import (codex). For the GRAPH a misread errs toward FOLLOWING the edge
+      // (worst case a rare host-peer false-POSITIVE, never a hidden import).
+      if (isTypeQueryAt(skeleton, m.index, close)) continue;
+    }
+    const spec = strings[Number(m[2])];
+    if (spec) out.add(spec);
+  }
+  return [...out];
+}
+
 export function serverEntryGraph(serverEntryRel, sources, pkg = null) {
   const reachable = new Set();
   if (!serverEntryRel || !Object.prototype.hasOwnProperty.call(sources, serverEntryRel)) return reachable;
@@ -701,7 +749,7 @@ export function serverEntryGraph(serverEntryRel, sources, pkg = null) {
     const rel = stack.pop();
     if (reachable.has(rel)) continue;
     reachable.add(rel);
-    for (const spec of extractImports(sources[rel] ?? "")) {
+    for (const spec of valueEdgeSpecifiers(sources[rel] ?? "")) {
       let next = resolveRelativeInSources(rel, spec, sources);
       // Self-package subpath (`@scope/ext/helper`) resolves via the exports map to
       // a repo-relative file (Node self-resolves the package's own name) — follow
@@ -725,17 +773,17 @@ export function serverEntryGraph(serverEntryRel, sources, pkg = null) {
 
 export function checkHostPeerValueImportBan(pkg, sources, serverEntryRel = null) {
   const errs = [];
-  // Files reachable from the serverEntry via relative imports are ALWAYS scanned
-  // (the serverEntry graph), even when `.test.`-named — a host-peer value import
-  // anywhere in that graph ships to production (codex round-15).
+  // SCOPE = the serverEntry GRAPH ONLY, matching cinatra's host-peer-value-import-
+  // ban exactly: the ban targets the SERVER runtime graph (the SDK is a host peer
+  // present only at runtime in the server context). A UI/client file NOT reachable
+  // from `serverEntry` legitimately value-imports `@cinatra-ai/sdk-ui` (React
+  // components) and is NOT scanned. When the manifest declares NO serverEntry,
+  // there is no graph -> graceful skip (cinatra's resolveServerEntryFile returns
+  // null). Scanning all files would over-flag relative to the host gate.
   const graph = serverEntryGraph(serverEntryRel, sources, pkg);
-  for (const [relPath, text] of Object.entries(sources)) {
+  for (const relPath of graph) {
     if (!isSourceFile(relPath)) continue;
-    // Test files legitimately value-import the SDK harness, so they are excluded —
-    // EXCEPT files in the serverEntry graph (the root + its relative-import
-    // closure), which always ship and must be scanned (codex rounds 13+15).
-    if (isTestPath(relPath) && !graph.has(relPath)) continue;
-    for (const f of sdkValueImports(text)) {
+    for (const f of sdkValueImports(sources[relPath] ?? "")) {
       errs.push({ id: "host-peer-value-import", level: "error", message: `${relPath}: VALUE import of host-peer "${f.specifier}" (${f.form}) — serverEntry-graph SDK imports must be type-only (\`import type\`), the SDK is a host peer present only at runtime.` });
     }
   }

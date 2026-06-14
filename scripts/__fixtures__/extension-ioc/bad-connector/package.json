@@ -9,8 +9,19 @@
   "cinatra": {
     "apiVersion": "1",
     "kind": "frobnicator",
-    "requestedHostPorts": ["nango", "wormhole"],
+    "requestedHostPorts": [
+      "nango",
+      "wormhole"
+    ],
     "sdkAbiRange": "not a range !!",
-    "dependencies": [{ "packageName": "x" }]
+    "dependencies": [
+      {
+        "packageName": "x"
+      }
+    ],
+    "serverEntry": "./register"
+  },
+  "exports": {
+    "./register": "./src/register.ts"
   }
 }
