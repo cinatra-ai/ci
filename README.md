@@ -122,6 +122,107 @@ clean on this repository and that the test suite passes.
 node --test scripts/__tests__/source-leak-gate.test.mjs scripts/__tests__/source-leak-ratchet.test.mjs
 ```
 
+## extension-ioc-gate
+
+A reusable GitHub Actions workflow + standalone Node script (`node
+scripts/extension-ioc-gate.mjs`, Node builtins only) that validates a single
+extension package against the **extension→host IoC conformance contract**: an
+extension must reach the host ONLY through its `register(ctx)` ports and the
+`@cinatra-ai/host:*` services — never via a host `@/` import, another extension,
+or a non-SDK first-party package; its `serverEntry` graph keeps SDK imports
+type-only; its manifest is well-shaped; its README, license, and kind conform.
+
+It is **self-contained** — Node builtins only, zero registry dependency — and
+**host-tree-independent**: it validates ONE package directory in isolation, with
+no monorepo inventory, no pinned baselines, no `SCANNER_EPOCH`, and no
+generated-file lists. It is the org-wide generalization of the cinatra monorepo's
+per-package audit gates (`scripts/audit/extension-{import-ban,host-peer-value-
+import-ban,deps-gate,readme-gate,license-gate}.mjs` + the SDK manifest schema).
+
+It **consumes** (does not duplicate) the SDK validator substrate
+(cinatra-engineering#163): the host-port grammar is checked against the
+substrate's `TEST_HOST_PORT_NAMES`, and `--register-probe` runs the package's
+`register(ctx)` against the faithful grant-aware `createTestHostContext`, both
+imported from a **byte-identical vendored** copy at
+[`scripts/lib/vendor/test-host-context.mjs`](scripts/lib/vendor/test-host-context.mjs).
+
+### Scope — extension→host ONLY
+
+The **core→extension** direction (instance-coupling ban, core-import-ban,
+dispatcher-bypass, cover-gate equality, generated-map byte-pinning) is
+host-monorepo-specific by construction (baselines, `SCANNER_EPOCH`,
+generated-file lists, lock equality). It stays in `cinatra/scripts/audit`,
+documented as host-side — exporting it would export the migration machinery, not
+the rule.
+
+### Use it from another repo
+
+Replace the connector/artifact/skill `kind-gates` placeholder with a thin caller:
+
+```yaml
+name: extension-ioc-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  extension-ioc-gate:
+    # In production pin BOTH the workflow ref (`@<sha>`) and `ref` to the SAME
+    # commit SHA, so the gate code is not pulled from mutable main.
+    uses: cinatra-ai/ci/.github/workflows/extension-ioc-gate.yml@main  # @<sha> in prod
+    with:
+      package: "."
+      register-probe: true
+      ref: main  # set to the same <sha> in production
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `package` | `.` | Path to the extension package directory to validate. |
+| `register-probe` | `false` | Also run `register(ctx)` against the test host context, reporting a REDACTED summary. |
+| `format` | `text` | `text` or `json`. |
+| `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
+
+### Rules
+
+| Rule id(s) | Checks |
+|------------|--------|
+| `manifest-shape` / `-kind` / `-ports` / `-abi` / `-deps` / `-serverentry` | `cinatra` block present; `kind` valid; `requestedHostPorts ⊆ HOST_PORT_NAMES`; `sdkAbiRange` grammar; dependency-edge shape; serverEntry is a package-relative path. |
+| `import-ban-host-alias` / `import-ban-first-party` | No `@/` host imports; no cross-extension / non-SDK first-party imports (only `@cinatra-ai/sdk-extensions` + `@cinatra-ai/sdk-ui` are permitted, subpaths allowed). |
+| `host-peer-value-import` | Host-peer (`sdk-extensions` / `sdk-ui` / `mcp-client`) imports in the serverEntry graph are type-only. |
+| `deps-sdk-only` / `deps-host-scope` | `package.json` deps name no `@cinatra-ai/*` package but the SDK packages. |
+| `source-too-large` | A source file too large to scan fails closed (no padding bypass). |
+| `readme-*` | README byte bounds + the small card contract (only the `Works with` / `Capabilities` H2s; `Capabilities` required). |
+| `license-*` | A plausible SPDX `license` field. |
+| `serverentry-exports` / `serverentry-artifact` | A declared serverEntry resolves via `exports` and its built artifact exists. |
+| `register-probe` | (`--register-probe`, opt-in) best-effort AUTHOR diagnostic: the package's `register(ctx)` runs clean against the test host, in an isolated child process. NOT a trust boundary — it runs untrusted code in-process, so its verdict is hardened (defeats `process.exit(0)` / stdout forgery) but not forgery-proof. The static rules above are the conformance gate. |
+
+### Run locally
+
+```sh
+node scripts/extension-ioc-gate.mjs --package <dir> [--register-probe] [--format json]
+```
+
+### Cross-repo parity
+
+The gate's pinned contract constants (host ports, kinds, dependency-edge
+grammar, README bounds) and its vendored substrate MUST track the cinatra source
+of truth — a divergence would let an extension pass the org-wide gate while
+failing the host. A **real** cross-repo parity test
+([`scripts/__tests__/extension-ioc-gate.test.mjs`](scripts/__tests__/extension-ioc-gate.test.mjs))
+reads the cinatra source directly (checked out by the `extension-ioc-parity`
+self-check job) and asserts every pinned value matches — the build-server-entry
+§4.1 lockstep-pin precedent, not a daily detection-only diff. Re-vendor with:
+
+```sh
+cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
+   scripts/lib/vendor/test-host-context.mjs
+```
+
 ## gitignore-gate
 
 A reusable GitHub Actions workflow + check that fails CI when a repo's root
