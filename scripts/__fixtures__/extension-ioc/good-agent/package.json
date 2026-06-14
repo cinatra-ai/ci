@@ -1,0 +1,15 @@
+{
+  "name": "@cinatra-ai/example-agent",
+  "version": "2.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": { "@cinatra-ai/sdk-extensions": "^2.2.0" },
+  "cinatra": {
+    "apiVersion": "1",
+    "kind": "agent",
+    "sdkAbiRange": "2.0.0 - 2.5.0",
+    "dependencies": [
+      { "packageName": "@cinatra-ai/email-connector", "kind": "connector", "edgeType": "runtime", "requirement": "required", "versionConstraint": { "kind": "semver-range", "range": "^1.0.0" } }
+    ]
+  }
+}

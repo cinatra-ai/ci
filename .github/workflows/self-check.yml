@@ -35,6 +35,15 @@ jobs:
       - name: actions-pinned-gate runs clean on its own repository
         run: node scripts/actions-pinned-gate.mjs
 
+      - name: extension-ioc-gate passes the good fixtures + fails the bad fixture
+        run: |
+          node scripts/extension-ioc-gate.mjs --package scripts/__fixtures__/extension-ioc/good-connector --register-probe
+          node scripts/extension-ioc-gate.mjs --package scripts/__fixtures__/extension-ioc/good-agent
+          if node scripts/extension-ioc-gate.mjs --package scripts/__fixtures__/extension-ioc/bad-connector; then
+            echo "::error::extension-ioc-gate did not fail the bad-connector fixture" >&2
+            exit 1
+          fi
+
       - name: Gitignore gate runs clean on its own repository
         run: node scripts/gitignore-gate.mjs
 
@@ -54,7 +63,8 @@ jobs:
             scripts/__tests__/truthful-attribution-gate.test.mjs \
             scripts/__tests__/gate-suite-index.test.mjs \
             scripts/__tests__/gate-suite-audit-report.test.mjs \
-            scripts/__tests__/doc-code-value-gate.test.mjs
+            scripts/__tests__/doc-code-value-gate.test.mjs \
+            scripts/__tests__/extension-ioc-gate.test.mjs
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,
@@ -66,3 +76,42 @@ jobs:
         # real suite, requiring auth) runs in the monthly Gate-suite audit job,
         # not in this hermetic self-check.
         run: node scripts/gate-suite-index-selfcheck.mjs
+
+  extension-ioc-parity:
+    # The REAL cross-repo parity guard (cinatra-engineering#156): assert the
+    # reusable IoC gate's pinned contract constants + its vendored #163 substrate
+    # match the cinatra monorepo source of truth. Checks out cinatra (PUBLIC) at
+    # main and runs ONLY the parity test with CINATRA_REPO set, so the parity
+    # assertion actually executes (locally it is skipped when cinatra is absent).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout ci
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Checkout cinatra (source of truth)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/cinatra
+          ref: main
+          path: .cinatra-src
+          sparse-checkout: |
+            packages/sdk-extensions/src
+            scripts/audit/extension-readme-gate.mjs
+            scripts/audit/host-peer-value-import-ban.mjs
+            scripts/extensions/inventory.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Run the cross-repo parity test against cinatra source of truth
+        env:
+          CINATRA_REPO: ${{ github.workspace }}/.cinatra-src
+          # FAIL CLOSED: if the checkout is incomplete, the parity test errors
+          # instead of skipping green (the test asserts the root resolves).
+          CINATRA_REQUIRED: "1"
+        # --test-name-pattern scopes node:test to ONLY the PARITY case.
+        run: node --test --test-name-pattern='PARITY' scripts/__tests__/extension-ioc-gate.test.mjs

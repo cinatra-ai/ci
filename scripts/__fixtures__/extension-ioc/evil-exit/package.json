@@ -1,0 +1,9 @@
+{
+  "name": "@cinatra-ai/evil-exit",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": { "./register": "./compiled/register.mjs" },
+  "dependencies": { "@cinatra-ai/sdk-extensions": "^2.2.0" },
+  "cinatra": { "apiVersion": "1", "kind": "connector", "serverEntry": "./register", "requestedHostPorts": [] }
+}

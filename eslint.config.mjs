@@ -6,7 +6,12 @@ import { uiDesignSystem } from "./config/ui-design-system.flat.mjs";
 
 export default [
   {
-    ignores: ["scripts/__fixtures__/ui-design-system/**"],
+    // Fixture trees deliberately contain rule-violating / TypeScript-syntax
+    // sources linted only by their own test harnesses, not the dogfood lint.
+    ignores: [
+      "scripts/__fixtures__/ui-design-system/**",
+      "scripts/__fixtures__/extension-ioc/**",
+    ],
   },
   ...uiDesignSystem(),
 ];
