@@ -1,0 +1,162 @@
+name: skills-drift-closeout-sweep
+
+# RELEASE-closeout companion to skills-drift-gate (the per-PR gate). Run at
+# release closeout to re-prove, across the WHOLE release range, that no
+# assistant-skills watched surface drifted unreviewed — closing the gap the
+# per-PR gate cannot: squash-merge drops the per-PR Skills-* trailers, and a
+# release re-pins assistant-skills to a newer ref whose cinatra-watches may have
+# grown. The sweep:
+#   1. BUMPS THE PIN FIRST — reconciles against the assistant-skills tree at the
+#      release-current `skills_ref` (verified to be exactly the checked-out SHA).
+#   2. DIFFS THE RELEASE RANGE — base..head (previous release tag -> release head;
+#      first release: the empty tree -> head). base/head are EXPLICIT INPUTS —
+#      release tags are owner-gated, so the sweep never guesses a moving ref.
+#   3. HARVESTS ACKS FROM DURABLE METADATA — merged-commit messages in the range
+#      + a committed decision-log file read from `head` (never the workspace),
+#      scoped to the release section — NOT the live per-PR trailers (squash drops
+#      them).
+#   4. APPLIES THE SAME ACK SET as the per-PR gate, but PER-SURFACE (a blanket
+#      release-wide Skills-reviewed:/Skills-unaffected: clears nothing).
+#   5. BLOCKS — lists every unresolved flagged surface and fails (exit 1) until
+#      each is resolved (linked Skills-PR) or carries a surface-scoped recorded
+#      decision. Fail-loud (exit 2) on any unresolvable input.
+#
+# This is a MANUAL/release entrypoint (workflow_dispatch) — it is NOT a required
+# PR check (the per-PR skills-drift-gate is). Run it as the last gate before an
+# owner cuts a release tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Previous release tag/commit (the base of the release range). Leave EMPTY and set first_release=true for the very first release (base = the empty tree). Tags are owner-gated — pass the exact endpoint."
+        type: string
+        required: false
+        default: ""
+      head:
+        description: "Release head tag/commit (the head of the release range)."
+        type: string
+        required: true
+      skills_ref:
+        description: "Release-current assistant-skills git ref — the ref the cinatra lock pin is being bumped TO. The sweep verifies the checkout is at exactly this ref and reconciles against its cinatra-watches declarations."
+        type: string
+        required: true
+      first_release:
+        description: "true for the very first release (no previous tag): base becomes the empty tree. Mutually exclusive with a non-empty base."
+        type: boolean
+        required: false
+        default: false
+      skills_repo:
+        description: "assistant-skills repository (owner/name)."
+        type: string
+        required: false
+        default: "cinatra-ai/assistant-skills"
+      decision_log:
+        description: "Optional path (in the release repo, at head) to a committed decision-log markdown file carrying surface-scoped Skills-reviewed:/Skills-unaffected: entries. Read from the COMMITTED head, never the workspace."
+        type: string
+        required: false
+        default: ""
+      decision_log_section:
+        description: "Optional `## <section>` heading in the decision log to scope acks to this release (e.g. the release version). Prevents a stale older-release ack masking a new finding."
+        type: string
+        required: false
+        default: ""
+      config:
+        description: "Optional path (in the release repo) to a per-repo JSON config (e.g. primitiveStopwords)."
+        type: string
+        required: false
+        default: ""
+      release_repo:
+        description: "The release repository to sweep (owner/name). This workflow lives in cinatra-ai/ci, so the release repo MUST be checked out explicitly — the default workspace checkout would otherwise be ci, not the release repo."
+        type: string
+        required: false
+        default: "cinatra-ai/cinatra"
+      ref:
+        description: "Git ref of this gate repo (cinatra-ai/ci) to check out (pin to a SHA in production)."
+        type: string
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  skills-drift-closeout-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate inputs (fail loud on empty skills_ref / head)
+        env:
+          SKILLS_REF: ${{ inputs.skills_ref }}
+          HEAD_REF: ${{ inputs.head }}
+        run: |
+          if [ -z "$SKILLS_REF" ]; then
+            echo "::error::skills_ref is empty. The sweep must reconcile against a PINNED assistant-skills snapshot (the release-current @cinatra-ai/assistant-skills resolvedSha), never a moving default branch." >&2
+            exit 1
+          fi
+          if [ -z "$HEAD_REF" ]; then
+            echo "::error::head is empty. Pass the exact release head tag/commit." >&2
+            exit 1
+          fi
+
+      - name: Checkout the RELEASE repository (full history + tags for the range)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # EXPLICIT release repo. This workflow lives in cinatra-ai/ci; a bare
+          # checkout would clone ci, not the release repo being swept.
+          repository: ${{ inputs.release_repo }}
+          path: release
+          fetch-depth: 0
+          # Fetch tags so an owner-gated release tag (base/head) resolves.
+          fetch-tags: true
+
+      - name: Checkout gate (cinatra-ai/ci)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: gate
+
+      - name: Checkout assistant-skills at the release-current ref (the bumped pin)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.skills_repo }}
+          ref: ${{ inputs.skills_ref }}
+          path: skills
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      # base/head/skills_ref/decision_log are owner-supplied dispatch inputs; pass
+      # every value through an env var, never interpolated into a shell line.
+      # The sweep runs FROM the release checkout (working-directory) so
+      # process.cwd() is the release repo; the gate + assistant-skills are
+      # referenced by absolute $GITHUB_WORKSPACE paths.
+      - name: Run release-closeout sweep
+        working-directory: release
+        env:
+          BASE_REF: ${{ inputs.base }}
+          HEAD_REF: ${{ inputs.head }}
+          SKILLS_REF: ${{ inputs.skills_ref }}
+          FIRST_RELEASE: ${{ inputs.first_release }}
+          DECISION_LOG: ${{ inputs.decision_log }}
+          DECISION_LOG_SECTION: ${{ inputs.decision_log_section }}
+          CONFIG: ${{ inputs.config }}
+        run: |
+          args=( --skills-dir "$GITHUB_WORKSPACE/skills/skills" --skills-ref "$SKILLS_REF" --head "$HEAD_REF" )
+          if [ "$FIRST_RELEASE" = "true" ]; then
+            args+=( --first-release )
+          else
+            if [ -z "$BASE_REF" ]; then
+              echo "::error::base is empty and first_release is false. Pass the previous release tag/commit, or set first_release=true for the very first release." >&2
+              exit 1
+            fi
+            args+=( --base "$BASE_REF" )
+          fi
+          [ -n "$DECISION_LOG" ] && args+=( --decision-log "$DECISION_LOG" )
+          [ -n "$DECISION_LOG_SECTION" ] && args+=( --decision-log-section "$DECISION_LOG_SECTION" )
+          [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
+          node "$GITHUB_WORKSPACE/gate/scripts/skills-drift-closeout-sweep.mjs" "${args[@]}"
