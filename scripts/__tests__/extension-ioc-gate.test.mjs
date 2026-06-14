@@ -156,6 +156,48 @@ test("division after a string/template/regex/postfix does not hide a dynamic imp
   assert.ok(rules.extractImports(`/a/ / await import("@cinatra-ai/objects")`).includes("@cinatra-ai/objects"));
 });
 
+test("serverEntry graph follows VALUE edges only — a type-only edge target is not in the runtime graph (cinatra value-edge BFS)", () => {
+  const readme = "x".repeat(300) + "\n\n## Capabilities\n- a\n- b\n";
+  // register --import type--> types.mjs (which value-imports sdk-ui): the type-only
+  // edge does not pull types.mjs into the runtime graph → NO host-peer finding.
+  const a = rules.conformExtensionPackage({
+    pkg: { name: "@cinatra-ai/x", license: "Apache-2.0", cinatra: { kind: "connector", serverEntry: "./register" }, exports: { "./register": "./src/register.mjs" } },
+    sources: { "src/register.mjs": `import type { T } from "./types"; export function register(){}`, "src/types.mjs": `import { Button } from "@cinatra-ai/sdk-ui";` },
+    files: new Set(["src/register.mjs"]),
+    readme,
+  });
+  assert.equal(a.findings.filter((f) => f.id === "host-peer-value-import").length, 0);
+  // register --VALUE import--> helper.mjs (value-imports SDK): IS in the runtime graph → caught.
+  const b = rules.conformExtensionPackage({
+    pkg: { name: "@cinatra-ai/x", license: "Apache-2.0", cinatra: { kind: "connector", serverEntry: "./register" }, exports: { "./register": "./src/register.mjs" } },
+    sources: { "src/register.mjs": `import { h } from "./helper"; export function register(){}`, "src/helper.mjs": `import { foo } from "@cinatra-ai/sdk-extensions";` },
+    files: new Set(["src/register.mjs"]),
+    readme,
+  });
+  assert.ok(b.findings.some((f) => f.id === "host-peer-value-import"));
+});
+
+test("host-peer ban scopes to the serverEntry GRAPH only — UI/no-serverEntry value imports are not flagged (cinatra parity)", () => {
+  const readme = "x".repeat(300) + "\n\n## Capabilities\n- a\n- b\n";
+  // NO serverEntry: a UI file value-importing sdk-ui / sdk-extensions is NOT a
+  // host-peer finding (cinatra's resolveServerEntryFile returns null → skip).
+  const a = rules.conformExtensionPackage({
+    pkg: { name: "@cinatra-ai/ui-ext", license: "Apache-2.0", cinatra: { kind: "connector" } },
+    sources: { "src/setup.tsx": `import { Button } from "@cinatra-ai/sdk-ui/marketplace"; import { x } from "@cinatra-ai/sdk-extensions";` },
+    files: new Set(["src/setup.tsx"]),
+    readme,
+  });
+  assert.equal(a.findings.filter((f) => f.id === "host-peer-value-import").length, 0);
+  // A UI file OUTSIDE the serverEntry graph is not scanned even when a serverEntry exists.
+  const b = rules.conformExtensionPackage({
+    pkg: { name: "@cinatra-ai/srv", license: "Apache-2.0", cinatra: { kind: "connector", serverEntry: "./register" }, exports: { "./register": "./src/register.mjs" } },
+    sources: { "src/register.mjs": `import type { T } from "@cinatra-ai/sdk-extensions"; export function register(){}`, "src/setup.tsx": `import { Button } from "@cinatra-ai/sdk-ui";` },
+    files: new Set(["src/register.mjs"]),
+    readme,
+  });
+  assert.equal(b.findings.filter((f) => f.id === "host-peer-value-import").length, 0);
+});
+
 test("serverEntry graph trace: a `.test.`-named helper reached from serverEntry is scanned (codex round-15 MUST-FIX)", () => {
   const readme = "x".repeat(300) + "\n\n## Capabilities\n- a\n- b\n";
   const a = rules.conformExtensionPackage({
