@@ -3,16 +3,18 @@ description: >-
   Run the WordPress/Drupal assistant Playwright UAT suite inside a
   cinatra-ai/cinatra checkout (the checkout must be the workspace the caller
   runs this action from — every step below operates on the caller's working
-  directory). Bring up the docker WP/Drupal stack, run `cinatra setup dev`
-  (clones the plugin/module + provisions the DB), then run the Playwright UAT
-  suite (which boots its own dev server with the deterministic scripted
-  provider). The companion devApp repos (wordpress-plugin, drupal-module,
-  a2a-servers-dev) are PUBLIC, so the default anonymous-HTTPS clone needs no
-  credential; pass `deploy-key` only if a devApp repo goes private again.
-  Requires a Docker-capable runner that also provides the app-service env
-  (SUPABASE_DB_URL, BETTER_AUTH_SECRET, REDIS_URL, …) — typically a
-  provisioned self-hosted runner. See tests/e2e/wp-drupal-uat/README.md in
-  cinatra-ai/cinatra.
+  directory). Run `cinatra setup dev` (clones the plugin/module + provisions
+  the DB), bring up ONLY the four CMS containers the UAT exercises (WordPress +
+  Drupal + their dbs — see the slim bring-up step for why the heavy
+  neo4j/graphiti/nango/verdaccio/wayflow services are intentionally NOT
+  started), then run the Playwright UAT suite (which boots its own dev server
+  with the deterministic scripted provider). The companion devApp repos
+  (wordpress-plugin, drupal-module, a2a-servers-dev) are PUBLIC, so the default
+  anonymous-HTTPS clone needs no credential; pass `deploy-key` only if a devApp
+  repo goes private again. Requires a Docker-capable runner that also provides
+  the app-service env (SUPABASE_DB_URL, BETTER_AUTH_SECRET, REDIS_URL, …); the
+  slim CMS-only stack fits the default ubuntu-latest runner. See
+  tests/e2e/wp-drupal-uat/README.md in cinatra-ai/cinatra.
 
 inputs:
   deploy-key:
@@ -74,11 +76,14 @@ runs:
 
     - name: Provision DB + clone plugin/module (BEFORE the CMS containers)
       shell: bash
-      # MUST run before `docker compose --profile wordpress --profile drupal up`:
-      # the clone targets dev/wordpress-plugin/ + dev/drupal-module/cinatra/ are bind-
-      # mounted into the CMS containers. If the containers start first, Docker
-      # creates root-owned empty bind-source dirs (breaking the clone) and the
-      # entrypoints try to activate a plugin/module whose code does not exist yet.
+      # MUST run before the CMS containers come up (next step): the clone targets
+      # dev/wordpress-plugin/ + dev/drupal-module/cinatra/ are bind-mounted into
+      # the CMS containers. If the containers start first, Docker creates root-
+      # owned empty bind-source dirs (breaking the clone) and the entrypoints try
+      # to activate a plugin/module whose code does not exist yet.
+      # `cinatra setup dev` only provisions the Postgres schema + clones the
+      # plugin/module/devApps — it does NOT start any docker compose service, so
+      # the explicit `up` in the next step is the single bring-up point.
       # The runner must export SUPABASE_DB_URL / BETTER_AUTH_SECRET / REDIS_URL
       # (and CINATRA_RUNTIME_MODE=development) for the dev backend + clone sync.
       run: node packages/cli/bin/cinatra.mjs setup dev
@@ -87,7 +92,29 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        docker compose --profile wordpress --profile drupal up -d
+        # SLIM bring-up (cinatra#173): start ONLY the four CMS containers the
+        # WP/Drupal assistant UAT actually exercises — WordPress (:8080) + its db
+        # and Drupal (:8082) + its db. We name the services EXPLICITLY instead of
+        # `--profile wordpress --profile drupal up` because in docker-compose.yml
+        # the heavy services (neo4j, graphiti, nango-server, nango-db, verdaccio)
+        # carry NO `profiles:` key, so a profile-targeted `up` with no service
+        # args ALSO starts every profile-less service — and on the 2-core/7GB
+        # ubuntu-latest runner that heavy stack (neo4j JVM + graphiti + nango)
+        # starves the CMS containers so their install/activation never finishes
+        # inside the readiness poll below. Naming services explicitly auto-enables
+        # their profiles and brings up ONLY those services + their `depends_on`
+        # (verified via `docker compose up --dry-run wordpress wordpress-db drupal
+        # drupal-db` → exactly the four containers; nothing else).
+        # This UAT needs none of neo4j/graphiti/nango/verdaccio/wayflow: the
+        # assistant message→stream path runs the deterministic scripted LLM
+        # provider, which short-circuits in the orchestrator before any LLM/tool
+        # call, and the app's Postgres/Redis come from the caller's service
+        # containers (SUPABASE_DB_URL / REDIS_URL), not the compose ones.
+        # `down --remove-orphans` first so a reused (self-hosted) runner can't
+        # leave a prior run's heavy profile-less containers competing for RAM
+        # (a no-op on a fresh ubuntu-latest runner).
+        docker compose down --remove-orphans >/dev/null 2>&1 || true
+        docker compose up -d wordpress wordpress-db drupal drupal-db
         # The entrypoints background their bootstrap, so an HTTP 200 does NOT mean
         # wp-cli/drush + the plugin/module are ready. Poll for actual readiness:
         # WordPress installed + `cinatra` plugin active, Drupal `cinatra` module
@@ -104,6 +131,11 @@ runs:
           if wp_ready && drupal_ready; then echo "WordPress + Drupal ready (plugin/module active)"; break; fi
           if [ "$i" = "60" ]; then
             echo "::error::WordPress/Drupal not ready (plugin/module not active after ~5 min)"
+            # Diagnostics first (codex review): on starvation/boot failure the
+            # container state + logs pinpoint the stuck service faster than a
+            # bare timeout. Best-effort; never mask the failing exit.
+            docker compose ps 2>&1 | tail -20 || true
+            docker compose logs --tail 40 wordpress wordpress-db drupal drupal-db 2>&1 || true
             docker exec cinatra-wordpress-1 wp plugin list --allow-root 2>&1 | tail -20 || true
             docker exec cinatra-drupal-1 drush --root=/drupal/web pm:list --status=enabled 2>&1 | tail -20 || true
             exit 1
