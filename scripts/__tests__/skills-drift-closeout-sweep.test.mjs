@@ -44,7 +44,7 @@ function makeSkillsRepo(watchBlock) {
   return { dir, skillsDir: path.join(dir, "skills"), sha };
 }
 
-// A release repo (stands in for cinatra) with a base commit (tag v1) and a head
+// A release repo (stands in for cinatra) with a base commit (tag rel-base) and a head
 // commit whose diff touches a surface, plus controllable commit messages.
 function makeReleaseRepo({ baseSrc, headSrc, headMsg = "feat: change", tagBase = true }) {
   const dir = tmpDir();
@@ -54,11 +54,11 @@ function makeReleaseRepo({ baseSrc, headSrc, headMsg = "feat: change", tagBase =
   fs.writeFileSync(path.join(dir, "src.ts"), baseSrc);
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "base release");
-  if (tagBase) git(dir, "tag", "v1.0.0");
+  if (tagBase) git(dir, "tag", "rel-base");
   fs.writeFileSync(path.join(dir, "src.ts"), headSrc);
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", headMsg);
-  git(dir, "tag", "v2.0.0");
+  git(dir, "tag", "rel-head");
   return dir;
 }
 
@@ -135,7 +135,7 @@ test("sweep BLOCKS (exit 1) on an unresolved watched surface changed across the 
     headSrc: "export const x = agent_run_v2();\n",
   });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head"]);
     assert.equal(r.status, 1, r.stderr);
     const out = JSON.parse(r.stdout);
     assert.equal(out.watchFindingCount, 1);
@@ -152,7 +152,7 @@ test("sweep PASSES (exit 0) when a merged-commit message carries a surface-scope
     headMsg: "feat: rename primitive\n\nSkills-reviewed: demo-skill — updated SKILL.md\n",
   });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head"]);
     assert.equal(r.status, 0, r.stderr);
     const out = JSON.parse(r.stdout);
     assert.equal(out.unresolvedCount, 0);
@@ -167,16 +167,16 @@ test("sweep reads the decision log from the COMMITTED head, not the mutable work
   });
   try {
     // First: an UNCOMMITTED workspace decision log must NOT satisfy the sweep.
-    fs.writeFileSync(path.join(rel, "DECISIONS.md"), "## v2.0.0\nSkills-reviewed: demo-skill — local only\n");
-    let r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0", "--decision-log", "DECISIONS.md", "--decision-log-section", "v2.0.0"]);
-    // The file is absent at v2.0.0 (uncommitted) -> fail-loud exit 2.
+    fs.writeFileSync(path.join(rel, "DECISIONS.md"), "## rel-head\nSkills-reviewed: demo-skill — local only\n");
+    let r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head", "--decision-log", "DECISIONS.md", "--decision-log-section", "rel-head"]);
+    // The file is absent at rel-head (uncommitted) -> fail-loud exit 2.
     assert.equal(r.status, 2, `expected fail-loud on uncommitted log; got ${r.status}: ${r.stdout}`);
 
     // Now commit it on a NEW head and re-tag; the committed ack resolves.
     git(rel, "add", "-A");
     git(rel, "commit", "-q", "-m", "chore: record decision");
-    git(rel, "tag", "-f", "v2.0.0");
-    r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0", "--decision-log", "DECISIONS.md", "--decision-log-section", "v2.0.0"]);
+    git(rel, "tag", "-f", "rel-head");
+    r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head", "--decision-log", "DECISIONS.md", "--decision-log-section", "rel-head"]);
     assert.equal(r.status, 0, r.stderr);
   } finally { rm(sk.dir); rm(rel); }
 });
@@ -188,12 +188,12 @@ test("decision-log section scoping: an ack under an OLDER section does not mask 
     headSrc: "export const x = agent_run_v2();\n",
   });
   try {
-    fs.writeFileSync(path.join(rel, "DECISIONS.md"), "## v1.0.0\nSkills-reviewed: demo-skill — old release\n## v2.0.0\nnothing relevant here\n");
+    fs.writeFileSync(path.join(rel, "DECISIONS.md"), "## rel-base\nSkills-reviewed: demo-skill — old release\n## rel-head\nnothing relevant here\n");
     git(rel, "add", "-A");
     git(rel, "commit", "-q", "-m", "chore: decisions");
-    git(rel, "tag", "-f", "v2.0.0");
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0", "--decision-log", "DECISIONS.md", "--decision-log-section", "v2.0.0"]);
-    assert.equal(r.status, 1, `stale v1 ack must not clear a v2 finding: ${r.stdout}`);
+    git(rel, "tag", "-f", "rel-head");
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head", "--decision-log", "DECISIONS.md", "--decision-log-section", "rel-head"]);
+    assert.equal(r.status, 1, `stale prior-release ack must not clear a current-release finding: ${r.stdout}`);
   } finally { rm(sk.dir); rm(rel); }
 });
 
@@ -206,9 +206,9 @@ test("first-release: --first-release uses the empty tree as base", () => {
   fs.writeFileSync(path.join(dir, "src.ts"), "export const x = agent_run();\n");
   git(dir, "add", "-A");
   git(dir, "commit", "-q", "-m", "feat: first release");
-  git(dir, "tag", "v0.1.0");
+  git(dir, "tag", "rel-first");
   try {
-    const r = runSweep(dir, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--first-release", "--head", "v0.1.0"]);
+    const r = runSweep(dir, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--first-release", "--head", "rel-first"]);
     assert.equal(r.status, 1, r.stderr); // agent_run is added vs empty tree -> flagged, unresolved
     const out = JSON.parse(r.stdout);
     assert.equal(out.firstRelease, true);
@@ -223,7 +223,7 @@ test("fail-loud (exit 2): --skills-dir not checked out at --skills-ref (stale pi
   const sk = makeSkillsRepo(WATCH);
   const rel = makeReleaseRepo({ baseSrc: "a\n", headSrc: "b\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", "0000000000000000000000000000000000000000", "--base", "v1.0.0", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", "0000000000000000000000000000000000000000", "--base", "rel-base", "--head", "rel-head"]);
     assert.equal(r.status, 2, r.stdout);
   } finally { rm(sk.dir); rm(rel); }
 });
@@ -232,7 +232,7 @@ test("fail-loud (exit 2): --base missing without --first-release", () => {
   const sk = makeSkillsRepo(WATCH);
   const rel = makeReleaseRepo({ baseSrc: "a\n", headSrc: "b\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--head", "rel-head"]);
     assert.equal(r.status, 2, r.stdout);
   } finally { rm(sk.dir); rm(rel); }
 });
@@ -241,7 +241,7 @@ test("fail-loud (exit 2): --base and --first-release are mutually exclusive", ()
   const sk = makeSkillsRepo(WATCH);
   const rel = makeReleaseRepo({ baseSrc: "a\n", headSrc: "b\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--first-release", "--base", "v1.0.0", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--first-release", "--base", "rel-base", "--head", "rel-head"]);
     assert.equal(r.status, 2, r.stdout);
   } finally { rm(sk.dir); rm(rel); }
 });
@@ -250,7 +250,7 @@ test("fail-loud (exit 2): malformed cinatra-watches block in the bumped pin", ()
   const sk = makeSkillsRepo("cinatra-watches:\n  primitives: []\n"); // empty class = malformed
   const rel = makeReleaseRepo({ baseSrc: "a\n", headSrc: "b\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head"]);
     assert.equal(r.status, 2, r.stdout);
   } finally { rm(sk.dir); rm(rel); }
 });
@@ -259,7 +259,7 @@ test("fail-loud (exit 2): unresolvable --base ref", () => {
   const sk = makeSkillsRepo(WATCH);
   const rel = makeReleaseRepo({ baseSrc: "a\n", headSrc: "b\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "no-such-tag", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "no-such-tag", "--head", "rel-head"]);
     assert.equal(r.status, 2, r.stdout);
   } finally { rm(sk.dir); rm(rel); }
 });
@@ -268,14 +268,14 @@ test("sweep clean (exit 0): release range touches no watched surface", () => {
   const sk = makeSkillsRepo(WATCH);
   const rel = makeReleaseRepo({ baseSrc: "export const y = 1;\n", headSrc: "export const y = 2;\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0", "--head", "v2.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base", "--head", "rel-head"]);
     assert.equal(r.status, 0, r.stderr);
     const out = JSON.parse(r.stdout);
     assert.equal(out.watchFindingCount, 0);
   } finally { rm(sk.dir); rm(rel); }
 });
 
-test("findingResolved: a CLASS-level token (e.g. 'primitives') clears NOTHING (codex r2 #1 — a whole release can be all-one-class)", () => {
+test("findingResolved: a CLASS-level token (e.g. 'primitives') clears NOTHING (rev-2 item 1 — a whole release can be all-one-class)", () => {
   // `Skills-reviewed: primitives — ...` must NOT resolve a primitives finding;
   // otherwise one ack blanket-clears every primitive surface in the release.
   const scoped = parseScopedDecisions("Skills-reviewed: primitives — looked at all of them\n");
@@ -284,11 +284,11 @@ test("findingResolved: a CLASS-level token (e.g. 'primitives') clears NOTHING (c
   assert.equal(findingResolved(finding, { linkedPRs: [], scoped: scoped2 }).resolved, false);
 });
 
-test("fail-loud (exit 2): --head is REQUIRED — the sweep never falls back to workspace HEAD (codex r2 #2)", () => {
+test("fail-loud (exit 2): --head is REQUIRED — the sweep never falls back to workspace HEAD (rev-2 item 2)", () => {
   const sk = makeSkillsRepo(WATCH);
   const rel = makeReleaseRepo({ baseSrc: "a\n", headSrc: "b\n" });
   try {
-    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "v1.0.0"]);
+    const r = runSweep(rel, ["--skills-dir", sk.skillsDir, "--skills-ref", sk.sha, "--base", "rel-base"]);
     assert.equal(r.status, 2, r.stdout);
   } finally { rm(sk.dir); rm(rel); }
 });

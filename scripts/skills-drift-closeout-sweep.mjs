@@ -190,7 +190,7 @@ function rangeCommitMessages(base, head, cwd, { firstRelease }) {
 /**
  * Read a committed decision-log file at the release HEAD (`git show <head>:<path>`)
  * — NEVER the mutable workspace copy. A local/uncommitted ack must not be able to
- * satisfy a release-blocking finding (codex r1 #3). Returns the committed file
+ * satisfy a release-blocking finding (rev-1 item 3). Returns the committed file
  * content, or null if the path does not exist at head.
  */
 function readCommittedDecisionLog(head, relPath, cwd) {
@@ -203,8 +203,8 @@ function readCommittedDecisionLog(head, relPath, cwd) {
 
 /**
  * Scope a cumulative decision log to the CURRENT release section so a stale ack
- * from an OLDER release cannot mask a new finding (codex r1 #4). The log is a
- * markdown file with `## <section>` headings (e.g. `## v0.4.0`); given
+ * from an OLDER release cannot mask a new finding (rev-1 item 4). The log is a
+ * markdown file with `## <section>` headings (e.g. `## current-release`); given
  * `--decision-log-section`, return only the lines under that exact heading (up to
  * the next `## ` heading). With no section flag the whole file is used (the
  * caller is then explicitly opting into cumulative semantics).
@@ -231,7 +231,7 @@ function sliceDecisionSection(text, section) {
 // The per-PR engine's `findingSatisfied` treats a single `Skills-reviewed:` /
 // `Skills-unaffected:` as run-GLOBAL — correct when the run IS one PR. Over a
 // whole release that is too loose: one blanket trailer in one merged commit must
-// not silently clear EVERY flagged surface (codex r1 #5). So the sweep requires
+// not silently clear EVERY flagged surface (rev-1 item 5). So the sweep requires
 // each finding to be ATTRIBUTED to its own surface/skill:
 //   - a linked `Skills-PR: <pr> covers: <slug>` whose covers-set includes EVERY
 //     skill of the finding (per-skill — the same as the engine); OR
@@ -387,7 +387,7 @@ function run() {
   if (!sStat || !sStat.isDirectory()) failLoud(`--skills-dir does not resolve to a directory: ${skillsDir} (assistant-skills pin unresolved?)`);
 
   // The skills-dir MUST be checked out at exactly --skills-ref. A stale/wrong
-  // checkout silently passing is the headline silent-pass risk (codex r1 #1):
+  // checkout silently passing is the headline silent-pass risk (rev-1 item 1):
   // resolve both to commit SHAs and require equality.
   const skillsRepo = locateGitRoot(skillsDir);
   if (!skillsRepo) failLoud(`--skills-dir ${skillsDir} is not inside a git checkout — cannot verify it is pinned at --skills-ref`);
