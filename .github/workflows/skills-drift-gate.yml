@@ -142,18 +142,40 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "assistant-skills pinned at $SHA"
 
+      # Runs on BOTH pull_request AND push (e.g. squash-merge to main). The
+      # acknowledgement marker (Skills-PR / Skills-reviewed / Skills-unaffected)
+      # can live in the PR body OR a commit message; on a squash merge it lands
+      # in the squash commit body, which is HEAD on main. The script reads acks
+      # ONLY from --ack-file, so the push arm MUST collect them too — otherwise a
+      # declared-watch finding fails on push even though the squash body
+      # acknowledged it (the required gate would red main with no way to clear).
+      # Branch names, PR bodies, and SHAs are attacker-influenceable, so every
+      # value is passed via env and never interpolated into a shell line.
       - name: Collect acknowledgements (PR body + commit trailers)
         id: acks
-        if: github.event_name == 'pull_request'
         env:
+          EVENT_NAME: ${{ github.event_name }}
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
         run: |
-          # Concatenate the PR body and every commit message in the range so the
-          # gate can read Skills-reviewed: / Skills-unaffected: markers from either.
           {
-            printf '%s\n' "$PR_BODY"
-            git log --format='%B' "origin/$BASE_REF...HEAD" 2>/dev/null || true
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              # Concatenate the PR body and every commit message in the range so
+              # the gate reads Skills-* markers from either.
+              printf '%s\n' "$PR_BODY"
+              git log --format='%B' "origin/$BASE_REF...HEAD" 2>/dev/null || true
+            else
+              # push (e.g. squash merge): the marker lives in the squash commit
+              # body (HEAD). Read the full pushed range when github.event.before
+              # is a real ancestor of HEAD; otherwise (branch-create, force-push,
+              # missing/non-ancestor before) fall back to the HEAD commit body.
+              if [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] && git merge-base --is-ancestor "$EVENT_BEFORE" HEAD 2>/dev/null; then
+                git log --format='%B' "$EVENT_BEFORE..HEAD" 2>/dev/null || git log -1 --format='%B' HEAD
+              else
+                git log -1 --format='%B' HEAD
+              fi
+            fi
           } > "$RUNNER_TEMP/skills-acks.txt"
           echo "file=$RUNNER_TEMP/skills-acks.txt" >> "$GITHUB_OUTPUT"
 
