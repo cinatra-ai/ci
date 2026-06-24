@@ -16,6 +16,7 @@ import {
   looksLikeAgent,
   analyzePreMerge,
   analyzePostMerge,
+  resolveTreeMatch,
   parseNameStatusZ,
   rangeCommitIdentities,
   rangeCommitMessages,
@@ -608,6 +609,115 @@ test("R2 postMerge: a non-PR correction (no reviewed head) legitimately skips th
     apiBound: false, // no PR / no reviewed head
   });
   assert.ok(!r.findings.some((f) => f.code === "tree-mismatch" || f.code === "tree-unverifiable"), JSON.stringify(r.findings));
+});
+
+// =========================================================================
+// §5 — resolveTreeMatch: the tree-identity bridge resolution layer (eng#221).
+// Local git first; GitHub commits-API fallback ONLY when local can't resolve
+// the object (a fork head whose commit lives only on the contributor's fork).
+// =========================================================================
+
+const TREE_MERGED = "63817b73ed8c3b23bb128d28fbd73f96e75fe3a0";
+const TREE_OTHER = "0000000000000000000000000000000000000001";
+const SHA_MERGED = "5".repeat(40);
+const SHA_REVIEWED = "f".repeat(40);
+
+test("resolveTreeMatch: local hit for BOTH — no API call, identical trees => true", () => {
+  let called = 0;
+  const client = { commitTree: () => { called++; return null; } };
+  const local = (sha) => (sha === SHA_MERGED || sha === SHA_REVIEWED ? TREE_MERGED : null);
+  const out = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(out, true);
+  assert.equal(called, 0, "API fallback must NOT be called when local git resolves both");
+});
+
+test("resolveTreeMatch: local hit for BOTH, DIFFERENT trees => false (no API call)", () => {
+  let called = 0;
+  const client = { commitTree: () => { called++; return null; } };
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : TREE_OTHER);
+  const out = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(out, false);
+  assert.equal(called, 0);
+});
+
+test("resolveTreeMatch: FORK reviewed head — local miss for reviewed sha, API resolves SAME tree => true (THE eng#221 case)", () => {
+  // local git resolves the merged squash (on main) but NOT the fork head (only on the fork).
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const seen = [];
+  const client = { commitTree: (sha) => { seen.push(sha); return sha === SHA_REVIEWED ? TREE_MERGED : null; } };
+  const out = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(out, true, "fork-head false negative must be resolved via the commits API (trees byte-identical)");
+  assert.deepEqual(seen, [SHA_REVIEWED], "API fallback called ONLY for the locally-unresolvable fork head");
+});
+
+test("resolveTreeMatch: API resolves a DIFFERENT tree => false (tree-mismatch preserved)", () => {
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const client = { commitTree: (sha) => (sha === SHA_REVIEWED ? TREE_OTHER : null) };
+  const out = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(out, false, "a genuinely divergent landed tree must NOT be masked by the API fallback");
+});
+
+test("resolveTreeMatch: local miss AND API miss => undefined (fail-closed; analyzePostMerge emits tree-unverifiable)", () => {
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const client = { commitTree: () => null }; // API can't resolve it either (404/403 -> null)
+  const out = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(out, undefined, "an unresolvable reviewed head must stay undefined so the gate fails closed");
+});
+
+test("resolveTreeMatch: no reviewedHeadSha => undefined, API never consulted for it", () => {
+  let calledFor = [];
+  const client = { commitTree: (sha) => { calledFor.push(sha); return TREE_MERGED; } };
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const out = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: null, treeOf: local });
+  assert.equal(out, undefined);
+  assert.ok(!calledFor.includes(null), "must not call the API with a null reviewed head");
+});
+
+test("resolveTreeMatch: no client (offline) and local miss => undefined (no throw)", () => {
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const out = resolveTreeMatch({ client: null, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(out, undefined);
+});
+
+// Both arms green for the committed suite, so the ONLY post-merge finding in
+// these cases is the tree code under test (no incidental check3 noise).
+const FORK_GATE_MSG = [
+  "feat: fork contribution", "",
+  "Assisted-by: Claude Opus 4.8 (claude-opus-4-8)",
+  "Gate-suite: cinatra-core@2026.06",
+  "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+].join("\n");
+const FORK_CHECKRUNS_OK = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+
+test("resolveTreeMatch -> analyzePostMerge: fork head with API-resolved treeMatch=true is finding-free", () => {
+  // local resolves merged squash, fork head only via API -> same tree -> true
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const client = { commitTree: (sha) => (sha === SHA_REVIEWED ? TREE_MERGED : null) };
+  const treeMatch = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(treeMatch, true);
+  const r = analyzePostMerge({
+    message: FORK_GATE_MSG, changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: SUITE_FILE,
+    apiBound: true, treeMatch,
+    checkRuns: FORK_CHECKRUNS_OK, suiteFile: SUITE_FILE,
+    reviewedHeadSha: SHA_REVIEWED, prAuthorLogin: "marcushorndt",
+  });
+  assert.ok(!r.findings.some((f) => f.code === "tree-unverifiable" || f.code === "tree-mismatch"),
+    "a fork-head record whose API-resolved tree matches must NOT red main: " + JSON.stringify(r.findings));
+});
+
+test("resolveTreeMatch -> analyzePostMerge: fork head unresolvable (treeMatch=undefined) STILL yields tree-unverifiable (fail-closed preserved)", () => {
+  const local = (sha) => (sha === SHA_MERGED ? TREE_MERGED : null);
+  const client = { commitTree: () => null }; // API also can't resolve
+  const treeMatch = resolveTreeMatch({ client, commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, treeOf: local });
+  assert.equal(treeMatch, undefined);
+  const r = analyzePostMerge({
+    message: FORK_GATE_MSG, changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: SUITE_FILE,
+    apiBound: true, treeMatch,
+    checkRuns: FORK_CHECKRUNS_OK, suiteFile: SUITE_FILE,
+    reviewedHeadSha: SHA_REVIEWED, prAuthorLogin: "marcushorndt",
+  });
+  assert.ok(r.findings.some((f) => f.code === "tree-unverifiable"),
+    "an unresolvable reviewed head must still fail closed: " + JSON.stringify(r.findings));
 });
 
 test("R2 preMerge: a DECLARED Reviewed-by with API unbound is unverifiable (fail closed)", () => {
