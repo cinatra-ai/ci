@@ -159,24 +159,14 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           EVENT_BEFORE: ${{ github.event.before }}
         run: |
-          {
-            if [ "$EVENT_NAME" = "pull_request" ]; then
-              # Concatenate the PR body and every commit message in the range so
-              # the gate reads Skills-* markers from either.
-              printf '%s\n' "$PR_BODY"
-              git log --format='%B' "origin/$BASE_REF...HEAD" 2>/dev/null || true
-            else
-              # push (e.g. squash merge): the marker lives in the squash commit
-              # body (HEAD). Read the full pushed range when github.event.before
-              # is a real ancestor of HEAD; otherwise (branch-create, force-push,
-              # missing/non-ancestor before) fall back to the HEAD commit body.
-              if [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] && git merge-base --is-ancestor "$EVENT_BEFORE" HEAD 2>/dev/null; then
-                git log --format='%B' "$EVENT_BEFORE..HEAD" 2>/dev/null || git log -1 --format='%B' HEAD
-              else
-                git log -1 --format='%B' HEAD
-              fi
-            fi
-          } > "$RUNNER_TEMP/skills-acks.txt"
+          # The collection logic lives in a single shared script so the push-arm
+          # behaviour shipped here and the behaviour under test
+          # (scripts/__tests__/collect-skills-acks.test.mjs) can never drift.
+          # Runs in the caller repo's working dir so HEAD / the squash body are
+          # the caller's; the script reads only env (no shell interpolation of
+          # attacker-influenceable refs).
+          bash "$GITHUB_WORKSPACE/.skills-drift-gate/scripts/collect-skills-acks.sh" \
+            > "$RUNNER_TEMP/skills-acks.txt"
           echo "file=$RUNNER_TEMP/skills-acks.txt" >> "$GITHUB_OUTPUT"
 
       - name: Run skills-drift-gate (WARN)
