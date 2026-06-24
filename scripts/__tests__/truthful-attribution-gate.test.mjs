@@ -185,6 +185,103 @@ test("§1 a non-trailer line in the final paragraph invalidates the block (no hi
   assert.ok(p.errors.some((e) => /non-trailer line/.test(e)));
 });
 
+// -------------------------------------------------------------------------
+// eng#213 — terminal auto-appended IDENTITY paragraph (Co-authored-by /
+// Signed-off-by) must NOT defeat a truthful record. On `gh pr merge --squash`
+// GitHub appends a `Co-authored-by:` line as its OWN paragraph (blank-separated)
+// after the real record block; reading only the final paragraph wrongly missed
+// the record and red main on `76b1f55` (cinatra#356/PR#375).
+// -------------------------------------------------------------------------
+
+test("§1 eng#213 POSITIVE: gate-arm record + appended Co-authored-by paragraph parses clean", () => {
+  const p = parseTrailers([
+    "fix(thing): a real change", "",
+    "Body text describing the change.", "",
+    "Gate-suite: cinatra-core@2026.06.2",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "Assisted-by: Codex CLI (gpt-5.5)",
+    "",
+    "Co-authored-by: groganz <sandro@cinatra.ai>",
+  ].join("\n"));
+  assert.deepEqual(p.errors, []);
+  assert.equal(p.assisted.length, 2);
+  assert.ok(p.hasGateArm);
+  const a = classifyArm(p);
+  assert.deepEqual(a.errors, []);
+});
+
+test("§1 eng#213 POSITIVE: Signed-off-by then Co-authored-by as two terminal identity paragraphs parses clean", () => {
+  const p = parseTrailers([
+    "fix: x", "",
+    "Gate-suite: cinatra-core@2026.06.2",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "",
+    "Signed-off-by: Sandro Groganz <sandro@cinatra.ai>",
+    "",
+    "Co-authored-by: groganz <sandro@cinatra.ai>",
+  ].join("\n"));
+  assert.deepEqual(p.errors, []);
+  assert.equal(p.assisted.length, 1);
+  assert.ok(p.hasGateArm);
+});
+
+test("§1 eng#213 POSITIVE: human-arm (Reviewed-by) record + appended Co-authored-by parses clean", () => {
+  const p = parseTrailers([
+    "fix: x", "",
+    "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "",
+    "Co-authored-by: groganz <sandro@cinatra.ai>",
+  ].join("\n"));
+  assert.deepEqual(p.errors, []);
+  assert.ok(p.hasHumanArm);
+  assert.equal(p.assisted.length, 1);
+});
+
+test("§1 eng#213 NEGATIVE: a final paragraph that is Co-authored-by + PROSE is NOT folded (no hiding behind prose preserved)", () => {
+  const p = parseTrailers([
+    "fix: x", "",
+    "Gate-suite: cinatra-core@2026.06.2",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "",
+    "Co-authored-by: groganz <sandro@cinatra.ai>",
+    "this is prose, not a trailer",
+  ].join("\n"));
+  // The final paragraph is NOT pure-identity → fold does not engage → the real
+  // record paragraph is never reached → record-less, exactly as before.
+  assert.ok(p.errors.some((e) => /non-trailer line/.test(e)));
+  assert.equal(p.assisted.length, 0);
+  assert.ok(classifyArm(p).errors.some((e) => /no verification arm/.test(e)));
+});
+
+test("§1 eng#213 NEGATIVE: a record-less commit with ONLY a Co-authored-by paragraph is not rescued", () => {
+  const p = parseTrailers([
+    "fix: x", "",
+    "Co-authored-by: groganz <sandro@cinatra.ai>",
+  ].join("\n"));
+  // Nothing precedes the identity paragraph → no record to fold in.
+  assert.ok(p.errors.some((e) => /missing Assisted-by/.test(e)));
+  assert.equal(p.assisted.length, 0);
+});
+
+test("§1 eng#213 ADJACENCY: a broken Gate-suite/Accountable order still flags after an appended Co-authored-by", () => {
+  const p = parseTrailers([
+    "fix: x", "",
+    "Gate-suite: cinatra-core@2026.06.2",
+    "Assisted-by: Claude Code (claude-opus-4-8)",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+    "",
+    "Co-authored-by: groganz <sandro@cinatra.ai>",
+  ].join("\n"));
+  // Folding only prepends the record paragraph before the identity lines, so the
+  // intra-record adjacency check (Accountable must immediately follow Gate-suite)
+  // is unaffected and still fires.
+  assert.ok(p.errors.some((e) => /Accountable must immediately follow Gate-suite/.test(e)));
+});
+
 test("§1 duplicate Assisted-by: none is rejected", () => {
   const p = parseTrailers("x\n\nAssisted-by: none\nAssisted-by: none\nReviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)");
   assert.ok(p.errors.some((e) => /none must appear at most once/.test(e)));
