@@ -116,6 +116,15 @@ const CORRECTION_RE = /^Correction-for:[ \t]+(?<sha>[0-9a-fA-F]{40})[ \t]*$/;
 // "unknown trailer"). Unknown keys (ticket refs etc.) are ignored, not errors.
 const OWNED_KEY_RE = /^(Assisted-by|Reviewed-by|Gate-suite|Accountable|Correction-for):/;
 
+// Git-standard auto-generated IDENTITY trailers (eng#213). On `gh pr merge
+// --squash`, GitHub auto-appends a `Co-authored-by:` line as its OWN trailer
+// paragraph (a blank line separating it from the real record block). A
+// `Signed-off-by:` may likewise be appended as a terminal identity paragraph.
+// These are NOT the AI/verification record (`Assisted-by` is); they must not be
+// allowed to displace a truthful record by sitting in the final paragraph.
+// git treats these keys case-insensitively; require a non-empty value.
+const IDENTITY_TRAILER_RE = /^(Co-authored-by|Signed-off-by):[ \t]+\S.*$/i;
+
 /**
  * Parse a commit message into a structured trailer-block analysis.
  *
@@ -142,11 +151,60 @@ export function parseTrailers(message) {
   // paragraph as the trailer block ONLY when its lines are all trailer-shaped;
   // a non-trailer line in that final paragraph means there is NO valid trailer
   // block (a record cannot hide behind prose in the final paragraph).
-  let end = allLines.length;
-  while (end > 0 && allLines[end - 1].trim() === "") end--;
-  let start = end;
-  while (start > 0 && allLines[start - 1].trim() !== "") start--;
-  const block = allLines.slice(start, end);
+  //
+  // Helper: locate the paragraph that ends at `to` (exclusive). Returns
+  // { start, end } where allLines.slice(start, end) is the paragraph's lines,
+  // skipping any trailing blank lines below `to` first. `end === start` (and 0)
+  // means there is no further paragraph.
+  const paragraphEndingAt = (to) => {
+    let e = to;
+    while (e > 0 && allLines[e - 1].trim() === "") e--;
+    let s = e;
+    while (s > 0 && allLines[s - 1].trim() !== "") s--;
+    return { start: s, end: e };
+  };
+  const isPureIdentityParagraph = (s, e) =>
+    e > s && allLines.slice(s, e).every((l) => IDENTITY_TRAILER_RE.test(l));
+
+  // eng#213 — terminal-identity-paragraph fold. GitHub's squash machinery can
+  // append one or more git-standard IDENTITY trailer paragraphs
+  // (`Co-authored-by:` / `Signed-off-by:`) AFTER the real record block, each as
+  // its own paragraph (blank-separated). Reading only the final paragraph would
+  // miss the record. So: peel off a TERMINAL SUFFIX of pure-identity paragraphs,
+  // then fold in EXACTLY ONE immediately-preceding paragraph as the candidate
+  // record paragraph (bounded — no unbounded backward scan, no resurrecting an
+  // arbitrary earlier `Key: value` paragraph). If the final paragraph is itself
+  // NOT pure-identity, nothing is folded and current behavior stands (the
+  // no-hiding-behind-prose protection is fully preserved).
+  let { start: recStart, end: recEnd } = paragraphEndingAt(allLines.length);
+  const identityLines = [];
+  // Peel terminal pure-identity paragraphs (one or more).
+  while (recEnd > recStart && isPureIdentityParagraph(recStart, recEnd)) {
+    // Prepend this identity paragraph's lines (preserve overall order) and step
+    // back to the paragraph that precedes its blank separator.
+    identityLines.unshift(...allLines.slice(recStart, recEnd));
+    const prev = paragraphEndingAt(recStart);
+    if (prev.end === prev.start) {
+      // No preceding paragraph at all — this is a record-less commit whose only
+      // content is identity trailers. Do NOT rescue it; leave the (empty) record
+      // paragraph so the missing-Assisted-by error stands. Drop the peeled
+      // identity lines from `block` (they are not a record).
+      recStart = prev.start;
+      recEnd = prev.end;
+      identityLines.length = 0;
+      break;
+    }
+    recStart = prev.start;
+    recEnd = prev.end;
+  }
+  // `block` = the candidate record paragraph's lines followed by the peeled
+  // terminal identity lines, WITHOUT the blank separators (a blank line in
+  // `block` would be treated as a non-trailer line and wrongly invalidate it).
+  // If no identity suffix was peeled this collapses to the plain final paragraph.
+  const block =
+    identityLines.length > 0
+      ? [...allLines.slice(recStart, recEnd), ...identityLines]
+      : allLines.slice(recStart, recEnd);
 
   const assisted = []; // { name, model, isNone, raw }
   const reviewed = []; // { name, email, login, tier, raw }
