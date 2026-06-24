@@ -594,6 +594,21 @@ export function treeOf(commitish, cwd = process.cwd()) {
   } catch { return null; }
 }
 
+/**
+ * Tree-identity for the post-merge bridge (§5, eng#221). LOCAL git first
+ * (fast, offline, unchanged for in-repo PRs); API fallback ONLY when local
+ * can't resolve the object — i.e. a FORK head whose commit lives only on the
+ * fork but whose tree the base repo's commits API can still resolve. Returns
+ * true | false | undefined (undefined => still fail-closed in analyzePostMerge).
+ */
+export function resolveTreeMatch({ client, commit, reviewedHeadSha, treeOf: treeOfFn = treeOf }) {
+  let tm = treeOfFn(commit);
+  if (!tm && client?.commitTree) tm = client.commitTree(commit);
+  let tr = reviewedHeadSha ? treeOfFn(reviewedHeadSha) : null;
+  if (!tr && reviewedHeadSha && client?.commitTree) tr = client.commitTree(reviewedHeadSha);
+  return tm && tr ? tm === tr : undefined;
+}
+
 // ===========================================================================
 // §5 — Known-agent identity (check 5)
 //
@@ -757,6 +772,15 @@ export function makeGhClient({ repo } = {}) {
     // authoritative input for check 5 on a squash merge, where the merge
     // commit's own first-parent diff is NOT the branch commits.
     prCommits(pr) { return ghApi(`/repos/${repo}/pulls/${pr}/commits`, { shape: "array" }); },
+    // Tree object sha of a commit via the API. The BASE repo can resolve a FORK
+    // head commit's tree (the local checkout cannot — fork heads aren't fetched),
+    // closing the post-merge fork-PR false negative (eng#221). Bound to THIS gate's
+    // `repo`, so a foreign sha 404s -> null -> fail-closed. ghApi throws on 404/403,
+    // so wrap in try/catch and return null on ANY miss (codex note).
+    commitTree(sha) {
+      try { return ghApi(`/repos/${repo}/commits/${sha}`)?.commit?.tree?.sha ?? null; }
+      catch { return null; }
+    },
   };
 }
 
@@ -1705,8 +1729,14 @@ function main() {
         ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha);
         ctx.runWorkflow = makeRunWorkflowResolver(client);
         ctx.suiteFile = repoSuite;
-        const tm = treeOf(commit); const tr = treeOf(ctx.reviewedHeadSha);
-        ctx.treeMatch = tm && tr ? tm === tr : undefined;
+        // Tree-identity bridge: local git first, GitHub commits-API fallback for
+        // FORK heads (whose commit lives only on the contributor's fork and so is
+        // unresolvable from this origin-only checkout) — eng#221. The resolved sha
+        // is the SAME reviewed head SHA the anti-fabrication checks already bind
+        // approvals/contexts to, and commitTree is bound to the gate's own repo
+        // (a foreign sha 404s -> null -> fail-closed). false => tree-mismatch,
+        // undefined (apiBound + arm) => tree-unverifiable — both preserved.
+        ctx.treeMatch = resolveTreeMatch({ client, commit, reviewedHeadSha: ctx.reviewedHeadSha });
         // check 5 (squash-correct): the PR's SOURCE commits via the API — NOT
         // the squash commit's first-parent diff (which is base→squash, not the
         // branch commits). Each API commit carries author/committer identity, so
