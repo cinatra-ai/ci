@@ -9,11 +9,17 @@ import path from "node:path";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { ESLint } from "eslint";
+import { ESLint, Linter } from "eslint";
+import tsParser from "@typescript-eslint/parser";
 
 import {
   uiDesignSystem,
   RAW_JSX_RESTRICTIONS,
+  DYNAMIC_IMPORT_BANS,
+  RADIX_BAN,
+  UI_LIB_BAN,
+  DRIZZLE_CLIENT_BAN,
+  GRID_LAYOUT_BAN,
 } from "../../config/ui-design-system.flat.mjs";
 
 const FIXTURE_ROOT = path.join(
@@ -132,6 +138,183 @@ describe("negative fixtures are flagged", () => {
   });
 });
 
+describe("Block C — dynamic-loader coverage (import()/require)", () => {
+  function syntaxBans(result) {
+    return messagesFor(result, "no-restricted-syntax");
+  }
+
+  it("require() of banned modules in a non-JSX file is flagged as error (no-restricted-imports never sees require)", async () => {
+    const result = await lintFixture("negative/dynamic-banned-require.ts");
+    assert.equal(
+      messagesFor(result, "no-restricted-imports").length,
+      0,
+      "no-restricted-imports does not see require()",
+    );
+    const bans = syntaxBans(result);
+    assert.equal(bans.length, 2, "one report per banned require()");
+    for (const message of bans) {
+      assert.equal(message.severity, ERROR);
+      assert.match(message.message, /require\(\) of a banned module/);
+    }
+  });
+
+  it("dynamic import() of banned modules (incl. a banned subpath) is flagged as error", async () => {
+    const result = await lintFixture("negative/dynamic-banned-import.ts");
+    const bans = syntaxBans(result);
+    assert.equal(bans.length, 2, "one report per banned import()");
+    for (const message of bans) {
+      assert.equal(message.severity, ERROR);
+      assert.match(message.message, /Dynamic import\(\) of a banned module/);
+    }
+  });
+
+  it("inside the Drizzle Cube carve-out, a dynamic import() of @mui is still an error (only the Drizzle Cube surface is re-allowed)", async () => {
+    const result = await lintFixture(
+      "negative/packages/dashboards/src/components/dynamic-mui-in-drizzle-carveout.ts",
+    );
+    const bans = syntaxBans(result);
+    assert.equal(bans.length, 1, "react-grid-layout re-allowed, @mui still banned");
+    assert.equal(bans[0].severity, ERROR);
+    assert.match(bans[0].message, /import\(\) of a banned module/);
+  });
+
+  it("dynamic Drizzle Cube loads inside the carve-out are clean", async () => {
+    expectClean(
+      await lintFixture(
+        "positive/packages/dashboards/src/components/dynamic-drizzle-allowed.ts",
+      ),
+    );
+  });
+
+  it("dynamic Radix loads inside the shadcn-primitives carve-out are clean", async () => {
+    expectClean(
+      await lintFixture("positive/components/ui/dynamic-radix-allowed.ts"),
+    );
+  });
+
+  it("a JSX file in the shadcn-primitives carve-out: dynamic Radix + raw elements are clean", async () => {
+    expectClean(
+      await lintFixture("positive/components/ui/dynamic-radix-allowed-jsx.tsx"),
+    );
+  });
+
+  it("a JSX file in the shadcn-primitives carve-out still bans a dynamic @mui load (.tsx ui hole closed)", async () => {
+    const result = await lintFixture(
+      "negative/components/ui/dynamic-mui-in-ui-jsx.tsx",
+    );
+    const bans = syntaxBans(result);
+    assert.equal(bans.length, 1, "Radix re-allowed, @mui still banned, raw <button> exempt");
+    assert.match(bans[0].message, /import\(\) of a banned module/);
+  });
+
+  it("dynamic recharts / relative-module loads are clean everywhere", async () => {
+    expectClean(await lintFixture("positive/dynamic-recharts-allowed.ts"));
+  });
+
+  it("on a JSX file the dynamic ban honors strictness (warn by default, error when ramped)", async () => {
+    const code =
+      'export function C(){ const m = require("@mui/material"); return m; }';
+    async function lintWith(strictness) {
+      const linter = new ESLint({
+        cwd: FIXTURE_ROOT,
+        overrideConfigFile: true,
+        overrideConfig: [
+          {
+            files: ["**/*.{ts,tsx}"],
+            languageOptions: {
+              parser: tsParser,
+              parserOptions: { ecmaFeatures: { jsx: true } },
+            },
+          },
+          ...uiDesignSystem({ strictness }),
+        ],
+      });
+      const [result] = await linter.lintText(code, {
+        filePath: path.join(FIXTURE_ROOT, "app/widget.tsx"),
+      });
+      return result.messages.filter(
+        (m) => m.ruleId === "no-restricted-syntax",
+      );
+    }
+    const warned = await lintWith("warn");
+    assert.equal(warned.length, 1);
+    assert.equal(warned[0].severity, WARN, "dynamic ban warns on a .tsx at strictness=warn");
+    const errored = await lintWith("error");
+    assert.equal(errored.length, 1);
+    assert.equal(errored[0].severity, ERROR, "dynamic ban errors on a .tsx at strictness=error");
+  });
+
+  it("the dynamic ban mirrors the static no-restricted-imports ban exactly (no over/under-match)", () => {
+    // Generated selectors and the authored import patterns must agree on every
+    // specifier so the two blocks can never drift (the dynamic block is derived
+    // from the same groups). A mismatch on a bare scope (@mui), a near-miss
+    // name (antdx), or a non-carved subpath would be a real regression.
+    const linter = new Linter();
+    const importPatterns = [
+      ...RADIX_BAN,
+      ...UI_LIB_BAN,
+      ...DRIZZLE_CLIENT_BAN,
+      ...GRID_LAYOUT_BAN,
+    ];
+    const lang = {
+      parser: tsParser,
+      parserOptions: { ecmaVersion: "latest", sourceType: "module" },
+    };
+    const isStaticBanned = (spec) =>
+      linter.verify(`import x from ${JSON.stringify(spec)};`, {
+        languageOptions: lang,
+        rules: {
+          "no-restricted-imports": ["error", { patterns: importPatterns }],
+        },
+      }).length > 0;
+    const isDynamicBanned = (spec) =>
+      linter.verify(
+        `const a = import(${JSON.stringify(spec)}); const b = require(${JSON.stringify(spec)});`,
+        {
+          languageOptions: lang,
+          rules: { "no-restricted-syntax": ["error", ...DYNAMIC_IMPORT_BANS] },
+        },
+      ).length > 0;
+
+    const specifiers = [
+      "@mui/material",
+      "@mui/material/Button",
+      "@mui", // bare scope: NOT statically banned (group is @mui/*) — must match
+      "@radix-ui/react-dialog",
+      "@radix-ui", // bare scope: not banned
+      "radix-ui",
+      "radix-ui/themes",
+      "radix-uix", // near-miss: not banned
+      "react-grid-layout",
+      "react-grid-layout/css",
+      "react-grid-layoutx", // near-miss: not banned
+      "styled-components",
+      "styled-components/macro",
+      "antd",
+      "antd/lib/button",
+      "antdx", // near-miss: not banned
+      "@headlessui/react",
+      "@chakra-ui/react",
+      "@mantine/core",
+      "@emotion/react",
+      "drizzle-cube/client",
+      "drizzle-cube/client/charts",
+      "drizzle-cube/server", // not banned (only /client*)
+      "drizzle-cube", // not banned
+      "recharts", // allowed everywhere
+      "react",
+      "./local",
+    ];
+    for (const spec of specifiers) {
+      assert.equal(
+        isDynamicBanned(spec),
+        isStaticBanned(spec),
+        `dynamic vs static ban disagree on "${spec}"`,
+      );
+    }
+  });
+});
+
 describe("positive controls are clean", () => {
   it("a vendored shadcn primitive (Radix import + raw <button> inside ui/) is clean", async () => {
     expectClean(await lintFixture("positive/components/ui/button.tsx"));
@@ -196,12 +379,16 @@ describe("factory options", () => {
     return block;
   }
 
-  it("raw-JSX severity defaults to warn and covers all five elements", () => {
+  it("raw-JSX severity defaults to warn and covers all five elements (plus the dynamic-loader bans)", () => {
     const [severity, ...restrictions] =
       rawJsxBlock(uiDesignSystem()).rules["no-restricted-syntax"];
     assert.equal(severity, "warn");
-    assert.deepEqual(restrictions, RAW_JSX_RESTRICTIONS);
-    assert.equal(restrictions.length, 5);
+    // The raw-JSX block leads with exactly the five raw-element selectors...
+    assert.deepEqual(restrictions.slice(0, 5), RAW_JSX_RESTRICTIONS);
+    // ...then carries the everywhere dynamic-loader bans (Block C shares this
+    // rule on JSX files; see the preset docblock).
+    assert.deepEqual(restrictions.slice(5), DYNAMIC_IMPORT_BANS);
+    assert.equal(restrictions.length, 5 + DYNAMIC_IMPORT_BANS.length);
   });
 
   it("strictness: error escalates the raw-JSX block only", () => {
