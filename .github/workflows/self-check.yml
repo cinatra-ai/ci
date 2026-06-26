@@ -47,6 +47,33 @@ jobs:
       - name: Gitignore gate runs clean on its own repository
         run: node scripts/gitignore-gate.mjs
 
+      - name: secrets-required-gate passes the clean fixture + fails the orphan fixtures
+        # The ci repo itself ships no .github/secrets-required.txt manifest, so the
+        # gate is dogfooded against fixtures (a clean repo, an orphan reference,
+        # an orphan declaration) instead of a self-scan of this repo.
+        run: |
+          node scripts/secrets-required-gate.mjs --root scripts/__fixtures__/secrets-required/clean
+          if node scripts/secrets-required-gate.mjs --root scripts/__fixtures__/secrets-required/orphan-reference; then
+            echo "::error::secrets-required-gate did not fail the orphan-reference fixture" >&2
+            exit 1
+          fi
+          if node scripts/secrets-required-gate.mjs --root scripts/__fixtures__/secrets-required/orphan-declaration; then
+            echo "::error::secrets-required-gate did not fail the orphan-declaration fixture" >&2
+            exit 1
+          fi
+
+      - name: governance-drift-gate passes the matching fixture + fails the drifted fixture
+        run: |
+          node scripts/governance-drift-gate.mjs \
+            --root scripts/__fixtures__/governance-drift/clean \
+            --live-json live.json
+          if node scripts/governance-drift-gate.mjs \
+            --root scripts/__fixtures__/governance-drift/drifted \
+            --live-json live.json; then
+            echo "::error::governance-drift-gate did not fail the drifted fixture" >&2
+            exit 1
+          fi
+
       - name: Design-system preset runs clean on its own repository
         run: npx eslint .
 
@@ -66,7 +93,9 @@ jobs:
             scripts/__tests__/gate-suite-index.test.mjs \
             scripts/__tests__/gate-suite-audit-report.test.mjs \
             scripts/__tests__/doc-code-value-gate.test.mjs \
-            scripts/__tests__/extension-ioc-gate.test.mjs
+            scripts/__tests__/extension-ioc-gate.test.mjs \
+            scripts/__tests__/secrets-required-gate.test.mjs \
+            scripts/__tests__/governance-drift-gate.test.mjs
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,

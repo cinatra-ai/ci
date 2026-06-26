@@ -1,0 +1,8 @@
+name: ci
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.ALPHA_TOKEN }}"
+      - run: echo "${{ secrets.DEV_LOCK_BUMP_TOKEN }}"  # undeclared => orphan reference
