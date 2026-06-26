@@ -2,7 +2,40 @@
 
 Shared, reusable CI for the cinatra-ai organization.
 
-Org-wide conventions documented here:
+Most gates are a standalone Node script (`scripts/*.mjs`, Node built-ins only)
+that can be run locally, plus a reusable `workflow_call` caller in
+`.github/workflows/`. For gates backed by a `scripts/*.mjs` engine, consuming
+repos add a thin caller workflow that pins both the workflow ref and the inner
+`ref` input to the same immutable commit SHA. Some gates (such as
+`secret-scan-gate`) wrap an upstream action directly and do not use an inner
+`ref`.
+
+## What belongs in this repo
+
+- **Reusable gate workflows** (`.github/workflows/*.yml`) — org-wide quality
+  controls that any cinatra-ai repo can wire in through a thin caller.
+- **Gate scripts** (`scripts/*.mjs`) — the standalone Node engines; zero
+  runtime npm dependencies.
+- **Shared config** (`config/`) — profiles, baselines, and JSON config files
+  consumed by the gate engines.
+
+What does **not** belong here: per-repo configuration files (keep those in the
+consuming repo), operational runbooks, or secret material of any kind.
+
+## Repository structure
+
+```
+.github/workflows/   Gate workflows (reusable workflow_call callers) and
+                     org-level scheduled/self-check workflows
+scripts/             Gate engine scripts (Node, no runtime deps)
+  __tests__/         Unit test suite (node --test)
+  __fixtures__/      Deterministic fixtures for the test suite
+  lib/vendor/        Vendored substrate (extension-ioc-gate)
+config/              Shared profiles, baselines, and JSON config files
+docs/                Org-wide conventions (release contract)
+```
+
+## Org-wide conventions documented here
 
 - **[The release contract](docs/release-contract.md)** — what a tagged release
   is and carries per repo type (PR-list notes, archives, npm tarballs), the
@@ -157,7 +190,10 @@ the rule.
 
 ### Use it from another repo
 
-Replace the connector/artifact/skill `kind-gates` placeholder with a thin caller:
+Add a thin caller workflow. The job name below (`extension-ioc-gate`) becomes
+part of the required-check context name — keep it stable if you use it as a
+required check. If your extension repo already has a placeholder job named
+`kind-gates`, replace that job with this caller:
 
 ```yaml
 name: extension-ioc-gate
@@ -434,6 +470,83 @@ Zero runtime dependencies (Node built-ins only); requires Node 24+. The
 fail-closed behavior (a deliberately unpinned ref fails the gate) is exercised
 by unit fixtures in the test suite, and the [`self-check`](.github/workflows/self-check.yml)
 workflow dogfoods the gate against this repository's own workflows.
+
+## secret-scan-gate
+
+A reusable GitHub Actions workflow that blocks a PR when a verified or
+unverifiable secret is introduced into the diff. The engine is
+[TruffleHog OSS](https://github.com/trufflesecurity/trufflehog), run with
+`--results=verified,unknown` (verified leaks and verification-error results
+both fail; unverified results are excluded to limit false positives). The
+engine version is pinned to match the companion scheduled sweep.
+
+This gate is the **preventive** control; the companion `secret-scan-sweep`
+workflow (scheduled, org-wide) is the **detective** control that covers the
+`--admin` bypass case.
+
+### Use it from another repo
+
+```yaml
+name: secret-scan-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  secret-scan-gate:
+    uses: cinatra-ai/ci/.github/workflows/secret-scan-gate.yml@main  # @<sha> in prod
+    with:
+      base_sha: ${{ github.event.pull_request.base.sha }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+```
+
+When `base_sha` is empty (push events, or not provided), TruffleHog performs
+a full working-tree scan rather than a diff scan.
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `base_sha` | _(none)_ | Diff base commit SHA (PR: `pull_request.base.sha`). Empty triggers a full tree scan. |
+| `head_sha` | _(none)_ | Diff head commit SHA (PR: `pull_request.head.sha`). Empty defaults to `HEAD`. |
+| `extra_args` | _(none)_ | Optional extra TruffleHog CLI args appended after the gate defaults (e.g. `--exclude-paths=.trufflehog-exclude`). |
+
+### Required-check context
+
+The check context name is `secret-scan-gate / secret-scan-gate` (the workflow
+name and the job key are both `secret-scan-gate`).
+
+Note: unlike the `source-leak-gate` family, this gate does **not** take a `ref`
+input. The scanning engine is the upstream TruffleHog action (SHA-pinned in the
+workflow), not a script from this repository. There is no local run command.
+
+## wp-drupal-rename-gate
+
+A reusable GitHub Actions workflow that fails a PR when a deprecated legacy
+identity token is reintroduced into a caller repo's tree. It is shared plumbing
+for the cinatra core repo and any companion WordPress/Drupal repos that carry
+the current canonical identity.
+
+### Use it from another repo
+
+```yaml
+name: wp-drupal-rename-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  rename-gate:
+    uses: cinatra-ai/ci/.github/workflows/wp-drupal-rename-gate.yml@main  # @<sha> in prod
+```
+
+The workflow takes no inputs; it checks the caller's own tree using
+`ripgrep` (installed in the job). Git-ignored paths (such as companion dev
+clones) are excluded automatically.
 
 ## ui-design-system-gate
 
@@ -763,3 +876,98 @@ node --test scripts/__tests__/truthful-attribution-gate.test.mjs \
             scripts/__tests__/gate-suite-index.test.mjs \
             scripts/__tests__/gate-suite-audit-report.test.mjs
 ```
+
+## Developing in this repo
+
+### Run the full test suite
+
+```sh
+npm ci
+node --test scripts/__tests__/*.test.mjs
+```
+
+The [`self-check`](.github/workflows/self-check.yml) workflow dogfoods a
+subset of gates on this repository's own source and exercises the full test
+suite on every PR and push to `main`.
+
+### Add a new gate
+
+1. Write the engine script at `scripts/<gate-name>.mjs` (Node built-ins only,
+   zero registry dependencies).
+2. Add unit tests at `scripts/__tests__/<gate-name>.test.mjs` using
+   `node:test`.
+3. Add the reusable workflow at `.github/workflows/<gate-name>.yml`.
+4. Where the gate has a local script, add a `self-check` step so it dogfoods
+   on this repo.
+5. Document the gate in this README (purpose, thin-caller snippet, inputs
+   table, local run command where applicable, develop command).
+
+### Update the vendored substrate (extension-ioc-gate)
+
+```sh
+cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
+   scripts/lib/vendor/test-host-context.mjs
+```
+
+Then run the parity test to confirm the vendored copy matches the cinatra
+source of truth:
+
+```sh
+CINATRA_REPO=<path-to-cinatra-checkout> \
+  node --test --test-name-pattern='PARITY' scripts/__tests__/extension-ioc-gate.test.mjs
+```
+
+## Troubleshooting
+
+### A gate is failing but I can't tell which rule triggered it
+
+Run the gate locally with `--format json` (where supported) or `--exit-on-match`
+to get per-finding detail. Gate scripts that support it accept `--help` for the
+full flag list (e.g. `node scripts/extension-ioc-gate.mjs --help`).
+
+```sh
+# source-leak-gate: show all findings as JSON
+node scripts/source-leak-gate.mjs --profile default --ratchet-mode off --format json
+
+# actions-pinned-gate: list every offending ref
+node scripts/actions-pinned-gate.mjs
+
+# extension-ioc-gate: verbose output for a package
+node scripts/extension-ioc-gate.mjs --package <dir> --register-probe
+```
+
+### The source-leak-gate fires on lines I didn't add
+
+The default ratchet mode is `line`: only findings on lines the PR *added* should
+block. If the gate fires on pre-existing lines, confirm your caller workflow sets
+`fetch-depth: 0` so the gate can diff against the merge base.
+
+If you are using `ratchet_mode: file` or `ratchet_mode: baseline`, check that
+your allowlist or baseline file is committed and that the path is correct.
+
+### The actions-pinned-gate version comment does not match
+
+Every `uses:` ref must be pinned to a 40-character commit SHA and carry a
+version comment in the form `# vX.Y.Z` (or `# X.Y.Z` for upstreams that do not
+use a `v` prefix). The version in the comment must exactly match a real upstream
+tag — it is what Renovate uses to propose updates.
+
+### The extension-ioc-gate fails with a parity error in CI
+
+The gate's pinned constants (host-port names, kinds, dependency-edge grammar)
+must track the cinatra source of truth. Run the local parity check (see
+"Developing" above) to identify the drift. Re-vendor
+`scripts/lib/vendor/test-host-context.mjs` if the substrate diverged.
+
+### The truthful-attribution-gate reports a stale gate suite
+
+The `lastAuditedAt` field in a repo's `.github/gate-suite.json` must be updated
+monthly by the named `Accountable` engineer (with audit evidence). A date older
+than 35 days produces a warning; older than 65 days blocks the machine arm. See
+the `truthful-attribution-gate` section above for the full audit protocol.
+
+### A self-check job fails only in CI, passes locally
+
+Check that your local Node version is 24+ (`node --version`). All gate scripts
+require `node >= 24` (see `package.json` `engines` field). The self-check CI job
+installs Node 24 explicitly.
