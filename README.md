@@ -403,6 +403,123 @@ node --test scripts/__tests__/gitignore-gate.test.mjs
 
 Zero runtime dependencies (Node built-ins only); requires Node 24+.
 
+## secrets-required-gate
+
+A reusable GitHub Actions workflow + check that keeps a repo's
+`.github/secrets-required.txt` manifest in lockstep with the secrets its
+workflows actually reference (cinatra-engineering#315). Deterministic and
+repo-local (no GitHub API), so it is safe to wire as a required PR/push status
+check. It fails on two drift classes:
+
+- **orphan reference** — a `secrets.NAME` used in `.github/workflows/**` with no
+  matching manifest entry (the recurrence the audit hit: `DEV_LOCK_BUMP_TOKEN`
+  was wired but undocumented);
+- **orphan declaration** — a manifest entry that no workflow references (a stale
+  name, or a rename that silently dropped the real reference).
+
+The built-in `GITHUB_TOKEN` is auto-provided by Actions and is excluded from
+both sides. A *dynamic* bracket reference (`secrets[matrix.x]`) cannot be
+resolved statically, so the gate fails closed and asks for the concrete name.
+
+### Manifest grammar
+
+An ENTRY is a token at **column 0** matching `UPPER_SNAKE` (a line that does not
+start with whitespace and is not a `#` comment). A single line may declare
+several names separated by ` / ` (e.g. `DOCKERHUB_USERNAME / DOCKERHUB_TOKEN`).
+Indented prose (purpose/scope/wiring notes) and comments are NOT entries, so a
+name mentioned mid-sentence in a note never counts as a declaration. Names only
+— never a value (Actions secrets are write-only and cannot be read back).
+
+### Use it from another repo
+
+```yaml
+name: secrets-required-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  secrets-required-gate:
+    uses: cinatra-ai/ci/.github/workflows/secrets-required-gate.yml@<sha>  # vX.Y.Z
+    with:
+      ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+```
+
+### Run locally
+
+```sh
+node scripts/secrets-required-gate.mjs            # scans ./.github
+node scripts/secrets-required-gate.mjs --root <dir> --format json
+```
+
+Exit codes: `0` pass, `1` gate failure, `2` usage/internal error.
+
+```sh
+node --test scripts/__tests__/secrets-required-gate.test.mjs
+```
+
+## governance-drift-gate
+
+A reusable engine that detects drift between a repo's COMMITTED
+release-governance manifests (`.github/branch-protections.json`,
+`.github/tag-protections.json`, optional `.github/baseline-protection.json`) and
+the LIVE GitHub config they describe (cinatra-engineering#315). A release
+governance closeout audit found four manifest-vs-live drifts that had to be
+reconciled by hand; this gate makes that self-policing.
+
+It normalizes both sides order-insensitively (sorting required-check contexts,
+rule types, bypass actors; dropping `_comment` prose), diffs them, and fails on
+any unexplained drift. A deliberate live-only value is declared in
+`.github/governance-drift-allowlist.json` (`{ "branchProtection": ["field"], … }`)
+with a rationale.
+
+### Why it is SCHEDULED, not a required PR check
+
+Reading branch protection needs repo `Administration: read`; reading org
+rulesets (with `bypass_actors`) needs org `Administration`. The default Actions
+`GITHUB_TOKEN` cannot do this and a fork PR has no privileged token, so this
+runs on a schedule / on demand only — never as a required `pull_request`
+context.
+
+- Pass an operator-provisioned fine-grained PAT or App token as the
+  `governance_read_token` secret.
+- When that secret is **absent** the gate **skips green** (`exit 0` + a
+  `::notice`) so it can ship before the token is provisioned.
+- When the token is **present** but a read returns 401/403/incomplete, the gate
+  **hard fails** — a degraded privileged read must not mask drift.
+
+### Use it from another repo
+
+```yaml
+name: governance-drift-gate
+on:
+  schedule: [{ cron: "17 7 * * *" }]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  governance-drift-gate:
+    uses: cinatra-ai/ci/.github/workflows/governance-drift-gate.yml@<sha>  # vX.Y.Z
+    with:
+      repo: cinatra-ai/cinatra
+      ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+    secrets:
+      governance_read_token: ${{ secrets.GOVERNANCE_DRIFT_READ_TOKEN }}
+```
+
+### Run locally
+
+```sh
+# offline: diff committed manifests against a saved live-state JSON
+node scripts/governance-drift-gate.mjs --root <dir> --live-json live.json
+# live: read the GitHub API via `gh` (needs GOVERNANCE_DRIFT_READ_TOKEN)
+GOVERNANCE_DRIFT_READ_TOKEN=<token> \
+  node scripts/governance-drift-gate.mjs --live --repo cinatra-ai/cinatra
+node --test scripts/__tests__/governance-drift-gate.test.mjs
+```
+
 ## doc-code-value-gate
 
 A reusable GitHub Actions workflow + engine for the **"a doc asserts a code

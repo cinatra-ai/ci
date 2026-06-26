@@ -1,0 +1,85 @@
+name: governance-drift-gate
+
+# Reusable workflow (cinatra-engineering#315). Detects drift between a repo's
+# COMMITTED release-governance manifests (.github/branch-protections.json,
+# .github/tag-protections.json, optional .github/baseline-protection.json) and
+# the LIVE GitHub config they describe.
+#
+# WHY NOT A REQUIRED PR CHECK: reading branch protection needs repo
+# Administration:read and reading org rulesets (with bypass_actors) needs org
+# Administration. The default Actions GITHUB_TOKEN cannot do this and a fork PR
+# has no privileged token, so this runs SCHEDULED / on demand only — never as a
+# required pull_request status context.
+#
+# AUTH: pass an operator-provisioned fine-grained PAT or App token as the
+# `governance_read_token` secret (repo Administration:read + org Administration).
+# When that secret is ABSENT the gate SKIPS GREEN (exit 0 + ::notice) so it can
+# ship before the token is provisioned. When the token IS present but a read
+# returns 401/403/incomplete, the gate HARD FAILS (a degraded privileged read
+# must not mask drift).
+#
+# A consuming repo calls it from its own thin SCHEDULED caller, e.g.:
+#
+#   on:
+#     schedule: [{ cron: "17 7 * * *" }]
+#     workflow_dispatch:
+#   jobs:
+#     governance-drift-gate:
+#       uses: cinatra-ai/ci/.github/workflows/governance-drift-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         repo: cinatra-ai/cinatra
+#         ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+#       secrets:
+#         governance_read_token: ${{ secrets.GOVERNANCE_DRIFT_READ_TOKEN }}
+#
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "owner/name of the repository whose governance manifests to check."
+        type: string
+        required: true
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+      baseline_ruleset_name:
+        description: "Org ruleset name to diff against an optional committed .github/baseline-protection.json snapshot."
+        type: string
+        default: "baseline-protection"
+    secrets:
+      governance_read_token:
+        description: "Fine-grained PAT / App token: repo Administration:read + org Administration. Absent => green skip."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  governance-drift-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .governance-drift-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        env:
+          GOVERNANCE_DRIFT_READ_TOKEN: ${{ secrets.governance_read_token }}
+        run: |
+          node .governance-drift-gate/scripts/governance-drift-gate.mjs \
+            --live \
+            --repo "${{ inputs.repo }}" \
+            --baseline-ruleset-name "${{ inputs.baseline_ruleset_name }}"

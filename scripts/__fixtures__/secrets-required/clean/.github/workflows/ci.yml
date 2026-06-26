@@ -1,0 +1,10 @@
+name: ci
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.ALPHA_TOKEN }}"
+      - run: echo "${{ secrets.DOCKERHUB_USERNAME }} ${{ secrets.DOCKERHUB_TOKEN }}"
+      # GITHUB_TOKEN is auto-provided and never needs declaring.
+      - run: echo "${{ secrets.GITHUB_TOKEN }}"
