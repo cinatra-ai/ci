@@ -15,4 +15,4 @@ metadata:
 This skill declares its watches under `metadata.cinatra-watches` instead of a
 bare top-level `cinatra-watches:` key, so the upstream Anthropic SKILL.md
 validator (which only allows name/description/license/allowed-tools/metadata at
-top level) accepts it. The drift gate reads the nested location PREFERRED.
+top level) accepts it. The gate reads the nested location first.
