@@ -259,6 +259,87 @@ cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
    scripts/lib/vendor/test-host-context.mjs
 ```
 
+## docs-contract-gate
+
+A reusable GitHub Actions workflow + standalone Node script (`node
+scripts/docs-contract-gate.mjs`, Node builtins only) that validates one
+integration's `docs/` directory against the **integration docs contract** — the
+fixed page-set + frontmatter shape authored in
+[`cinatra-ai/docs`](https://github.com/cinatra-ai/docs) (docs#51) and compiled
+into the Integrations chapter of docs.cinatra.ai by the docs publish path
+(cinatra-ai/ops#378). Integration repos call it **pre-tag** so their per-repo
+docs stay consistent without central control; the publish path runs the SAME
+gate at compile time against the tagged docs tree.
+
+It is **self-contained** — Node builtins only, zero registry dependency — and
+**fully offline**: it never fetches anything and never reads outside the docs
+dir, so it requires no private-repo access (a hard requirement of ci#39).
+
+### The contract it enforces
+
+- **The fixed 6-page set** (exact filenames at the docs root): `overview.md` ·
+  `quick-start.md` · `use-it.md` · `settings-and-permissions.md` ·
+  `troubleshooting.md` · `advanced-and-reference.md`. No stray/extra Markdown.
+- **Required frontmatter on every page:** `slug, title, description, navOrder,
+  tier, lifecycle, cinatraCompat, integrationVersion, sourceRepo, supportUrl,
+  marketplaceUrl`. `tier` must be `first-party` (third-party never compiles into
+  the hub); `lifecycle ∈ {draft, active, deprecated, retired}`; `navOrder` must
+  match the canonical page order; `slug` must equal the registry slug passed via
+  `--slug`; `sourceRepo`/`supportUrl`/`marketplaceUrl` must be absolute https.
+- **Allowed content:** Markdown + static assets only. **No MDX/JSX, no `import`
+  / `export`, no `{…}` expressions** outside code fences (untrusted-repo content
+  crosses into a trusted build, so build-time code surface is rejected for v1).
+- **Link policy:** relative links must resolve to a file INSIDE the docs dir (no
+  `../` escape out of the integration); cross-chapter links must be absolute
+  canonical (`https://…` or a root-absolute `/guides|/references` path); no
+  `file:`/`data:`/other schemes.
+- **Assets:** namespaced under `docs/assets/`, stable lowercase-kebab filenames,
+  per-asset ≤ 1 MiB, total ≤ 8 MiB, image types only.
+
+### Use it from another repo (pre-tag)
+
+Add a thin caller workflow that runs on PR/push so `docs/` is validated before
+you cut a tag:
+
+```yaml
+name: docs-contract-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  docs-contract-gate:
+    # In production pin BOTH the workflow ref (`@<sha>`) and `ref` to the SAME
+    # commit SHA, so the gate code is not pulled from mutable main.
+    uses: cinatra-ai/ci/.github/workflows/docs-contract-gate.yml@main  # @<sha> in prod
+    with:
+      docs: "docs"
+      slug: "wordpress"  # this integration's registry slug
+      ref: main          # set to the same <sha> in production
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `docs` | `docs` | Path to the docs directory to validate. |
+| `slug` | _(required)_ | The integration's registry slug; every page's frontmatter `slug` must equal it. |
+| `format` | `text` | `text` or `json`. |
+| `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
+
+### Run locally
+
+```sh
+node scripts/docs-contract-gate.mjs --docs <dir> --slug <registry-slug> [--format json]
+```
+
+Exit codes: `0` conform · `1` findings · `2` usage/internal error. The rule
+library lives in [`scripts/lib/docs-contract-rules.mjs`](scripts/lib/docs-contract-rules.mjs);
+tests + good/bad fixtures in
+[`scripts/__tests__/docs-contract-gate.test.mjs`](scripts/__tests__/docs-contract-gate.test.mjs).
+
 ## gitignore-gate
 
 A reusable GitHub Actions workflow + check that fails CI when a repo's root

@@ -1,0 +1,83 @@
+name: docs-contract-gate
+
+# Reusable workflow: the integration docs-contract validator (cinatra-ai/ci#39).
+# Integration repos (wordpress-plugin, drupal-module, twenty-connector,
+# plane-connector) call it from a thin caller PRE-TAG to validate their per-repo
+# `docs/` against the docs contract authored in cinatra-ai/docs (docs#51); the
+# docs publish path (cinatra-ai/ops#378) runs the same gate at compile time.
+#
+#   jobs:
+#     docs-contract-gate:
+#       # In production pin BOTH the workflow ref (`@<sha>`) and the `ref` input
+#       # below to the SAME commit SHA, so the gate code is not pulled from
+#       # mutable main.
+#       uses: cinatra-ai/ci/.github/workflows/docs-contract-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         docs: "docs"        # the docs/ directory to validate
+#         slug: "wordpress"   # the integration's registry slug
+#         ref: <sha>
+#
+# Validates ONE integration `docs/` directory: the fixed 6-page set, the required
+# frontmatter schema + value domains, slug == registry slug, the allowed-content
+# policy (Markdown + static assets only — no MDX/imports/code execution), the
+# link/path policy (relative links resolve inside docs/; cross-chapter links are
+# absolute canonical; no private-repo / non-https schemes), and asset path/size +
+# stable-filename rules. Node builtins only, zero registry dependency, fully
+# offline (no private-repo access).
+
+on:
+  workflow_call:
+    inputs:
+      docs:
+        description: "Path (in the caller repo) to the docs/ directory to validate."
+        type: string
+        default: "docs"
+      slug:
+        description: "The integration's registry slug (every page's frontmatter slug must equal this)."
+        type: string
+        required: true
+      format:
+        description: "Output format: text | json."
+        type: string
+        default: "text"
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  docs-contract-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .docs-contract-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        # Caller inputs are passed via ENV, never interpolated into the shell
+        # source, so a crafted `docs`/`slug`/`format` input cannot inject a
+        # command.
+        env:
+          DCG_DOCS: ${{ inputs.docs }}
+          DCG_SLUG: ${{ inputs.slug }}
+          DCG_FORMAT: ${{ inputs.format }}
+        run: |
+          node .docs-contract-gate/scripts/docs-contract-gate.mjs \
+            --docs "$DCG_DOCS" \
+            --slug "$DCG_SLUG" \
+            --format "$DCG_FORMAT"
