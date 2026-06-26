@@ -514,6 +514,136 @@ test("parseWatches FAIL-LOUD: cinatra-watches with no recognized child keys thro
   assert.throws(() => parseWatches("---\nname: x\ncinatra-watches:\nname2: y\n---\nb"), WatchParseError);
 });
 
+// --- Dual-read: metadata.cinatra-watches (Skills cluster Wave-0) -------------
+
+test("parseWatches DUAL-READ: metadata.cinatra-watches is read (preferred location)", () => {
+  // The upstream-validator-compatible shape: the block lives under `metadata:`.
+  const w = parseWatches([
+    "---", "name: x",
+    "metadata:",
+    "  cinatra-watches:",
+    "    primitives: [agent_run, \"agent_run_get\"]",
+    "    packages:",
+    '      - "@cinatra-ai/trigger-agent"',
+    "    routes: [/api/agents/passthrough]",
+    "    paths:",
+    "      - packages/agents/src/a2a-actions.ts",
+    "---", "body",
+  ].join("\n"));
+  assert.deepEqual(w.primitives, ["agent_run", "agent_run_get"]);
+  assert.deepEqual(w.packages, ["@cinatra-ai/trigger-agent"]);
+  assert.deepEqual(w.routes, ["/api/agents/passthrough"]);
+  assert.deepEqual(w.paths, ["packages/agents/src/a2a-actions.ts"]);
+  assert.ok(hasDeclaredWatches(w));
+});
+
+test("parseWatches DUAL-READ: legacy top-level cinatra-watches still works (fallback)", () => {
+  // Unchanged legacy behavior: no `metadata:` wrapper.
+  const w = parseWatches([
+    "---", "name: x",
+    "cinatra-watches:",
+    "  primitives: [agent_run]",
+    "---", "body",
+  ].join("\n"));
+  assert.deepEqual(w.primitives, ["agent_run"]);
+  assert.ok(hasDeclaredWatches(w));
+});
+
+test("parseWatches DUAL-READ FAIL-LOUD: declaring the block in BOTH locations is ambiguous and throws", () => {
+  // codex convergence: rather than silently preferring one (which would let a
+  // malformed legacy block slip past), a co-present declaration fails loud.
+  assert.throws(() => parseWatches([
+    "---", "name: x",
+    "metadata:",
+    "  cinatra-watches:",
+    "    primitives: [agent_run]",
+    "cinatra-watches:",
+    "  primitives: [legacy_primitive]",
+    "---", "body",
+  ].join("\n")), (e) => e instanceof WatchParseError && /BOTH/.test(e.message));
+  // A malformed legacy block alongside a valid metadata block ALSO fails loud
+  // (the legacy inline-value guard still runs).
+  assert.throws(() => parseWatches([
+    "---", "name: x",
+    "metadata:",
+    "  cinatra-watches:",
+    "    primitives: [agent_run]",
+    "cinatra-watches: agent_run",
+    "---", "body",
+  ].join("\n")), WatchParseError);
+});
+
+test("parseWatches DUAL-READ: a metadata block with a trailing comment + comment lines parses", () => {
+  // `metadata: # ...` must be recognized, and a comment-only line must not set
+  // the metadata child indent nor be mistaken for a key.
+  const w = parseWatches([
+    "---", "name: x",
+    "metadata: # skill metadata",
+    "  # the watches the gate enforces",
+    "  cinatra-watches:",
+    "    primitives: [agent_run]",
+    "---", "body",
+  ].join("\n"));
+  assert.deepEqual(w.primitives, ["agent_run"]);
+});
+
+test("parseWatches DUAL-READ: a comment-only value on metadata.cinatra-watches is a block (symmetry with legacy)", () => {
+  // codex r2: `cinatra-watches: # note` (comment-only value) must be read as a
+  // block in the metadata location exactly as the legacy top-level location does
+  // — NOT mistaken for an inline value.
+  const meta = parseWatches([
+    "---", "name: x", "metadata:", "  cinatra-watches: # the watched surfaces",
+    "    primitives: [agent_run]", "---", "body",
+  ].join("\n"));
+  assert.deepEqual(meta.primitives, ["agent_run"]);
+  // Legacy top-level accepts the same shape.
+  const legacy = parseWatches([
+    "---", "name: x", "cinatra-watches: # the watched surfaces",
+    "  primitives: [agent_run]", "---", "body",
+  ].join("\n"));
+  assert.deepEqual(legacy.primitives, ["agent_run"]);
+});
+
+test("parseWatches DUAL-READ: a metadata block without cinatra-watches falls back to legacy top-level", () => {
+  // `metadata:` carries only unrelated keys, while a legacy top-level
+  // cinatra-watches is still present — the gate must read the legacy block.
+  const w = parseWatches([
+    "---", "name: x",
+    "metadata:",
+    "  category: workflow",
+    "cinatra-watches:",
+    "  primitives: [agent_run]",
+    "---", "body",
+  ].join("\n"));
+  assert.deepEqual(w.primitives, ["agent_run"]);
+});
+
+test("parseWatches DUAL-READ: no cinatra-watches in either location => null (undeclared)", () => {
+  assert.equal(parseWatches("---\nname: x\nmetadata:\n  category: workflow\n---\nbody"), null);
+});
+
+test("parseWatches DUAL-READ FAIL-LOUD: an unknown key under metadata.cinatra-watches throws", () => {
+  assert.throws(() => parseWatches([
+    "---", "name: x", "metadata:", "  cinatra-watches:",
+    "    primitives: [agent_run]", '    pakages: ["@cinatra-ai/typo"]',
+    "---", "b",
+  ].join("\n")), WatchParseError);
+});
+
+test("parseWatches DUAL-READ FAIL-LOUD: an inline metadata.cinatra-watches value throws", () => {
+  assert.throws(() => parseWatches([
+    "---", "name: x", "metadata:", "  cinatra-watches: agent_run",
+    "---", "b",
+  ].join("\n")), WatchParseError);
+});
+
+test("parseWatches DUAL-READ FAIL-LOUD: a present-but-EMPTY key under metadata throws", () => {
+  assert.throws(() => parseWatches([
+    "---", "name: x", "metadata:", "  cinatra-watches:",
+    "    primitives: []", "---", "b",
+  ].join("\n")), WatchParseError);
+});
+
 // --- Pure: path globs --------------------------------------------------------
 
 test("globToRegExp: * stays within a segment; ** crosses segments", () => {
@@ -554,6 +684,20 @@ test("buildWatchIndex FAIL-LOUD: a malformed watch block throws with the skill p
   // codex r2 HIGH: a watch value the extractor can never produce must fail loud.
   assert.throws(() => buildWatchIndex(path.join(FIX, "skills-watch-badvalue")), (e) =>
     e instanceof WatchParseError && /skill-v\/SKILL\.md/.test(e.message) && /never match/.test(e.message));
+});
+
+test("buildWatchIndex DUAL-READ: a skill declaring watches under metadata is indexed", () => {
+  const { watchIndex, declaredSkills } = buildWatchIndex(path.join(FIX, "skills-watch-metadata"));
+  assert.deepEqual([...declaredSkills], ["skill-m/SKILL.md"]);
+  assert.ok(watchIndex.primitives.has("workflow_draft_create"));
+  assert.ok(watchIndex.packages.has("@cinatra-ai/blog-pipeline-agent"));
+  assert.ok(watchIndex.routes.has("/api/workflows/preview"));
+  assert.ok(watchIndex.paths.has("packages/workflows/src/**"));
+});
+
+test("buildWatchIndex DUAL-READ FAIL-LOUD: a malformed metadata.cinatra-watches block throws with the skill path", () => {
+  assert.throws(() => buildWatchIndex(path.join(FIX, "skills-watch-metadata-badkey")), (e) =>
+    e instanceof WatchParseError && /skill-mb\/SKILL\.md/.test(e.message));
 });
 
 test("validateWatchSurface: round-trips a watch value through the extractor grammar (codex r2 HIGH)", () => {

@@ -365,6 +365,23 @@ export function buildSkillIndex(skillsDir, opts = {}) {
 // string keys — so a tiny, STRICT, fail-loud parser is both sufficient and
 // safer than a permissive YAML load (a typo'd key must break, not silently parse
 // to "no watches" and create a false negative).
+//
+// DUAL-READ (Skills cluster Wave-0). The upstream Anthropic SKILL.md validator
+// (`quick_validate.py`) only permits these TOP-LEVEL frontmatter keys: name,
+// description, license, allowed-tools, metadata. A bare top-level
+// `cinatra-watches:` key trips it, so skills migrate the declaration UNDER
+// `metadata:`:
+//
+//     metadata:
+//       cinatra-watches:
+//         primitives: [agent_run]
+//
+// `parseWatches` therefore reads `metadata.cinatra-watches` PREFERRED and FALLS
+// BACK to the legacy top-level `cinatra-watches:` — so already-migrated skills
+// and not-yet-migrated skills both keep precise coverage. A later wave removes
+// the legacy fallback. The strict, fail-loud child-mapping grammar is identical
+// in both locations (only the base indentation differs). A skill declaring the
+// block in BOTH locations is AMBIGUOUS and fails loud (keep exactly one).
 // ---------------------------------------------------------------------------
 
 const WATCH_KEYS = ["primitives", "packages", "routes", "paths"];
@@ -381,12 +398,101 @@ export function extractFrontmatter(text) {
   return m ? m[1] : null;
 }
 
+// A blank or comment-only frontmatter line carries no structure. Such lines are
+// skipped when determining mapping membership / child indentation so a `# note`
+// can never be mistaken for a key (and never sets the metadata child indent).
+function isBlankOrComment(line) {
+  const t = line.trim();
+  return t === "" || t.startsWith("#");
+}
+
+// Strip a trailing `# comment` from a value, mirroring how unquoteScalar treats
+// comments. A value that IS a comment (starts with `#`, after the key's `\s*`
+// has consumed the separating space) collapses to empty — so a comment-only
+// value such as `cinatra-watches: # note` is treated as "no inline value" in the
+// metadata location exactly as the legacy top-level regex already does.
+function stripTrailingComment(value) {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("#")) return "";
+  const hash = trimmed.indexOf(" #");
+  return (hash === -1 ? trimmed : trimmed.slice(0, hash)).trim();
+}
+
+/**
+ * Locate the `cinatra-watches:` mapping in the frontmatter lines, supporting
+ * dual-read: PREFER `metadata.cinatra-watches` (nested under a top-level
+ * `metadata:` block, the upstream-validator-compatible location), and FALL BACK
+ * to the legacy TOP-LEVEL `cinatra-watches:`. Returns the index of the
+ * `cinatra-watches:` line and the indentation width of that key (0 for the
+ * legacy top-level location, the metadata child indent for the nested one), so
+ * the child-mapping grammar below can run identically in either spot.
+ *
+ * FAIL-LOUD (codex convergence). Both locations are ALWAYS scanned and the
+ * legacy inline-value guard still runs even when a metadata block is present, so
+ * a malformed legacy declaration can never silently slip past the gate. If BOTH
+ * a valid `metadata.cinatra-watches` block AND a legacy top-level
+ * `cinatra-watches:` key are present, that is an AMBIGUOUS declaration and we
+ * refuse to guess — fail loud and require the author to keep exactly one. A
+ * `cinatra-watches:` key (in either location) carrying an inline value also
+ * fails loud (it must be a block mapping).
+ *
+ * Returns null when no `cinatra-watches:` key exists in either location.
+ */
+function locateWatchesBlock(lines, skillLabel) {
+  const inlineError = () =>
+    new WatchParseError(`${skillLabel}: \`cinatra-watches:\` must be a mapping (a block of indented keys), not an inline value`);
+
+  // Preferred location: `metadata:` (top-level mapping) -> `cinatra-watches:`.
+  // `metadata:` may carry a trailing comment (`metadata: # ...`).
+  let metadataHit = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^metadata:\s*(#.*)?$/.test(lines[i])) continue;
+    // Scan metadata's child lines for `cinatra-watches:`. A non-indented line
+    // ends the metadata mapping. Determine the child indent from the first
+    // STRUCTURAL (non-blank, non-comment) child so a `# note` line never sets it.
+    let childIndent = null;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j];
+      if (isBlankOrComment(line)) continue;
+      const indent = line.length - line.replace(/^\s+/, "").length;
+      if (indent === 0) break; // end of metadata mapping
+      if (childIndent === null) childIndent = indent;
+      if (indent !== childIndent) continue; // deeper nesting — not a direct child
+      const m = /^(\s+)cinatra-watches:\s*(.*)$/.exec(line);
+      if (m) {
+        if (stripTrailingComment(m[2]) !== "") throw inlineError();
+        metadataHit = { keyIdx: j, keyIndent: m[1].length };
+        break;
+      }
+    }
+    break; // only the first top-level `metadata:` mapping is considered
+  }
+
+  // Legacy location: top-level `cinatra-watches:` (no indentation). ALWAYS scan
+  // — even when a metadata block exists — so the legacy inline-value guard runs
+  // and a co-present legacy block is detected (ambiguity below).
+  let legacyHit = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^cinatra-watches:\s*(#.*)?$/.test(lines[i])) { legacyHit = { keyIdx: i, keyIndent: 0 }; break; }
+    if (/^cinatra-watches:\s*\S/.test(lines[i])) throw inlineError();
+  }
+
+  if (metadataHit && legacyHit) {
+    throw new WatchParseError(`${skillLabel}: \`cinatra-watches:\` is declared in BOTH \`metadata.cinatra-watches\` and a legacy top-level \`cinatra-watches:\` — keep exactly one (prefer \`metadata.cinatra-watches\`)`);
+  }
+  return metadataHit ?? legacyHit;
+}
+
 /**
  * Parse a `cinatra-watches:` block from a SKILL.md's frontmatter. STRICT and
  * fail-loud (throws WatchParseError) on anything malformed, so a typo can never
  * silently disable a watch (HIGH-2). Recognizes two list syntaxes under each
  * watch key: a flow array (`primitives: [a, b]`) and a YAML block sequence
  * (`primitives:` then `  - a`). Both yield a list of trimmed, unquoted strings.
+ *
+ * Dual-read (Skills cluster Wave-0): the block is read from
+ * `metadata.cinatra-watches` PREFERRED, falling back to the legacy top-level
+ * `cinatra-watches:`. The grammar is identical in both locations.
  *
  * Returns:
  *   - null            => no `cinatra-watches:` key at all (skill is UNDECLARED).
@@ -401,27 +507,26 @@ export function parseWatches(text, { skillLabel = "SKILL.md" } = {}) {
   if (fm == null) return null;
   const lines = fm.split(/\r?\n/);
 
-  // Find the `cinatra-watches:` line (top-level, no indentation).
-  let i = 0;
-  for (; i < lines.length; i++) {
-    if (/^cinatra-watches:\s*$/.test(lines[i])) break;
-    if (/^cinatra-watches:\s*\S/.test(lines[i])) {
-      throw new WatchParseError(`${skillLabel}: \`cinatra-watches:\` must be a mapping (a block of indented keys), not an inline value`);
-    }
-  }
-  if (i >= lines.length) return null; // no cinatra-watches key
+  const located = locateWatchesBlock(lines, skillLabel);
+  if (located == null) return null; // no cinatra-watches key in either location
+  // The watch-key mapping is nested under `cinatra-watches:`. Its child keys
+  // (primitives/…) must be indented strictly MORE than the `cinatra-watches:`
+  // key itself, so the grammar works at top-level (keyIndent 0) and nested under
+  // `metadata:` (keyIndent = the metadata child indent) alike.
+  const baseIndent = located.keyIndent;
 
   const watches = { primitives: [], packages: [], routes: [], paths: [] };
   const seen = new Set();
   let seenAny = false;
-  i += 1;
+  let i = located.keyIdx + 1;
   while (i < lines.length) {
     const line = lines[i];
     if (line.trim() === "") { i += 1; continue; }
-    // A non-indented line ends the cinatra-watches mapping.
-    if (!/^\s/.test(line)) break;
-    // A watch key, indented exactly under cinatra-watches. Capture the key and
-    // either an inline flow array or the following block sequence.
+    const indent = line.length - line.replace(/^\s+/, "").length;
+    // A line at or below the `cinatra-watches:` indent ends its mapping.
+    if (indent <= baseIndent) break;
+    // A watch key, indented under cinatra-watches. Capture the key and either an
+    // inline flow array or the following block sequence.
     const keyMatch = /^(\s+)([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
     if (!keyMatch) {
       throw new WatchParseError(`${skillLabel}: cannot parse \`cinatra-watches\` line: ${JSON.stringify(line)}`);
