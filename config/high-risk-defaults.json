@@ -6,7 +6,8 @@
     "migrations": "DB migrations, schema definitions, the extension-migration runner",
     "release-ci-infra": "CI workflows, gate configs, CODEOWNERS, release/publish scripts — all repos",
     "org-governance": "policy docs, gate-suite.json, high-risk-defaults.json, the attribution gate workflow itself",
-    "extension-system-architecture": "the extension SDK, loader, trust/signature gates, capability/transport registration, IoC audit gates"
+    "extension-system-architecture": "the extension SDK, loader, trust/signature gates, capability/transport registration, IoC audit gates",
+    "docs-publish-pipeline": "the docs.cinatra.ai build/deploy surface — the Starlight site config + content schema, the integrations registry (source of truth for what publishes to the live site), the docs sync compiler, and the integration docs-contract validator (cinatra-ai/ci#39 / docs#51 / ops#378)"
   },
   "highRiskGlobs": [
     "**/auth/**",
@@ -36,6 +37,13 @@
     "**/trust-gate/**",
     "**/signature-gate/**",
     "**/capability-registry/**",
-    "**/transport-registry/**"
+    "**/transport-registry/**",
+    "docs-site/astro.config.mjs",
+    "docs-site/src/content.config.ts",
+    "docs-site/integrations-registry.json",
+    "**/integrations-registry.json",
+    "scripts/sync-docs.mjs",
+    "scripts/docs-contract-gate.mjs",
+    "scripts/lib/docs-contract-rules.mjs"
   ]
 }
