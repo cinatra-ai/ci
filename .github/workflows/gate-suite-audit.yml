@@ -1,10 +1,10 @@
 name: gate-suite-audit
 
 # Monthly continuous-audit job for the org-wide truthful-attribution gate suite
-# registry (cinatra-engineering#119 §4). It is the MACHINE half of the §4 audit
-# obligation; the HUMAN half is the Accountable engineer reviewing the suite +
-# a 10% sample of gate-arm merges and recording evidence on the recurring
-# `Gate-suite audit YYYY-MM` issue in cinatra-engineering, then bumping
+# registry — the Truthful Attribution protocol §4 audit. It is the MACHINE half
+# of the §4 audit obligation; the HUMAN half is the Accountable engineer
+# reviewing the suite + a 10% sample of gate-arm merges and recording evidence
+# on the recurring `Gate-suite audit YYYY-MM` tracking issue, then bumping
 # lastAuditedAt + auditEvidence in the per-repo .github/gate-suite.json.
 #
 # This job, with read auth, does what the hermetic self-check cannot:

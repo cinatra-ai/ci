@@ -2,7 +2,7 @@
 /**
  * secrets-required-gate — reusable CI gate that keeps a repo's
  * `.github/secrets-required.txt` manifest in lockstep with the secrets its
- * workflows actually reference (cinatra-engineering#315).
+ * workflows actually reference.
  *
  * Two drift classes, both fail-closed:
  *

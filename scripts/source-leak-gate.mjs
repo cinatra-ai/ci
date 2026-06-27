@@ -206,6 +206,27 @@ const RULES = [
       return false;
     },
   },
+  {
+    // Reference to the PRIVATE cinatra-ai/engineering tracker leaking into a
+    // public repo. Covers the `eng#<n>` / `cinatra-engineering#<n>` shorthands
+    // (the latter also catches the `cinatra-ai/cinatra-engineering#<n>` legacy
+    // form), the full `cinatra-ai/engineering` repo path (incl. `#<n>` and
+    // `/issues/<n>` URL forms), and the bare `engineering/issues/` URL tail.
+    // It must NOT match public-repo refs (`cinatra#231`, `cinatra-cli#61`,
+    // `cinatra-ai/cinatra#231`): those are deliberately public and stay. The
+    // boundaries are repo-token-aware (a `-`/`_`/alnum on either side is NOT a
+    // boundary) so look-alikes like `cinatra-ai/engineering-foo`,
+    // `reverse-engineering/issues/`, and `myeng#5` do NOT trip — JS `\b` treats
+    // `-` as a boundary and would false-positive on those. `#` and `/` after
+    // `engineering` ARE allowed (they are the `#<n>` / `/issues/` URL forms).
+    // Deliberately-public references go in a per-repo allowlist via
+    // config.lineExcludes / config.exemptFileBasenames (the same mechanism the
+    // other rules use); the org-wide attribution-protocol citation is rephrased
+    // to a public-safe name rather than allowlisted.
+    id: "SLG_PRIVATE_ENG_REF",
+    description: "Reference to the private cinatra-ai/engineering tracker",
+    re: /(?<![A-Za-z0-9_-])(?:eng#\d+|cinatra-engineering#\d+|cinatra-ai\/engineering(?![A-Za-z0-9_-])|engineering\/issues\/)/gi,
+  },
 ];
 // Single-prefix requirement IDs are project-specific; supply via config.reqIdSinglePrefixes.
 const REQ_ID_SINGLE_RULE_ID = "SLG_REQ_ID_SINGLE";

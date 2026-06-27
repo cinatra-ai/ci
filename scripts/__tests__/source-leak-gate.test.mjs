@@ -77,3 +77,60 @@ test("config-driven single-prefix IDs are detected only when configured", () => 
   assert.ok(single, "config should add SLG_REQ_ID_SINGLE");
   assert.ok(matchRule(single, "see ABC-12 in the tracker") >= 1, "should match configured prefix");
 });
+
+test("SLG_PRIVATE_ENG_REF ships in the default profile", () => {
+  assert.ok(byId.has("SLG_PRIVATE_ENG_REF"), "private-eng-ref rule must be a default rule (no config needed)");
+});
+
+test("SLG_PRIVATE_ENG_REF flags every private-tracker reference form", () => {
+  const rule = byId.get("SLG_PRIVATE_ENG_REF");
+  const hits = [
+    "rationale in eng#231 here",
+    "// (eng#119 §7 step 6 rollout)",
+    "per ratified spec cinatra-engineering#119 (re-scopes #116)",
+    "see cinatra-ai/cinatra-engineering#56 form",
+    "filed under cinatra-ai/engineering tracker",
+    "fixed in cinatra-ai/engineering#309",
+    "https://github.com/cinatra-ai/engineering/issues/343",
+    "see engineering/issues/343 directly", // the bare URL-tail form, tested independently
+  ];
+  for (const line of hits) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_ENG_REF does NOT flag public-repo references", () => {
+  const rule = byId.get("SLG_PRIVATE_ENG_REF");
+  const misses = [
+    "public ref cinatra#231 stays",
+    "public ref cinatra-cli#61 stays",
+    "full public path cinatra-ai/cinatra#231",
+    "the engineering team shipped this feature",
+    "reverse-engineering the protocol",
+    "https://github.com/cinatra-ai/cinatra/issues/255",
+    // Repo-token-boundary look-alikes (JS `\b` would false-positive on these):
+    "see cinatra-ai/engineering-foo for the helper", // hyphen after `engineering`
+    "the cinatra-ai/engineering_tools dir",          // underscore after `engineering`
+    "cinatra-ai/engineeringx is unrelated",          // letter after `engineering`
+    "reverse-engineering/issues/ is a folder",       // hyphen-prefixed `engineering`
+    "the myeng#5 token is unrelated",                // alnum before `eng#`
+    "a reeng#5 marker",                              // alnum before `eng#`
+  ];
+  for (const line of misses) {
+    assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_ENG_REF can be allowlisted on a single line via config.lineExcludes", () => {
+  // A deliberately-public reference is excused by the same lineExcludes
+  // mechanism the other rules honor (full-line-anchored so it cannot mask a
+  // token elsewhere on the line).
+  const withAllow = buildRules(
+    { lineExcludes: ["^// PUBLIC-OK: see cinatra-ai/engineering for the protocol$"] },
+    "default",
+    null,
+  );
+  const rule = withAllow.find((r) => r.id === "SLG_PRIVATE_ENG_REF");
+  assert.equal(matchRule(rule, "// PUBLIC-OK: see cinatra-ai/engineering for the protocol"), 0, "allowlisted line is excused");
+  assert.ok(matchRule(rule, "// not allowlisted: see cinatra-ai/engineering here") >= 1, "a different line still flags");
+});
