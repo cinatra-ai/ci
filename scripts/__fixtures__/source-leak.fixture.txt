@@ -40,6 +40,15 @@ MISS:SLG_PRIVATE_ENG_REF:the engineering team shipped it
 MISS:SLG_PRIVATE_ENG_REF:see cinatra-ai/engineering-foo helper
 MISS:SLG_PRIVATE_ENG_REF:reverse-engineering/issues/ is a folder
 MISS:SLG_PRIVATE_ENG_REF:the myeng#5 token is unrelated
+HIT:SLG_PRIVATE_REPO_REF:tokens live in cinatra-ai/design here
+HIT:SLG_PRIVATE_REPO_REF:see cinatra-ai/marketplace#12 for the submission
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/website/issues/4
+HIT:SLG_PRIVATE_DESIGN_PHRASE:pull tokens from the design repository
+HIT:SLG_PRIVATE_DESIGN_PHRASE:edit the design repo to add a token
+MISS:SLG_PRIVATE_REPO_REF:import { x } from "@cinatra-ai/design";
+MISS:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/.github/workflows/deploy.yml
+MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/design-system-foo for the helper
+MISS:SLG_PRIVATE_REPO_REF:public ref cinatra-ai/cinatra#231 stays
 MISS:SLG_MILESTONE_NUMBER:Phase 1 of the project
 MISS:SLG_MILESTONE_NUMBER:phased rollout is enabled
 MISS:SLG_MILESTONE_NUMBER:if (NEXT_PHASE=phase-production-build) return;
