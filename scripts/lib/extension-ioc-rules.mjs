@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // extension-ioc-rules — the SELF-CONTAINED, host-tree-INDEPENDENT extension→host
-// IoC conformance rule library (cinatra-engineering#156).
+// IoC conformance rule library.
 //
 // This is the generalization of the cinatra MONOREPO's per-package audit gates
 // (`scripts/audit/extension-{import-ban,host-peer-value-import-ban,deps-gate,

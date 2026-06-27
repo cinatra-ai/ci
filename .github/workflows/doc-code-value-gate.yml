@@ -1,7 +1,7 @@
 name: doc-code-value-gate
 
-# Reusable workflow for the "a doc asserts a code value" drift class
-# (cinatra-engineering#152): fails when the value a documentation file claims
+# Reusable workflow for the "a doc asserts a code value" drift class:
+# fails when the value a documentation file claims
 # drifts from the value the source-of-truth file actually carries. The template
 # for every doc-asserts-a-code-value case across the org.
 #

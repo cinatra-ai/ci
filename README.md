@@ -123,6 +123,26 @@ introduced ones block.
   the baseline block.
 - **off**: every finding blocks (used by this repo's own self-check).
 
+### Private-tracker references
+
+A default rule (`SLG_PRIVATE_ENG_REF`) flags references to the **private**
+`cinatra-ai/engineering` issue tracker leaking into a public repo:
+
+- `eng#<n>` and `cinatra-engineering#<n>` shorthands (the latter also catches
+  the `cinatra-ai/cinatra-engineering#<n>` legacy form);
+- the full `cinatra-ai/engineering` repo path (including `#<n>` and
+  `/issues/<n>` URL forms);
+- the bare `engineering/issues/` URL tail.
+
+Public-repo references — `cinatra#231`, `cinatra-cli#61`, `cinatra-ai/cinatra` —
+are **not** flagged; those are deliberately public and should stay. Like every
+content rule it rides the **line ratchet**, so it blocks only newly-added
+references and never reds an already-unclean repo before its sweep finishes.
+Don't cite a private issue number in committed source: describe the change, or
+name a public spec/protocol (e.g. "the Truthful Attribution protocol"). For a
+genuinely-public reference, allowlist the single line via `config.lineExcludes`
+(full-line-anchored) or the whole file via `config.exemptFileBasenames`.
+
 ### Per-repo config
 
 See [`config/example-config.json`](config/example-config.json). A config may add
@@ -172,8 +192,8 @@ generated-file lists. It is the org-wide generalization of the cinatra monorepo'
 per-package audit gates (`scripts/audit/extension-{import-ban,host-peer-value-
 import-ban,deps-gate,readme-gate,license-gate}.mjs` + the SDK manifest schema).
 
-It **consumes** (does not duplicate) the SDK validator substrate
-(cinatra-engineering#163): the host-port grammar is checked against the
+It **consumes** (does not duplicate) the SDK validator substrate:
+the host-port grammar is checked against the
 substrate's `TEST_HOST_PORT_NAMES`, and `--register-probe` runs the package's
 `register(ctx)` against the faithful grant-aware `createTestHostContext`, both
 imported from a **byte-identical vendored** copy at
@@ -407,7 +427,7 @@ Zero runtime dependencies (Node built-ins only); requires Node 24+.
 
 A reusable GitHub Actions workflow + check that keeps a repo's
 `.github/secrets-required.txt` manifest in lockstep with the secrets its
-workflows actually reference (cinatra-engineering#315). Deterministic and
+workflows actually reference. Deterministic and
 repo-local (no GitHub API), so it is safe to wire as a required PR/push status
 check. It fails on two drift classes:
 
@@ -465,7 +485,7 @@ node --test scripts/__tests__/secrets-required-gate.test.mjs
 A reusable engine that detects drift between a repo's COMMITTED
 release-governance manifests (`.github/branch-protections.json`,
 `.github/tag-protections.json`, optional `.github/baseline-protection.json`) and
-the LIVE GitHub config they describe (cinatra-engineering#315). A release
+the LIVE GitHub config they describe. A release
 governance closeout audit found four manifest-vs-live drifts that had to be
 reconciled by hand; this gate makes that self-policing.
 
@@ -526,7 +546,7 @@ A reusable GitHub Actions workflow + engine for the **"a doc asserts a code
 value"** drift class: it fails CI when the value a documentation file claims
 drifts from the value the source-of-truth file actually carries. The recurring
 failure mode of version/ABI constants is a README that quietly diverges from the
-`const` it documents (cinatra-engineering#152); this gate pins that mechanically
+`const` it documents; this gate pins that mechanically
 and is the org template for every doc-asserts-a-code-value case.
 
 Each assertion pairs a `doc` side with a `code` side. A side names a `file` and
@@ -985,9 +1005,9 @@ and fail-loud on a bad pin / diff base.
 
 ## truthful-attribution-gate
 
-The org-wide gate for the **truthful verification-record model** ratified in
-[cinatra-engineering#119](https://github.com/cinatra-ai/cinatra-engineering/issues/119)
-(it re-scopes and supersedes the old no-AI-attribution gate, #116). Every merge
+The org-wide gate for the **truthful verification-record model** — the
+**Truthful Attribution protocol** (it supersedes the earlier paused
+no-AI-attribution gate). Every merge
 carries a truthful record: an `Assisted-by:` transparency trailer (what produced
 the change) plus one verification arm — a human `Reviewed-by:` (a real,
 non-self, non-stale GitHub PR approval by a login whose repo permission meets the
