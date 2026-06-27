@@ -227,6 +227,38 @@ const RULES = [
     description: "Reference to the private cinatra-ai/engineering tracker",
     re: /(?<![A-Za-z0-9_-])(?:eng#\d+|cinatra-engineering#\d+|cinatra-ai\/engineering(?![A-Za-z0-9_-])|engineering\/issues\/)/gi,
   },
+  {
+    // Sibling of SLG_PRIVATE_ENG_REF: catches the bare GitHub path-form of OTHER
+    // private cinatra-ai repos leaking into a public repo (the `cinatra-ai/design`
+    // / `cinatra-ai/marketplace` / … forms, incl. `#<n>` and `/issues/<n>` URL
+    // tails, since the token-boundary lookahead permits `#`/`/` after the name).
+    //
+    // The NEGATIVE LOOKBEHIND for `@` is LOAD-BEARING: the in-repo vendored npm
+    // workspace packages are named `@cinatra-ai/<x>` — those are package scopes,
+    // NOT repo references, and must NEVER be flagged. JS `\b` would not protect
+    // them; the `(?<![@A-Za-z0-9_-])` prefix does.
+    //
+    // DELIBERATELY EXCLUDED from the alternation:
+    //   - `engineering` — already owned by SLG_PRIVATE_ENG_REF (avoid double-flag).
+    //   - `ops` — `cinatra-ai/ops` is a REQUIRED functional dispatch target named
+    //     in many public workflows (`uses: cinatra-ai/ops/...`, `repository:
+    //     cinatra-ai/ops`). Flagging it would be all-false-positive, so it is
+    //     omitted from the regex entirely.
+    // The trailing `(?![A-Za-z0-9_-])` keeps look-alikes like
+    // `cinatra-ai/design-system-foo` from tripping. Deliberately-public refs (if
+    // any ever arise) use the same config.lineExcludes / config.exemptFileBasenames
+    // allowlist mechanism the other rules honor.
+    id: "SLG_PRIVATE_REPO_REF",
+    description: "Reference to a private cinatra-ai repository (bare GitHub path-form)",
+    re: /(?<![@A-Za-z0-9_-])cinatra-ai\/(design|marketplace|website|cinatra-business|create-cinatra-extension|dev-skills-store|extension-release-tooling|legal-archive-skills|renovate-config|dev-internal-archive|cinatra-poc|cinatra-oss-transit|cinatra-claude-memory)(?![A-Za-z0-9_-])/gi,
+  },
+  {
+    // Descriptive prose naming the private design repository (the human-readable
+    // form a scrub would otherwise miss). Rephrase to "the Cinatra design system".
+    id: "SLG_PRIVATE_DESIGN_PHRASE",
+    description: "Descriptive phrase naming the private design repository",
+    re: /\bdesign reposit(?:or|ri)y\b|\bthe design repo\b/gi,
+  },
 ];
 // Single-prefix requirement IDs are project-specific; supply via config.reqIdSinglePrefixes.
 const REQ_ID_SINGLE_RULE_ID = "SLG_REQ_ID_SINGLE";

@@ -134,3 +134,71 @@ test("SLG_PRIVATE_ENG_REF can be allowlisted on a single line via config.lineExc
   assert.equal(matchRule(rule, "// PUBLIC-OK: see cinatra-ai/engineering for the protocol"), 0, "allowlisted line is excused");
   assert.ok(matchRule(rule, "// not allowlisted: see cinatra-ai/engineering here") >= 1, "a different line still flags");
 });
+
+test("SLG_PRIVATE_REPO_REF ships in the default profile", () => {
+  assert.ok(byId.has("SLG_PRIVATE_REPO_REF"), "private-repo-ref rule must be a default rule (no config needed)");
+});
+
+test("SLG_PRIVATE_REPO_REF flags bare private-repo path forms", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  const hits = [
+    "tokens live in cinatra-ai/design here",
+    "see cinatra-ai/marketplace#12 for the submission",
+    "https://github.com/cinatra-ai/website/issues/4",
+    "filed in cinatra-ai/cinatra-business tracker",
+    "scaffold from cinatra-ai/create-cinatra-extension",
+    "see cinatra-ai/renovate-config for the preset",
+    "archived in cinatra-ai/cinatra-poc legacy",
+  ];
+  for (const line of hits) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_REPO_REF does NOT flag the @cinatra-ai npm scope, cinatra-ai/ops, public repos, or look-alikes", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  const misses = [
+    // The vendored npm workspace package scope — load-bearing negative lookbehind:
+    'import { x } from "@cinatra-ai/design";',
+    'const m = require("@cinatra-ai/marketplace-sdk");',
+    // cinatra-ai/ops is a REQUIRED functional dispatch target, deliberately excluded:
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yml",
+    "repository: cinatra-ai/ops",
+    // engineering is owned by SLG_PRIVATE_ENG_REF, not this rule:
+    "filed under cinatra-ai/engineering tracker",
+    // public repos stay:
+    "public ref cinatra-ai/cinatra#231 stays",
+    "https://github.com/cinatra-ai/cinatra-cli/issues/61",
+    // token-boundary look-alikes:
+    "see cinatra-ai/design-system-foo for the helper", // hyphen after name
+    "the cinatra-ai/website_tools dir",                // underscore after name
+    "cinatra-ai/marketplacex is unrelated",            // letter after name
+  ];
+  for (const line of misses) {
+    assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_DESIGN_PHRASE flags descriptive design-repo prose", () => {
+  const rule = byId.get("SLG_PRIVATE_DESIGN_PHRASE");
+  const hits = [
+    "pull tokens from the design repository",
+    "the legacy design repositriy typo form",
+    "edit the design repo to add a token",
+  ];
+  for (const line of hits) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_DESIGN_PHRASE does NOT flag the public-safe phrasing", () => {
+  const rule = byId.get("SLG_PRIVATE_DESIGN_PHRASE");
+  const misses = [
+    "pull tokens from the Cinatra design system",
+    "the design team owns the tokens",
+    "redesign repository layout later", // not the standalone phrase
+  ];
+  for (const line of misses) {
+    assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
