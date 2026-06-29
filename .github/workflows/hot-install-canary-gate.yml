@@ -1,0 +1,161 @@
+name: hot-install-canary-gate
+
+# Reusable workflow: the cross-kind no-rebuild HOT-INSTALL canary gate
+# (engineering#348 milestone proof; cinatra-ai/ci#49). It RUNS the PR-11a
+# canary harness — the single, DB-less, in-process root-vitest file that lives
+# in the host repo (cinatra) — so the milestone's one terminal proof gates the
+# host's milestone branch:
+#
+#   jobs:
+#     hot-install-canary-gate:
+#       # In production pin the workflow ref (`@<sha>`) to an immutable commit so
+#       # the gate's checkout/setup steps are not pulled from mutable main.
+#       uses: cinatra-ai/ci/.github/workflows/hot-install-canary-gate.yml@<sha>  # vX.Y.Z
+#
+# WHY CALLER-CHECKOUT (not a hardcoded `cinatra@ref`): the harness AND the
+# `./.github/actions/clone-extensions` composite both live in the host repo, so
+# checking out the CALLER gives the EXACT branch-under-test copy of both — the
+# gate proves the code on the PR head, never a drifted main. The thin caller in
+# the host repo (cinatra/.github/workflows/hot-install-canary-gate.yml) wires
+# this as a required status check on the milestone/default branch.
+#
+# WHAT IT PROVES (PR-11a, cinatra-ai/cinatra#718): for every extension kind —
+# connector, agent, skill, artifact, workflow, cube/portlet —
+# install -> surface appears -> disable -> surface disappears -> uninstall ->
+# teardown, with NO rebuild / NO restart / NO `src/lib/generated/**`
+# regeneration (the keystone oracle: generated-tree hash + process pid +
+# per-file mtime), the CG-6 direct-invocation refusals, and the negative cases
+# (unsigned, cross-org, stale static reference, closure-without-v2). The harness
+# drives the EXACT pure runtime-install gates the live call-sites consume and a
+# SOURCE-WIRING GUARD pins those call-sites so the proof cannot rot into dead
+# code.
+#
+# HONEST REALIZATION OF "BUILD THE IMAGE ONCE" (ci#49): PR-11a deliberately
+# rewrote the harness to be DB-less and in-process (a `vi.mock` injects the
+# canonical-store reader), so it needs NO built image, NO container, and NO live
+# DB. A plain `vitest run` IS the no-rebuild proof — the keystone oracle asserts
+# the generated tree is byte-identical and the process never restarted across
+# every kind's full lifecycle. This gate therefore does not claim image-level
+# coverage; it runs the harness whose in-process oracle is the no-regeneration
+# assertion.
+#
+# FAIL-CLOSED PRESENCE GUARD: before running, the gate asserts the harness file
+# exists and still carries its keystone-oracle + source-wiring-guard describe
+# blocks — so a caller PR cannot silently delete or gut the proof and have the
+# gate pass vacuously (mirrors the clone-extensions fail-closed empty-manifest
+# guard and the extension-ioc-parity CINATRA_REQUIRED posture).
+
+on:
+  workflow_call:
+    inputs:
+      harness:
+        description: "Path (in the caller repo) to the no-rebuild canary harness vitest file."
+        type: string
+        default: "src/lib/__tests__/hot-install-canary-harness.test.ts"
+      vitest-config:
+        description: "Path (in the caller repo) to the vitest config that hosts src/** unit tests."
+        type: string
+        default: "vitest.config.ts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hot-install-canary-gate:
+    name: Hot-install no-rebuild canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout caller repository (the host tree under test)
+        # No `repository:` — this gets the CALLER (the host) at the PR head, so
+        # the harness + the clone-extensions composite + the workspace are the
+        # exact branch-under-test copy.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Assert the canary harness is present and not gutted (fail-closed)
+        # The harness path + its keystone-oracle and source-wiring-guard markers
+        # are required, never interpolated into the shell. A caller PR that
+        # deletes or hollows the proof fails HERE rather than passing vacuously.
+        env:
+          HARNESS: ${{ inputs.harness }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$HARNESS" ]; then
+            echo "::error::hot-install-canary-gate: harness file not found at '$HARNESS'." >&2
+            echo "  The cross-kind no-rebuild canary harness (PR-11a) must exist in the host tree." >&2
+            exit 1
+          fi
+          missing=0
+          for marker in \
+            'hot-install canary — keystone no-regeneration oracle' \
+            'hot-install canary — source-wiring guard (the gates are the LIVE call-sites)'
+          do
+            if ! grep -qF "$marker" "$HARNESS"; then
+              echo "::error::hot-install-canary-gate: required harness section missing: \"$marker\"." >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "  The keystone no-regeneration oracle AND the source-wiring guard are the" >&2
+            echo "  load-bearing halves of the proof — neither may be removed. See cinatra-ai/ci#49." >&2
+            exit 1
+          fi
+          echo "Harness present with keystone oracle + source-wiring guard."
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Clone companion extension repos (pinned)
+        # The harness imports workspace packages (@cinatra-ai/extensions,
+        # @cinatra-ai/skills) whose source lives in the companion repos. PINNED
+        # mode checks each companion out at the sha committed in the host's lock
+        # files, so a companion-repo merge can never change what this gate proves.
+        uses: ./.github/actions/clone-extensions
+        with:
+          mode: pinned
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run the cross-kind no-rebuild hot-install canary harness
+        # The keystone oracle inside the harness IS the no-rebuild/no-restart/
+        # no-`src/lib/generated/**`-regeneration assertion; CG-6 direct-invocation
+        # refusals + the unsigned/cross-org/stale-static/closure-without-v2
+        # negatives all run here. The JUnit report makes per-kind failures
+        # actionable for the owning repo (ci#49 acceptance criterion).
+        env:
+          HARNESS: ${{ inputs.harness }}
+          VITEST_CONFIG: ${{ inputs.vitest-config }}
+        run: |
+          set -euo pipefail
+          # --passWithNoTests=false makes the no-vacuous-pass invariant explicit:
+          # if the harness path ever matched ZERO test files, the gate FAILS
+          # rather than greening on nothing (vitest's default already does this;
+          # we pin it so a future default change cannot weaken the proof).
+          pnpm exec vitest run \
+            --config "$VITEST_CONFIG" \
+            --no-coverage \
+            --passWithNoTests=false \
+            --reporter=default \
+            --reporter=junit \
+            --outputFile="hot-install-canary-report.junit.xml" \
+            "$HARNESS"
+
+      - name: Upload per-kind canary report (actionable on failure)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: hot-install-canary-report
+          path: hot-install-canary-report.junit.xml
+          if-no-files-found: warn
+          retention-days: 14

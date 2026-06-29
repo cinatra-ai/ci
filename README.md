@@ -279,6 +279,88 @@ cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
    scripts/lib/vendor/test-host-context.mjs
 ```
 
+## hot-install-canary-gate
+
+A reusable GitHub Actions workflow that RUNS the host repo's **cross-kind
+no-rebuild hot-install canary harness** — the one terminal proof for the full
+extension hot-installability milestone. Unlike the other gates, the engine here
+is NOT a `scripts/*.mjs` in this repo: the harness is a single, DB-less,
+in-process root-vitest file that lives in the host repo (cinatra) at
+`src/lib/__tests__/hot-install-canary-harness.test.ts`. This workflow checks out
+the **caller** (the host) at the PR head and runs that harness, so the proof
+always covers the exact branch under test.
+
+For every extension kind — connector, agent, skill, artifact, workflow,
+cube/portlet — the harness proves
+`install -> surface appears -> disable -> surface disappears -> uninstall ->
+teardown` with **no rebuild, no restart, and no `src/lib/generated/**`
+regeneration** (the keystone oracle: generated-tree hash + process pid +
+per-file mtime, re-checked after every kind). It also asserts the
+direct-invocation refusals (a disabled agent's `agent_run` refuses, a disabled
+cube serves `cube_not_active` on BOTH the HTTP and MCP transports, an archived
+artifact type's direct write is denied, a disabled skill is not resolvable, a
+disabled connector's render anchor is not live) and the negative cases
+(unsigned/untrusted, cross-org actor, stale static reference, and a
+closure-package-without-a-v2-signature install refusal). A **source-wiring
+guard** inside the harness pins the live production call-sites to those gates so
+the proof cannot rot into dead code.
+
+### Why caller-checkout (not a hardcoded host ref)
+
+The harness AND the host's `./.github/actions/clone-extensions` composite both
+live in the host repo, so checking out the **caller** gives the exact
+branch-under-test copy of both — the gate proves the code on the PR head, never
+a drifted `main`. A **fail-closed presence guard** runs first: it asserts the
+harness file exists and still carries both its keystone-oracle and
+source-wiring-guard sections, so a caller PR cannot silently delete or hollow
+the proof and have the gate pass vacuously.
+
+### "Build the image once" — honest realization
+
+The milestone's executable-proof issue framed this as "build the app image once,
+then install fixtures without rebuild." The harness was deliberately written to
+be DB-less and in-process (a `vi.mock` injects the canonical-store reader the
+real runtime-install gates consume), so it needs **no built image, no container,
+and no live DB**. A plain `vitest run` IS the no-rebuild proof — the keystone
+oracle is the in-process assertion that the generated tree is byte-identical and
+the process never restarted across every kind's full lifecycle. This gate
+therefore does not claim image-level coverage; it runs the harness whose
+in-process oracle is the no-regeneration assertion.
+
+### Use it from the host repo
+
+Add a thin caller workflow in the host repo and wire its job as a required
+status check on the milestone/default branch. The harness imports host workspace
+packages, so the caller's job (this reusable workflow) clones the pinned
+companion extension repos and runs `pnpm install --frozen-lockfile` before the
+harness:
+
+```yaml
+name: hot-install-canary-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  hot-install-canary-gate:
+    # In production pin the workflow ref (`@<sha>`) to an immutable commit.
+    uses: cinatra-ai/ci/.github/workflows/hot-install-canary-gate.yml@main  # @<sha> in prod
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `harness` | `src/lib/__tests__/hot-install-canary-harness.test.ts` | Path (in the caller repo) to the no-rebuild canary harness vitest file. |
+| `vitest-config` | `vitest.config.ts` | Path (in the caller repo) to the vitest config hosting `src/**` unit tests. |
+
+### Artifacts
+
+The harness emits a JUnit report (`hot-install-canary-report.junit.xml`),
+uploaded on every run, so a per-kind failure is actionable for the owning repo.
+
 ## docs-contract-gate
 
 A reusable GitHub Actions workflow + standalone Node script (`node
