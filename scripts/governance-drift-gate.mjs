@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
  * governance-drift-gate — detects drift between a repo's COMMITTED
- * release-governance manifests and the LIVE GitHub config they describe
- * (cinatra-engineering#315).
+ * release-governance manifests and the LIVE GitHub config they describe.
  *
  * A release-governance closeout audit found four manifest-vs-live drifts that
  * had to be reconciled by hand (cinatra#488). This gate makes that

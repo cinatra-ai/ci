@@ -1,6 +1,6 @@
 name: governance-drift-gate
 
-# Reusable workflow (cinatra-engineering#315). Detects drift between a repo's
+# Reusable governance-drift workflow. Detects drift between a repo's
 # COMMITTED release-governance manifests (.github/branch-protections.json,
 # .github/tag-protections.json, optional .github/baseline-protection.json) and
 # the LIVE GitHub config they describe.

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * truthful-attribution-gate — reusable CI gate (org-wide; re-scopes eng#116).
+ * truthful-attribution-gate — reusable CI gate (org-wide).
  *
- * Ratified spec: cinatra-engineering#119 (converged spec comment
+ * Ratified truthful-attribution spec (converged spec comment
  * issuecomment-4692554529, AS AMENDED by the ratification comment
  * issuecomment-4694404775). This gate REPLACES the paused/closed #116
  * no-AI-attribution gate: its semantics flip from *banning* AI records to
@@ -116,7 +116,7 @@ const CORRECTION_RE = /^Correction-for:[ \t]+(?<sha>[0-9a-fA-F]{40})[ \t]*$/;
 // "unknown trailer"). Unknown keys (ticket refs etc.) are ignored, not errors.
 const OWNED_KEY_RE = /^(Assisted-by|Reviewed-by|Gate-suite|Accountable|Correction-for):/;
 
-// Git-standard auto-generated IDENTITY trailers (eng#213). On `gh pr merge
+// Git-standard auto-generated IDENTITY trailers. On `gh pr merge
 // --squash`, GitHub auto-appends a `Co-authored-by:` line as its OWN trailer
 // paragraph (a blank line separating it from the real record block). A
 // `Signed-off-by:` may likewise be appended as a terminal identity paragraph.
@@ -166,7 +166,7 @@ export function parseTrailers(message) {
   const isPureIdentityParagraph = (s, e) =>
     e > s && allLines.slice(s, e).every((l) => IDENTITY_TRAILER_RE.test(l));
 
-  // eng#213 — terminal-identity-paragraph fold. GitHub's squash machinery can
+  // terminal-identity-paragraph fold. GitHub's squash machinery can
   // append one or more git-standard IDENTITY trailer paragraphs
   // (`Co-authored-by:` / `Signed-off-by:`) AFTER the real record block, each as
   // its own paragraph (blank-separated). Reading only the final paragraph would
@@ -567,7 +567,7 @@ export function parseNameStatusZ(out) {
 // trailers. That commit is integration machinery, not authored branch content —
 // it must NOT be subjected to check 5 (`agent-commit-no-assisted`), or every
 // enforce PR from the dedicated agent identity would self-trip on its own merge
-// ref now that the bot is a recognized agent (eng#119 §5). Check 5 cares about
+// ref now that the bot is a recognized agent (spec §5). Check 5 cares about
 // the real branch commits' attribution; merge commits carry no authored change.
 /** Commit messages (full %B) for the PR range base..HEAD, newest-first. */
 export function rangeCommitMessages(base, cwd = process.cwd()) {
@@ -653,7 +653,7 @@ export function treeOf(commitish, cwd = process.cwd()) {
 }
 
 /**
- * Tree-identity for the post-merge bridge (§5, eng#221). LOCAL git first
+ * Tree-identity for the post-merge bridge (spec §5). LOCAL git first
  * (fast, offline, unchanged for in-repo PRs); API fallback ONLY when local
  * can't resolve the object — i.e. a FORK head whose commit lives only on the
  * fork but whose tree the base repo's commits API can still resolve. Returns
@@ -680,7 +680,7 @@ export const DEFAULT_AGENT_NAME_TOKENS = [
   "claude", "anthropic", "copilot", "cursor", "devin", "gemini",
   "gpt", "codex", "openai", "ossgtm",
   // The org's dedicated agent identity that authors all agent-opened PRs
-  // (cinatra-agent-bot[bot], App 4040322; eng#119 §5/§8.5, eng#137). Its
+  // (cinatra-agent-bot[bot], App 4040322; spec §5/§8.5). Its
   // name/email contain none of the vendor tokens above, so without this the
   // gate's check 5 would NOT recognize the exact identity that authors every
   // agent PR — an Assisted-by omission on a bot-authored commit would slip
@@ -832,7 +832,7 @@ export function makeGhClient({ repo } = {}) {
     prCommits(pr) { return ghApi(`/repos/${repo}/pulls/${pr}/commits`, { shape: "array" }); },
     // Tree object sha of a commit via the API. The BASE repo can resolve a FORK
     // head commit's tree (the local checkout cannot — fork heads aren't fetched),
-    // closing the post-merge fork-PR false negative (eng#221). Bound to THIS gate's
+    // closing the post-merge fork-PR false negative. Bound to THIS gate's
     // `repo`, so a foreign sha 404s -> null -> fail-closed. ghApi throws on 404/403,
     // so wrap in try/catch and return null on ANY miss (codex note).
     commitTree(sha) {
@@ -1789,7 +1789,7 @@ function main() {
         ctx.suiteFile = repoSuite;
         // Tree-identity bridge: local git first, GitHub commits-API fallback for
         // FORK heads (whose commit lives only on the contributor's fork and so is
-        // unresolvable from this origin-only checkout) — eng#221. The resolved sha
+        // unresolvable from this origin-only checkout). The resolved sha
         // is the SAME reviewed head SHA the anti-fabrication checks already bind
         // approvals/contexts to, and commitTree is bound to the gate's own repo
         // (a foreign sha 404s -> null -> fail-closed). false => tree-mismatch,

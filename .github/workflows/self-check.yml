@@ -99,7 +99,7 @@ jobs:
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,
-        # cinatra-engineering#119 §4) is GENERATED. Here we re-run the generator
+        # per the attribution spec) is GENERATED. Here we re-run the generator
         # offline (no GitHub token in self-check) and confirm its OWN structure +
         # the committed file's shape are internally consistent: regenerate with a
         # null reader and assert the committed file parses + carries the inventory
@@ -109,7 +109,7 @@ jobs:
         run: node scripts/gate-suite-index-selfcheck.mjs
 
   extension-ioc-parity:
-    # The REAL cross-repo parity guard (cinatra-engineering#156): assert the
+    # The REAL cross-repo parity guard: assert the
     # reusable IoC gate's pinned contract constants + its vendored #163 substrate
     # match the cinatra monorepo source of truth. Checks out cinatra (PUBLIC) at
     # main and runs ONLY the parity test with CINATRA_REPO set, so the parity
