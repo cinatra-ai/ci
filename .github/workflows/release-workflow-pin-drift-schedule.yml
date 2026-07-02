@@ -1,0 +1,27 @@
+name: release-workflow-pin-drift-schedule
+
+# Thin SCHEDULED caller that arms the org-wide release-pin drift check.
+# It runs the reusable gate (in THIS repo) against the whole org daily, so a
+# release.yml that drifts back onto an ungated reusable-release ref is caught
+# without waiting for a human to remember to scan.
+#
+# TOKEN: the gate needs an operator-provisioned token (repo contents:read across
+# the org + read:org) as RELEASE_PIN_DRIFT_READ_TOKEN. Until that org secret is
+# provisioned the gate GREEN-SKIPS (exit 0 + ::notice) — this caller is safe to
+# ship dormant and arms itself the moment the secret exists.
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  release-workflow-pin-drift-gate:
+    uses: cinatra-ai/ci/.github/workflows/release-workflow-pin-drift-gate.yml@7df7b4014f53951b8dbfe6d5d6aef9484933b5f4 # v0.0.0-main.7df7b40
+    with:
+      org: cinatra-ai
+      ref: 7df7b4014f53951b8dbfe6d5d6aef9484933b5f4
+    secrets:
+      release_pin_read_token: ${{ secrets.RELEASE_PIN_DRIFT_READ_TOKEN }}
