@@ -622,6 +622,88 @@ GOVERNANCE_DRIFT_READ_TOKEN=<token> \
 node --test scripts/__tests__/governance-drift-gate.test.mjs
 ```
 
+## release-workflow-pin-drift-gate
+
+Fails **closed** if any extension / connector repo's
+`.github/workflows/release.yml` calls the central
+`reusable-extension-release.yml` at a ref whose `release` job is **not** behind
+the `release-approval` Environment — i.e. a ref that would let a `v*` tag
+publish with **no** human-approval pause.
+
+**The trap it closes — opt-in vs enforced-default.** The `release-approval`
+wall is applied per repo by *pinning the gated reusable-workflow ref*. A
+security control that is opt-in-per-repo fails **open** for every repo that did
+not opt in — an older pin left behind, or a new/scaffolded repo that copies an
+old `release.yml`. This gate makes the wall enforced-by-default: it scans
+**every** org repo and reds the moment any one of them pins a non-gated ref, so
+a fail-open pin cannot sit undetected. (This is the same class of bug as an
+auth check that ships fail-open-by-default with an opt-in flag: the fix is
+never "remember to opt in each repo" — it is a default that fails closed and a
+gate that proves it.)
+
+The gated set is a **curated allowlist of gated SHAs**
+(`config/release-workflow-gated-refs.json`), not a "minimum ref" — commit SHAs
+are not orderable. Every ref whose reusable-release `release` job carries
+`environment: release-approval` goes in the list; a ref not in the list is
+treated as ungated. Publishing a **new** gated reusable-workflow tag ⇒ verify
+its release job still carries the wall, then add its SHA to the allowlist (and
+bump the extension repos onto it). A repo whose `release.yml` publishes
+elsewhere (e.g. a direct `npm publish`, or no reusable call) is skipped; a repo
+with no `release.yml` is skipped.
+
+### Why it is SCHEDULED, not a required PR check
+
+The drift lives in repos **other** than the one a PR touches, and enumerating
+org repos + reading each `release.yml` needs a token a fork PR does not have.
+So this runs on a schedule / on demand only.
+
+- Pass an operator-provisioned fine-grained PAT or App token
+  (repo `contents: read` across the org + `read:org`) as the
+  `release_pin_read_token` secret; it also honors `GH_TOKEN`/`GITHUB_TOKEN`.
+- When **no** token is available the gate **skips green** (`exit 0` + a
+  `::notice`) so it can ship before the token is provisioned.
+- When a token is **present** but a read fails / returns unparseable data, the
+  gate **hard fails** — a degraded privileged read must not mask drift.
+
+### Residual gap (documented honestly)
+
+A scheduled scan **detects and reds** drift; it does not physically stop a `v*`
+tag that fires on an ungated ref in the window before the next scan +
+remediation. The physical stop for an already-gated repo is the reusable
+workflow's own `environment: release-approval` (and, defense-in-depth, a
+self-guard step inside it). This gate is the enforced-by-default backstop that
+keeps every repo *on* a gated ref.
+
+### Use it from another repo
+
+```yaml
+name: release-workflow-pin-drift-gate
+on:
+  schedule: [{ cron: "23 6 * * *" }]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  release-workflow-pin-drift-gate:
+    uses: cinatra-ai/ci/.github/workflows/release-workflow-pin-drift-gate.yml@<sha>  # vX.Y.Z
+    with:
+      org: cinatra-ai
+      ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+    secrets:
+      release_pin_read_token: ${{ secrets.RELEASE_PIN_DRIFT_READ_TOKEN }}
+```
+
+### Run locally
+
+```sh
+# offline: audit a { repo -> release.yml text|null } map against the allowlist
+node scripts/release-workflow-pin-drift-gate.mjs --root <dir> --repos-json repos.json
+# live: scan the whole org via `gh` (needs a token; --only scopes to a subset)
+GH_TOKEN=$(gh auth token) \
+  node scripts/release-workflow-pin-drift-gate.mjs --live --org cinatra-ai
+node --test scripts/__tests__/release-workflow-pin-drift-gate.test.mjs
+```
+
 ## doc-code-value-gate
 
 A reusable GitHub Actions workflow + engine for the **"a doc asserts a code

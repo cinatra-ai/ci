@@ -74,6 +74,18 @@ jobs:
             exit 1
           fi
 
+      - name: release-workflow-pin-drift-gate passes the gated fixture + fails the ungated fixture
+        run: |
+          node scripts/release-workflow-pin-drift-gate.mjs \
+            --root scripts/__fixtures__/release-workflow-pin-drift/clean \
+            --repos-json repos.json
+          if node scripts/release-workflow-pin-drift-gate.mjs \
+            --root scripts/__fixtures__/release-workflow-pin-drift/drifted \
+            --repos-json repos.json; then
+            echo "::error::release-workflow-pin-drift-gate did not fail the ungated fixture" >&2
+            exit 1
+          fi
+
       - name: Design-system preset runs clean on its own repository
         run: npx eslint .
 
@@ -95,7 +107,8 @@ jobs:
             scripts/__tests__/doc-code-value-gate.test.mjs \
             scripts/__tests__/extension-ioc-gate.test.mjs \
             scripts/__tests__/secrets-required-gate.test.mjs \
-            scripts/__tests__/governance-drift-gate.test.mjs
+            scripts/__tests__/governance-drift-gate.test.mjs \
+            scripts/__tests__/release-workflow-pin-drift-gate.test.mjs
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,

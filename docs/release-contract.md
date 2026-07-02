@@ -92,3 +92,28 @@ SHA (org pin policy; the `actions-pinned-gate` rejects mutable refs):
 The canonical sources for the extraction tooling's templates are the live org
 files; the copies in the extension-release-tooling repo are reference mirrors
 kept byte-identical to them.
+
+## The release-approval wall — pin a GATED reusable-release ref
+
+A tagged extension release must **pause for a human approval** before it
+publishes. That pause is a GitHub `release-approval` Environment (required
+reviewer) declared on the `release` job of `reusable-extension-release.yml`
+(`environment: release-approval`). The wall first shipped at
+`reusable-extension-release.yml@1e4448a…` (tag `v0.1.1`); the older
+`fea09b38…`/`671d3e6f…` (`v0.1.0`) refs have **no** `environment:` on that job.
+
+**Requirement (fails closed):** every extension repo's `release.yml` MUST pin
+`reusable-extension-release.yml@<ref>` to a **gated ref** — a SHA in
+[`config/release-workflow-gated-refs.json`](../config/release-workflow-gated-refs.json).
+Pinning an ungated ref publishes with **no** approval pause.
+
+This is **not** an opt-in convenience — it is enforced by the
+**release-workflow-pin-drift-gate** (a scheduled org-wide scan that reds if any
+repo pins a non-gated ref). The lesson it encodes: a control that is
+*opt-in-per-repo* (each repo must remember to pin the gated ref) fails **open**
+for every repo that did not opt in — exactly the fail-open-by-default trap of an
+auth check gated on a per-repo flag. The durable fix is enforced-by-default: a
+default that fails closed plus a gate that proves every repo is on it. When a
+new gated reusable-workflow tag is published, verify its `release` job still
+carries `environment: release-approval`, add its SHA to the allowlist, and bump
+the extension repos onto it.

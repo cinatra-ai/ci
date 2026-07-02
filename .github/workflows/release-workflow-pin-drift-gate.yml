@@ -1,0 +1,84 @@
+name: release-workflow-pin-drift-gate
+
+# Reusable release-workflow-pin-drift workflow. Fails CLOSED if any Cinatra
+# extension / connector repo's .github/workflows/release.yml calls the central
+# reusable-extension-release.yml at a ref whose `release` job is NOT behind the
+# `release-approval` Environment — i.e. a ref that would let a `v*` tag publish
+# with NO human-approval pause.
+#
+# THE TRAP THIS CLOSES (opt-in vs enforced-default): the release-approval wall is
+# applied per-repo by PINNING the gated reusable-workflow ref. A control that is
+# opt-in-per-repo fails OPEN for every repo that did not opt in (an old pin, or a
+# new/scaffolded repo copying an old release.yml). The durable fix is
+# enforced-by-default: this gate scans EVERY org repo and reds the moment any one
+# of them pins a non-gated ref.
+#
+# WHY NOT A REQUIRED PR CHECK: the drift lives in OTHER repos than the one a PR
+# touches, and enumerating org repos + reading each release.yml needs a token a
+# fork PR does not have. So this runs SCHEDULED / on demand only — never as a
+# required pull_request status context. When NO token is available the gate SKIPS
+# GREEN (exit 0 + ::notice) so it ships before the token is provisioned; when a
+# token IS present but a read degrades, the gate HARD FAILS (a degraded
+# privileged read must not mask drift).
+#
+# AUTH: pass an operator-provisioned fine-grained PAT / App token as the
+# `release_pin_read_token` secret (repo contents:read across the org + read:org).
+# Absent => green skip.
+#
+# A consuming repo (e.g. cinatra-ai/.github or cinatra-ai/ci) calls it from its
+# own thin SCHEDULED caller, e.g.:
+#
+#   on:
+#     schedule: [{ cron: "23 6 * * *" }]
+#     workflow_dispatch:
+#   jobs:
+#     release-workflow-pin-drift-gate:
+#       uses: cinatra-ai/ci/.github/workflows/release-workflow-pin-drift-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         org: cinatra-ai
+#         ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+#       secrets:
+#         release_pin_read_token: ${{ secrets.RELEASE_PIN_DRIFT_READ_TOKEN }}
+#
+on:
+  workflow_call:
+    inputs:
+      org:
+        description: "GitHub org whose extension repos to scan."
+        type: string
+        default: "cinatra-ai"
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+    secrets:
+      release_pin_read_token:
+        description: "Fine-grained PAT / App token: repo contents:read across the org + read:org. Absent => green skip."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-workflow-pin-drift-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        env:
+          RELEASE_PIN_DRIFT_READ_TOKEN: ${{ secrets.release_pin_read_token }}
+        run: |
+          node scripts/release-workflow-pin-drift-gate.mjs \
+            --live \
+            --org "${{ inputs.org }}"

@@ -1,0 +1,7 @@
+{
+  "_comment": "Clean fixture: every release repo pins the gated ref; one repo has no release.yml (null, skipped); one publishes elsewhere (no reusable call, skipped). The gate exits 0.",
+  "cinatra-ai/example-connector": "name: release\non:\n  push:\n    tags: ['v*']\njobs:\n  release:\n    uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@1e4448a75dc27b7be4d52ac3ce0734fa7c766957 # v0.1.1\n    secrets: inherit\n",
+  "cinatra-ai/example-agent": "name: release\non:\n  push:\n    tags: ['v*']\njobs:\n  release:\n    uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@1e4448a75dc27b7be4d52ac3ce0734fa7c766957 # v0.1.1\n    secrets: inherit\n",
+  "cinatra-ai/example-no-release": null,
+  "cinatra-ai/example-cli": "name: release\non:\n  push:\n    tags: ['v*']\njobs:\n  release:\n    steps:\n      - run: npm publish --access public\n"
+}
