@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Allowlist of gated reusable-release refs (consumed by the release-pin scan).",
+    "Each entry is a 40-hex commit SHA of cinatra-ai/.github whose",
+    "reusable-extension-release.yml",
+    "`release` job carries `environment: release-approval` (the human-approval",
+    "wall). An extension repo's release.yml MUST pin its",
+    "reusable-extension-release.yml@<ref> to a SHA in this list; any other ref is",
+    "treated as UNGATED and fails the gate closed.",
+    "",
+    "The wall first appears at 1e4448a (tag v0.1.1). The older 671d3e6f (v0.1.0)",
+    "and the pre-tag fea09b38 have NO `environment:` on the release job and are",
+    "DELIBERATELY absent here. Publishing a NEW gated reusable-workflow tag =>",
+    "verify its release job still carries `environment: release-approval`, then",
+    "add its SHA below (and bump the extension repos onto it)."
+  ],
+  "gatedRefs": [
+    "1e4448a75dc27b7be4d52ac3ce0734fa7c766957"
+  ]
+}
