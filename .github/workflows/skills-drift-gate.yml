@@ -66,6 +66,16 @@ on:
 
 permissions:
   contents: read
+  # pull-requests:read lets the PUSH arm resolve the merged PR via the commit->PR
+  # association (GET /commits/{sha}/pulls) and read its body, so a PR-body-only
+  # acknowledgement greens the post-merge run even when the squash body did not
+  # repeat the marker as a trailer. Read-only; no write scope. NOTE (rollout): a
+  # reusable workflow's permissions are capped by the CALLER — the caller's own
+  # `permissions:` block must ALSO grant `pull-requests: read`, and requesting a
+  # scope the caller lacks fails the run at startup. So bump the caller's pin and
+  # add this scope to the caller ATOMICALLY. Until then the resolve step below
+  # degrades to an empty body (commit-trailers-only, the prior behaviour).
+  pull-requests: read
 
 jobs:
   skills-drift-gate:
@@ -142,6 +152,40 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "assistant-skills pinned at $SHA"
 
+      # On push (a squash-merge to main) the event carries no PR body, yet the
+      # acknowledgement marker may live ONLY in the PR body (the squash body need
+      # not repeat it as a trailer). Resolve the merged PR via the commit->PR
+      # association and stage its body so the collector can fold it in — the SAME
+      # trust source the pull_request arm reads (an unbound self-attestation
+      # recorded on the PR; not approval-bound in either arm). RECOVERY source
+      # only: a direct push with no associated PR, an ambiguous association, or
+      # any API/permission miss leaves the file EMPTY, so only commit trailers are
+      # then available (fail-closed, unchanged from before). The body is written
+      # to a FILE (never an env interpolation or a GITHUB_ENV heredoc) so an
+      # attacker-crafted body cannot inject a delimiter or a shell line; the SHA
+      # reaches jq via `env`, never string-interpolated into the filter.
+      - name: Resolve merged PR body (push)
+        id: prbody
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          out="$RUNNER_TEMP/skills-pr-body.txt"
+          : > "$out"
+          # The PR whose squash landed THIS commit on the default branch: the
+          # single association whose merge_commit_sha == the pushed SHA. Zero or
+          # more than one exact match => ambiguous => empty body (fail-closed to
+          # trailers). No blind "first PR".
+          PR_NUMBER="$(gh api "/repos/$REPO/commits/$MERGE_SHA/pulls" \
+            --jq '[ .[] | select(.merge_commit_sha == env.MERGE_SHA) | .number ] | if length == 1 then .[0] else empty end' \
+            2>/dev/null || true)"
+          if [ -n "$PR_NUMBER" ]; then
+            gh api "/repos/$REPO/pulls/$PR_NUMBER" --jq '.body // empty' > "$out" 2>/dev/null || : > "$out"
+          fi
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+
       # Runs on BOTH pull_request AND push (e.g. squash-merge to main). The
       # acknowledgement marker (Skills-PR / Skills-reviewed / Skills-unaffected)
       # can live in the PR body OR a commit message; on a squash merge it lands
@@ -158,6 +202,9 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           EVENT_BEFORE: ${{ github.event.before }}
+          # Empty on pull_request (the step above is push-only); the collector
+          # ignores an empty PR_BODY_FILE, so the pull_request arm is unchanged.
+          PR_BODY_FILE: ${{ steps.prbody.outputs.file }}
         run: |
           # The collection logic lives in a single shared script so the push-arm
           # behaviour shipped here and the behaviour under test
