@@ -54,6 +54,7 @@
  * analysis is unit-testable offline with a stub client.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -668,6 +669,205 @@ export function resolveTreeMatch({ client, commit, reviewedHeadSha, treeOf: tree
 }
 
 // ===========================================================================
+// §5 — content/diff binding (engineering#483 keystone). Rebinds an approval's
+// staleness from tree-exact to the reviewed CHANGE's content fingerprint, so a
+// mechanical update-branch / non-up-to-date merge / merge_group synthetic
+// commit that replays the SAME change on a moved base no longer invalidates a
+// real approval — while a materially CHANGED diff still does. Tree-identity
+// (resolveTreeMatch, above) stays the strongest FAST-PATH proof; content
+// binding is the fallback. FAIL CLOSED on anything unresolvable (null => STALE
+// / content-unverifiable, never a silent pass). The mandatory post-merge verify
+// on the REAL merged SHA remains the backstop for a semantic conflict (same
+// diff, different behavior on a moved base) — content binding is intentionally
+// weaker than tree binding.
+//
+// contentFingerprint is deliberately NOT `git patch-id`: patch-id coalesces
+// whitespace (empirically a 2-space vs a tab deletion collide to one id — a
+// fabrication hole for whitespace-significant files) and is blind to binary and
+// filemode. Instead we hash a canonical, base-move-invariant representation:
+//   T = the -U0 diff hashed VERBATIM with only the two base-move-volatile bits
+//       removed (the `index <old>..<new>` line, and the `@@ -a,b +c,d @@` line
+//       NUMBERS). The +/- hunk bytes (whitespace-exact, so the pre-image of the
+//       removed content and the exact added content are both bound) survive; a
+//       benign base move that only shifts surrounding line numbers does not.
+//   S = a structural digest (status/newmode/path[/newpath]) carrying the
+//       post-image blob sha ONLY for BINARY destination paths (where T is
+//       blind); for TEXT files newsha is EXCLUDED so a same-file outside-hunk
+//       base move on main does not churn the fingerprint. Submodule
+//       (`Subproject commit <sha>`) + symlink target changes appear as text
+//       hunks in T, so they carry no newsha either.
+// Both sides of any comparison are computed by the SAME local git for byte-
+// parity; a fork/merge_group head must be locally resolvable (ci#55 refetch)
+// else the fingerprint is null => content-unverifiable (same fail-closed
+// posture as today's tree-unverifiable).
+// ===========================================================================
+
+/** First parent (M^1) of a commit — the base tip a squash/merge landed on. */
+export function firstParentOf(commit, cwd = process.cwd()) {
+  try {
+    return execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${commit}^1`], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    }).trim() || null;
+  } catch { return null; }
+}
+
+/** merge-base (fork point) of two commits, or null if unresolvable. */
+export function mergeBaseOf(a, b, cwd = process.cwd()) {
+  if (!a || !b) return null;
+  try {
+    return execFileSync("git", ["--literal-pathspecs", "merge-base", "--end-of-options", a, b], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    }).trim() || null;
+  } catch { return null; }
+}
+
+/**
+ * Binary DESTINATION-path set for a diff, via `git diff --numstat -z`. A binary
+ * entry is `-\t-\t<path>`; a rename/copy entry is `<a>\t<d>\t\0<old>\0<new>`, so
+ * the content path is the DESTINATION (the binary sha must attach to the raw
+ * destination path/status, never the old path). Returns null (FAIL CLOSED) on a
+ * git error or a malformed/truncated walk — the caller then returns null so a
+ * binary post-image is never silently dropped from the fingerprint.
+ */
+export function binaryPathsOf(base, head, cwd = process.cwd()) {
+  const set = new Set();
+  let out;
+  try {
+    out = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--find-renames", "--numstat", "-z", "--end-of-options", base, head, "--"], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch { return null; }                          // fail closed
+  const toks = out.split("\0");
+  let i = 0;
+  while (i < toks.length) {
+    const tok = toks[i];
+    if (tok === "") { i += 1; continue; }           // trailing split artifact
+    const parts = tok.split("\t");                  // [added, deleted, inlinePathOrEmpty]
+    if (parts.length < 3) return null;              // malformed numstat row => fail closed
+    const isBinary = parts[0] === "-" && parts[1] === "-";
+    const inlinePath = parts.slice(2).join("\t");
+    let destPath;
+    if (inlinePath === "") {                         // rename/copy form: next two toks = old, new
+      if (toks[i + 2] === undefined) return null;    // truncated rename walk => fail closed
+      destPath = toks[i + 2]; i += 3;                // destination path
+    } else {
+      destPath = inlinePath; i += 1;
+    }
+    if (isBinary && destPath) set.add(destPath);
+  }
+  return set;
+}
+
+/**
+ * Canonical content fingerprint of the change base..head, or null (fail closed)
+ * when base/head is unresolvable or any git error occurs.
+ */
+export function contentFingerprint(base, head, cwd = process.cwd()) {
+  if (!base || !head) return null;
+  for (const ref of [base, head]) {                 // both endpoints must resolve locally
+    try {
+      execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], { stdio: "ignore", cwd });
+    } catch { return null; }
+  }
+  // T — verbatim, base-move-invariant text-patch hash.
+  let diffOut;
+  try {
+    diffOut = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-algorithm=histogram", "--find-renames", "-U0", "--end-of-options", base, head, "--"], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch { return null; }
+  const canonical = diffOut.split("\n").filter((l) => {
+    if (l.startsWith("index ")) return false;              // oldsha..newsha — base-move volatile
+    if (l.startsWith("similarity index ")) return false;   // rename heuristic, mildly base-dependent
+    if (l.startsWith("dissimilarity index ")) return false;
+    return true;
+  }).map((l) => (l.startsWith("@@") ? l.replace(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$/, "@@") : l)).join("\n");
+  const T = createHash("sha256").update(canonical).digest("hex");
+  // S — structural digest; post-image newsha only for binary destination paths.
+  let rawOut;
+  try {
+    rawOut = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--find-renames", "--raw", "--abbrev=40", "-z", "--end-of-options", base, head, "--"], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch { return null; }
+  const binarySet = binaryPathsOf(base, head, cwd);
+  if (binarySet === null) return null;              // numstat failed — cannot prove binary binding => fail closed
+  const toks = rawOut.split("\0");
+  const rows = [];
+  let i = 0;
+  while (i < toks.length) {
+    const meta = toks[i];
+    if (!meta) { i += 1; continue; }                // trailing split artifact
+    const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])(\d*)$/.exec(meta);
+    if (!m) return null;                            // unexpected raw shape => fail closed (never under-bind S)
+    const oldsha = m[3];
+    const newmode = m[2];
+    const newsha = m[4];
+    const statusLetter = m[5];
+    let path, newpath = null, destPath;
+    if (statusLetter === "R" || statusLetter === "C") {
+      path = toks[i + 1]; newpath = toks[i + 2]; destPath = newpath; i += 3;
+    } else {
+      path = toks[i + 1]; destPath = path; i += 2;
+    }
+    if (path === undefined || destPath === undefined) return null;   // truncated raw walk => fail closed
+    let row = `${statusLetter}\t${newmode}\t${path}`;
+    if (newpath !== null) row += `\t${newpath}`;
+    // Bind a blob sha only where T is blind (binary). Post-image (newsha) for
+    // add/modify/rename; for a binary DELETION newsha is all-zeros, so bind the
+    // pre-image (oldsha) — else two different deleted binary blobs at one path
+    // would collide (a fabrication hole T cannot see).
+    if (binarySet.has(destPath)) row += `\t${statusLetter === "D" ? oldsha : newsha}`;
+    rows.push(row);
+  }
+  rows.sort();
+  const S = createHash("sha256").update(rows.join("\n")).digest("hex");
+  if (!canonical && rows.length === 0) return "empty";     // degenerate no-op change
+  return createHash("sha256").update(`patch:${T}\nstruct:${S}`).digest("hex");
+}
+
+/**
+ * Post-merge content bridge (analog of resolveTreeMatch): does the LANDED squash
+ * commit M carry the SAME change as the reviewed head H? baseM = firstParent(M);
+ * baseH = merge-base(baseM, H). true | false | undefined (undefined => a side is
+ * unresolvable => fail closed in analyzePostMerge). Helpers injectable for tests.
+ */
+export function resolveContentMatch({ commit, reviewedHeadSha, cwd = process.cwd(),
+  fingerprint = contentFingerprint, firstParent = firstParentOf, mergeBase = mergeBaseOf } = {}) {
+  if (!commit || !reviewedHeadSha) return undefined;
+  const baseM = firstParent(commit, cwd);
+  if (!baseM) return undefined;
+  const fpM = fingerprint(baseM, commit, cwd);
+  const baseH = mergeBase(baseM, reviewedHeadSha, cwd);
+  const fpH = baseH ? fingerprint(baseH, reviewedHeadSha, cwd) : null;
+  return (fpM && fpH) ? (fpM === fpH) : undefined;
+}
+
+/**
+ * Staleness resolver factory for verifyReviewedLine. Given an on-main `anchor`
+ * (pre-merge: the diff base; post-merge: firstParent(M)), returns
+ * (approvedSha, reviewedSha) => true | false | undefined: does the commit an
+ * approval was cast on carry the SAME change as the current reviewed head? Each
+ * side re-based to its own merge-base(anchor, sha), so an update-branch /
+ * mechanical rebase re-derives EQUAL. undefined (either side unresolvable) =>
+ * STALE (fail closed) at the call site. Returns null when no anchor is
+ * available, so the caller falls back to exact-SHA staleness (back-compat).
+ */
+export function makeContentBinds({ anchor, cwd = process.cwd(),
+  fingerprint = contentFingerprint, mergeBase = mergeBaseOf } = {}) {
+  if (!anchor) return null;
+  return (approvedSha, reviewedSha) => {
+    if (!approvedSha || !reviewedSha) return undefined;
+    if (approvedSha === reviewedSha) return true;
+    const baseA = mergeBase(anchor, approvedSha, cwd);
+    const fpA = baseA ? fingerprint(baseA, approvedSha, cwd) : null;
+    const baseR = mergeBase(anchor, reviewedSha, cwd);
+    const fpR = baseR ? fingerprint(baseR, reviewedSha, cwd) : null;
+    return (fpA && fpR) ? (fpA === fpR) : undefined;
+  };
+}
+
+// ===========================================================================
 // §5 — Known-agent identity (check 5)
 //
 // AI-vendor tokens are public; INTERNAL agent codenames stay in private per-repo
@@ -861,7 +1061,7 @@ export function permissionMeetsTier(permission, tier) {
  * review with the greatest submitted_at; DISMISSED approvals do not count; that
  * latest review must be APPROVED with commit_id == reviewedHeadSha.
  */
-export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, reviewedHeadSha }) {
+export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, reviewedHeadSha, contentBinds }) {
   const reasons = [];
   const login = line.login;
   if (prAuthorLogin && login.toLowerCase() === prAuthorLogin.toLowerCase()) {
@@ -876,7 +1076,17 @@ export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, r
   } else if (latest.state !== "APPROVED") {
     reasons.push(`@${login}'s latest review is ${latest.state}, not APPROVED`);
   } else if (reviewedHeadSha && latest.commit_id !== reviewedHeadSha) {
-    reasons.push(`@${login}'s approval is STALE (approved ${String(latest.commit_id).slice(0, 8)}, head is ${String(reviewedHeadSha).slice(0, 8)} — re-approval required)`);
+    // §5 content binding (engineering#483): a differing approval SHA is no longer
+    // automatically stale. If the approved commit re-derives the SAME reviewed
+    // CHANGE as the current head (a mechanical update-branch / rebase / non-up-to-
+    // date merge), the approval still binds (bind === true). A materially changed
+    // diff (false) or an unresolvable one (undefined) stays STALE — fail closed.
+    // With NO resolver injected we keep the exact-SHA behavior (differs => STALE),
+    // so offline callers and existing tests are unchanged.
+    const bind = typeof contentBinds === "function" ? contentBinds(latest.commit_id, reviewedHeadSha) : false;
+    if (bind !== true) {
+      reasons.push(`@${login}'s approval is STALE (approved ${String(latest.commit_id).slice(0, 8)}, head is ${String(reviewedHeadSha).slice(0, 8)}${bind === undefined ? " — content unverifiable" : ""} — re-approval required)`);
+    }
   }
   if (!permissionMeetsTier(permission, line.tier)) {
     reasons.push(`@${login} repo permission '${permission || "none"}' does not meet claimed tier=${line.tier}`);
@@ -1469,6 +1679,7 @@ export function analyzePreMerge(ctx) {
           permission: (ctx.permissionByLogin || {})[l.login],
           prAuthorLogin: ctx.prAuthorLogin,
           reviewedHeadSha: ctx.reviewedHeadSha,
+          contentBinds: ctx.contentBinds,
         }).ok);
       // Fallback when no declared Reviewed-by claim is available pre-merge: is
       // there ANY real maintainer-standing, non-self, non-stale APPROVED review?
@@ -1477,6 +1688,7 @@ export function analyzePreMerge(ctx) {
         permission: (ctx.permissionByLogin || {})[login],
         prAuthorLogin: ctx.prAuthorLogin,
         reviewedHeadSha: ctx.reviewedHeadSha,
+        contentBinds: ctx.contentBinds,
       }).ok);
       if (!maintainerOk && !anyMaintainerApproval) {
         findings.push({
@@ -1501,6 +1713,7 @@ export function analyzePreMerge(ctx) {
           permission: (ctx.permissionByLogin || {})[l.login],
           prAuthorLogin: ctx.prAuthorLogin,
           reviewedHeadSha: ctx.reviewedHeadSha,
+          contentBinds: ctx.contentBinds,
         });
         if (!v.ok) findings.push({ code: "reviewed-by-fabricated", severity: "error", message: `Reviewed-by @${l.login} (tier=${l.tier}) fails verification: ${v.reasons.join("; ")}` });
       }
@@ -1566,12 +1779,26 @@ export function analyzePostMerge(ctx) {
   // reviewed/checked. A mismatch invalidates the binding of approvals/contexts.
   // Only a genuine non-PR correction (no reviewed head exists) is exempt.
   if (!isNonPrCorrection) {
-    if (ctx.treeMatch === false) {
+    if (ctx.treeMatch === true) {
+      // Byte-identical tree — the strongest proof; pass without a content recompute.
+    } else if (ctx.contentMatch === true) {
+      // Tree differs (or was unresolvable) but the LANDED change re-derives to the
+      // SAME content fingerprint as the reviewed change (engineering#483): a
+      // mechanical rebase / update-branch / non-up-to-date merge / merge_group
+      // synthetic commit. The approval binds. (A semantic conflict — same diff,
+      // different behavior on a moved base — is caught by the mandatory post-merge
+      // verify on the REAL merged SHA, the intended backstop for content binding's
+      // intentionally weaker proof.)
+    } else if (ctx.contentMatch === false) {
+      findings.push({ code: "content-mismatch", severity: "error", message: `the landed change is not the reviewed change (content fingerprint differs) — the landed tree is not what was reviewed; approvals/contexts do not bind` });
+    } else if (ctx.treeMatch === false) {
+      // Tree resolved and differs, and content could NOT be re-derived on both
+      // sides to prove equivalence — preserve the tree-mismatch signal (fail closed).
       findings.push({ code: "tree-mismatch", severity: "error", message: `tree(merged) != tree(reviewed head) — the landed tree is not what was reviewed; approvals/contexts do not bind` });
-    } else if (apiBound && ctx.treeMatch === undefined && (parsed.hasHumanArm || parsed.hasGateArm)) {
-      // API was bound but the tree could not be resolved on BOTH sides — we
+    } else if (apiBound && (parsed.hasHumanArm || parsed.hasGateArm)) {
+      // API bound but NEITHER tree NOR content could be resolved on both sides —
       // cannot confirm what landed == what was reviewed. Fail closed.
-      findings.push({ code: "tree-unverifiable", severity: "error", message: `cannot resolve tree(merged) and tree(reviewed head) to confirm the landed tree was the reviewed one — failing closed` });
+      findings.push({ code: "tree-unverifiable", severity: "error", message: `cannot resolve tree(merged) and tree(reviewed head), nor re-derive the content fingerprint on both sides, to confirm the landed change was the reviewed one — failing closed` });
     }
   }
 
@@ -1593,6 +1820,7 @@ export function analyzePostMerge(ctx) {
           permission: (ctx.permissionByLogin || {})[l.login],
           prAuthorLogin: ctx.prAuthorLogin,
           reviewedHeadSha: ctx.reviewedHeadSha,
+          contentBinds: ctx.contentBinds,
         });
         if (!v.ok) findings.push({ code: "reviewed-by-fabricated", severity: "error", message: `Reviewed-by @${l.login} (tier=${l.tier}) fails verification: ${v.reasons.join("; ")}` });
         else if (l.tier === "maintainer") passingMaintainer.push(l.login);
@@ -1714,6 +1942,12 @@ function main() {
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
       defaults, repoSuite,
     };
+    // §5 content binding (engineering#483): the staleness resolver injected into
+    // every verifyReviewedLine below. anchor = the on-main diff base; an approval
+    // whose commit re-derives the SAME change as the reviewed head (a mechanical
+    // update-branch / rebase) is no longer stale. null when there is no base
+    // (offline) => verifyReviewedLine falls back to exact-SHA staleness.
+    ctx.contentBinds = makeContentBinds({ anchor: base });
     // §4 version-bump rule: the PARENT gate-suite.json is the file as it stood at
     // the diff base the changed-file range was computed against (local git, no
     // TOCTOU). Absent at the base => a NEW suite, bump rule is vacuous.
@@ -1795,6 +2029,16 @@ function main() {
         // (a foreign sha 404s -> null -> fail-closed). false => tree-mismatch,
         // undefined (apiBound + arm) => tree-unverifiable — both preserved.
         ctx.treeMatch = resolveTreeMatch({ client, commit, reviewedHeadSha: ctx.reviewedHeadSha });
+        // §5 content binding (engineering#483): the content bridge + the record's
+        // Reviewed-by staleness resolver, anchored at firstParent(M) (the on-main
+        // base the squash landed on). contentMatch lets a landed change that
+        // re-derives EQUAL to the reviewed change bind even when the tree differs
+        // (a mechanical rebase / non-up-to-date merge) or is unresolvable (a fork
+        // head); a differing change => content-mismatch. Fork / merge_group heads
+        // need the ci#55 refetch to resolve locally, else undefined => fail closed
+        // (the same posture as tree-unverifiable).
+        ctx.contentMatch = resolveContentMatch({ commit, reviewedHeadSha: ctx.reviewedHeadSha });
+        ctx.contentBinds = makeContentBinds({ anchor: firstParentOf(commit) });
         // check 5 (squash-correct): the PR's SOURCE commits via the API — NOT
         // the squash commit's first-parent diff (which is base→squash, not the
         // branch commits). Each API commit carries author/committer identity, so
