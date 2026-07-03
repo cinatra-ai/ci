@@ -40,6 +40,11 @@ MISS:SLG_PRIVATE_ENG_REF:the engineering team shipped it
 MISS:SLG_PRIVATE_ENG_REF:see cinatra-ai/engineering-foo helper
 MISS:SLG_PRIVATE_ENG_REF:reverse-engineering/issues/ is a folder
 MISS:SLG_PRIVATE_ENG_REF:the myeng#5 token is unrelated
+HIT:SLG_PRIVATE_ENG_REF_STRICT:see engineering#231 for the rationale
+HIT:SLG_PRIVATE_ENG_REF_STRICT:tracked in the cinatra-engineering repo
+MISS:SLG_PRIVATE_ENG_REF_STRICT:the engineering team shipped it
+MISS:SLG_PRIVATE_ENG_REF_STRICT:reverse-engineering#5 is unrelated
+MISS:SLG_PRIVATE_ENG_REF_STRICT:cinatra-ai/engineering#309 stays the universal rule's
 HIT:SLG_PRIVATE_REPO_REF:tokens live in cinatra-ai/design here
 HIT:SLG_PRIVATE_REPO_REF:see cinatra-ai/marketplace#12 for the submission
 HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/website/issues/4

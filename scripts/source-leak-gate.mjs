@@ -38,7 +38,7 @@ const FIXTURE_REAL = (() => {
 function realPathOf(p) {
   try { return fs.realpathSync(path.resolve(p)); } catch { return ""; }
 }
-const VALID_PROFILES = ["default", "ts-monorepo", "php-wp-plugin", "drupal-module", "ops-docs"];
+const VALID_PROFILES = ["default", "ts-monorepo", "php-wp-plugin", "drupal-module", "ops-docs", "public-strict"];
 const VALID_RATCHET_MODES = ["line", "file", "baseline", "off"];
 
 const DEFAULT_SKIP_DIRS = new Set([
@@ -228,6 +228,39 @@ const RULES = [
     re: /(?<![A-Za-z0-9_-])(?:eng#\d+|cinatra-engineering#\d+|cinatra-ai\/engineering(?![A-Za-z0-9_-])|engineering\/issues\/)/gi,
   },
   {
+    // PUBLIC-STRICT-ONLY sibling of SLG_PRIVATE_ENG_REF (profiles: ["public-strict"]).
+    // It closes the one gap the universal rule deliberately leaves open EVERYWHERE:
+    // the bare-NAME full form `engineering#<n>` (no org / no `cinatra-` prefix) and
+    // the bare legacy repo name `cinatra-engineering` (with no `#`). That bare
+    // `engineering#<n>` form is the org-SANCTIONED cross-repo citation style for
+    // PRIVATE repos' committed content (issue-placement policy), so it MUST keep
+    // passing under every other profile — therefore this rule activates ONLY under
+    // the `public-strict` profile that PUBLIC repos opt into, where a private
+    // tracker must not be referenced at all. (Scoping is enforced by buildRules,
+    // which — unlike the legacy behavior — does NOT force profile-scoped rules into
+    // the `default` profile that several PRIVATE repos run.)
+    //
+    // Boundaries are LOAD-BEARING. The negative lookbehind `(?<![@A-Za-z0-9_/-])`
+    // rejects a `-`/`_`/`/`/`@`/alnum immediately before the token, so the prefixed
+    // forms the universal rule already owns (`cinatra-ai/engineering#<n>`,
+    // `cinatra-engineering#<n>`) are NOT double-flagged, and look-alikes
+    // (`reverse-engineering#5`, `re-engineering#5`, `bioengineering#5`,
+    // `@cinatra-ai/engineering`) do NOT trip. The `engineering#<n>` branch requires
+    // `#<digit>`, so the ordinary English word "engineering" never matches; the
+    // `cinatra-engineering` branch's trailing `(?![A-Za-z0-9_#-])` keeps
+    // `cinatra-engineering-foo` from tripping AND excludes a trailing `#`, so the
+    // `cinatra-engineering#<n>` ISSUE-ref form is left SOLELY to the universal
+    // SLG_PRIVATE_ENG_REF (this rule owns only the bare NAME) — no double-flag,
+    // the same principle SLG_PRIVATE_REPO_REF follows by omitting `engineering`.
+    // Deliberately-public references (if any ever arise) use the same
+    // config.lineExcludes / config.exemptFileBasenames allowlist mechanism every
+    // other rule honors.
+    id: "SLG_PRIVATE_ENG_REF_STRICT",
+    description: "Full-form private engineering-tracker reference (public-repo strict)",
+    re: /(?<![@A-Za-z0-9_/-])(?:engineering#\d+|cinatra-engineering(?![A-Za-z0-9_#-]))/gi,
+    profiles: ["public-strict"],
+  },
+  {
     // Sibling of SLG_PRIVATE_ENG_REF: catches the bare GitHub path-form of OTHER
     // private cinatra-ai repos leaking into a public repo (the `cinatra-ai/design`
     // / `cinatra-ai/marketplace` / … forms, incl. `#<n>` and `/issues/<n>` URL
@@ -334,7 +367,14 @@ function buildRules(config, profile, onlyRules) {
 
   const globalLineExcludes = (Array.isArray(config.lineExcludes) ? config.lineExcludes : []).map((s) => new RegExp(s));
 
-  let active = rules.filter((r) => profile === "default" || r.profiles.includes(profile) || r.profiles.includes("default"));
+  // A rule is active when its profiles list includes the requested profile, or
+  // when it is a base rule (its profiles include "default"). We deliberately do
+  // NOT treat profile === "default" as "activate every rule": that legacy
+  // short-circuit forced a profile-scoped rule (e.g. a public-strict-only rule)
+  // to ALSO fire under the `default` profile, which several repos run — leaking a
+  // stricter check where it must not apply. Base rules keep "default" in their
+  // profiles, so the `default` profile still runs the complete base set, unchanged.
+  let active = rules.filter((r) => r.profiles.includes(profile) || r.profiles.includes("default"));
   if (onlyRules) {
     const set = new Set(onlyRules.split(",").map((s) => s.trim()).filter(Boolean));
     active = active.filter((r) => set.has(r.id));

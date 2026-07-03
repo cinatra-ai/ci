@@ -84,11 +84,20 @@ jobs:
 Suggested per-repo profiles: `cinatra` → `ts-monorepo`, `wordpress-plugin` →
 `php-wp-plugin`, `drupal-module` → `drupal-module`.
 
+`public-strict` is the hardened profile for **public** repos: it runs the full
+base rule set **plus** rules that flag the full-form private-tracker issue
+reference (the bare `<private-tracker>#<n>` form and the bare legacy repo name)
+that the base rules deliberately allow — that form is the org-sanctioned
+cross-repo citation style for **private** repos' content, so it stays permitted
+under every other profile and is blocked only where public repos opt in. Adopt
+it per-repo (scrub any pre-existing hits first, since `ratchet_mode: line`
+grandfathers existing lines but blocks net-new ones).
+
 ### Inputs
 
 | Input | Default | Meaning |
 |-------|---------|---------|
-| `profile` | `default` | Rule profile: `default`, `ts-monorepo`, `php-wp-plugin`, `drupal-module`, `ops-docs`. |
+| `profile` | `default` | Rule profile: `default`, `ts-monorepo`, `php-wp-plugin`, `drupal-module`, `ops-docs`, `public-strict`. |
 | `manifest` | _(none)_ | Include/negation manifest to scope the scan to a published file set. |
 | `config` | _(none)_ | Per-repo JSON config (extra rules, token lists, scope tweaks). |
 | `rules` | _(all)_ | Comma-separated rule-ID allowlist. |
