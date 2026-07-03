@@ -125,19 +125,21 @@ jobs:
         run: |
           git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
 
+      # Resolve the diff base via the shared resolver (single source of truth,
+      # regression-locked by scripts/__tests__/resolve-diff-base.test.mjs) so this
+      # gate diffs the same base under test and in production and posts correct
+      # incremental status on a merge_group (merge-queue) candidate. On
+      # merge_group the base_sha is an ancestor of the checked-out candidate HEAD
+      # (fetch-depth: 0 above), so it is reachable without an extra fetch.
       - name: Compute diff base
         id: base
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           EVENT_BEFORE: ${{ github.event.before }}
         run: |
-          if [ -n "$BASE_REF" ]; then
-            echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
-          elif [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
-            echo "ref=$EVENT_BEFORE" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=" >> "$GITHUB_OUTPUT"
-          fi
+          printf 'ref=%s\n' "$(bash .skills-drift-gate/scripts/resolve-diff-base.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Resolve pinned assistant-skills SHA (fail loud if unresolvable)
         id: pin
