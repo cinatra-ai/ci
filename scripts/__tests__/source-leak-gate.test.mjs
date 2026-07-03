@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildRules, scanFile } from "../source-leak-gate.mjs";
+import { buildRules, scanFile, RULES } from "../source-leak-gate.mjs";
 
 // Replicates the scanner's per-line matching for a single rule on a string.
 function matchRule(rule, line) {
@@ -21,6 +21,12 @@ function matchRule(rule, line) {
 const active = buildRules({}, "default", null);
 const byId = new Map(active.map((r) => [r.id, r]));
 
+// `public-strict` is the SUPERSET profile: it activates every base ("default")
+// rule PLUS the public-strict-only rules. Fixture lines for a public-strict-only
+// rule (and the stricter public-repo assertions) resolve through this map.
+const strictActive = buildRules({}, "public-strict", null);
+const strictById = new Map(strictActive.map((r) => [r.id, r]));
+
 function fixtureLines(tag) {
   const fixture = fs.readFileSync(path.join(import.meta.dirname, "..", "__fixtures__", "source-leak.fixture.txt"), "utf8");
   const out = [];
@@ -34,7 +40,7 @@ function fixtureLines(tag) {
 test("every fixture HIT line matches its named rule", () => {
   const hits = fixtureLines("HIT");
   for (const [ruleId, payload] of hits) {
-    const rule = byId.get(ruleId);
+    const rule = strictById.get(ruleId);
     assert.ok(rule, `fixture references unknown rule ${ruleId}`);
     assert.ok(matchRule(rule, payload) >= 1, `${ruleId} did not match payload: ${JSON.stringify(payload)}`);
   }
@@ -45,7 +51,7 @@ test("every fixture MISS line does not match its named rule", () => {
   const misses = fixtureLines("MISS");
   assert.ok(misses.length >= 8, `expected >=8 fixture MISS lines, got ${misses.length}`);
   for (const [ruleId, payload] of misses) {
-    const rule = byId.get(ruleId);
+    const rule = strictById.get(ruleId);
     assert.ok(rule, `unknown rule ${ruleId}`);
     assert.equal(matchRule(rule, payload), 0, `${ruleId} should NOT match: ${JSON.stringify(payload)}`);
   }
@@ -133,6 +139,100 @@ test("SLG_PRIVATE_ENG_REF can be allowlisted on a single line via config.lineExc
   const rule = withAllow.find((r) => r.id === "SLG_PRIVATE_ENG_REF");
   assert.equal(matchRule(rule, "// PUBLIC-OK: see cinatra-ai/engineering for the protocol"), 0, "allowlisted line is excused");
   assert.ok(matchRule(rule, "// not allowlisted: see cinatra-ai/engineering here") >= 1, "a different line still flags");
+});
+
+test("SLG_PRIVATE_ENG_REF_STRICT is scoped to the public-strict profile ONLY", () => {
+  // The full-form strict rule must NOT be active under the base profile or the
+  // profiles PRIVATE repos run (default, ops-docs, ts-monorepo, ...), so their
+  // org-sanctioned `engineering#<n>` cross-repo refs keep passing there. It must
+  // be active ONLY under `public-strict`.
+  assert.equal(byId.has("SLG_PRIVATE_ENG_REF_STRICT"), false, "must be absent under the default profile");
+  for (const p of ["default", "ops-docs", "ts-monorepo", "php-wp-plugin", "drupal-module"]) {
+    const ids = new Set(buildRules({}, p, null).map((r) => r.id));
+    assert.equal(ids.has("SLG_PRIVATE_ENG_REF_STRICT"), false, `must be absent under ${p}`);
+  }
+  assert.equal(strictById.has("SLG_PRIVATE_ENG_REF_STRICT"), true, "must be present under public-strict");
+});
+
+test("public-strict is a SUPERSET: every base (default) rule stays active", () => {
+  for (const id of byId.keys()) {
+    assert.ok(strictById.has(id), `public-strict dropped base rule ${id}`);
+  }
+});
+
+test("removing the default short-circuit does NOT drop any built-in rule under default", () => {
+  // Regression lock for the filter change: every built-in rule is a base rule
+  // (carries "default"), so the `default` profile still runs the full base set.
+  const defaultIds = new Set(active.map((r) => r.id));
+  for (const r of RULES) {
+    // RULES entries with no explicit `profiles` default to universal (incl. default).
+    if (!r.profiles || r.profiles.includes("default")) {
+      assert.ok(defaultIds.has(r.id), `base rule ${r.id} must stay active under default`);
+    }
+  }
+});
+
+test("under a non-strict profile the sanctioned bare `engineering#<n>` form passes ALL rules", () => {
+  // The point of the scoping: a PRIVATE repo cites the tracker as `engineering#<n>`
+  // and NO active rule may flag it under the profiles those repos run.
+  const sanctioned = "see engineering#231 for the rationale";
+  for (const p of ["default", "ops-docs"]) {
+    const rules = buildRules({}, p, null);
+    const total = rules.reduce((n, r) => n + matchRule(r, sanctioned), 0);
+    assert.equal(total, 0, `no rule may flag the sanctioned bare form under ${p}`);
+  }
+  // …but under public-strict it IS flagged (by the strict rule).
+  const strictTotal = strictActive.reduce((n, r) => n + matchRule(r, sanctioned), 0);
+  assert.ok(strictTotal >= 1, "public-strict must flag the bare form");
+});
+
+test("SLG_PRIVATE_ENG_REF_STRICT flags the bare full-form private-tracker references", () => {
+  const rule = strictById.get("SLG_PRIVATE_ENG_REF_STRICT");
+  const hits = [
+    "see engineering#231 for the rationale",
+    "filed engineering#5 upstream",
+    "regressed by engineering#1099 last week",
+    "tracked in the cinatra-engineering repo",
+  ];
+  for (const line of hits) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_ENG_REF_STRICT does NOT flag public refs, look-alikes, or the prefixed forms the universal rule owns", () => {
+  const rule = strictById.get("SLG_PRIVATE_ENG_REF_STRICT");
+  const misses = [
+    "the engineering team shipped it",                 // common word, no #<n>
+    "software engineering is a discipline",            // common word
+    "reverse-engineering#5 is unrelated",              // hyphen before
+    "re-engineering#5 marker",                          // hyphen before
+    "bioengineering#5 domain token",                    // letter before
+    "cinatra-ai/engineering#309 (universal rule owns)", // slash before -> universal's job, not double-flagged
+    "legacy note per cinatra-engineering#119",          // trailing #<n> -> universal's job, NOT double-flagged
+    "cinatra-engineering-tools is a directory",         // trailing hyphen after the name
+    'import x from "@cinatra-ai/engineering";',         // @-scope before
+    "public ref cinatra#231 stays",                     // public repo
+    "public ref cinatra-cli#61 stays",                  // public repo
+  ];
+  for (const line of misses) {
+    assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_ENG_REF_STRICT can be allowlisted on a single line via config.lineExcludes", () => {
+  const withAllow = buildRules(
+    { lineExcludes: ["^// PUBLIC-OK: historical note re engineering#5$"] },
+    "public-strict",
+    null,
+  );
+  const rule = withAllow.find((r) => r.id === "SLG_PRIVATE_ENG_REF_STRICT");
+  assert.equal(matchRule(rule, "// PUBLIC-OK: historical note re engineering#5"), 0, "allowlisted line is excused");
+  assert.ok(matchRule(rule, "a different engineering#5 reference") >= 1, "a different line still flags");
+});
+
+test("the gate is clean on its own source under public-strict (sentinel self-exemption)", () => {
+  const findings = scanFile("scripts/source-leak-gate.mjs", strictActive);
+  assert.equal(findings.length, 0, `self-scan(public-strict) found ${findings.length}: ${JSON.stringify(findings.slice(0, 5))}`);
 });
 
 test("SLG_PRIVATE_REPO_REF ships in the default profile", () => {
