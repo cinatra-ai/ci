@@ -924,6 +924,60 @@ export function looksLikeAgent({ name, email }, { tokens = DEFAULT_AGENT_NAME_TO
 // the analysis core is unit-testable offline with a stub.
 // ===========================================================================
 
+/**
+ * Combine a `gh api --paginate --slurp` payload into the flat shape callers
+ * expect. `--slurp` guarantees ONE valid JSON document: a top-level array whose
+ * elements are the per-page response bodies. So there is never more than one
+ * JSON value to parse — the exact failure the pre-slurp code hit, which split
+ * gh's separator-less concatenation of page bodies on a newline and JSON.parsed
+ * each fragment (breaking the instant a response spanned >1 page). PURE +
+ * exported so the combine is unit-testable offline with synthetic slurp docs.
+ *   - shape:"array" -> each page is itself an array; return their concatenation.
+ *                      `.flat()` combines pages one level only; page ELEMENTS
+ *                      (review/commit objects) are never arrays, so a real
+ *                      element is never wrongly flattened.
+ *   - arrayField    -> each page is an object; return the concatenation of every
+ *                      page's `arrayField` array.
+ *
+ * FAIL CLOSED (codex-converge): a page whose shape is not the expected
+ * array (array endpoints) / object-carrying-an-array-field (object endpoints) is
+ * a MALFORMED / error-shaped response, NOT "no items" — it THROWS, so the
+ * caller's anti-fabrication block treats it as an unreadable API response (fail
+ * closed for high-risk) exactly as a JSON.parse error would, never as an empty
+ * (risk-free) result. Silently skipping such a page would fail OPEN — turning
+ * "could not understand the API response" into "no risky items found."
+ */
+export function combinePaginatedSlurp(out, { shape = "object", arrayField = null } = {}) {
+  const parsed = JSON.parse(out);
+  // --slurp yields a top-level array of per-page bodies; defensively treat a
+  // non-array (a hypothetical single unwrapped page) as one page.
+  const pages = Array.isArray(parsed) ? parsed : [parsed];
+  if (shape === "array") {
+    for (let i = 0; i < pages.length; i++) {
+      if (!Array.isArray(pages[i])) {
+        throw new Error(`paginated array endpoint: page ${i} is not an array (malformed response) — failing closed`);
+      }
+    }
+    return pages.flat();
+  }
+  if (arrayField) {
+    const merged = [];
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+      if (!p || typeof p !== "object" || Array.isArray(p)) {
+        throw new Error(`paginated object endpoint: page ${i} is not an object (malformed response) — failing closed`);
+      }
+      const field = p[arrayField];
+      if (!Array.isArray(field)) {
+        throw new Error(`paginated object endpoint: page ${i} missing array field "${arrayField}" (malformed response) — failing closed`);
+      }
+      for (const x of field) merged.push(x);
+    }
+    return merged;
+  }
+  return pages;
+}
+
 export function makeGhClient({ repo } = {}) {
   // shape: "array"  -> endpoint returns a JSON array (e.g. /reviews); with
   //                    --paginate, gh concatenates one array per page.
@@ -932,23 +986,25 @@ export function makeGhClient({ repo } = {}) {
   //                    with --paginate, gh concatenates one object per page and
   //                    we must merge that field across pages.
   function ghApi(endpoint, { shape = "object", arrayField = null } = {}) {
+    const paginated = shape === "array" || Boolean(arrayField);
     const args = ["api"];
-    if (shape === "array" || arrayField) args.push("--paginate");
+    // `--paginate --slurp`: gh follows every Link `next` and emits ONE valid JSON
+    // document — a top-level array whose elements are the per-page response
+    // bodies (an array of the page-arrays for array endpoints; an array of the
+    // page-objects for object endpoints). This REPLACES string-splitting gh's raw
+    // concatenated page bodies on a newline-before-bracket: gh inserts NO
+    // separator between pages, so `[...][...]` / `{...}{...}` collapsed into a
+    // single un-parseable blob once a response exceeded one page (~>100 items),
+    // and JSON.parse threw "Unexpected non-whitespace character after JSON at
+    // position N" — which caught in the anti-fabrication try/catch as "GitHub API
+    // unavailable" and failed the high-risk approval check CLOSED on exactly the
+    // heavily-reviewed / many-check-run PRs the gate most needs to verify. With
+    // `--slurp`, JSON.parse never sees more than one top-level value; combining is
+    // a pure, offline-unit-tested transform (combinePaginatedSlurp).
+    if (paginated) args.push("--paginate", "--slurp");
     args.push("-H", "Accept: application/vnd.github+json", endpoint);
     const out = execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-    if (shape === "array") {
-      // One JSON array per page; concatenated. Split on a newline that begins a
-      // new top-level array and flatten.
-      const docs = out.split(/\n(?=\[)/).map((s) => s.trim()).filter(Boolean).map((s) => JSON.parse(s));
-      return docs.flat();
-    }
-    if (arrayField) {
-      // One JSON OBJECT per page; concatenated. Merge the named array field.
-      const docs = out.split(/\n(?=\{)/).map((s) => s.trim()).filter(Boolean).map((s) => JSON.parse(s));
-      const merged = [];
-      for (const d of docs) for (const x of (d[arrayField] || [])) merged.push(x);
-      return merged;
-    }
+    if (paginated) return combinePaginatedSlurp(out, { shape, arrayField });
     return JSON.parse(out);
   }
   return {
