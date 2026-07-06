@@ -33,6 +33,7 @@ import {
   AUDIT_STALE_WARN_DAYS,
   AUDIT_STALE_FAIL_DAYS,
   makeRunWorkflowResolver,
+  combinePaginatedSlurp,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -1958,6 +1959,59 @@ test("makeGhClient.checkRunsFor uses filter=all (server must not pre-filter to l
   const src = fs.readFileSync(GATE, "utf8");
   assert.match(src, /commits\/\$\{sha\}\/check-runs\?filter=all/, "checkRunsFor must request ?filter=all");
   void seen;
+});
+
+test("combinePaginatedSlurp: concatenates multi-page ARRAY endpoints (gh --paginate --slurp)", () => {
+  // --slurp emits ONE JSON doc: a top-level array of per-page bodies. For an
+  // array endpoint (e.g. /reviews, /pulls/{n}/commits) each page is itself an
+  // array; the pages concatenate in order.
+  const out = JSON.stringify([[{ id: 1 }, { id: 2 }], [{ id: 3 }]]);
+  assert.deepEqual(combinePaginatedSlurp(out, { shape: "array" }), [{ id: 1 }, { id: 2 }, { id: 3 }]);
+  // Single page (slurp still wraps): [[...]] -> [...].
+  assert.deepEqual(combinePaginatedSlurp(JSON.stringify([[{ id: 9 }]]), { shape: "array" }), [{ id: 9 }]);
+  // Empty first/only page -> [].
+  assert.deepEqual(combinePaginatedSlurp(JSON.stringify([[]]), { shape: "array" }), []);
+  // A non-array page is a MALFORMED response -> FAIL CLOSED (throw), never a
+  // silent empty result (codex-converge: silent-skip would fail OPEN).
+  assert.throws(
+    () => combinePaginatedSlurp(JSON.stringify([{ not: "an array" }]), { shape: "array" }),
+    /not an array/,
+  );
+});
+
+test("combinePaginatedSlurp: merges the arrayField across pages (object endpoints like /check-runs)", () => {
+  const out = JSON.stringify([
+    { total_count: 3, check_runs: [{ name: "a" }, { name: "b" }] },
+    { total_count: 3, check_runs: [{ name: "c" }] },
+  ]);
+  assert.deepEqual(
+    combinePaginatedSlurp(out, { arrayField: "check_runs" }),
+    [{ name: "a" }, { name: "b" }, { name: "c" }],
+  );
+  // A page missing/!array on the field is a MALFORMED response -> FAIL CLOSED
+  // (throw), never silently treated as "no items" (codex-converge: fail-open).
+  assert.throws(
+    () => combinePaginatedSlurp(JSON.stringify([{ check_runs: [{ name: "x" }] }, {}]), { arrayField: "check_runs" }),
+    /missing array field/,
+  );
+});
+
+test("combinePaginatedSlurp: the >1-page shape that BROKE the old newline-split now parses (anti-fabrication fetch regression)", () => {
+  // Reproduce the OLD failure input: gh's raw --paginate output concatenates page
+  // bodies with NO separator ("}{"), which split(/\n(?=\{)/) could not divide, so
+  // JSON.parse of the whole blob threw "Unexpected non-whitespace character after
+  // JSON at position N" — caught upstream as "GitHub API unavailable" and failed
+  // the high-risk approval check CLOSED (blocking owner-approved merges).
+  const rawConcatNoSeparator =
+    JSON.stringify({ check_runs: [{ n: 1 }] }) + JSON.stringify({ check_runs: [{ n: 2 }] });
+  assert.throws(
+    () => JSON.parse(rawConcatNoSeparator),
+    /after JSON/,
+    "old approach: JSON.parse of gh's separator-less page concatenation throws",
+  );
+  // The NEW path consumes gh's --slurp document (a single valid array of pages).
+  const slurped = JSON.stringify([{ check_runs: [{ n: 1 }] }, { check_runs: [{ n: 2 }] }]);
+  assert.deepEqual(combinePaginatedSlurp(slurped, { arrayField: "check_runs" }), [{ n: 1 }, { n: 2 }]);
 });
 
 test("makeGhClient.workflowRun fetches the run AND its latest-attempt jobs (PAGINATED), fail-closed shape", () => {
