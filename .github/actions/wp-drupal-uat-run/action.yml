@@ -3,7 +3,7 @@ description: >-
   Run the WordPress/Drupal assistant Playwright UAT suite inside a
   cinatra-ai/cinatra checkout (the checkout must be the workspace the caller
   runs this action from — every step below operates on the caller's working
-  directory). Bring up the docker WP/Drupal stack, run `cinatra setup dev`
+  directory). Bring up the docker WP/Drupal stack, run `cinatra instance setup dev`
   (clones the plugin/module + provisions the DB), then run the Playwright UAT
   suite (which boots its own dev server with the deterministic scripted
   provider). The companion devApp repos (wordpress-plugin, drupal-module,
@@ -35,7 +35,7 @@ runs:
 
     - name: Configure read-only clone key (SSH)
       # Only when a deploy key is provided. The devApps are PUBLIC, so the
-      # default path is `cinatra setup dev` cloning the package.json
+      # default path is `cinatra instance setup dev` cloning the package.json
       # `cinatra.devApps` URLs anonymously over HTTPS — no key material, no
       # GIT_SSH_COMMAND, no CINATRA_*_REPO_URL overrides. The SSH path below
       # stays fully functional for a future private repo: syncDevApps picks the
@@ -65,8 +65,14 @@ runs:
       # caller-local action from this shared action is brittle.
       # These extension repos are PUBLIC (plain HTTPS), unaffected by the
       # optional deploy key (which only redirects the devApp clones to SSH).
+      # --pinned (ci#61): check every repo out DETACHED at the sha committed in
+      # cinatra-required-extensions.lock.json / cinatra-dev-extensions.lock.json.
+      # This is a merge-adjacent verification surface, not the floating-HEAD
+      # canary — a branch-tip clone drifts from the committed pnpm-lock.yaml the
+      # moment any companion repo merges (ERR_PNPM_OUTDATED_LOCKFILE on the
+      # frozen install below).
       shell: bash
-      run: node scripts/ci/sync-dev-extensions.mjs
+      run: node scripts/ci/sync-dev-extensions.mjs --pinned
 
     - name: Install dependencies
       shell: bash
@@ -81,7 +87,16 @@ runs:
       # entrypoints try to activate a plugin/module whose code does not exist yet.
       # The runner must export SUPABASE_DB_URL / BETTER_AUTH_SECRET / REDIS_URL
       # (and CINATRA_RUNTIME_MODE=development) for the dev backend + clone sync.
-      run: node packages/cli/bin/cinatra.mjs setup dev
+      # `pnpm setup:dev` (→ `cinatra instance setup dev`, ci#61): the CLI was
+      # extracted to the published @cinatra-ai/cinatra package and the command
+      # moved under `instance`; packages/cli/bin/cinatra.mjs is now only a
+      # deploy-compat forwarder and `setup dev` is an unknown command. The
+      # workspace script is the stable invocation surface.
+      # --pinned flows through to setup's own dev-extension sync so it accepts
+      # (and re-pins) the detached lock-sha checkouts made above — without it
+      # the sync refuses the detached HEAD ("branch 'main' is expected") and
+      # exits non-zero.
+      run: corepack pnpm setup:dev --pinned
 
     - name: Bring up docker WordPress + Drupal (bind sources now exist)
       shell: bash
