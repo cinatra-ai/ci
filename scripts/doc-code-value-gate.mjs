@@ -5,7 +5,7 @@
  * pattern with a source-of-truth file + pattern, it fails when the value the
  * docs claim does not equal the value the code actually carries.
  *
- * Motivating case (cinatra-engineering#152): a README that states an ABI/version
+ * Motivating case: a README that states an ABI/version
  * constant drifting from the `const` it documents. The recurring failure mode of
  * that lineage is doc/code version drift; this gate pins it mechanically and is
  * the template for every doc-asserts-a-code-value case across the org.

@@ -69,22 +69,31 @@ jobs:
         with:
           node-version: "24"
 
+      # A branch ref / SHA is attacker-influenceable, so every value is passed
+      # through an env var and never interpolated into a shell line (no command
+      # injection via a crafted ref).
       - name: Fetch base ref
         if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          git fetch --no-tags origin \
-            "${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+          git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
 
+      # Resolve the diff base via the shared resolver (single source of truth,
+      # regression-locked by scripts/__tests__/resolve-diff-base.test.mjs) so this
+      # gate diffs the same base under test and in production and posts correct
+      # incremental status on a merge_group (merge-queue) candidate. On
+      # merge_group the base_sha is an ancestor of the checked-out candidate HEAD
+      # (fetch-depth: 0 above), so it is reachable without an extra fetch.
       - name: Compute diff base
         id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          EVENT_BEFORE: ${{ github.event.before }}
         run: |
-          if [ -n "${{ github.event.pull_request.base.ref }}" ]; then
-            echo "ref=origin/${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            echo "ref=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=" >> "$GITHUB_OUTPUT"
-          fi
+          printf 'ref=%s\n' "$(bash .source-leak-gate/scripts/resolve-diff-base.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Run gate
         env:

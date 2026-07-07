@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ---------------------------------------------------------------------------
-// extension-ioc-gate — the reusable extension→host IoC conformance gate
-// (cinatra-engineering#156). Validates ONE extension package directory against
+// extension-ioc-gate — the reusable extension→host IoC conformance gate.
+// Validates ONE extension package directory against
 // the host-tree-INDEPENDENT IoC rules in `scripts/lib/extension-ioc-rules.mjs`:
 // manifest shape, import-ban (no `@/`, no cross-extension / non-SDK first-party
 // imports), host-peer value-import ban over the serverEntry graph, SDK-only

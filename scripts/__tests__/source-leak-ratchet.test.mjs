@@ -140,6 +140,32 @@ test("caller files at the gate's own paths are NOT exempt", () => {
   } finally { rm(dir); }
 });
 
+test("private-eng-ref: NET-NEW line blocks, pre-existing line is tolerated (line ratchet)", () => {
+  // The new SLG_PRIVATE_ENG_REF rule must ride the same line ratchet as every
+  // other content rule: a pre-existing private-tracker ref on an untouched line
+  // does NOT red an already-unclean repo before the sweep finishes; only a
+  // NET-NEW ref on a PR-added line blocks. (Use a .ts file so the doc-basename
+  // exemption for *.md does not drop the finding.)
+  const ENG = "// see " + "eng#" + "231 for rationale";
+  const ENG2 = "// see " + "eng#" + "232 for rationale";
+
+  // (a) pre-existing ref on an untouched line -> tolerated
+  const a = setupRepo();
+  try {
+    const base = commit(a, { "note.ts": ENG + "\nconst clean = 1;\n" }, "init");
+    commit(a, { "note.ts": ENG + "\nconst clean = 1;\nconst more = 2;\n" }, "append clean");
+    assert.equal(runGate(a, base, ["--ratchet-mode", "line"]), 0);
+  } finally { rm(a); }
+
+  // (b) NET-NEW ref on a PR-added line -> blocks
+  const b = setupRepo();
+  try {
+    const base = commit(b, { "note.ts": "const clean = 1;\n" }, "init");
+    commit(b, { "note.ts": "const clean = 1;\n" + ENG2 + "\n" }, "add eng ref");
+    assert.equal(runGate(b, base, ["--ratchet-mode", "line"]), 1);
+  } finally { rm(b); }
+});
+
 test("manifest include/negation scopes the scan", () => {
   const dir = setupRepo();
   try {

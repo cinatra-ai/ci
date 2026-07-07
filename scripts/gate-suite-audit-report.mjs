@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * gate-suite-audit-report — monthly staleness sweep across the inventoried
- * gate suites (cinatra-engineering#119 §4). Surfaces every repo whose audit is
+ * gate suites (the Truthful Attribution protocol §4). Surfaces every repo whose audit is
  * going stale (> 35d) or lapsed (> 65d, gate-arm merges blocked) BEFORE a PR
  * discovers it — the watchdog half of the §4 staleness mechanics.
  *

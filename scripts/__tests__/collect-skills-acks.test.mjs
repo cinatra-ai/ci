@@ -182,3 +182,118 @@ test("eng#212 WORKFLOW LOCK: the acks step invokes the shared collect-skills-ack
   assert.match(block, /collect-skills-acks\.sh/,
     "the acks step must call the shared collector script (the single source of truth under test)");
 });
+
+// ===========================================================================
+// ci#56 — the PUSH arm must also read the merged PR body (PR_BODY_FILE), so an
+// acknowledgement that lived ONLY in the PR body greens the post-merge run even
+// when the squash body did not repeat it as a trailer. That was the #881 cosmetic
+// red: the `Skills-unaffected:` ack was in the PR body; the squash body carried
+// only other trailers; the push run saw the finding as unacknowledged and red
+// main. PR_BODY_FILE is a RECOVERY source — empty/absent must stay fail-closed.
+// ===========================================================================
+
+// The PR body the workflow's "Resolve merged PR body (push)" step stages. The
+// ack lives ONLY here (the squash body — NO_MARKER — does not repeat it).
+const PR_BODY_MARKER =
+  "batch: land the approved fixes in one squash (#881)\n\n" +
+  "Skills-unaffected: reviewed all watching skills — agent_run internals only, tool contract unchanged\n";
+
+function writePrBodyFile(dir, body) {
+  const f = fs.realpathSync(dir) + path.sep + `pr-body-${Math.random().toString(36).slice(2)}.txt`;
+  fs.writeFileSync(f, body);
+  return f;
+}
+
+test("ci#56 PUSH arm: a PR-body-only ack (squash body has NO marker) is collected via PR_BODY_FILE and clears the gate", () => {
+  const { dir, baseSha } = repoWithSquash(NO_MARKER);
+  try {
+    // Sanity: commit-trailers-only (no PR body staged) => the finding gates.
+    // This is exactly the #881 cosmetic red the fix targets.
+    const trailersOnly = collectPush(dir, { EVENT_BEFORE: baseSha });
+    assert.doesNotMatch(trailersOnly, /Skills-(unaffected|reviewed|PR):/, "the squash body carries no marker");
+    const trailerAck = path.join(dir, "trailers.txt");
+    fs.writeFileSync(trailerAck, trailersOnly);
+    assert.equal(runGate(dir, baseSha, trailerAck).status, 1,
+      "without the PR body the push run reds — the #881 cosmetic red the fix targets");
+
+    // With the resolved PR body staged in PR_BODY_FILE the ack is collected and
+    // the gate clears — the SAME trust source the pull_request arm reads.
+    const prBodyFile = writePrBodyFile(dir, PR_BODY_MARKER);
+    const acks = collectPush(dir, { EVENT_BEFORE: baseSha, PR_BODY_FILE: prBodyFile });
+    assert.match(acks, /Skills-unaffected: reviewed all watching skills/,
+      "the collector must fold the PR-body ack into the push arm");
+    const ackFile = path.join(dir, "acks.txt");
+    fs.writeFileSync(ackFile, acks);
+    const pass = runGate(dir, baseSha, ackFile);
+    assert.equal(pass.status, 0, `the PR-body ack must clear the push-arm gate; stderr: ${pass.stderr}`);
+    const out = JSON.parse(pass.stdout);
+    assert.equal(out.unacknowledgedWatchFindingCount, 0);
+  } finally { rm(dir); }
+});
+
+test("ci#56 PUSH arm: an empty/absent/marker-less PR_BODY_FILE is inert — an unacknowledged finding STILL reds (recovery source must not weaken enforcement)", () => {
+  const { dir, baseSha } = repoWithSquash(NO_MARKER);
+  try {
+    const cases = [
+      { EVENT_BEFORE: baseSha },                                                     // PR_BODY_FILE unset
+      { EVENT_BEFORE: baseSha, PR_BODY_FILE: "" },                                   // empty value
+      { EVENT_BEFORE: baseSha, PR_BODY_FILE: path.join(dir, "does-not-exist.txt") }, // missing path
+      { EVENT_BEFORE: baseSha, PR_BODY_FILE: writePrBodyFile(dir, "no marker in this PR body\n") }, // present, no marker
+    ];
+    for (const env of cases) {
+      const acks = collectPush(dir, env);
+      assert.doesNotMatch(acks, /Skills-(unaffected|reviewed|PR):/,
+        `no marker anywhere for env ${JSON.stringify(env)}`);
+      const ackFile = path.join(dir, "acks.txt");
+      fs.writeFileSync(ackFile, acks);
+      assert.equal(runGate(dir, baseSha, ackFile).status, 1,
+        `an unacknowledged finding must STILL gate for env ${JSON.stringify(env)}`);
+    }
+  } finally { rm(dir); }
+});
+
+test("ci#56 PUSH arm: PR body is emitted BEFORE the commit range and both are readable", () => {
+  // A squash-body marker AND a distinct PR-body marker: both must survive into
+  // the collected blob (the gate reads whichever satisfies the finding).
+  const { dir, baseSha } = repoWithSquash(MARKER);
+  try {
+    const prBodyFile = writePrBodyFile(dir, PR_BODY_MARKER);
+    const acks = collectPush(dir, { EVENT_BEFORE: baseSha, PR_BODY_FILE: prBodyFile });
+    assert.match(acks, /Skills-unaffected: reviewed all watching skills/, "PR-body marker present");
+    assert.match(acks, /Skills-unaffected: identifier only moved/, "squash-body marker present");
+    // PR body first.
+    assert.ok(
+      acks.indexOf("reviewed all watching skills") < acks.indexOf("identifier only moved"),
+      "the PR body must be emitted before the commit range",
+    );
+  } finally { rm(dir); }
+});
+
+// --- WORKFLOW LOCK: the push PR-body wiring itself can't silently regress -----
+
+test("ci#56 WORKFLOW LOCK: the acks step forwards PR_BODY_FILE to the shared collector", () => {
+  const block = acksStepBlock();
+  assert.match(block, /PR_BODY_FILE:\s*\$\{\{\s*steps\.prbody\.outputs\.file\s*\}\}/,
+    "the acks step must pass the resolved merged-PR body file to the collector");
+});
+
+test("ci#56 WORKFLOW LOCK: a push-only step resolves the merged PR body via the commit->PR association, and pull-requests:read is granted", () => {
+  const text = fs.readFileSync(WORKFLOW, "utf8");
+  assert.match(text, /^\s*pull-requests:\s*read\s*$/m,
+    "the reusable workflow must request pull-requests:read for the commit->PR body resolution");
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => /^\s*-\s+name:\s+Resolve merged PR body/.test(l));
+  assert.ok(start >= 0, "a `Resolve merged PR body (push)` step must exist");
+  const indent = lines[start].match(/^(\s*)-/)[1];
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (new RegExp(`^${indent}-\\s+(name|uses):`).test(lines[i])) { end = i; break; }
+  }
+  const block = lines.slice(start, end).join("\n");
+  assert.match(block, /if:\s*github\.event_name\s*==\s*'push'/,
+    "the resolve step must be push-only (the pull_request event already carries the body)");
+  assert.match(block, /commits\/\$MERGE_SHA\/pulls/,
+    "the resolve step must use the commit->PR association GET /commits/{sha}/pulls");
+  assert.match(block, /merge_commit_sha == env\.MERGE_SHA/,
+    "must select the PR whose merge_commit_sha is the pushed SHA (no blind first PR); the SHA reaches jq via env");
+});

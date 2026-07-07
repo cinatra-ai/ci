@@ -17,6 +17,12 @@ import {
   analyzePreMerge,
   analyzePostMerge,
   resolveTreeMatch,
+  contentFingerprint,
+  resolveContentMatch,
+  makeContentBinds,
+  firstParentOf,
+  mergeBaseOf,
+  binaryPathsOf,
   parseNameStatusZ,
   rangeCommitIdentities,
   rangeCommitMessages,
@@ -27,6 +33,7 @@ import {
   AUDIT_STALE_WARN_DAYS,
   AUDIT_STALE_FAIL_DAYS,
   makeRunWorkflowResolver,
+  combinePaginatedSlurp,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -1954,6 +1961,59 @@ test("makeGhClient.checkRunsFor uses filter=all (server must not pre-filter to l
   void seen;
 });
 
+test("combinePaginatedSlurp: concatenates multi-page ARRAY endpoints (gh --paginate --slurp)", () => {
+  // --slurp emits ONE JSON doc: a top-level array of per-page bodies. For an
+  // array endpoint (e.g. /reviews, /pulls/{n}/commits) each page is itself an
+  // array; the pages concatenate in order.
+  const out = JSON.stringify([[{ id: 1 }, { id: 2 }], [{ id: 3 }]]);
+  assert.deepEqual(combinePaginatedSlurp(out, { shape: "array" }), [{ id: 1 }, { id: 2 }, { id: 3 }]);
+  // Single page (slurp still wraps): [[...]] -> [...].
+  assert.deepEqual(combinePaginatedSlurp(JSON.stringify([[{ id: 9 }]]), { shape: "array" }), [{ id: 9 }]);
+  // Empty first/only page -> [].
+  assert.deepEqual(combinePaginatedSlurp(JSON.stringify([[]]), { shape: "array" }), []);
+  // A non-array page is a MALFORMED response -> FAIL CLOSED (throw), never a
+  // silent empty result (codex-converge: silent-skip would fail OPEN).
+  assert.throws(
+    () => combinePaginatedSlurp(JSON.stringify([{ not: "an array" }]), { shape: "array" }),
+    /not an array/,
+  );
+});
+
+test("combinePaginatedSlurp: merges the arrayField across pages (object endpoints like /check-runs)", () => {
+  const out = JSON.stringify([
+    { total_count: 3, check_runs: [{ name: "a" }, { name: "b" }] },
+    { total_count: 3, check_runs: [{ name: "c" }] },
+  ]);
+  assert.deepEqual(
+    combinePaginatedSlurp(out, { arrayField: "check_runs" }),
+    [{ name: "a" }, { name: "b" }, { name: "c" }],
+  );
+  // A page missing/!array on the field is a MALFORMED response -> FAIL CLOSED
+  // (throw), never silently treated as "no items" (codex-converge: fail-open).
+  assert.throws(
+    () => combinePaginatedSlurp(JSON.stringify([{ check_runs: [{ name: "x" }] }, {}]), { arrayField: "check_runs" }),
+    /missing array field/,
+  );
+});
+
+test("combinePaginatedSlurp: the >1-page shape that BROKE the old newline-split now parses (anti-fabrication fetch regression)", () => {
+  // Reproduce the OLD failure input: gh's raw --paginate output concatenates page
+  // bodies with NO separator ("}{"), which split(/\n(?=\{)/) could not divide, so
+  // JSON.parse of the whole blob threw "Unexpected non-whitespace character after
+  // JSON at position N" — caught upstream as "GitHub API unavailable" and failed
+  // the high-risk approval check CLOSED (blocking owner-approved merges).
+  const rawConcatNoSeparator =
+    JSON.stringify({ check_runs: [{ n: 1 }] }) + JSON.stringify({ check_runs: [{ n: 2 }] });
+  assert.throws(
+    () => JSON.parse(rawConcatNoSeparator),
+    /after JSON/,
+    "old approach: JSON.parse of gh's separator-less page concatenation throws",
+  );
+  // The NEW path consumes gh's --slurp document (a single valid array of pages).
+  const slurped = JSON.stringify([{ check_runs: [{ n: 1 }] }, { check_runs: [{ n: 2 }] }]);
+  assert.deepEqual(combinePaginatedSlurp(slurped, { arrayField: "check_runs" }), [{ n: 1 }, { n: 2 }]);
+});
+
 test("makeGhClient.workflowRun fetches the run AND its latest-attempt jobs (PAGINATED), fail-closed shape", () => {
   // The resolver must read the run object AND the run's latest-attempt jobs
   // (GET /actions/runs/{id}/jobs, default filter=latest), paginated so a failed
@@ -2021,4 +2081,316 @@ test("WF-id end-to-end: analyzePostMerge gate-arm record where a context referen
     suiteFile: WF_SUITE, checkRuns: wfCheckRuns(), runWorkflow: wfResolverOk({ tagSha: "0".repeat(40) }),
   });
   assert.ok(r.findings.some((f) => f.code === "gate-suite-fabricated"), JSON.stringify(r.findings));
+});
+
+// =========================================================================
+// §5 — content/diff binding (engineering#483 keystone). Rebinds approval
+// staleness from tree-exact to the reviewed CHANGE's content fingerprint.
+// Injected/pure tests for the wiring; real-git tests for the fingerprint
+// contract (incl. the #919 batch-history case, the git patch-id whitespace
+// hole, and binary / rename / filemode coverage). The mandatory post-merge
+// verify on the real merged SHA remains the backstop (asserted at the epic
+// level, not here) — content binding is intentionally weaker than tree binding.
+// =========================================================================
+
+// ---- verifyReviewedLine: the injected staleness resolver -----------------
+
+test("§5 content-bind: approved sha != head but contentBinds=>true is NOT stale (rebase/update-branch survives)", () => {
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => true });
+  assert.equal(v.ok, true, JSON.stringify(v.reasons));
+  assert.ok(!v.reasons.some((r) => /STALE/.test(r)));
+});
+
+test("§5 content-bind: contentBinds=>false is STALE (materially changed diff)", () => {
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => false });
+  assert.equal(v.ok, false);
+  assert.ok(v.reasons.some((r) => /STALE/.test(r) && !/content unverifiable/.test(r)));
+});
+
+test("§5 content-bind: contentBinds=>undefined is STALE + flagged content unverifiable (fail closed)", () => {
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => undefined });
+  assert.equal(v.ok, false);
+  assert.ok(v.reasons.some((r) => /STALE/.test(r) && /content unverifiable/.test(r)));
+});
+
+test("§5 content-bind: NO resolver + differing sha => STALE (exact-sha back-compat preserved)", () => {
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
+  assert.equal(v.ok, false);
+  assert.ok(v.reasons.some((r) => /STALE/.test(r)));
+});
+
+test("§5 content-bind: exact sha match => not stale, resolver NEVER consulted (fast path)", () => {
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => { throw new Error("resolver must not be called on the exact-sha fast path"); } });
+  assert.equal(v.ok, true, JSON.stringify(v.reasons));
+});
+
+// ---- resolveContentMatch: the post-merge content bridge ------------------
+
+test("§5 resolveContentMatch: equal fingerprints => true", () => {
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => "base-m", mergeBase: () => "base-h", fingerprint: () => "FP" }), true);
+});
+
+test("§5 resolveContentMatch: differing fingerprints => false", () => {
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => "base-m", mergeBase: () => "base-h", fingerprint: (b) => (b === "base-m" ? "FP-M" : "FP-H") }), false);
+});
+
+test("§5 resolveContentMatch: either fingerprint null => undefined (fail closed)", () => {
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => "base-m", mergeBase: () => "base-h", fingerprint: (b) => (b === "base-m" ? "FP" : null) }), undefined);
+});
+
+test("§5 resolveContentMatch: firstParent unresolvable (fork/shallow) => undefined", () => {
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => null, mergeBase: () => "base-h", fingerprint: () => "FP" }), undefined);
+});
+
+test("§5 resolveContentMatch: merge-base unresolvable => undefined", () => {
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => "base-m", mergeBase: () => null, fingerprint: () => "FP" }), undefined);
+});
+
+test("§5 resolveContentMatch: no reviewed head => undefined", () => {
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: null }), undefined);
+});
+
+// ---- makeContentBinds: the staleness resolver factory --------------------
+
+test("§5 makeContentBinds: no anchor => null (caller falls back to exact-sha)", () => {
+  assert.equal(makeContentBinds({ anchor: null }), null);
+});
+
+test("§5 makeContentBinds: exact approved==reviewed => true without touching git", () => {
+  const binds = makeContentBinds({ anchor: "origin/main", mergeBase: () => { throw new Error("no git on exact match"); }, fingerprint: () => { throw new Error("no git"); } });
+  assert.equal(binds("s".repeat(40), "s".repeat(40)), true);
+});
+
+test("§5 makeContentBinds: equal fingerprints => true; per-side differ => false; null => undefined", () => {
+  assert.equal(makeContentBinds({ anchor: "origin/main", mergeBase: (a, b) => `mb-${b}`, fingerprint: () => "SAME" })(OLD, HEAD), true);
+  assert.equal(makeContentBinds({ anchor: "origin/main", mergeBase: (a, b) => `mb-${b}`, fingerprint: (base) => base })(OLD, HEAD), false);
+  assert.equal(makeContentBinds({ anchor: "origin/main", mergeBase: () => null, fingerprint: () => "X" })(OLD, HEAD), undefined);
+});
+
+// ---- analyzePostMerge: tree fast-path + content fallback -----------------
+
+function cbPostCtx(extra) {
+  return {
+    message: ["feat: button", "", "Assisted-by: Claude Code (claude-opus-4-8)", "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n"),
+    changedFiles: ["src/Button.tsx"], defaults: DEFAULTS_OK, repoSuite: null,
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }],
+    prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" }, apiBound: true,
+    ...extra,
+  };
+}
+
+test("§5 analyzePostMerge: treeMatch=true wins even if contentMatch=false (byte-identical tree is the strongest proof)", () => {
+  assert.deepEqual(analyzePostMerge(cbPostCtx({ treeMatch: true, contentMatch: false })).findings, []);
+});
+
+test("§5 analyzePostMerge: treeMatch=false but contentMatch=true => PASS (mechanical rebase; the keystone relaxation)", () => {
+  assert.deepEqual(analyzePostMerge(cbPostCtx({ treeMatch: false, contentMatch: true })).findings, []);
+});
+
+test("§5 analyzePostMerge: tree UNVERIFIABLE (fork head) but contentMatch=true => PASS (fixes the ci#55/#844 fork case)", () => {
+  assert.deepEqual(analyzePostMerge(cbPostCtx({ treeMatch: undefined, contentMatch: true })).findings, []);
+});
+
+test("§5 analyzePostMerge: contentMatch=false => content-mismatch, not tree-mismatch", () => {
+  const r = analyzePostMerge(cbPostCtx({ treeMatch: false, contentMatch: false }));
+  assert.ok(r.findings.some((f) => f.code === "content-mismatch"), JSON.stringify(r.findings));
+  assert.ok(!r.findings.some((f) => f.code === "tree-mismatch"));
+});
+
+test("§5 analyzePostMerge: contentMatch=false with tree UNVERIFIABLE => content-mismatch (affirmative, stronger than unverifiable)", () => {
+  assert.ok(analyzePostMerge(cbPostCtx({ treeMatch: undefined, contentMatch: false })).findings.some((f) => f.code === "content-mismatch"));
+});
+
+test("§5 analyzePostMerge: tree-mismatch PRESERVED when content is undefined (no weaker than today)", () => {
+  assert.ok(analyzePostMerge(cbPostCtx({ treeMatch: false, contentMatch: undefined })).findings.some((f) => f.code === "tree-mismatch"));
+});
+
+test("§5 analyzePostMerge: tree-unverifiable PRESERVED when BOTH tree and content undefined + arm (fail closed)", () => {
+  assert.ok(analyzePostMerge(cbPostCtx({ treeMatch: undefined, contentMatch: undefined })).findings.some((f) => f.code === "tree-unverifiable"));
+});
+
+test("§5 analyzePostMerge: content binding does NOT bypass the high-risk maintainer arm", () => {
+  const message = ["ci: change workflow", "", "Assisted-by: Claude Code (claude-opus-4-8)", "Gate-suite: cinatra-core@2026.06", "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)"].join("\n");
+  const checkRuns = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const r = analyzePostMerge({
+    message, changedFiles: [".github/workflows/ci.yml"], defaults: DEFAULTS_OK, repoSuite: SUITE_FILE,
+    reviews: [], prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: {},
+    suiteFile: SUITE_FILE, checkRuns, treeMatch: false, contentMatch: true, apiBound: true,
+  });
+  assert.ok(r.findings.some((f) => f.code === "high-risk-without-maintainer"), JSON.stringify(r.findings));
+});
+
+// ---- contentFingerprint: real git (the fingerprint contract) -------------
+
+function cbCommit(g, msg) { g("add", "-A"); g("commit", "-q", "-m", msg); return g("rev-parse", "HEAD").stdout.trim(); }
+const cbLines = (n) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+
+test("§5 contentFingerprint: #919 — the same change replayed on a moved base (main edits the SAME file OUTSIDE the hunk) is STABLE", () => {
+  const { dir, g } = tmpRepo();
+  const base = cbLines(20);
+  fs.writeFileSync(path.join(dir, "f.txt"), base);
+  const baseX = cbCommit(g, "base");
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 10\n", "line 10 CHANGED\n"));
+  const reviewedHead = cbCommit(g, "pr on X");
+  const fpReviewed = contentFingerprint(baseX, reviewedHead, dir);
+  g("checkout", "-q", baseX);
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 2\n", "line 2 mainmoved\n"));
+  fs.writeFileSync(path.join(dir, "h.txt"), "unrelated\n");
+  const baseY = cbCommit(g, "main move");
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 2\n", "line 2 mainmoved\n").replace("line 10\n", "line 10 CHANGED\n"));
+  const landed = cbCommit(g, "landed");
+  const fpLanded = contentFingerprint(baseY, landed, dir);
+  assert.ok(fpReviewed && fpLanded);
+  assert.equal(fpLanded, fpReviewed, "approval must survive a benign same-file outside-hunk base move (#919)");
+  assert.notEqual(g("rev-parse", `${reviewedHead}:f.txt`).stdout.trim(), g("rev-parse", `${landed}:f.txt`).stdout.trim(),
+    "post-image text blob differs — a newsha-in-S design (v1) would have false-invalidated");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: a materially changed +/- line yields a DIFFERENT fingerprint (fabrication-resistant)", () => {
+  const { dir, g } = tmpRepo();
+  const base = cbLines(20);
+  fs.writeFileSync(path.join(dir, "f.txt"), base);
+  const b = cbCommit(g, "base");
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 10\n", "line 10 CHANGED\n"));
+  const a1 = cbCommit(g, "reviewed");
+  const fpA = contentFingerprint(b, a1, dir);
+  g("checkout", "-q", b);
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 10\n", "line 10 DIFFERENT\n"));
+  const a2 = cbCommit(g, "changed");
+  assert.notEqual(fpA, contentFingerprint(b, a2, dir));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: whitespace-only-different removed line => DIFFERENT fingerprint (closes the git patch-id whitespace hole)", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "w.txt"), "a\n  spacey\nb\n");
+  const b1 = cbCommit(g, "sp base");
+  fs.writeFileSync(path.join(dir, "w.txt"), "a\nx\nb\n");
+  const fpSpace = contentFingerprint(b1, cbCommit(g, "sp head"), dir);
+  g("checkout", "-q", "-b", "tabbr", b1);
+  fs.writeFileSync(path.join(dir, "w.txt"), "a\n\tspacey\nb\n");
+  const b2 = cbCommit(g, "tab base");
+  fs.writeFileSync(path.join(dir, "w.txt"), "a\nx\nb\n");
+  const fpTab = contentFingerprint(b2, cbCommit(g, "tab head"), dir);
+  assert.ok(fpSpace && fpTab);
+  assert.notEqual(fpSpace, fpTab, "a 2-space vs a tab removed line must not collide (git patch-id --stable does)");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: a filemode-only change (exec bit) is bound and non-empty", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "s.sh"), "#!/bin/sh\necho hi\n");
+  const b = cbCommit(g, "base");
+  fs.chmodSync(path.join(dir, "s.sh"), 0o755);
+  const h = cbCommit(g, "chmod");
+  const fp = contentFingerprint(b, h, dir);
+  assert.ok(fp && fp !== "empty", `a pure mode change must be a non-empty bound fingerprint (got ${fp})`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: a pure rename is bound (status R + dest path) and non-empty", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "r.txt"), "long enough content to be detected as a rename\nsecond line also present\n");
+  const b = cbCommit(g, "base");
+  g("mv", "r.txt", "r2.txt");
+  const fp = contentFingerprint(b, cbCommit(g, "rename"), dir);
+  assert.ok(fp && fp !== "empty");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: different BINARY post-images at the same path do NOT collide (newsha in S binds what T is blind to)", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([0, 1, 2, 255, 254, 3, 4]));
+  const b = cbCommit(g, "base");
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([0, 1, 2, 255, 254, 3, 4, 42, 43]));
+  const h1 = cbCommit(g, "bin change 1");
+  const fp1 = contentFingerprint(b, h1, dir);
+  g("checkout", "-q", b);
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([0, 1, 2, 255, 254, 3, 4, 99]));
+  const fp2 = contentFingerprint(b, cbCommit(g, "bin change 2"), dir);
+  assert.ok(fp1 && fp2);
+  assert.notEqual(fp1, fp2, "T shows only 'Binary files differ' for both — only the S newsha distinguishes them");
+  assert.ok(binaryPathsOf(b, h1, dir).has("b.bin"), "binaryPathsOf must detect the binary destination path");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: empty diff => 'empty' sentinel; unresolvable ref => null (fail closed)", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "a.txt"), "x\n");
+  const c = cbCommit(g, "base");
+  assert.equal(contentFingerprint(c, c, dir), "empty");
+  assert.equal(contentFingerprint("dead".repeat(10), c, dir), null);
+  assert.equal(contentFingerprint(c, "dead".repeat(10), dir), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint: two DIFFERENT deleted binary blobs at one path do NOT collide (delete binds pre-image oldsha)", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "keep.txt"), "x\n");
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([0, 1, 2, 255, 7]));
+  const baseV1 = cbCommit(g, "base v1");
+  fs.rmSync(path.join(dir, "b.bin"));
+  const fpDelV1 = contentFingerprint(baseV1, cbCommit(g, "delete v1"), dir);
+  // a base where the same path holds a DIFFERENT binary blob, then deleted
+  g("checkout", "-q", "-b", "alt", baseV1);
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([9, 9, 9, 254, 8, 8]));
+  const baseV2 = cbCommit(g, "base v2");
+  fs.rmSync(path.join(dir, "b.bin"));
+  const fpDelV2 = contentFingerprint(baseV2, cbCommit(g, "delete v2"), dir);
+  assert.ok(fpDelV1 && fpDelV2);
+  assert.notEqual(fpDelV1, fpDelV2, "deleting different binary blobs at one path must not bind to the same approval");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 binaryPathsOf: normal detection returns a Set; a git error returns null (fail closed)", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([0, 1, 2, 255]));
+  const b = cbCommit(g, "base");
+  fs.writeFileSync(path.join(dir, "b.bin"), Buffer.from([0, 1, 2, 255, 3]));
+  const h = cbCommit(g, "change");
+  assert.ok(binaryPathsOf(b, h, dir) instanceof Set);
+  assert.equal(binaryPathsOf("dead".repeat(10), h, dir), null, "a git error must fail closed to null, never an empty Set");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 firstParentOf / mergeBaseOf: resolve real refs; return null on bad input", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "a.txt"), "1\n");
+  const c1 = cbCommit(g, "c1");
+  fs.writeFileSync(path.join(dir, "a.txt"), "2\n");
+  const c2 = cbCommit(g, "c2");
+  assert.equal(firstParentOf(c2, dir), c1);
+  assert.equal(firstParentOf(c1, dir), null, "root commit has no first parent");
+  assert.equal(mergeBaseOf(c1, c2, dir), c1);
+  assert.equal(mergeBaseOf("dead".repeat(10), c2, dir), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 resolveContentMatch + makeContentBinds (real git): reviewed head vs squash landed on a moved base binds; a materially different landing does not", () => {
+  const { dir, g } = tmpRepo();
+  const base = cbLines(12);
+  fs.writeFileSync(path.join(dir, "f.txt"), base);
+  const main0 = cbCommit(g, "main0");
+  g("checkout", "-q", "-b", "pr", main0);
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 6\n", "line 6 EDIT\n"));
+  const reviewedHead = cbCommit(g, "pr edit");
+  g("checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 1\n", "line 1 MAIN\n"));
+  const main1 = cbCommit(g, "main1");
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 1\n", "line 1 MAIN\n").replace("line 6\n", "line 6 EDIT\n"));
+  const landed = cbCommit(g, "squash land");
+  assert.equal(resolveContentMatch({ commit: landed, reviewedHeadSha: reviewedHead, cwd: dir }), true,
+    "the content bridge must bind the reviewed change to the landed squash across the base move");
+  assert.equal(makeContentBinds({ anchor: firstParentOf(landed, dir), cwd: dir })(reviewedHead, landed), true);
+  g("checkout", "-q", main1);
+  fs.writeFileSync(path.join(dir, "f.txt"), base.replace("line 1\n", "line 1 MAIN\n").replace("line 6\n", "line 6 TOTALLY DIFFERENT\n"));
+  const landedBad = cbCommit(g, "bad land");
+  assert.equal(resolveContentMatch({ commit: landedBad, reviewedHeadSha: reviewedHead, cwd: dir }), false);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

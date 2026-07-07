@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * gate-suite-index-selfcheck — OFFLINE structural check of the committed
- * org-wide gate-suite audit index (cinatra-engineering#119 §4), for the
+ * org-wide gate-suite audit index (the Truthful Attribution protocol §4), for the
  * hermetic self-check (no GitHub token).
  *
  * This does NOT do the live drift scan (a fresh read of every inventoried

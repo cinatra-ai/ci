@@ -1,7 +1,7 @@
 name: extension-ioc-gate
 
-# Reusable workflow: the extension→host IoC conformance gate
-# (cinatra-engineering#156). A consuming extension repo calls it from its own
+# Reusable workflow: the extension→host IoC conformance gate.
+# A consuming extension repo calls it from its own
 # thin caller — replacing the connector/artifact/skill `kind-gates` placeholder:
 #
 #   jobs:

@@ -1,5 +1,5 @@
-// Tests for the reusable extension→host IoC conformance gate
-// (cinatra-engineering#156): the rule library + the CLI + the REAL cross-repo
+// Tests for the reusable extension→host IoC conformance gate:
+// the rule library + the CLI + the REAL cross-repo
 // parity guard against the cinatra monorepo source of truth.
 
 import { test } from "node:test";

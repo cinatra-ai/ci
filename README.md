@@ -84,11 +84,20 @@ jobs:
 Suggested per-repo profiles: `cinatra` → `ts-monorepo`, `wordpress-plugin` →
 `php-wp-plugin`, `drupal-module` → `drupal-module`.
 
+`public-strict` is the hardened profile for **public** repos: it runs the full
+base rule set **plus** rules that flag the full-form private-tracker issue
+reference (the bare `<private-tracker>#<n>` form and the bare legacy repo name)
+that the base rules deliberately allow — that form is the org-sanctioned
+cross-repo citation style for **private** repos' content, so it stays permitted
+under every other profile and is blocked only where public repos opt in. Adopt
+it per-repo (scrub any pre-existing hits first, since `ratchet_mode: line`
+grandfathers existing lines but blocks net-new ones).
+
 ### Inputs
 
 | Input | Default | Meaning |
 |-------|---------|---------|
-| `profile` | `default` | Rule profile: `default`, `ts-monorepo`, `php-wp-plugin`, `drupal-module`, `ops-docs`. |
+| `profile` | `default` | Rule profile: `default`, `ts-monorepo`, `php-wp-plugin`, `drupal-module`, `ops-docs`, `public-strict`. |
 | `manifest` | _(none)_ | Include/negation manifest to scope the scan to a published file set. |
 | `config` | _(none)_ | Per-repo JSON config (extra rules, token lists, scope tweaks). |
 | `rules` | _(all)_ | Comma-separated rule-ID allowlist. |
@@ -122,6 +131,26 @@ introduced ones block.
 - **baseline**: a marker-free per-(rule, file) count snapshot; only counts above
   the baseline block.
 - **off**: every finding blocks (used by this repo's own self-check).
+
+### Private-tracker references
+
+A default rule (`SLG_PRIVATE_ENG_REF`) flags references to the **private**
+`cinatra-ai/engineering` issue tracker leaking into a public repo:
+
+- `eng#<n>` and `cinatra-engineering#<n>` shorthands (the latter also catches
+  the `cinatra-ai/cinatra-engineering#<n>` legacy form);
+- the full `cinatra-ai/engineering` repo path (including `#<n>` and
+  `/issues/<n>` URL forms);
+- the bare `engineering/issues/` URL tail.
+
+Public-repo references — `cinatra#231`, `cinatra-cli#61`, `cinatra-ai/cinatra` —
+are **not** flagged; those are deliberately public and should stay. Like every
+content rule it rides the **line ratchet**, so it blocks only newly-added
+references and never reds an already-unclean repo before its sweep finishes.
+Don't cite a private issue number in committed source: describe the change, or
+name a public spec/protocol (e.g. "the Truthful Attribution protocol"). For a
+genuinely-public reference, allowlist the single line via `config.lineExcludes`
+(full-line-anchored) or the whole file via `config.exemptFileBasenames`.
 
 ### Per-repo config
 
@@ -172,8 +201,8 @@ generated-file lists. It is the org-wide generalization of the cinatra monorepo'
 per-package audit gates (`scripts/audit/extension-{import-ban,host-peer-value-
 import-ban,deps-gate,readme-gate,license-gate}.mjs` + the SDK manifest schema).
 
-It **consumes** (does not duplicate) the SDK validator substrate
-(cinatra-engineering#163): the host-port grammar is checked against the
+It **consumes** (does not duplicate) the SDK validator substrate:
+the host-port grammar is checked against the
 substrate's `TEST_HOST_PORT_NAMES`, and `--register-probe` runs the package's
 `register(ctx)` against the faithful grant-aware `createTestHostContext`, both
 imported from a **byte-identical vendored** copy at
@@ -258,6 +287,88 @@ self-check job) and asserts every pinned value matches — the build-server-entr
 cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
    scripts/lib/vendor/test-host-context.mjs
 ```
+
+## hot-install-canary-gate
+
+A reusable GitHub Actions workflow that RUNS the host repo's **cross-kind
+no-rebuild hot-install canary harness** — the one terminal proof for the full
+extension hot-installability milestone. Unlike the other gates, the engine here
+is NOT a `scripts/*.mjs` in this repo: the harness is a single, DB-less,
+in-process root-vitest file that lives in the host repo (cinatra) at
+`src/lib/__tests__/hot-install-canary-harness.test.ts`. This workflow checks out
+the **caller** (the host) at the PR head and runs that harness, so the proof
+always covers the exact branch under test.
+
+For every extension kind — connector, agent, skill, artifact, workflow,
+cube/portlet — the harness proves
+`install -> surface appears -> disable -> surface disappears -> uninstall ->
+teardown` with **no rebuild, no restart, and no `src/lib/generated/**`
+regeneration** (the keystone oracle: generated-tree hash + process pid +
+per-file mtime, re-checked after every kind). It also asserts the
+direct-invocation refusals (a disabled agent's `agent_run` refuses, a disabled
+cube serves `cube_not_active` on BOTH the HTTP and MCP transports, an archived
+artifact type's direct write is denied, a disabled skill is not resolvable, a
+disabled connector's render anchor is not live) and the negative cases
+(unsigned/untrusted, cross-org actor, stale static reference, and a
+closure-package-without-a-v2-signature install refusal). A **source-wiring
+guard** inside the harness pins the live production call-sites to those gates so
+the proof cannot rot into dead code.
+
+### Why caller-checkout (not a hardcoded host ref)
+
+The harness AND the host's `./.github/actions/clone-extensions` composite both
+live in the host repo, so checking out the **caller** gives the exact
+branch-under-test copy of both — the gate proves the code on the PR head, never
+a drifted `main`. A **fail-closed presence guard** runs first: it asserts the
+harness file exists and still carries both its keystone-oracle and
+source-wiring-guard sections, so a caller PR cannot silently delete or hollow
+the proof and have the gate pass vacuously.
+
+### "Build the image once" — honest realization
+
+The milestone's executable-proof issue framed this as "build the app image once,
+then install fixtures without rebuild." The harness was deliberately written to
+be DB-less and in-process (a `vi.mock` injects the canonical-store reader the
+real runtime-install gates consume), so it needs **no built image, no container,
+and no live DB**. A plain `vitest run` IS the no-rebuild proof — the keystone
+oracle is the in-process assertion that the generated tree is byte-identical and
+the process never restarted across every kind's full lifecycle. This gate
+therefore does not claim image-level coverage; it runs the harness whose
+in-process oracle is the no-regeneration assertion.
+
+### Use it from the host repo
+
+Add a thin caller workflow in the host repo and wire its job as a required
+status check on the milestone/default branch. The harness imports host workspace
+packages, so the caller's job (this reusable workflow) clones the pinned
+companion extension repos and runs `pnpm install --frozen-lockfile` before the
+harness:
+
+```yaml
+name: hot-install-canary-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  hot-install-canary-gate:
+    # In production pin the workflow ref (`@<sha>`) to an immutable commit.
+    uses: cinatra-ai/ci/.github/workflows/hot-install-canary-gate.yml@main  # @<sha> in prod
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `harness` | `src/lib/__tests__/hot-install-canary-harness.test.ts` | Path (in the caller repo) to the no-rebuild canary harness vitest file. |
+| `vitest-config` | `vitest.config.ts` | Path (in the caller repo) to the vitest config hosting `src/**` unit tests. |
+
+### Artifacts
+
+The harness emits a JUnit report (`hot-install-canary-report.junit.xml`),
+uploaded on every run, so a per-kind failure is actionable for the owning repo.
 
 ## docs-contract-gate
 
@@ -407,7 +518,7 @@ Zero runtime dependencies (Node built-ins only); requires Node 24+.
 
 A reusable GitHub Actions workflow + check that keeps a repo's
 `.github/secrets-required.txt` manifest in lockstep with the secrets its
-workflows actually reference (cinatra-engineering#315). Deterministic and
+workflows actually reference. Deterministic and
 repo-local (no GitHub API), so it is safe to wire as a required PR/push status
 check. It fails on two drift classes:
 
@@ -465,7 +576,7 @@ node --test scripts/__tests__/secrets-required-gate.test.mjs
 A reusable engine that detects drift between a repo's COMMITTED
 release-governance manifests (`.github/branch-protections.json`,
 `.github/tag-protections.json`, optional `.github/baseline-protection.json`) and
-the LIVE GitHub config they describe (cinatra-engineering#315). A release
+the LIVE GitHub config they describe. A release
 governance closeout audit found four manifest-vs-live drifts that had to be
 reconciled by hand; this gate makes that self-policing.
 
@@ -520,13 +631,95 @@ GOVERNANCE_DRIFT_READ_TOKEN=<token> \
 node --test scripts/__tests__/governance-drift-gate.test.mjs
 ```
 
+## release-workflow-pin-drift-gate
+
+Fails **closed** if any extension / connector repo's
+`.github/workflows/release.yml` calls the central
+`reusable-extension-release.yml` at a ref whose `release` job is **not** behind
+the `release-approval` Environment — i.e. a ref that would let a `v*` tag
+publish with **no** human-approval pause.
+
+**The trap it closes — opt-in vs enforced-default.** The `release-approval`
+wall is applied per repo by *pinning the gated reusable-workflow ref*. A
+security control that is opt-in-per-repo fails **open** for every repo that did
+not opt in — an older pin left behind, or a new/scaffolded repo that copies an
+old `release.yml`. This gate makes the wall enforced-by-default: it scans
+**every** org repo and reds the moment any one of them pins a non-gated ref, so
+a fail-open pin cannot sit undetected. (This is the same class of bug as an
+auth check that ships fail-open-by-default with an opt-in flag: the fix is
+never "remember to opt in each repo" — it is a default that fails closed and a
+gate that proves it.)
+
+The gated set is a **curated allowlist of gated SHAs**
+(`config/release-workflow-gated-refs.json`), not a "minimum ref" — commit SHAs
+are not orderable. Every ref whose reusable-release `release` job carries
+`environment: release-approval` goes in the list; a ref not in the list is
+treated as ungated. Publishing a **new** gated reusable-workflow tag ⇒ verify
+its release job still carries the wall, then add its SHA to the allowlist (and
+bump the extension repos onto it). A repo whose `release.yml` publishes
+elsewhere (e.g. a direct `npm publish`, or no reusable call) is skipped; a repo
+with no `release.yml` is skipped.
+
+### Why it is SCHEDULED, not a required PR check
+
+The drift lives in repos **other** than the one a PR touches, and enumerating
+org repos + reading each `release.yml` needs a token a fork PR does not have.
+So this runs on a schedule / on demand only.
+
+- Pass an operator-provisioned fine-grained PAT or App token
+  (repo `contents: read` across the org + `read:org`) as the
+  `release_pin_read_token` secret; it also honors `GH_TOKEN`/`GITHUB_TOKEN`.
+- When **no** token is available the gate **skips green** (`exit 0` + a
+  `::notice`) so it can ship before the token is provisioned.
+- When a token is **present** but a read fails / returns unparseable data, the
+  gate **hard fails** — a degraded privileged read must not mask drift.
+
+### Residual gap (documented honestly)
+
+A scheduled scan **detects and reds** drift; it does not physically stop a `v*`
+tag that fires on an ungated ref in the window before the next scan +
+remediation. The physical stop for an already-gated repo is the reusable
+workflow's own `environment: release-approval` (and, defense-in-depth, a
+self-guard step inside it). This gate is the enforced-by-default backstop that
+keeps every repo *on* a gated ref.
+
+### Use it from another repo
+
+```yaml
+name: release-workflow-pin-drift-gate
+on:
+  schedule: [{ cron: "23 6 * * *" }]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  release-workflow-pin-drift-gate:
+    uses: cinatra-ai/ci/.github/workflows/release-workflow-pin-drift-gate.yml@<sha>  # vX.Y.Z
+    with:
+      org: cinatra-ai
+      ref: <sha>  # the SAME 40-char SHA as the workflow @ref
+    secrets:
+      release_pin_read_token: ${{ secrets.RELEASE_PIN_DRIFT_READ_TOKEN }}
+```
+
+### Run locally
+
+```sh
+# offline: audit a { repo -> release.yml text|null } map against the allowlist
+node scripts/release-workflow-pin-drift-gate.mjs --root <dir> --repos-json repos.json
+# live: scan the whole org via `gh` (needs a token; --only scopes to a subset)
+GH_TOKEN=$(gh auth token) \
+  node scripts/release-workflow-pin-drift-gate.mjs --live --org cinatra-ai
+node --test scripts/__tests__/release-workflow-pin-drift-gate.test.mjs
+```
+
 ## doc-code-value-gate
 
 A reusable GitHub Actions workflow + engine for the **"a doc asserts a code
 value"** drift class: it fails CI when the value a documentation file claims
 drifts from the value the source-of-truth file actually carries. The recurring
 failure mode of version/ABI constants is a README that quietly diverges from the
-`const` it documents (cinatra-engineering#152); this gate pins that mechanically
+`const` it documents; this gate pins that mechanically
 and is the org template for every doc-asserts-a-code-value case.
 
 Each assertion pairs a `doc` side with a `code` side. A side names a `file` and
@@ -985,9 +1178,9 @@ and fail-loud on a bad pin / diff base.
 
 ## truthful-attribution-gate
 
-The org-wide gate for the **truthful verification-record model** ratified in
-[cinatra-engineering#119](https://github.com/cinatra-ai/cinatra-engineering/issues/119)
-(it re-scopes and supersedes the old no-AI-attribution gate, #116). Every merge
+The org-wide gate for the **truthful verification-record model** — the
+**Truthful Attribution protocol** (it supersedes the earlier paused
+no-AI-attribution gate). Every merge
 carries a truthful record: an `Assisted-by:` transparency trailer (what produced
 the change) plus one verification arm — a human `Reviewed-by:` (a real,
 non-self, non-stale GitHub PR approval by a login whose repo permission meets the

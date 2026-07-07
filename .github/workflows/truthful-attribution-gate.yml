@@ -1,8 +1,9 @@
 name: truthful-attribution-gate
 
 # Reusable workflow_call gate — the truthful verification-record model
-# (cinatra-engineering#119; re-scopes/supersedes the paused #116 no-AI-attribution
-# gate). It does NOT ban AI records — it REQUIRES truthful ones and verifies them:
+# (the Truthful Attribution protocol; supersedes the earlier paused
+# no-AI-attribution gate). It does NOT ban AI records — it REQUIRES truthful
+# ones and verifies them:
 #   - presence: a §1 trailer block (Assisted-by mandatory; a verification arm);
 #   - anti-fabrication: a Reviewed-by must match a real, non-self, non-stale PR
 #     approval at the reviewed head by a login whose repo permission meets the
