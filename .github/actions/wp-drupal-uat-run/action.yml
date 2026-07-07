@@ -92,7 +92,11 @@ runs:
       # moved under `instance`; packages/cli/bin/cinatra.mjs is now only a
       # deploy-compat forwarder and `setup dev` is an unknown command. The
       # workspace script is the stable invocation surface.
-      run: corepack pnpm setup:dev
+      # --pinned flows through to setup's own dev-extension sync so it accepts
+      # (and re-pins) the detached lock-sha checkouts made above — without it
+      # the sync refuses the detached HEAD ("branch 'main' is expected") and
+      # exits non-zero.
+      run: corepack pnpm setup:dev --pinned
 
     - name: Bring up docker WordPress + Drupal (bind sources now exist)
       shell: bash
