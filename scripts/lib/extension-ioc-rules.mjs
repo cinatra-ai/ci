@@ -49,7 +49,7 @@ import { TEST_HOST_PORT_NAMES } from "./vendor/test-host-context.mjs";
 // the cross-repo parity test fails if any of these drift from cinatra).
 
 /** The 5 extension kinds (manifest.ts CinatraManifest["kind"]). */
-export const VALID_KINDS = ["agent", "connector", "artifact", "skill", "workflow"];
+export const VALID_KINDS = ["agent", "connector", "artifact", "skill"];
 
 /**
  * The canonical host-port names a manifest's `requestedHostPorts` is validated
