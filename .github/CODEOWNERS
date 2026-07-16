@@ -1,5 +1,11 @@
 # Code owners for cinatra-ai/ci.
 # FULL-tier repos require CODEOWNERS per org governance policy.
-# Listed owners are requested for review on PRs touching matching paths.
+# Routine paths have NO code owner: no reviewer is auto-requested on ordinary PRs.
+# Security-relevant paths request the owner plus the org review account, so a
+# change to CI/workflows/gates or the dependency manifest gets explicit review.
 # Reference: https://docs.github.com/articles/about-code-owners
-* @groganz @megajustice
+
+# Security-relevant paths — request the owner + the org review account.
+/.github/ @groganz @megajustice
+/package.json @groganz @megajustice
+/package-lock.json @groganz @megajustice
