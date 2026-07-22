@@ -1,0 +1,95 @@
+name: meta-commentary-gate
+
+# Reusable workflow: the meta-commentary gate (cinatra-ai/docs#119, promoting the
+# repo-local check from cinatra-ai/docs#114 to a SHA-pinnable org-wide reusable).
+# Integration repos (wordpress-plugin, drupal-module, twenty-connector,
+# plane-connector) call it from a thin caller to keep their published `docs/`
+# pages free of meta/implementation commentary about how the docs THEMSELVES are
+# produced, compiled, mirrored, or maintained — generation mechanics, "forthcoming"/
+# placeholder transition notes, editorial TODOs, and the like. Product content that
+# merely uses words like "compiled"/"generated" to describe Cinatra the product is
+# not in scope (that is what the optional allowlist covers).
+#
+#   jobs:
+#     meta-commentary-gate:
+#       # Pin BOTH the workflow ref (`@<sha>`) and the `ref` input below to the
+#       # SAME 40-char commit SHA, so the gate ENGINE is not pulled from mutable
+#       # main under a caller that pinned only the workflow ref (`ref` is REQUIRED
+#       # and SHA-validated below). The `# vX.Y.Z` comment names the ci release
+#       # tag that SHA belongs to (see cinatra-ai/ci tags).
+#       uses: cinatra-ai/ci/.github/workflows/meta-commentary-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         docs: "docs"        # the docs/ directory to scan (default "docs")
+#         ref: <same-sha>
+#
+# Scans the caller's `docs/` tree (tracked Markdown only, via `git ls-files`) with
+# the SAME pattern list, line-pinned allowlist semantics, and expired-entry
+# handling as docs' own scripts/check-meta-commentary.mjs — the reusable enforces
+# exactly what the source repo does, scoped to one directory.
+#
+# ALLOWLIST (docs#119 step 3): the allowlist is OPTIONAL and per-repo — an ABSENT
+# file means an EMPTY allowlist. Integration `docs/` is product-only (the fixed
+# 6-page contract, no docs-about-docs pages), so no repo needs one today; a repo
+# that ever has a verified false positive adds its OWN
+# `.github/meta-commentary-gate-allowlist.json` (override the path with the
+# `allowlist` input). There is deliberately no cross-repo shared allowlist: each
+# repo owns and reviews its own exceptions. Node builtins only, fully offline.
+
+on:
+  workflow_call:
+    inputs:
+      docs:
+        description: "Path (in the caller repo) to the docs/ directory to scan."
+        type: string
+        default: "docs"
+      allowlist:
+        description: "Optional path (in the caller repo) to the reviewed false-positive allowlist. Absent file = empty allowlist."
+        type: string
+        default: ".github/meta-commentary-gate-allowlist.json"
+      ref:
+        description: "40-char commit SHA of this gate repo to check out. REQUIRED and must be an immutable SHA — a tag/branch (e.g. main) would let the gate engine change under a caller that pinned only the workflow ref."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  meta-commentary-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require an immutable SHA ref
+        env:
+          GATE_REF: ${{ inputs.ref }}
+        run: |
+          if ! printf '%s' "$GATE_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::meta-commentary-gate: 'ref' must be a 40-char commit SHA (got '$GATE_REF'). Pin the gate engine to an immutable SHA — never a branch/tag." >&2
+            exit 1
+          fi
+
+      - name: Checkout caller repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Checkout gate
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .meta-commentary-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        # Caller inputs are passed via ENV, never interpolated into the shell
+        # source, so a crafted `docs`/`allowlist` input cannot inject a command.
+        env:
+          MCG_DOCS: ${{ inputs.docs }}
+          MCG_ALLOWLIST: ${{ inputs.allowlist }}
+        run: |
+          node .meta-commentary-gate/scripts/check-meta-commentary.mjs \
+            --docs "$MCG_DOCS" \
+            --allowlist "$MCG_ALLOWLIST"

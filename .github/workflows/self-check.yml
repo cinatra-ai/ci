@@ -86,6 +86,14 @@ jobs:
             exit 1
           fi
 
+      - name: meta-commentary-gate passes the clean docs fixture + fails the violating fixture
+        run: |
+          node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/clean/docs
+          if node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/violating/docs; then
+            echo "::error::meta-commentary-gate did not fail the violating docs fixture" >&2
+            exit 1
+          fi
+
       - name: Design-system preset runs clean on its own repository
         run: npx eslint .
 
@@ -109,7 +117,8 @@ jobs:
             scripts/__tests__/extension-ioc-gate.test.mjs \
             scripts/__tests__/secrets-required-gate.test.mjs \
             scripts/__tests__/governance-drift-gate.test.mjs \
-            scripts/__tests__/release-workflow-pin-drift-gate.test.mjs
+            scripts/__tests__/release-workflow-pin-drift-gate.test.mjs \
+            scripts/__tests__/check-meta-commentary.test.mjs
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,
