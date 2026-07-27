@@ -1,0 +1,19 @@
+# Self-caller for the org baseline source-leak gate — see self-actions-pinned-gate.yml
+# for why this repo needs its own thin callers.
+name: source-leak-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  source-leak-gate:
+    uses: cinatra-ai/ci/.github/workflows/source-leak-gate.yml@83ca29ef8df0a33d11ba02568c61f2fdc56a3eaf # v0.1.1
+    with:
+      profile: default
+      ratchet_mode: line
+      ref: 83ca29ef8df0a33d11ba02568c61f2fdc56a3eaf
