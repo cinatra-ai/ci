@@ -25,13 +25,19 @@ name: skills-drift-gate
 # min-repo-config rollout — no other repo calls it (cinatra is the only repo
 # whose changes can drift the assistant-skills knowledge).
 #
-# A consuming repo (only cinatra) calls it from a thin caller, e.g.:
+# A consuming repo (only cinatra) calls it from a thin caller. Two modes:
+# SINGLE-repo (skills_repo + skills_ref) for one skills pack, or MULTI-repo
+# (skills_repos: pinned `owner/name@sha` entries) for a skills surface spread
+# across several repos (cinatra#2090 S3 — the assistant-skills successors);
+# the union is scanned in ONE job so the required-check context is unchanged.
 #
 #   jobs:
 #     skills-drift-gate:                       # <- stable caller JOB name
 #       uses: cinatra-ai/ci/.github/workflows/skills-drift-gate.yml@<sha>  # vX.Y.Z
 #       with:
-#         skills_ref: <assistant-skills SHA pinned in cinatra's lock>
+#         skills_repos: |                      # each pinned in the caller's lock
+#           cinatra-ai/chat-assistant-core-skill@<sha>
+#           cinatra-ai/extension-authoring-skill@<sha>
 #         mode: enforce                        # warn (advisory) | enforce (gates)
 #         ref: <sha>
 #
@@ -44,13 +50,17 @@ on:
   workflow_call:
     inputs:
       skills_ref:
-        description: "assistant-skills git ref to check out — REQUIRED. Pin to the SHA in cinatra's required-extensions lock (@cinatra-ai/assistant-skills resolvedSha). An empty value fails loud: the gate must read a pinned snapshot, never a moving default branch."
+        description: "SINGLE-repo mode: skills git ref to check out. Pin to the repo's resolvedSha in the caller's required-extensions lock. Exactly ONE of skills_ref / skills_repos must be set — an empty pair fails loud: the gate must read a pinned snapshot, never a moving default branch."
         type: string
-        required: true
+        default: ""
       skills_repo:
-        description: "assistant-skills repository (owner/name)."
+        description: "SINGLE-repo mode: skills repository (owner/name)."
         type: string
         default: "cinatra-ai/assistant-skills"
+      skills_repos:
+        description: "MULTI-repo mode (cinatra#2090 S3 — the watch-bearing SKILL.mds are spread across successor skill repos): whitespace/comma/newline-separated `owner/name@<40-hex-sha>` entries, each pinned to that repo's resolvedSha in the caller's required-extensions lock. The gate materializes the UNION of every repo's skills/<slug>/ bundles (scripts/materialize-skills-union.sh — fail-loud on a branch pin, a missing skills/ dir, or a duplicate slug) and scans it in ONE job, so the caller keeps its single stable required-check context. Mutually exclusive with skills_ref."
+        type: string
+        default: ""
       mode:
         description: "warn (non-failing; reports watch + heuristic findings) | enforce (gates an UNACKNOWLEDGED declared-watch finding; heuristic findings stay advisory)."
         type: string
@@ -82,12 +92,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require a pinned assistant-skills ref (fail loud on empty)
+      - name: Require exactly one pinned skills source (fail loud on empty/both)
         env:
           SKILLS_REF: ${{ inputs.skills_ref }}
+          SKILLS_REPOS: ${{ inputs.skills_repos }}
         run: |
-          if [ -z "$SKILLS_REF" ]; then
-            echo "::error::skills_ref is empty. The skills-drift-gate must read a PINNED assistant-skills snapshot (the @cinatra-ai/assistant-skills resolvedSha in cinatra-required-extensions.lock.json), never a moving default branch." >&2
+          if [ -z "$SKILLS_REF" ] && [ -z "$SKILLS_REPOS" ]; then
+            echo "::error::both skills_ref and skills_repos are empty. This gate must read PINNED skills snapshots (the resolvedSha entries in the caller's required-extensions lock), never a moving default branch." >&2
+            exit 1
+          fi
+          if [ -n "$SKILLS_REF" ] && [ -n "$SKILLS_REPOS" ]; then
+            echo "::error::skills_ref and skills_repos are both set — they are mutually exclusive (single-repo vs multi-repo mode)." >&2
             exit 1
           fi
 
@@ -103,12 +118,28 @@ jobs:
           ref: ${{ inputs.ref }}
           path: .skills-drift-gate
 
-      - name: Checkout assistant-skills (pinned)
+      - name: Checkout skills repo (pinned, single-repo mode)
+        if: inputs.skills_repos == ''
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: ${{ inputs.skills_repo }}
           ref: ${{ inputs.skills_ref }}
           path: .assistant-skills
+
+      # Multi-repo mode: materialize the pinned UNION into the same
+      # .assistant-skills/skills layout the engine already consumes — the scan
+      # itself is repo-count-agnostic and the required-check context stays the
+      # one caller-job context. The materializer is a versioned script with its
+      # own regression test (scripts/__tests__/materialize-skills-union.test.mjs)
+      # and validates every entry before it reaches git (fail-loud on branch
+      # pins / malformed entries — the list is caller-influenceable input).
+      - name: Materialize pinned skills union (multi-repo mode)
+        if: inputs.skills_repos != ''
+        env:
+          SKILLS_REPOS: ${{ inputs.skills_repos }}
+          UNION_DIR: .assistant-skills
+        run: |
+          bash .skills-drift-gate/scripts/materialize-skills-union.sh
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -141,18 +172,28 @@ jobs:
         run: |
           printf 'ref=%s\n' "$(bash .skills-drift-gate/scripts/resolve-diff-base.sh)" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve pinned assistant-skills SHA (fail loud if unresolvable)
+      - name: Resolve pinned skills SHA(s) (fail loud if unresolvable)
         id: pin
         env:
           SKILLS_REF: ${{ inputs.skills_ref }}
+          SKILLS_REPOS: ${{ inputs.skills_repos }}
         run: |
-          SHA="$(git -C .assistant-skills rev-parse HEAD)"
-          if [ -z "$SHA" ]; then
-            echo "::error::could not resolve the assistant-skills pin (skills_ref='$SKILLS_REF')." >&2
-            exit 1
+          if [ -n "$SKILLS_REPOS" ]; then
+            # Multi-repo mode: the materializer above already fetched each repo
+            # at EXACTLY its pinned SHA (or failed loud). Report the pins as
+            # the engine's display ref.
+            PINS="$(printf '%s' "$SKILLS_REPOS" | tr ',\n' '  ' | xargs)"
+            echo "sha=$PINS" >> "$GITHUB_OUTPUT"
+            echo "skills union pinned at: $PINS"
+          else
+            SHA="$(git -C .assistant-skills rev-parse HEAD)"
+            if [ -z "$SHA" ]; then
+              echo "::error::could not resolve the skills pin (skills_ref='$SKILLS_REF')." >&2
+              exit 1
+            fi
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "skills repo pinned at $SHA"
           fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "assistant-skills pinned at $SHA"
 
       # On push (a squash-merge to main) the event carries no PR body, yet the
       # acknowledgement marker may live ONLY in the PR body (the squash body need
