@@ -20,6 +20,15 @@ name: truthful-attribution-gate
 # A third ORG WATCHDOG (scheduled, outside any target repo) is a separate
 # workflow; it is not part of this reusable gate.
 #
+# EVAL TIMING + SELF-REFERENCE: this gate is itself one of the required contexts
+# in the suites that gate on it, and the other required contexts are sibling runs
+# that start in the same second. The engine therefore (a) excludes its OWN Actions
+# run from the required-context verification, keyed on GITHUB_RUN_ID (a default
+# runner variable — no env wiring needed) and never on the context NAME, so a
+# same-name check-run from any other run is still fully verified, and (b) re-polls
+# a context that has not concluded yet within a bounded window, failing only on a
+# concluded non-success or on the window expiring.
+#
 # ============================ STAGE 2 — WARN MODE ============================
 # Default mode is `warn`: the gate COMPUTES every finding and emits GitHub
 # annotations + a step summary, but ALWAYS exits 0 — no PR is ever failed. The
@@ -80,7 +89,13 @@ permissions:
 jobs:
   truthful-attribution-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The gate-arm verification WAITS (bounded, default up to 10 minutes) for a
+    # required context that has not concluded yet, instead of reading a sibling
+    # gate mid-flight and calling that a failure. The job budget must therefore
+    # exceed that window plus the normal work, or the wait would be cut short by
+    # a job timeout — which surfaces as a CANCELLED required context, i.e. the
+    # same false red by another name.
+    timeout-minutes: 20
     steps:
       # WARN: even an infra hiccup (checkout/setup) must not redden the required
       # check while we tune false positives (spec §7 step 4). All infra steps
@@ -162,14 +177,18 @@ jobs:
           CONFIG: ${{ inputs.config }}
           GATE_SUITE: ${{ inputs.gate_suite }}
         run: |
-          # Resolve the PR this push merged (if any) so anti-fabrication +
-          # tree-identity can bind to the reviewed head. Best-effort: a direct
-          # push with no associated PR runs grammar/structure-only (honest about
-          # its own limit; the script annotates that anti-fabrication was skipped).
+          # The PR this push merged is resolved by the SCRIPT, authoritatively:
+          # the commit->PR association API and the squash subject's "(#N)", each
+          # accepted only when that PR's merge_commit_sha IS this commit. The
+          # previous `gh pr list --search "$MERGE_SHA"` guess could return any PR
+          # that merely mentions or contains the commit (and its first hit is not
+          # stable), which bound the reviewed head, the approvals and the required
+          # contexts to a DIFFERENT change — an internally consistent verdict about
+          # the wrong PR that then red-flagged the tree. A direct push with no
+          # associated PR still runs grammar/structure-only (the script annotates
+          # that anti-fabrication was skipped).
           MERGE_SHA="${GITHUB_SHA:-HEAD}"
-          PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --search "$MERGE_SHA" --json number --jq '.[0].number' 2>/dev/null || true)"
           args=( --arm post-merge --mode "$MODE" --repo "$GITHUB_REPOSITORY" --commit "$MERGE_SHA" )
-          [ -n "$PR_NUMBER" ] && args+=( --pr "$PR_NUMBER" )
           [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
           [ -n "$GATE_SUITE" ] && args+=( --gate-suite "$GATE_SUITE" )
           node .truthful-attribution-gate/scripts/truthful-attribution-gate.mjs "${args[@]}"

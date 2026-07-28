@@ -68,6 +68,9 @@ const VALID_FORMATS = ["text", "json"];
 const VALUE_FLAGS = new Set([
   "arm", "mode", "format", "config", "high-risk-defaults", "gate-suite",
   "diff-base", "diff-base-env", "commit", "repo", "pr", "head-sha",
+  // This gate's own Actions run id (defaults to GITHUB_RUN_ID) and the re-poll
+  // budget for required contexts that have not concluded yet.
+  "self-run-id", "gate-arm-wait-ms",
 ]);
 const BOOLEAN_FLAGS = new Set(["quiet"]);
 
@@ -644,12 +647,46 @@ export function jsonFileAtRef(ref, filePath, cwd = process.cwd()) {
   try { return { ok: true, value: JSON.parse(raw) }; } catch (e) { return { ok: false, reason: `invalid JSON at ${ref}: ${e.message}`, operational: true }; }
 }
 
-/** tree object id of a commit (for the tree-identity bridge, §5). */
-export function treeOf(commitish, cwd = process.cwd()) {
+/**
+ * Full 40-hex sha of a commit-ish via local git, or null. Used to compare a
+ * merge commit against a PR's merge_commit_sha (which is always a full sha).
+ */
+export function resolveCommitSha(commitish, cwd = process.cwd()) {
+  if (!commitish) return null;
   try {
-    return execFileSync("git", ["--literal-pathspecs", "rev-parse", "--end-of-options", `${commitish}^{tree}`], {
+    const out = execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${commitish}^{commit}`], {
       encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
     }).trim();
+    return /^[0-9a-f]{40}$/.test(out) ? out : null;
+  } catch { return null; }
+}
+
+/**
+ * tree object id of a commit (for the tree-identity bridge, §5), or null.
+ *
+ * `--verify` is REQUIRED here, not decoration. Plain `git rev-parse` ECHOES the
+ * arguments it does not itself consume, and `--end-of-options` is one of them, so
+ * `git rev-parse --end-of-options <rev>^{tree}` prints TWO lines:
+ *     --end-of-options
+ *     <40-hex tree sha>
+ * A trimmed capture of that is not a tree id. Local-vs-local comparisons happened
+ * to survive (both sides carried the same prefix), but the moment ONE side was
+ * resolved through the commits API — a FORK head, or any head this checkout does
+ * not have (a deleted branch after merge) — the prefixed string could never equal
+ * the API's bare sha, so the fork/deleted-head fallback reported tree-MISMATCH on
+ * byte-identical trees. `--verify` puts rev-parse in single-revision mode (no
+ * echo) and `--quiet` keeps a genuinely unresolvable object silent; the explicit
+ * 40-hex assertion then fails CLOSED to "unresolvable" if any future git ever
+ * decorates the output again, rather than emitting a value that silently compares
+ * unequal to a real tree id.
+ */
+export function treeOf(commitish, cwd = process.cwd()) {
+  if (!commitish) return null;
+  try {
+    const out = execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${commitish}^{tree}`], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return /^[0-9a-f]{40}$/.test(out) ? out : null;
   } catch { return null; }
 }
 
@@ -666,6 +703,151 @@ export function resolveTreeMatch({ client, commit, reviewedHeadSha, treeOf: tree
   let tr = reviewedHeadSha ? treeOfFn(reviewedHeadSha) : null;
   if (!tr && reviewedHeadSha && client?.commitTree) tr = client.commitTree(reviewedHeadSha);
   return tm && tr ? tm === tr : undefined;
+}
+
+/**
+ * The heads a LIVE, QUALIFIED approval actually sits on at merge time.
+ *
+ * "Live" is not just `state === "APPROVED"` on some historical row. GitHub
+ * rewrites a dismissed review's state to DISMISSED, so that filter removes
+ * dismissals — but an approval the SAME reviewer later superseded with
+ * CHANGES_REQUESTED is still an APPROVED row in the list, and honouring it would
+ * bind the record to a head its reviewer stopped vouching for (codex-converge
+ * HIGH). So this applies the gate's own §5 latest-review semantics and the same
+ * standing rules verifyReviewedLine enforces:
+ *   - per LOGIN, take that login's LATEST non-dismissed review; keep the head only
+ *     if that latest review is APPROVED;
+ *   - never the PR author's own approval (a self-approval is not a review);
+ *   - the login's repo permission must meet at least the peer tier, when the
+ *     permission data is available — an unknown permission does NOT qualify
+ *     (fail closed).
+ * Newest first, de-duplicated.
+ */
+export function resolveApprovedHeads(reviews, { prAuthorLogin = null, permissionByLogin = null } = {}) {
+  const byLogin = new Map();
+  for (const r of Array.isArray(reviews) ? reviews : []) {
+    const login = r?.user?.login;
+    if (!login || !r.state || r.state === "DISMISSED") continue;
+    // COMMENTED reviews do not change an approval's standing (GitHub keeps the
+    // APPROVED row live), so they are not "latest-review" candidates.
+    if (r.state === "COMMENTED") continue;
+    const t = new Date(r.submitted_at).getTime();
+    const prev = byLogin.get(login.toLowerCase());
+    const pt = prev ? prev.t : -Infinity;
+    if (!prev || (Number.isFinite(t) ? t : -Infinity) >= pt) byLogin.set(login.toLowerCase(), { r, t: Number.isFinite(t) ? t : -Infinity, login });
+  }
+  const rows = [];
+  for (const { r, t, login } of byLogin.values()) {
+    if (r.state !== "APPROVED") continue;
+    if (typeof r.commit_id !== "string" || r.commit_id === "") continue;
+    if (prAuthorLogin && login.toLowerCase() === String(prAuthorLogin).toLowerCase()) continue;
+    if (permissionByLogin) {
+      if (!permissionMeetsTier(permissionByLogin[login], "peer")) continue;
+    }
+    rows.push({ sha: r.commit_id, t });
+  }
+  rows.sort((a, b) => b.t - a.t);
+  return [...new Set(rows.map((r) => r.sha))];
+}
+
+/**
+ * Reviewed head for the post-merge bindings.
+ *
+ * The PR head at merge stays PRIMARY: resolving the reviewed head to an older
+ * approval would let commits pushed AFTER that approval be blessed by it, which
+ * is the fail-open this whole gate exists to prevent. The live approved heads
+ * (state APPROVED, never DISMISSED) are returned alongside for the tree-equality
+ * fallback below. Only when there is no PR head at all does the latest LIVE
+ * approval become the reviewed head — never a dismissed review's commit.
+ */
+export function resolveReviewedHead({ prHeadSha, reviews, prAuthorLogin = null, permissionByLogin = null }) {
+  const approvedHeads = resolveApprovedHeads(reviews, { prAuthorLogin, permissionByLogin });
+  if (prHeadSha) return { headSha: prHeadSha, approvedHeads, source: "pr-head" };
+  if (approvedHeads.length) return { headSha: approvedHeads[0], approvedHeads, source: "latest-live-approval" };
+  return { headSha: null, approvedHeads, source: "none" };
+}
+
+/**
+ * TREE-EQUALITY FALLBACK against the live approvals (§5).
+ *
+ * A squash whose TREE is byte-identical to a commit a maintainer actually
+ * approved landed exactly the reviewed bytes — the intermediate commit ids on the
+ * branch (a rebase, a force-push reconcile, an approval dismissed and re-cast)
+ * are irrelevant to that fact. Byte-identical trees are the STRONGEST proof this
+ * gate has; weaker than nothing it is not. Returns:
+ *   true      — tree(merged) equals the tree of at least one LIVE approved head;
+ *   false     — every approved head resolved and NONE matched;
+ *   undefined — nothing to compare (no approvals) or a side is unresolvable.
+ * `false`/`undefined` never pass on their own: the caller falls through to the
+ * existing tree/content bridge, which is unchanged and still fail-closed.
+ */
+export function resolveApprovedTreeMatch({ client, commit, approvedHeads, treeOf: treeOfFn = treeOf }) {
+  const heads = Array.isArray(approvedHeads) ? approvedHeads.filter(Boolean) : [];
+  if (!commit || heads.length === 0) return undefined;
+  let tm = treeOfFn(commit);
+  if (!tm && client?.commitTree) tm = client.commitTree(commit);
+  if (!tm) return undefined;
+  let anyResolved = false;
+  for (const h of heads) {
+    let th = treeOfFn(h);
+    if (!th && client?.commitTree) th = client.commitTree(h);
+    if (!th) continue;
+    anyResolved = true;
+    if (th === tm) return true;
+  }
+  return anyResolved ? false : undefined;
+}
+
+/**
+ * Authoritative PR resolution for the post-merge arm.
+ *
+ * The PR a merge commit came from must be resolved from data that BINDS the two:
+ * a fuzzy code/issue SEARCH for the merge SHA can return any PR that merely
+ * mentions or contains that commit, and the first hit is not stable — binding the
+ * reviewed head, the approvals and the required contexts to a DIFFERENT PR
+ * produces an internally consistent verdict against the wrong change (its
+ * approvals verify, its contexts are green) and then red-flags the tree, which is
+ * exactly the false red this replaces. Resolution order, each candidate accepted
+ * ONLY if its merge_commit_sha equals this commit:
+ *   1. the commit→PR association API (GET /commits/{sha}/pulls);
+ *   2. the "(#N)" reference GitHub writes into the squash subject;
+ *   3. the caller-supplied hint (--pr).
+ * No candidate binds => null (the arm runs record-grammar-only and any
+ * unverifiable CLAIM in the record is still a fail-closed finding).
+ */
+export function resolveMergedPr({ commitSha, message, declaredPr, listPullsForCommit, getPr }) {
+  const want = String(commitSha || "").toLowerCase();
+  // merge_commit_sha alone is NOT proof of a merge: for an OPEN pull request
+  // GitHub reports the synthetic TEST-merge commit there, and that value changes
+  // once the PR merges (codex-converge). So the PR must also be MERGED — `merged`
+  // on the single-PR resource, `merged_at` on list/association entries.
+  const isMerged = (pr) => pr?.merged === true || typeof pr?.merged_at === "string";
+  const bound = (pr) => Boolean(
+    pr && want !== "" &&
+    typeof pr.merge_commit_sha === "string" && pr.merge_commit_sha.toLowerCase() === want &&
+    isMerged(pr),
+  );
+  if (want && typeof listPullsForCommit === "function") {
+    let pulls = null;
+    try { pulls = listPullsForCommit(want); } catch { pulls = null; }
+    for (const p of Array.isArray(pulls) ? pulls : []) {
+      if (bound(p)) return { number: p.number, pr: p, source: "commit-association" };
+    }
+  }
+  const candidates = [];
+  const subject = String(message || "").split("\n", 1)[0];
+  const m = /\(#(\d+)\)\s*$/.exec(subject);
+  if (m) candidates.push({ n: Number(m[1]), source: "squash-subject" });
+  if (declaredPr !== undefined && declaredPr !== null && String(declaredPr) !== "") {
+    candidates.push({ n: Number(declaredPr), source: "declared" });
+  }
+  for (const c of candidates) {
+    if (!Number.isFinite(c.n) || typeof getPr !== "function") continue;
+    let pr = null;
+    try { pr = getPr(c.n); } catch { pr = null; }
+    if (bound(pr)) return { number: c.n, pr, source: c.source };
+  }
+  return { number: null, pr: null, source: "none" };
 }
 
 // ===========================================================================
@@ -1095,6 +1277,13 @@ export function makeGhClient({ repo } = {}) {
       try { return ghApi(`/repos/${repo}/commits/${sha}`)?.commit?.tree?.sha ?? null; }
       catch { return null; }
     },
+    // GET /repos/{repo}/commits/{sha}/pulls — the PRs GitHub itself associates
+    // with a commit. This is the AUTHORITATIVE binding the post-merge arm needs
+    // (a merge-SHA text search can return any PR that merely mentions or contains
+    // the commit); the caller still requires merge_commit_sha === the commit, so
+    // an association that is merely "this commit is in that PR's branch" cannot
+    // bind. Paginated; bound to THIS gate's repo.
+    pullsForCommit(sha) { return ghApi(`/repos/${repo}/commits/${sha}/pulls`, { shape: "array" }); },
   };
 }
 
@@ -1160,24 +1349,69 @@ export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, r
  * @param checkRuns          array of check-run objects for reviewedHeadSha
  * @param now                injectable epoch-ms "current time" (default Date.now()),
  *                           so the §4 staleness window is deterministic in tests.
+ * @param selfRunId          the Actions run id of THIS gate run (GITHUB_RUN_ID).
+ *                           A required context whose ONLY check-run is produced by
+ *                           this very run is SELF-REFERENTIAL — see below.
+ * @param waitedMs           how long the caller already re-polled for an unconcluded
+ *                           context (null = no wait window). Only shapes the message.
  *
- * Returns { ok, reasons, warnings }. `warnings` carries the §4 35-day staleness
- * NOTICE — a gate-arm merge with a 35–65-day-old audit is still verifiable (ok),
- * but the audit is going stale and the engineer is being told. `reasons` carries
- * hard gate-arm failures (incl. the §4 65-day lapse and a missing audit record).
- * Staleness applies to the GATE ARM ONLY: a lapsed audit stops machine
- * verification, never a human-arm merge (the human arm doesn't call this).
+ * Returns { ok, reasons, warnings, pending, pendingOnly }. `warnings` carries the
+ * §4 35-day staleness NOTICE — a gate-arm merge with a 35–65-day-old audit is
+ * still verifiable (ok), but the audit is going stale and the engineer is being
+ * told. `reasons` carries hard gate-arm failures (incl. the §4 65-day lapse and a
+ * missing audit record). Staleness applies to the GATE ARM ONLY: a lapsed audit
+ * stops machine verification, never a human-arm merge (the human arm doesn't
+ * call this).
+ *
+ * `pending` lists the required contexts that have NOT CONCLUDED yet (a check-run
+ * or its Actions run still queued/in_progress). Those are TRANSIENT — a sibling
+ * gate that goes green two seconds later must not red-flag the record — so the
+ * caller (makeSettlingGateArmVerifier) re-polls them within a bounded window and
+ * only the final verdict is reported. `pendingOnly` is true when EVERY reason is
+ * an unconcluded-context reason, i.e. waiting can still change the verdict; a
+ * concluded non-success, a suite mismatch or a stale audit never becomes green by
+ * waiting, so those short-circuit the wait.
  */
 export const AUDIT_STALE_WARN_DAYS = 35;
 export const AUDIT_STALE_FAIL_DAYS = 65;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), reviewedHeadSha = null, runWorkflow = null }) {
+// Message halves that MUST stay distinguishable (the operator has to be able to
+// tell "this context reported a failure" from "this context never finished"):
+//   - CONCLUDED_NON_SUCCESS: the context RAN and reported a non-success result.
+//   - NEVER_CONCLUDED:       the context never reported at all inside the window.
+export const CONCLUDED_NON_SUCCESS_PHRASE = "did not conclude success";
+export const NEVER_CONCLUDED_PHRASE = "never concluded";
+
+/** Human-readable tail describing how long we waited for a conclusion. */
+function waitedPhrase(waitedMs) {
+  if (waitedMs === null || waitedMs === undefined) return "no re-poll window was available in this run";
+  if (waitedMs <= 0) return "the re-poll window was exhausted before it could re-poll";
+  return `it was still unconcluded after re-polling for ${Math.round(waitedMs / 1000)}s`;
+}
+
+export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), reviewedHeadSha = null, runWorkflow = null, selfRunId = null, waitedMs = null }) {
   const reasons = [];
   const warnings = [];
+  // Contexts that have not concluded yet (transient — the caller may re-poll).
+  const pending = [];
+  const pendingReasons = new Set();
+  // Non-failure observations the operator should still see in the run log (today:
+  // the self-reference exclusion). Kept OUT of `warnings`, which is the §4 audit-
+  // staleness channel, so the two are never reported under one finding code.
+  const notes = [];
+  const finish = () => ({
+    ok: reasons.length === 0,
+    reasons,
+    warnings,
+    notes,
+    pending,
+    // Waiting can only help when EVERY reason is an unconcluded-context reason.
+    pendingOnly: pending.length > 0 && reasons.every((r) => pendingReasons.has(r)),
+  });
   if (!suiteFile || !suiteFile.ok) {
     reasons.push(`cannot read .github/gate-suite.json at the merged SHA (${suiteFile?.reason || "missing"}) — gate arm cannot be verified`);
-    return { ok: false, reasons, warnings };
+    return finish();
   }
   const suite = suiteFile.value;
   if (parsed.gateSuite.suite !== suite.suiteId || parsed.gateSuite.version !== suite.version) {
@@ -1192,7 +1426,7 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   const acc = suite.accountable || {};
   if (acc.github === undefined || acc.name === undefined || acc.email === undefined) {
     reasons.push(`gate-suite.json accountable is incomplete (needs github + name + email) — cannot verify the Accountable trailer (fail closed)`);
-    return { ok: false, reasons, warnings };
+    return finish();
   }
   if (parsed.accountable.login !== acc.github) {
     reasons.push(`Accountable @${parsed.accountable.login} != gate-suite.json accountable @${acc.github}`);
@@ -1208,7 +1442,7 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   // closed: an empty suite is not "machine verification").
   if (!Array.isArray(suite.requiredContexts) || suite.requiredContexts.length === 0) {
     reasons.push(`gate-suite.json declares no requiredContexts — an empty gate suite is not machine verification (fail closed)`);
-    return { ok: false, reasons, warnings };
+    return finish();
   }
   // Required-context resolution. A context NAME alone is spoofable (any check
   // run can claim that display name), so when the suite pins an app/workflow
@@ -1238,6 +1472,16 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   //     dropped in favour of an older success (closes the candidate-ordering
   //     fail-open, codex-converge round 1 finding 5/G).
   const PINNED_RE = /^[0-9a-fA-F]{40}$/;
+  // Record an unconcluded (queued/in_progress) context: the reason is pushed like
+  // any other failure — the verdict is still fail-closed on this pass — but it is
+  // ALSO registered as pending so the settling caller knows re-polling may change
+  // it, and so `pendingOnly` can distinguish "waiting can help" from "waiting is
+  // pointless" (a concluded failure / a suite mismatch never becomes green).
+  function pushPending(ctx, reason, status) {
+    reasons.push(reason);
+    pendingReasons.add(reason);
+    pending.push({ context: ctx.context, status });
+  }
   function runIsCandidate(run, ctx) {
     if (run.name !== ctx.context) return false;
     if (ctx.appSlug && (run.app?.slug || "") !== ctx.appSlug) return false;
@@ -1264,6 +1508,67 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   // or null. (latestAttemptJobIds is consumed by the grouping/attempt-restriction
   // in the per-context loop, not here; here we use headSha/checkSuiteId/
   // referencedWorkflows + the optional caller fields path/event.)
+  // Does a resolved Actions run reference EXACTLY ctx.workflow@ctx.pinned? The
+  // referenced_workflows entry path is "<workflow-path>@<ref>"; we split on the
+  // FINAL "@" and compare the workflow PATH portion EXACTLY (case-SENSITIVE —
+  // GitHub paths are case-sensitive, so a same-pinned-commit file at a different
+  // case must NOT satisfy) and the ref/sha case-INSENSITIVELY (git hex). The
+  // matched ref must be a full 40-hex equal to ctx.pinned — @branch/@tag/@short-sha
+  // are rejected. Shared by the candidate verification and the self-run identity
+  // proof so the two can never drift apart.
+  function referencesPinnedWorkflow(wr, ctx) {
+    if (!wr || !Array.isArray(wr.referencedWorkflows)) return false;
+    if (!ctx.pinned || !PINNED_RE.test(String(ctx.pinned))) return false;
+    const pinnedLower = String(ctx.pinned).toLowerCase();
+    return wr.referencedWorkflows.some((e) => {
+      if (!e || typeof e.path !== "string") return false;
+      const at = e.path.lastIndexOf("@");
+      if (at <= 0) return false;
+      const ePath = e.path.slice(0, at);
+      const eRef = e.path.slice(at + 1);
+      if (ePath !== ctx.workflow) return false;                       // path EXACT, case-sensitive
+      if (eRef.toLowerCase() !== pinnedLower) return false;           // ref == pinned (case-insensitive hex)
+      return typeof e.sha === "string" && e.sha.toLowerCase() === pinnedLower; // and the resolved sha agrees
+    });
+  }
+  // The OUTCOME-INDEPENDENT caller constraints a required context may declare.
+  // Shared by verifyWorkflowIdentity AND the self-run identity proof: the self
+  // exclusion skips a context's OUTCOME, never its IDENTITY, so every predicate
+  // that says "this is the run the suite meant" must hold there too. Skipping
+  // these in the self proof would let an already-existing alternate caller or
+  // trigger event satisfy a context the suite pinned to one caller/event without
+  // touching .github/** (codex-converge round 2 HIGH).
+  //   - callerPath: the caller workflow file the run executed (run.path). GitHub
+  //     returns a BARE path or a "<path>@<ref>" form; we compare the PATH portion
+  //     case-sensitively and ignore a trailing @ref (the CALLEE pin already binds
+  //     the executed reusable-workflow commit).
+  //   - allowedEvents: the trigger events the caller may have run under (run.event).
+  // A context that OMITS a key (undefined) is unchanged (backward compatible).
+  // A key that is PRESENT-but-MALFORMED FAILS CLOSED, never silently behaving
+  // like "undeclared" (e.g. `allowedEvents: "pull_request"` as a string, or
+  // `callerPath: []`, would otherwise disable the check it was meant to add).
+  function verifyCallerConstraints(wr, ctx, runId) {
+    if (ctx.callerPath !== undefined) {
+      if (typeof ctx.callerPath !== "string" || ctx.callerPath === "") {
+        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'callerPath' (must be a non-empty string) — failing closed rather than skipping the caller check it was meant to add` };
+      }
+      const wrPath = typeof wr.path === "string" ? wr.path : "";
+      const at = wrPath.lastIndexOf("@");
+      const wrPathBare = at > 0 ? wrPath.slice(0, at) : wrPath;
+      if (wrPathBare !== ctx.callerPath) {
+        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} caller workflow '${wrPathBare || "?"}' != the declared callerPath '${ctx.callerPath}' (fail closed)` };
+      }
+    }
+    if (ctx.allowedEvents !== undefined) {
+      if (!Array.isArray(ctx.allowedEvents) || ctx.allowedEvents.length === 0 || !ctx.allowedEvents.every((e) => typeof e === "string" && e !== "")) {
+        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'allowedEvents' (must be a non-empty array of non-empty strings) — failing closed rather than skipping the caller-event check it was meant to add` };
+      }
+      if (typeof wr.event !== "string" || !ctx.allowedEvents.includes(wr.event)) {
+        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} event '${wr.event || "?"}' is not in the declared allowedEvents [${ctx.allowedEvents.join(", ")}] (fail closed)` };
+      }
+    }
+    return { ok: true, reason: null };
+  }
   function verifyWorkflowIdentity(run, ctx) {
     if (!ctx.pinned || !PINNED_RE.test(String(ctx.pinned))) {
       return { ok: false, reason: `required context '${ctx.context}' pins workflow '${ctx.workflow}' but gate-suite.json has no valid 40-hex 'pinned' SHA — cannot verify the workflow commit (fail closed)` };
@@ -1305,17 +1610,7 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     // case must NOT satisfy, codex-converge round 2 MEDIUM), and the ref/sha
     // case-INSENSITIVELY (git hex is case-insensitive). The matched ref must be a
     // full 40-hex equal to ctx.pinned — rejects @branch/@tag/@short-sha refs.
-    const pinnedLower = String(ctx.pinned).toLowerCase();
-    const matched = wr.referencedWorkflows.some((e) => {
-      if (!e || typeof e.path !== "string") return false;
-      const at = e.path.lastIndexOf("@");
-      if (at <= 0) return false;
-      const ePath = e.path.slice(0, at);
-      const eRef = e.path.slice(at + 1);
-      if (ePath !== ctx.workflow) return false;                       // path EXACT, case-sensitive
-      if (eRef.toLowerCase() !== pinnedLower) return false;           // ref == pinned (case-insensitive hex)
-      return typeof e.sha === "string" && e.sha.toLowerCase() === pinnedLower; // and the resolved sha agrees
-    });
+    const matched = referencesPinnedWorkflow(wr, ctx);
     if (!matched) {
       return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} did not reference the pinned reusable workflow '${ctx.workflow}@${ctx.pinned}' (no referenced_workflows entry with that exact path AND sha) (fail closed)` };
     }
@@ -1338,25 +1633,8 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     // behave like "undeclared" (codex-converge MEDIUM: e.g. `allowedEvents:
     // "pull_request"` (a string, not an array) or `callerPath: []` would
     // otherwise disable the check the engineer intended to add).
-    if (ctx.callerPath !== undefined) {
-      if (typeof ctx.callerPath !== "string" || ctx.callerPath === "") {
-        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'callerPath' (must be a non-empty string) — failing closed rather than skipping the caller check it was meant to add` };
-      }
-      const wrPath = typeof wr.path === "string" ? wr.path : "";
-      const at = wrPath.lastIndexOf("@");
-      const wrPathBare = at > 0 ? wrPath.slice(0, at) : wrPath;
-      if (wrPathBare !== ctx.callerPath) {
-        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} caller workflow '${wrPathBare || "?"}' != the declared callerPath '${ctx.callerPath}' (fail closed)` };
-      }
-    }
-    if (ctx.allowedEvents !== undefined) {
-      if (!Array.isArray(ctx.allowedEvents) || ctx.allowedEvents.length === 0 || !ctx.allowedEvents.every((e) => typeof e === "string" && e !== "")) {
-        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'allowedEvents' (must be a non-empty array of non-empty strings) — failing closed rather than skipping the caller-event check it was meant to add` };
-      }
-      if (typeof wr.event !== "string" || !ctx.allowedEvents.includes(wr.event)) {
-        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} event '${wr.event || "?"}' is not in the declared allowedEvents [${ctx.allowedEvents.join(", ")}] (fail closed)` };
-      }
-    }
+    const caller = verifyCallerConstraints(wr, ctx, runId);
+    if (!caller.ok) return caller;
     return { ok: true, reason: null };
   }
   // Latest run per context by the freshest available timestamp. A newer
@@ -1392,8 +1670,16 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   // never rescue it.
   function evaluateFreshest(ctx, members) {
     for (const r of members) {
-      if (!(r.status === "completed" && r.conclusion === "success")) {
-        reasons.push(`required context '${ctx.context}' did not conclude success (status=${r.status}, conclusion=${r.conclusion || "n/a"}; skipped/neutral/cancelled/in-progress/queued count as failure)`);
+      // EVAL-TIMING: a check-run that has not CONCLUDED is not a failure — it is
+      // an answer we do not have yet. Record it as pending (the caller re-polls
+      // within a bounded window) and phrase it so the operator can never confuse
+      // "it never finished" with "it finished and reported a failure".
+      if (r.status !== "completed") {
+        pushPending(ctx, `required context '${ctx.context}' ${NEVER_CONCLUDED_PHRASE} (check-run status=${r.status || "unknown"}, conclusion=${r.conclusion || "n/a"}) — ${waitedPhrase(waitedMs)}; an unconcluded context cannot bless a merge (fail closed)`, r.status || "unknown");
+        return true;
+      }
+      if (r.conclusion !== "success") {
+        reasons.push(`required context '${ctx.context}' ${CONCLUDED_NON_SUCCESS_PHRASE} (status=${r.status}, conclusion=${r.conclusion || "n/a"}; skipped/neutral/cancelled count as failure)`);
         return true;
       }
       if (ctx.workflow) {
@@ -1459,8 +1745,18 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
       // A repo that wants to additionally pin the trusted caller can declare the
       // optional callerPath/allowedEvents on the required context (see
       // verifyWorkflowIdentity), which bounds which caller workflow/events satisfy it.
-      if (wr.status !== "completed" || wr.conclusion !== "success") {
-        reasons.push(`required context '${ctx.context}' — Actions run ${runId} did not conclude success overall (run status=${wr.status || "n/a"}, conclusion=${wr.conclusion || "n/a"}) — a same-run job (e.g. the genuine reusable job) is non-passing, so a surviving same-name success cannot bless the context (fail closed)`);
+      //
+      // EVAL-TIMING split: a run that is still queued/in_progress has not
+      // ANSWERED yet. Sibling required gates start within the same second as this
+      // one, so reading their run mid-flight and calling it a failure red-flags a
+      // record whose contexts go green moments later. Unconcluded => pending (the
+      // caller re-polls, bounded); only a CONCLUDED non-success is a real failure.
+      if (wr.status !== "completed") {
+        pushPending(ctx, `required context '${ctx.context}' — Actions run ${runId} ${NEVER_CONCLUDED_PHRASE} (run status=${wr.status || "n/a"}, conclusion=${wr.conclusion || "n/a"}) — ${waitedPhrase(waitedMs)}; an unconcluded run cannot bless the context (fail closed)`, wr.status || "unknown");
+        return true;
+      }
+      if (wr.conclusion !== "success") {
+        reasons.push(`required context '${ctx.context}' — Actions run ${runId} ${CONCLUDED_NON_SUCCESS_PHRASE} overall (run status=${wr.status || "n/a"}, conclusion=${wr.conclusion || "n/a"}) — a same-run job (e.g. the genuine reusable job) is non-passing, so a surviving same-name success cannot bless the context (fail closed)`);
         return true;
       }
       // Restrict to the run's LATEST attempt: check-run id == job id. Stale
@@ -1477,8 +1773,63 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     // resolver — same wr — and binds head + check_suite + referenced_workflows).
     return evaluateFreshest(ctx, currentMembers);
   }
+  // SELF-REFERENCE (this gate is itself a required context in every repo suite
+  // that gates on it). While THIS run is the one evaluating, its own check-run is
+  // by definition status=in_progress: it cannot have concluded inside itself, and
+  // no amount of waiting changes that — the wait would just burn the job timeout
+  // and then red-flag the record anyway. So the gate's OWN check-run is excluded
+  // from the candidate set. ONLY ITS OUTCOME is skipped; its IDENTITY is proved
+  // FIRST, with the same bindings every other candidate must satisfy:
+  //   - the run id in the check-run url equals GITHUB_RUN_ID (never the context
+  //     NAME — a same-name check-run from any other run stays fully verified, so a
+  //     surviving same-name success can still never bless a run whose genuine job
+  //     is non-passing);
+  //   - the check-run comes from the github-actions App;
+  //   - the resolved run's head_sha is the reviewed head, its check_suite_id is
+  //     THIS check-run's check_suite.id, and this check-run's id is in the run's
+  //     LATEST-attempt job set. The url is App-controllable, so url-agreement
+  //     alone is NOT identity: without these binds any App with checks:write could
+  //     point a forged check-run's details_url at this run and have a required
+  //     context skipped (codex-converge HIGH — reproduced as a fail-open);
+  //   - for a workflow-pinned context, the run must additionally reference the
+  //     pinned reusable workflow at the pinned SHA.
+  // A candidate that does not PROVE all of that is not "ours": it stays in the set
+  // and is verified normally (fail closed). Only when every remaining candidate is
+  // a proven job of this very run is the context satisfied by THIS run — its real
+  // outcome IS this run's own conclusion, which branch protection enforces
+  // directly, so blessing it here cannot make a red gate look green.
+  // RESIDUAL, on record: a caller workflow could add a SECOND job to this same run
+  // whose name impersonates ANOTHER required context. That requires editing
+  // .github/** — a high-risk path that requires the MAINTAINER HUMAN ARM, never
+  // this machine arm (the same residual class as the continue-on-error note above).
+  const selfId = (selfRunId === null || selfRunId === undefined || String(selfRunId).trim() === "") ? null : String(selfRunId).trim();
+  function isOwnRunCheckRun(run, ctx) {
+    if (!selfId || extractRunId(run) !== selfId) return false;
+    if ((run.app?.slug || "") !== "github-actions") return false;
+    if (typeof runWorkflow !== "function") return false;
+    if (!reviewedHeadSha || !/^[0-9a-fA-F]{40}$/.test(String(reviewedHeadSha))) return false;
+    let wr;
+    try { wr = runWorkflow(selfId); } catch { wr = null; }
+    if (!wr) return false;
+    if (String(wr.headSha || "").toLowerCase() !== String(reviewedHeadSha).toLowerCase()) return false;
+    const csId = run.check_suite?.id;
+    if (csId === undefined || csId === null || wr.checkSuiteId === null || String(wr.checkSuiteId) !== String(csId)) return false;
+    if (!(wr.latestAttemptJobIds instanceof Set) || !wr.latestAttemptJobIds.has(String(run.id))) return false;
+    if (ctx.workflow && !referencesPinnedWorkflow(wr, ctx)) return false;
+    // The suite's declared caller/event constraints are part of the context's
+    // IDENTITY, not its outcome — enforce them here exactly as the normal path
+    // does, malformed-declaration fail-closed included.
+    if (!verifyCallerConstraints(wr, ctx, selfId).ok) return false;
+    return true;
+  }
   for (const ctx of suite.requiredContexts) {
-    const candidates = checkRuns.filter((r) => runIsCandidate(r, ctx));
+    const allCandidates = checkRuns.filter((r) => runIsCandidate(r, ctx));
+    const selfCandidates = allCandidates.filter((r) => isOwnRunCheckRun(r, ctx));
+    const candidates = selfCandidates.length ? allCandidates.filter((r) => !selfCandidates.includes(r)) : allCandidates;
+    if (candidates.length === 0 && selfCandidates.length > 0) {
+      notes.push(`required context '${ctx.context}' resolves ONLY to check-run(s) proven to belong to this gate's own Actions run ${selfId} (head + check_suite + latest-attempt job id${ctx.workflow ? " + the pinned reusable workflow" : ""} all bind) — a run cannot have concluded inside itself; the context's outcome is this run's own conclusion (enforced by branch protection), so it is not re-verified here (self-reference)`);
+      continue;
+    }
     if (candidates.length === 0) { reasons.push(`required context '${ctx.context}' has no matching check-run on the reviewed head`); continue; }
     // F4: a candidate with a non-finite timestamp (no usable started/completed/
     // updated/created_at) is an ORDERING AMBIGUITY — runTs returns -Infinity, so
@@ -1556,7 +1907,91 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
   const staleErr = checkAuditStaleness(suite.lastAuditedAt, now);
   if (staleErr.fail) reasons.push(staleErr.message);
   else if (staleErr.warn) warnings.push(staleErr.message);
-  return { ok: reasons.length === 0, reasons, warnings };
+  return finish();
+}
+
+// ===========================================================================
+// EVAL-TIMING — bounded re-poll of unconcluded required contexts.
+//
+// The required contexts of a suite are SIBLING workflow runs that start within
+// the same second as this gate. Reading them while they are still queued/
+// in_progress and calling that a failure red-flags records whose contexts go
+// green seconds later — a false red on a truthful record. The fix is to WAIT for
+// an answer, bounded, and to fail only on:
+//   - a CONCLUDED non-success (immediately — waiting cannot change it), or
+//   - the window expiring with the context still unconcluded (a distinct
+//     "never concluded" message, never confusable with a reported failure).
+// Everything stays fail-CLOSED: an unconcluded context never passes, it is only
+// given a bounded chance to conclude first.
+// ===========================================================================
+
+/** Total re-poll budget for unconcluded required contexts (10 minutes). */
+export const GATE_ARM_SETTLE_MAX_MS = 10 * 60 * 1000;
+/** Backoff schedule; the last entry repeats until the budget is spent. */
+export const GATE_ARM_SETTLE_BACKOFF_MS = [15_000, 30_000, 60_000, 90_000];
+
+/**
+ * Synchronous sleep. The whole gate is synchronous (execFileSync/`gh api`), so
+ * the re-poll cannot use timers without rewriting every call site as async.
+ * Atomics.wait on a private SharedArrayBuffer blocks this thread only.
+ */
+export function sleepSync(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Wrap verifyGateArm in the bounded re-poll. Returns a function with the SAME
+ * (parsed, opts) signature as verifyGateArm, so every call site is unchanged and
+ * offline/unit callers keep the pure single-shot behavior.
+ *
+ * @param refresh   () => { checkRuns, runWorkflow } — re-fetches the check-runs
+ *                  for the reviewed head and a FRESH run resolver (the resolver
+ *                  memoizes per invocation, so a stale one would replay the old
+ *                  in_progress run forever). Returns null/throws on failure.
+ * @param sleep     injectable blocking sleep (tests pass a recorder).
+ * @param maxWaitMs total budget; 0 disables waiting (single-shot).
+ * @param nowMs     injectable clock so tests are deterministic.
+ *
+ * The loop only runs while `pendingOnly` — every reason is an unconcluded
+ * context. A concluded non-success, a suite/accountable mismatch or a stale audit
+ * returns immediately (waiting is pointless and would burn the job budget).
+ */
+export function makeSettlingGateArmVerifier({
+  refresh,
+  sleep = sleepSync,
+  maxWaitMs = GATE_ARM_SETTLE_MAX_MS,
+  backoff = GATE_ARM_SETTLE_BACKOFF_MS,
+  verify = verifyGateArm,
+  onWait = null,
+} = {}) {
+  return (parsed, opts) => {
+    let waited = 0;
+    let attempt = 0;
+    let v = verify(parsed, { ...opts, waitedMs: null });
+    if (typeof refresh !== "function" || !(maxWaitMs > 0)) return v;
+    while (!v.ok && v.pendingOnly && waited < maxWaitMs) {
+      const step = backoff[Math.min(attempt, backoff.length - 1)];
+      const delay = Math.min(step, maxWaitMs - waited);
+      if (!(delay > 0)) break;
+      if (typeof onWait === "function") onWait({ attempt, delay, waited, pending: v.pending });
+      sleep(delay);
+      waited += delay;
+      attempt += 1;
+      let fresh = null;
+      try { fresh = refresh(); } catch { fresh = null; }
+      // A refresh failure keeps the LAST verdict (fail closed) rather than
+      // inventing a pass; the message already says how long we waited.
+      if (!fresh || !Array.isArray(fresh.checkRuns)) break;
+      v = verify(parsed, {
+        ...opts,
+        checkRuns: fresh.checkRuns,
+        runWorkflow: fresh.runWorkflow === undefined ? opts.runWorkflow : fresh.runWorkflow,
+        waitedMs: waited,
+      });
+    }
+    return v;
+  };
 }
 
 /**
@@ -1782,9 +2217,14 @@ export function analyzePreMerge(ctx) {
     if (!ctx.apiBound || !ctx.checkRuns) {
       findings.push({ code: "gate-suite-unverifiable", severity: "error", message: `the PR declares a Gate-suite claim but suite/check-run data isn't available to verify it — failing closed` });
     } else {
-      const v = verifyGateArm(ctx.declaredGateArm, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json" }, checkRuns: ctx.checkRuns, now: ctx.now, reviewedHeadSha: ctx.reviewedHeadSha, runWorkflow: ctx.runWorkflow });
+      // ctx.verifyGateArm (when main() supplies it) is the settling wrapper: it
+      // re-polls unconcluded required contexts within a bounded window before
+      // reporting. Absent it, the pure single-shot verifier is used unchanged.
+      const verifyArm = ctx.verifyGateArm || verifyGateArm;
+      const v = verifyArm(ctx.declaredGateArm, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json" }, checkRuns: ctx.checkRuns, now: ctx.now, reviewedHeadSha: ctx.reviewedHeadSha, runWorkflow: ctx.runWorkflow, selfRunId: ctx.selfRunId });
       if (!v.ok) findings.push({ code: "gate-suite-fabricated", severity: "error", message: `Gate-suite arm fails verification: ${v.reasons.join("; ")}` });
       for (const w of v.warnings || []) findings.push({ code: "gate-suite-audit-stale", severity: "warning", message: w });
+      for (const n of v.notes || []) findings.push({ code: "gate-suite-self-reference", severity: "warning", message: n });
     }
   }
 
@@ -1805,9 +2245,9 @@ export function analyzePreMerge(ctx) {
  * itself. §5 checks 1–4 on the merge commit. The tree-identity bridge (§5) and
  * the live API checks are passed in via ctx (collected by main()).
  *
- * ctx: { message, changedFiles, defaults, repoSuite, treeMatch,
+ * ctx: { message, changedFiles, defaults, repoSuite, treeMatch, approvedTreeMatch,
  *        reviews, prAuthorLogin, reviewedHeadSha, permissionByLogin,
- *        suiteFile, checkRuns }
+ *        suiteFile, checkRuns, selfRunId, verifyGateArm }
  */
 export function analyzePostMerge(ctx) {
   const findings = [];
@@ -1846,7 +2286,19 @@ export function analyzePostMerge(ctx) {
       // verify on the REAL merged SHA, the intended backstop for content binding's
       // intentionally weaker proof.)
     } else if (ctx.contentMatch === false) {
+      // A PROVEN content divergence is never overridden — not even by a tree that
+      // equals some other approved head (codex-converge HIGH: that would bless a
+      // tree approved at head A while the approvals/contexts bound to head B).
       findings.push({ code: "content-mismatch", severity: "error", message: `the landed change is not the reviewed change (content fingerprint differs) — the landed tree is not what was reviewed; approvals/contexts do not bind` });
+    } else if (ctx.approvedTreeMatch === true) {
+      // Neither bridge could DECIDE (the reviewed head is not resolvable in this
+      // checkout — a fork head, or a branch deleted at merge — so the content
+      // fingerprint is undefined), but the landed tree is BYTE-IDENTICAL to a
+      // commit a qualified LIVE approval was cast on (state APPROVED not
+      // DISMISSED, that reviewer's latest review, non-self, peer standing). The
+      // landed bytes ARE bytes a reviewer vouched for, whatever the branch's
+      // intermediate commit ids were. Used only where the alternative is
+      // "cannot tell" — never to overrule a proven mismatch above.
     } else if (ctx.treeMatch === false) {
       // Tree resolved and differs, and content could NOT be re-derived on both
       // sides to prove equivalence — preserve the tree-mismatch signal (fail closed).
@@ -1896,9 +2348,11 @@ export function analyzePostMerge(ctx) {
     } else if (!ctx.checkRuns) {
       findings.push({ code: "gate-suite-unverifiable", severity: "error", message: `record asserts a gate arm but the check-runs for the reviewed head could not be fetched — failing closed` });
     } else {
-      const v = verifyGateArm(parsed, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json at the merged SHA" }, checkRuns: ctx.checkRuns, now: ctx.now, reviewedHeadSha: ctx.reviewedHeadSha, runWorkflow: ctx.runWorkflow });
+      const verifyArm = ctx.verifyGateArm || verifyGateArm;
+      const v = verifyArm(parsed, { suiteFile: ctx.suiteFile || { ok: false, reason: "no committed gate-suite.json at the merged SHA" }, checkRuns: ctx.checkRuns, now: ctx.now, reviewedHeadSha: ctx.reviewedHeadSha, runWorkflow: ctx.runWorkflow, selfRunId: ctx.selfRunId });
       if (!v.ok) findings.push({ code: "gate-suite-fabricated", severity: "error", message: `Gate-suite arm fails verification: ${v.reasons.join("; ")}` });
       for (const w of v.warnings || []) findings.push({ code: "gate-suite-audit-stale", severity: "warning", message: w });
+      for (const n of v.notes || []) findings.push({ code: "gate-suite-self-reference", severity: "warning", message: n });
     }
   }
 
@@ -1987,6 +2441,24 @@ function main() {
   let result;
   let apiSkippedReason = null;
 
+  // This gate's own Actions run id — the self-reference exclusion key (§5 check3).
+  const selfRunId = args["self-run-id"] || process.env.GITHUB_RUN_ID || null;
+  // Re-poll budget for unconcluded required contexts. `0` disables waiting.
+  const gateArmWaitMs = args["gate-arm-wait-ms"] !== undefined
+    ? Number(args["gate-arm-wait-ms"])
+    : GATE_ARM_SETTLE_MAX_MS;
+  // Build the settling verifier for a given reviewed head: each re-poll re-fetches
+  // the check-runs AND mints a FRESH run resolver (the resolver memoizes per
+  // invocation, so reusing it would replay the same in-flight run forever).
+  const settlingVerifier = (headSha) => makeSettlingGateArmVerifier({
+    maxWaitMs: Number.isFinite(gateArmWaitMs) ? gateArmWaitMs : GATE_ARM_SETTLE_MAX_MS,
+    refresh: () => ({ checkRuns: client.checkRunsFor(headSha), runWorkflow: makeRunWorkflowResolver(client) }),
+    onWait: ({ delay, pending }) => {
+      const names = [...new Set(pending.map((p) => p.context))].join(", ");
+      process.stderr.write(`truthful-attribution-gate: required context(s) not concluded yet [${names}] — re-polling in ${Math.round(delay / 1000)}s\n`);
+    },
+  });
+
   if (arm === "pre-merge") {
     const base = resolveDiffBase({ explicit: args["diff-base"], envVarName: args["diff-base-env"] || DEFAULT_DIFF_BASE_ENV });
     const changedFiles = changedFilesForRange(base);
@@ -2037,8 +2509,12 @@ function main() {
           if (!login || ctx.permissionByLogin[login] !== undefined) continue;
           try { ctx.permissionByLogin[login] = client.permissionOf(login).permission; } catch { /* unknown */ }
         }
-        if (ctx.reviewedHeadSha) { ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha); }
+        if (ctx.reviewedHeadSha) {
+          ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha);
+          ctx.verifyGateArm = settlingVerifier(ctx.reviewedHeadSha);
+        }
         ctx.runWorkflow = makeRunWorkflowResolver(client);
+        ctx.selfRunId = selfRunId;
         ctx.suiteFile = repoSuite;
         ctx.apiBound = true;
       } catch (e) { apiSkippedReason = `GitHub API unavailable (${e.message}) — anti-fabrication checks skipped; offline checks only`; ctx.apiBound = false; }
@@ -2062,20 +2538,56 @@ function main() {
     // available. We collect them from the associated PR when bound; otherwise
     // best-effort from the merge commit's first-parent range.
     // tree-identity + API anti-fabrication require knowing the PR + reviewed head.
-    if (client && args.pr) {
+    //
+    // The PR is resolved AUTHORITATIVELY from the merge commit itself (the
+    // commit→PR association, the squash subject's "(#N)", or the --pr hint — each
+    // accepted only when its merge_commit_sha IS this commit). A PR that does not
+    // bind to this commit is never used: binding the reviewed head, the approvals
+    // and the required contexts to the wrong PR yields an internally consistent
+    // verdict about a different change.
+    const mergedSha = resolveCommitSha(commit) || commit;
+    const prResolution = client
+      ? resolveMergedPr({
+        commitSha: mergedSha,
+        message,
+        declaredPr: args.pr,
+        listPullsForCommit: (sha) => client.pullsForCommit(sha),
+        getPr: (n) => client.pr(n),
+      })
+      : { number: null, pr: null, source: "none" };
+    if (client && args.pr && prResolution.number === null) {
+      apiSkippedReason = `the PR hint --pr ${args.pr} does not merge this commit (${String(mergedSha).slice(0, 8)}) and no PR could be bound to it authoritatively — anti-fabrication + tree-identity skipped rather than bound to the wrong PR`;
+    }
+    if (client && prResolution.number !== null) {
       try {
-        const pr = client.pr(args.pr);
+        const prNumber = prResolution.number;
+        const pr = prResolution.pr;
         ctx.prAuthorLogin = pr.user?.login;
-        ctx.reviewedHeadSha = args["head-sha"] || pr.head?.sha;
-        ctx.reviews = client.listReviews(args.pr);
+        ctx.reviews = client.listReviews(prNumber);
+        // Reviewed head: the PR head at merge stays primary (an older approval
+        // must never bless commits pushed after it); the LIVE approved heads
+        // (state APPROVED — GitHub rewrites a dismissed review's state, so this
+        // excludes dismissed ones) feed the tree-equality fallback below.
         ctx.approverLogins = [...new Set(ctx.reviews.filter((r) => r.state === "APPROVED").map((r) => r.user?.login).filter(Boolean))];
         ctx.permissionByLogin = {};
         for (const login of [...ctx.approverLogins, ...parseTrailers(message).reviewed.map((r) => r.login)]) {
           if (!login || ctx.permissionByLogin[login] !== undefined) continue;
           try { ctx.permissionByLogin[login] = client.permissionOf(login).permission; } catch { /* unknown */ }
         }
+        // Reviewed head + the qualified live approvals (permissions resolved
+        // above, so the peer-standing filter can be applied).
+        const rh = resolveReviewedHead({
+          prHeadSha: args["head-sha"] || pr.head?.sha,
+          reviews: ctx.reviews,
+          prAuthorLogin: ctx.prAuthorLogin,
+          permissionByLogin: ctx.permissionByLogin,
+        });
+        ctx.reviewedHeadSha = rh.headSha;
+        ctx.approvedHeads = rh.approvedHeads;
         ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha);
         ctx.runWorkflow = makeRunWorkflowResolver(client);
+        ctx.verifyGateArm = settlingVerifier(ctx.reviewedHeadSha);
+        ctx.selfRunId = selfRunId;
         ctx.suiteFile = repoSuite;
         // Tree-identity bridge: local git first, GitHub commits-API fallback for
         // FORK heads (whose commit lives only on the contributor's fork and so is
@@ -2085,6 +2597,12 @@ function main() {
         // (a foreign sha 404s -> null -> fail-closed). false => tree-mismatch,
         // undefined (apiBound + arm) => tree-unverifiable — both preserved.
         ctx.treeMatch = resolveTreeMatch({ client, commit, reviewedHeadSha: ctx.reviewedHeadSha });
+        // TREE-EQUALITY against the LIVE approvals: a squash whose tree is
+        // byte-identical to a commit a non-dismissed APPROVED review was cast on
+        // landed exactly the reviewed bytes, whatever the branch's intermediate
+        // commit ids were. Same resolution path as the bridge above (local git
+        // first, repo-bound commits API for heads this checkout cannot resolve).
+        ctx.approvedTreeMatch = resolveApprovedTreeMatch({ client, commit, approvedHeads: ctx.approvedHeads });
         // §5 content binding (engineering#483): the content bridge + the record's
         // Reviewed-by staleness resolver, anchored at firstParent(M) (the on-main
         // base the squash landed on). contentMatch lets a landed change that
@@ -2100,7 +2618,7 @@ function main() {
         // branch commits). Each API commit carries author/committer identity, so
         // a known-agent commit in the squashed range is detected even though it
         // never appears as its own commit on the default branch.
-        const prCommits = client.prCommits(args.pr);
+        const prCommits = client.prCommits(prNumber);
         ctx.rangeIdentities = (prCommits || []).map((c) => ({
           sha: c.sha,
           authorName: c.commit?.author?.name,
@@ -2114,7 +2632,7 @@ function main() {
         ctx.apiBound = true;
       } catch (e) { apiSkippedReason = `GitHub API unavailable (${e.message}) — anti-fabrication checks skipped; record grammar/structure only`; ctx.apiBound = false; }
     } else {
-      apiSkippedReason = `no PR context — anti-fabrication + tree-identity skipped; record grammar/structure only`;
+      apiSkippedReason = apiSkippedReason || `no PR bound to this commit — anti-fabrication + tree-identity skipped; record grammar/structure only`;
       ctx.apiBound = false;
     }
     result = analyzePostMerge(ctx);

@@ -34,6 +34,15 @@ import {
   AUDIT_STALE_FAIL_DAYS,
   makeRunWorkflowResolver,
   combinePaginatedSlurp,
+  makeSettlingGateArmVerifier,
+  resolveApprovedHeads,
+  resolveReviewedHead,
+  resolveApprovedTreeMatch,
+  resolveMergedPr,
+  NEVER_CONCLUDED_PHRASE,
+  CONCLUDED_NON_SUCCESS_PHRASE,
+  GATE_ARM_SETTLE_MAX_MS,
+  treeOf,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -1008,7 +1017,12 @@ test("§5 check3: a newer in-progress rerun is NOT masked by an older success", 
   ];
   const v = verifyGateArm(parsed, { suiteFile: SUITE_FILE, checkRuns });
   assert.ok(!v.ok, "a pending rerun must override the older success");
-  assert.ok(v.reasons.some((r) => /did not conclude success/.test(r)));
+  // Still fail-closed, but reported as UNCONCLUDED (the answer is not in yet),
+  // never as a reported failure — the two must stay distinguishable.
+  assert.ok(v.reasons.some((r) => new RegExp(NEVER_CONCLUDED_PHRASE).test(r)), v.reasons.join("; "));
+  assert.ok(!v.reasons.some((r) => new RegExp(CONCLUDED_NON_SUCCESS_PHRASE).test(r)), v.reasons.join("; "));
+  assert.deepEqual(v.pending.map((p) => p.context), ["source-leak-gate / source-leak-gate"]);
+  assert.equal(v.pendingOnly, true);
 });
 
 test("§5 check3: a suite file with NO requiredContexts fails closed", () => {
@@ -1591,7 +1605,10 @@ test("WF-id: a fresher FAILING run still beats an older success (status check un
   const resolver = (runId) => wrWith({ headSha: REVIEWED, checkSuiteId: 73878390023, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] }, ["22"]);
   const v = verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: [old, newer], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
   assert.ok(!v.ok);
-  assert.ok(v.reasons.some((r) => /did not conclude success/.test(r)));
+  // Fail-closed as before; classified as unconcluded (re-pollable), not as a
+  // reported failure.
+  assert.ok(v.reasons.some((r) => new RegExp(NEVER_CONCLUDED_PHRASE).test(r)), v.reasons.join("; "));
+  assert.equal(v.pendingOnly, true);
 });
 
 test("WF-id: a NULL/invalid reviewedHeadSha FAILS CLOSED for a workflow-pinned context (cannot bind to a commit)", () => {
@@ -1757,7 +1774,8 @@ test("WF-id F2: attempt-1 SUCCESS + attempt-2 IN_PROGRESS under ONE run_id FAILS
   const resolver = (runId) => wrWith({ headSha: REVIEWED, checkSuiteId: 73878390099, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }] }, ["200"]);
   const v = verifyGateArm(gateParsed(), { suiteFile: oneCtx, checkRuns: [a1, a2], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
   assert.ok(!v.ok, "a newer in-flight rerun must override the older success");
-  assert.ok(v.reasons.some((r) => /did not conclude success/.test(r)), v.reasons.join("; "));
+  assert.ok(v.reasons.some((r) => new RegExp(NEVER_CONCLUDED_PHRASE).test(r)), v.reasons.join("; "));
+  assert.equal(v.pendingOnly, true, "an in-flight rerun is re-pollable, not a reported failure");
 });
 
 test("WF-id F2: a stale attempt-1 SUCCESS is NOT a hiding place — attempt-2 FAILURE (latest) FAILS the context", () => {
@@ -2393,4 +2411,487 @@ test("§5 resolveContentMatch + makeContentBinds (real git): reviewed head vs sq
   const landedBad = cbCommit(g, "bad land");
   assert.equal(resolveContentMatch({ commit: landedBad, reviewedHeadSha: reviewedHead, cwd: dir }), false);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// =========================================================================
+// FALSE-RED CLASSES — evaluation timing, self-reference, reviewed-head
+// resolution. Every case here is a record that was TRUTHFUL and was red-flagged
+// anyway; each assertion also re-asserts the fail-closed property it must not
+// weaken. Fixtures mirror the real shapes observed on the two arms:
+//   - pre-merge: "Actions run <this run id> did not conclude success overall
+//     (run status=in_progress, conclusion=n/a)" — the gate reading ITSELF, plus
+//     a sibling required gate still in flight;
+//   - post-merge: "tree(merged) != tree(reviewed head)" on a squash whose tree
+//     is byte-identical to the head a maintainer approved.
+// =========================================================================
+
+// A single workflow-pinned required context + a green run for it on REVIEWED.
+const FR_CTX = { context: "source-leak-gate / source-leak-gate", workflow: "cinatra-ai/ci/.github/workflows/source-leak-gate.yml", pinned: SLG };
+const FR_SUITE = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [FR_CTX] } };
+const FR_RUN = "30337103906";
+const FR_JOB = 81164436609;
+const FR_SUITE_ID = 73878390034;
+function frCheckRun({ status = "completed", conclusion = "success", runId = FR_RUN, jobId = FR_JOB } = {}) {
+  return {
+    id: jobId, name: FR_CTX.context, status, conclusion,
+    app: { slug: "github-actions" }, check_suite: { id: FR_SUITE_ID },
+    html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${runId}/job/${jobId}`,
+    started_at: "2026-07-28T07:05:34Z", updated_at: "2026-07-28T07:05:40Z",
+  };
+}
+function frResolver({ status = "completed", conclusion = "success", runId = FR_RUN, jobId = FR_JOB } = {}) {
+  return (id) => (String(id) === String(runId)
+    ? {
+      headSha: REVIEWED, checkSuiteId: FR_SUITE_ID,
+      referencedWorkflows: [{ path: `${FR_CTX.workflow}@${SLG}`, sha: SLG }],
+      runAttempt: 1, path: ".github/workflows/source-leak-gate.yml", event: "pull_request",
+      workflowId: 1001, status, conclusion, latestAttemptJobIds: new Set([String(jobId)]),
+    }
+    : null);
+}
+
+test("EVAL-TIMING: a required context that is in_progress and THEN concludes green PASSES (re-poll, no false red)", () => {
+  // The exact race: the sibling required gate is still running when this gate
+  // reads it, and goes green a few seconds later.
+  const waits = [];
+  const states = [
+    { checkRuns: [frCheckRun({ status: "in_progress", conclusion: null })], runWorkflow: frResolver({ status: "in_progress", conclusion: null }) },
+    { checkRuns: [frCheckRun({ status: "in_progress", conclusion: null })], runWorkflow: frResolver({ status: "in_progress", conclusion: null }) },
+    { checkRuns: [frCheckRun()], runWorkflow: frResolver() },
+  ];
+  let i = 0;
+  const settle = makeSettlingGateArmVerifier({
+    refresh: () => states[Math.min(++i, states.length - 1)],
+    sleep: (ms) => waits.push(ms),
+  });
+  const v = settle(gateParsed(), { suiteFile: FR_SUITE, checkRuns: states[0].checkRuns, reviewedHeadSha: REVIEWED, runWorkflow: states[0].runWorkflow });
+  assert.ok(v.ok, "a context that concludes green during the wait must PASS: " + v.reasons.join("; "));
+  assert.deepEqual(waits, [15_000, 30_000], "bounded backoff, one sleep per re-poll");
+});
+
+test("EVAL-TIMING: a context that NEVER concludes fails on TIMEOUT with the distinct 'never concluded' message", () => {
+  const waits = [];
+  const stuck = { checkRuns: [frCheckRun({ status: "in_progress", conclusion: null })], runWorkflow: frResolver({ status: "in_progress", conclusion: null }) };
+  const settle = makeSettlingGateArmVerifier({
+    refresh: () => stuck,
+    sleep: (ms) => waits.push(ms),
+    maxWaitMs: 120_000,
+  });
+  const v = settle(gateParsed(), { suiteFile: FR_SUITE, checkRuns: stuck.checkRuns, reviewedHeadSha: REVIEWED, runWorkflow: stuck.runWorkflow });
+  assert.ok(!v.ok, "an unconcluded context still fails closed after the window");
+  const reason = v.reasons.join("; ");
+  assert.ok(new RegExp(NEVER_CONCLUDED_PHRASE).test(reason), reason);
+  assert.ok(!new RegExp(CONCLUDED_NON_SUCCESS_PHRASE).test(reason),
+    "a timeout must NOT be reported as a concluded non-success");
+  assert.ok(/re-polling for 120s/.test(reason), reason);
+  assert.equal(waits.reduce((a, b) => a + b, 0), 120_000, "the wait budget is respected exactly");
+});
+
+test("EVAL-TIMING: a CONCLUDED non-success short-circuits the wait (no re-poll, distinct message)", () => {
+  let refreshed = 0;
+  const settle = makeSettlingGateArmVerifier({
+    refresh: () => { refreshed += 1; return { checkRuns: [frCheckRun()], runWorkflow: frResolver() }; },
+    sleep: () => { throw new Error("must not sleep on a concluded failure"); },
+  });
+  const failed = { checkRuns: [frCheckRun({ conclusion: "failure" })], runWorkflow: frResolver({ conclusion: "failure" }) };
+  const v = settle(gateParsed(), { suiteFile: FR_SUITE, checkRuns: failed.checkRuns, reviewedHeadSha: REVIEWED, runWorkflow: failed.runWorkflow });
+  assert.ok(!v.ok);
+  assert.ok(v.reasons.some((r) => new RegExp(CONCLUDED_NON_SUCCESS_PHRASE).test(r)), v.reasons.join("; "));
+  assert.equal(v.pendingOnly, false);
+  assert.equal(refreshed, 0, "a reported failure is never re-polled into a pass");
+});
+
+test("EVAL-TIMING: a non-pending failure alongside a pending one is NOT waited out", () => {
+  const twoCtx = { ok: true, value: { ...FR_SUITE.value, requiredContexts: [FR_CTX, { context: "ci / build-test" }] } };
+  const runs = [frCheckRun({ status: "in_progress", conclusion: null }), { name: "ci / build-test", status: "completed", conclusion: "failure", completed_at: "2026-07-28T07:05:00Z" }];
+  const v = verifyGateArm(gateParsed(), { suiteFile: twoCtx, checkRuns: runs, reviewedHeadSha: REVIEWED, runWorkflow: frResolver({ status: "in_progress", conclusion: null }) });
+  assert.ok(!v.ok);
+  assert.equal(v.pendingOnly, false, "waiting cannot fix the concluded failure, so the wait must not start");
+});
+
+test("EVAL-TIMING: a refresh that fails keeps the last (failing) verdict — never a pass", () => {
+  const stuck = { checkRuns: [frCheckRun({ status: "in_progress", conclusion: null })], runWorkflow: frResolver({ status: "in_progress", conclusion: null }) };
+  const settle = makeSettlingGateArmVerifier({
+    refresh: () => { throw new Error("API unavailable"); },
+    sleep: () => {},
+    maxWaitMs: 60_000,
+  });
+  const v = settle(gateParsed(), { suiteFile: FR_SUITE, checkRuns: stuck.checkRuns, reviewedHeadSha: REVIEWED, runWorkflow: stuck.runWorkflow });
+  assert.ok(!v.ok, "an unreadable refresh must not turn an unconcluded context green");
+});
+
+test("SELF-REFERENCE: the gate's OWN run is excluded — a context carried only by this run does not red-flag it", () => {
+  // The observed pre-merge false red: run <N> reporting that run <N> "did not
+  // conclude success (in_progress)" — it is the run doing the evaluating.
+  const selfRun = "30335735831";
+  const selfCtx = { context: "truthful-attribution-gate / truthful-attribution-gate", workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml", pinned: TAG };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [selfCtx] } };
+  const own = {
+    id: 999, name: selfCtx.context, status: "in_progress", conclusion: null,
+    app: { slug: "github-actions" }, check_suite: { id: 7777 },
+    html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${selfRun}/job/999`,
+    started_at: "2026-07-28T06:42:54Z",
+  };
+  const resolver = () => wrWith({ headSha: REVIEWED, checkSuiteId: 7777, referencedWorkflows: [{ path: `${selfCtx.workflow}@${TAG}`, sha: TAG }], status: "in_progress", conclusion: null }, ["999"]);
+  // WITHOUT the self id this is the false red we are fixing.
+  const before = verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [own], reviewedHeadSha: REVIEWED, runWorkflow: resolver });
+  assert.ok(!before.ok, "regression witness: the un-excluded own run fails the record");
+  // WITH it, the context is recognized as self-referential and not re-verified.
+  const after = verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [own], reviewedHeadSha: REVIEWED, runWorkflow: resolver, selfRunId: selfRun });
+  assert.ok(after.ok, after.reasons.join("; "));
+  assert.ok(after.notes.some((n) => /self-reference/.test(n)), "the exclusion is stated in the run log, never silent");
+});
+
+test("SELF-REFERENCE: exclusion is by RUN ID only — a same-NAME check-run from ANOTHER run is still fully verified", () => {
+  // The fail-closed property that must survive: a surviving same-name success
+  // from a different run cannot bless a run whose genuine job is non-passing.
+  const selfRun = "30335735831";
+  const otherRun = "30335999999";
+  const selfCtx = { context: "truthful-attribution-gate / truthful-attribution-gate", workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml", pinned: TAG };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [selfCtx] } };
+  const decoy = {
+    id: 555, name: selfCtx.context, status: "completed", conclusion: "success",
+    app: { slug: "github-actions" }, check_suite: { id: 8888 },
+    html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${otherRun}/job/555`,
+    completed_at: "2026-07-28T06:50:00Z",
+  };
+  // That other run's OVERALL conclusion is a failure (its genuine job failed).
+  const resolver = (id) => (String(id) === otherRun
+    ? wrWith({ headSha: REVIEWED, checkSuiteId: 8888, referencedWorkflows: [{ path: `${selfCtx.workflow}@${TAG}`, sha: TAG }], status: "completed", conclusion: "failure" }, ["555"])
+    : null);
+  const v = verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [decoy], reviewedHeadSha: REVIEWED, runWorkflow: resolver, selfRunId: selfRun });
+  assert.ok(!v.ok, "a same-name success from a DIFFERENT run must still not bless a non-passing run");
+  assert.ok(v.reasons.some((r) => new RegExp(CONCLUDED_NON_SUCCESS_PHRASE).test(r)), v.reasons.join("; "));
+  assert.equal(v.notes.length, 0, "nothing was treated as self-referential here");
+});
+
+test("SELF-REFERENCE: a genuine OTHER run for the same context still decides it (self-exclusion is not a blanket skip)", () => {
+  const selfRun = "30335735831";
+  const selfCtx = { context: "truthful-attribution-gate / truthful-attribution-gate", workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml", pinned: TAG };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [selfCtx] } };
+  const own = { id: 999, name: selfCtx.context, status: "in_progress", conclusion: null, app: { slug: "github-actions" }, check_suite: { id: 7777 }, html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${selfRun}/job/999`, started_at: "2026-07-28T06:42:54Z" };
+  const other = { id: 555, name: selfCtx.context, status: "completed", conclusion: "success", app: { slug: "github-actions" }, check_suite: { id: 8888 }, html_url: "https://github.com/cinatra-ai/cinatra/actions/runs/30335999999/job/555", completed_at: "2026-07-28T06:50:00Z" };
+  const resolver = (id) => (String(id) === "30335999999"
+    ? wrWith({ headSha: REVIEWED, checkSuiteId: 8888, referencedWorkflows: [{ path: `${selfCtx.workflow}@${TAG}`, sha: TAG }] }, ["555"])
+    : null);
+  const v = verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [own, other], reviewedHeadSha: REVIEWED, runWorkflow: resolver, selfRunId: selfRun });
+  assert.ok(v.ok, v.reasons.join("; "));
+  assert.equal(v.notes.length, 0, "a real candidate existed, so nothing was self-satisfied");
+});
+
+test("SELF-REFERENCE: with no self run id supplied, behavior is exactly as before (no silent widening)", () => {
+  const runs = SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" }));
+  const v = verifyGateArm(gateParsed(), { suiteFile: SUITE_FILE, checkRuns: runs });
+  assert.ok(v.ok);
+  assert.equal(v.notes.length, 0);
+});
+
+test("REVIEWED HEAD: live approvals are resolved from APPROVED reviews, never from DISMISSED ones", () => {
+  // The real shape: two approvals dismissed by later pushes, then a live one.
+  const reviews = [
+    { state: "DISMISSED", commit_id: "dab2c1a41".padEnd(40, "0"), submitted_at: "2026-07-27T15:26:22Z", user: { login: "groganz" } },
+    { state: "DISMISSED", commit_id: "8c3979cd3".padEnd(40, "0"), submitted_at: "2026-07-27T15:47:44Z", user: { login: "groganz" } },
+    { state: "APPROVED", commit_id: "ef2350ae3".padEnd(40, "0"), submitted_at: "2026-07-27T22:27:17Z", user: { login: "groganz" } },
+    { state: "COMMENTED", commit_id: "ef2350ae3".padEnd(40, "0"), submitted_at: "2026-07-27T22:27:31Z", user: { login: "coderabbitai[bot]" } },
+  ];
+  assert.deepEqual(resolveApprovedHeads(reviews), ["ef2350ae3".padEnd(40, "0")]);
+  // The PR head stays the reviewed head (an older approval must never bless
+  // commits pushed after it), and the live approval rides alongside it.
+  const rh = resolveReviewedHead({ prHeadSha: "ef2350ae3".padEnd(40, "0"), reviews });
+  assert.equal(rh.headSha, "ef2350ae3".padEnd(40, "0"));
+  assert.equal(rh.source, "pr-head");
+  assert.deepEqual(rh.approvedHeads, ["ef2350ae3".padEnd(40, "0")]);
+  // Newest live approval first when several REVIEWERS have one.
+  const many = [
+    { state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "peerdev" } },
+    { state: "APPROVED", commit_id: "b".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
+  ];
+  assert.deepEqual(resolveApprovedHeads(many), ["b".repeat(40), "a".repeat(40)]);
+  // Per LOGIN only the LATEST review counts: an approval the same reviewer later
+  // superseded with CHANGES_REQUESTED is NOT a live approval.
+  const superseded = [
+    { state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "groganz" } },
+    { state: "CHANGES_REQUESTED", commit_id: "b".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
+  ];
+  assert.deepEqual(resolveApprovedHeads(superseded), [], "a withdrawn approval must not bind anything");
+  // A later COMMENTED review does NOT withdraw an approval (GitHub keeps it live).
+  const commentedAfter = [
+    { state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "groganz" } },
+    { state: "COMMENTED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
+  ];
+  assert.deepEqual(resolveApprovedHeads(commentedAfter), ["a".repeat(40)]);
+  // A SELF-approval never qualifies, and an unknown/insufficient permission never
+  // qualifies when permission data is being applied (fail closed).
+  const selfApproved = [{ state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "author" } }];
+  assert.deepEqual(resolveApprovedHeads(selfApproved, { prAuthorLogin: "author" }), []);
+  assert.deepEqual(resolveApprovedHeads(selfApproved, { permissionByLogin: {} }), [], "unknown permission does not qualify");
+  assert.deepEqual(resolveApprovedHeads(selfApproved, { permissionByLogin: { author: "read" } }), []);
+  assert.deepEqual(resolveApprovedHeads(selfApproved, { permissionByLogin: { author: "write" } }), ["a".repeat(40)]);
+  // With no PR head at all, the LIVE approval is used — never a dismissed one.
+  const noHead = resolveReviewedHead({ prHeadSha: null, reviews });
+  assert.equal(noHead.headSha, "ef2350ae3".padEnd(40, "0"));
+  assert.equal(noHead.source, "latest-live-approval");
+  // A history with ONLY dismissed reviews yields no head to bind to (fail closed).
+  assert.equal(resolveReviewedHead({ prHeadSha: null, reviews: reviews.slice(0, 2) }).headSha, null);
+});
+
+test("TREE-EQUALITY: a squash whose tree equals the APPROVED head's tree binds (identical trees pass)", () => {
+  const approved = "ef2350ae3".padEnd(40, "0");
+  const trees = { squash: "090a21d97", [approved]: "090a21d97" };
+  const treeOfFn = (sha) => trees[sha] || null;
+  assert.equal(resolveApprovedTreeMatch({ commit: "squash", approvedHeads: [approved], treeOf: treeOfFn }), true);
+});
+
+test("TREE-EQUALITY: a DIFFERING tree still fails (the fallback is not a bypass)", () => {
+  const approved = "ef2350ae3".padEnd(40, "0");
+  const trees = { squash: "090a21d97", [approved]: "ffffffff0" };
+  const treeOfFn = (sha) => trees[sha] || null;
+  assert.equal(resolveApprovedTreeMatch({ commit: "squash", approvedHeads: [approved], treeOf: treeOfFn }), false);
+  // …and a DISMISSED review's head is not in approvedHeads at all, so a squash
+  // matching only a dismissed head cannot bind.
+  assert.equal(resolveApprovedTreeMatch({ commit: "squash", approvedHeads: [], treeOf: treeOfFn }), undefined);
+  // An unresolvable approved head is "cannot tell", never "matches".
+  assert.equal(resolveApprovedTreeMatch({ commit: "squash", approvedHeads: ["c".repeat(40)], treeOf: () => null }), undefined);
+});
+
+test("TREE-EQUALITY: the API fallback resolves an approved head this checkout cannot (deleted branch)", () => {
+  const approved = "ef2350ae3".padEnd(40, "0");
+  const client = { commitTree: (sha) => (sha === approved ? "090a21d97" : null) };
+  assert.equal(resolveApprovedTreeMatch({ client, commit: "squash", approvedHeads: [approved], treeOf: (s) => (s === "squash" ? "090a21d97" : null) }), true);
+});
+
+test("POST-MERGE: a truthful squash matching the APPROVED head passes even when tree(reviewed head) resolution says otherwise", () => {
+  // End-to-end shape of the observed post-merge false red: the record is
+  // truthful, the landed tree IS the approved tree, and the old bridge reported
+  // tree-mismatch. approvedTreeMatch must rescue it.
+  const message = [
+    "feat(x): a real change (#2136)", "",
+    "Gate-suite: cinatra-core@2026.06",
+    "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)",
+    "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
+    "Assisted-by: Claude Code (claude-opus-5)",
+  ].join("\n");
+  const head = "61e7f1ba9".padEnd(40, "0");
+  const ctx = {
+    message, changedFiles: ["src/app.ts"], defaults: DEFAULTS_OK, repoSuite: SUITE_FILE,
+    apiBound: true, reviewedHeadSha: head, prAuthorLogin: "cinatra-agent-bot[bot]",
+    reviews: [
+      { state: "DISMISSED", commit_id: "86e52e721".padEnd(40, "0"), submitted_at: "2026-07-27T17:00:23Z", user: { login: "groganz" } },
+      { state: "APPROVED", commit_id: head, submitted_at: "2026-07-27T17:28:03Z", user: { login: "groganz" } },
+    ],
+    permissionByLogin: { groganz: "admin" },
+    checkRuns: SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" })),
+    suiteFile: SUITE_FILE,
+    treeMatch: false,          // what the old bridge reported
+    contentMatch: undefined,   // fork/deleted branch — not locally re-derivable
+    approvedTreeMatch: true,   // …but the landed tree IS the approved tree
+  };
+  const r = analyzePostMerge(ctx);
+  assert.deepEqual(r.findings.filter((f) => f.severity === "error").map((f) => f.code), [],
+    "a truthful record must not be red-flagged: " + JSON.stringify(r.findings));
+  // Dual: with a genuinely different landed tree the finding is preserved.
+  const bad = analyzePostMerge({ ...ctx, approvedTreeMatch: false });
+  assert.ok(bad.findings.some((f) => f.code === "tree-mismatch"), "a real tree divergence must still red");
+});
+
+test("POST-MERGE PR RESOLUTION: only a PR whose merge_commit_sha IS this commit may bind", () => {
+  const sha = "57ba6ad9f".padEnd(40, "0");
+  const right = { number: 2136, merge_commit_sha: sha, merged_at: "2026-07-27T21:34:33Z", head: { sha: "61e7f1ba9".padEnd(40, "0") } };
+  const wrong = { number: 2147, merge_commit_sha: "d".repeat(40), merged_at: "2026-07-27T23:00:00Z", head: { sha: "e".repeat(40) } };
+  // 1. the association API wins, and a merely-associated PR that did NOT produce
+  //    this commit is rejected even when it is listed FIRST.
+  const viaAssoc = resolveMergedPr({
+    commitSha: sha, message: "feat: x (#2136)", declaredPr: null,
+    listPullsForCommit: () => [wrong, right], getPr: () => null,
+  });
+  assert.equal(viaAssoc.number, 2136);
+  assert.equal(viaAssoc.source, "commit-association");
+  // 2. no association => the squash subject's (#N), validated the same way.
+  const viaSubject = resolveMergedPr({
+    commitSha: sha, message: "feat: x (#2136)", declaredPr: null,
+    listPullsForCommit: () => [], getPr: (n) => (n === 2136 ? right : wrong),
+  });
+  assert.equal(viaSubject.number, 2136);
+  assert.equal(viaSubject.source, "squash-subject");
+  // 3. a WRONG hint (the fuzzy-search failure mode) never binds.
+  const viaBadHint = resolveMergedPr({
+    commitSha: sha, message: "feat: x", declaredPr: 2147,
+    listPullsForCommit: () => [], getPr: () => wrong,
+  });
+  assert.equal(viaBadHint.number, null);
+  assert.equal(viaBadHint.source, "none");
+  // 4. a throwing association API degrades to the subject, never to a guess.
+  const viaThrow = resolveMergedPr({
+    commitSha: sha, message: "feat: x (#2136)", declaredPr: null,
+    listPullsForCommit: () => { throw new Error("boom"); }, getPr: (n) => (n === 2136 ? right : null),
+  });
+  assert.equal(viaThrow.number, 2136);
+});
+
+test("EVAL-TIMING: the default re-poll budget is bounded and non-zero", () => {
+  assert.ok(GATE_ARM_SETTLE_MAX_MS > 0 && GATE_ARM_SETTLE_MAX_MS <= 15 * 60 * 1000,
+    "the wait window must fit inside the job budget");
+});
+
+test("TREE BRIDGE: treeOf returns a BARE 40-hex tree id (git rev-parse echoes --end-of-options without --verify)", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "f.txt"), "x\n");
+  const c = cbCommit(g, "c1");
+  const t = treeOf(c, dir);
+  assert.match(t, /^[0-9a-f]{40}$/, `treeOf must be a bare tree sha, got: ${JSON.stringify(t)}`);
+  assert.ok(!String(t).includes("--end-of-options"), "the rev-parse echo must never leak into the id");
+  assert.equal(treeOf("dead".repeat(10), dir), null, "an unresolvable object is null, never a decorated string");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("TREE BRIDGE: a FORK head resolved via the commits API compares EQUAL to the local merge tree (post-merge false red)", () => {
+  // The observed shape: both false-red records were FORK PRs, so the reviewed
+  // head exists only on the contributor's fork and the runner's checkout cannot
+  // resolve it — one side of the comparison comes from local git, the other from
+  // the commits API. Those two must be the same kind of value.
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "f.txt"), "x\n");
+  const landed = cbCommit(g, "squash");
+  const localTree = treeOf(landed, dir);
+  const forkHead = "f".repeat(40); // not in this checkout
+  const client = { commitTree: (sha) => (sha === forkHead ? localTree : null) };
+  assert.equal(
+    resolveTreeMatch({ client, commit: landed, reviewedHeadSha: forkHead, treeOf: (s) => treeOf(s, dir) }),
+    true,
+    "a byte-identical fork head must bind, not report tree-mismatch",
+  );
+  // Dual: a genuinely different fork tree still reports a mismatch.
+  const other = { commitTree: () => "0".repeat(40) };
+  assert.equal(
+    resolveTreeMatch({ client: other, commit: landed, reviewedHeadSha: forkHead, treeOf: (s) => treeOf(s, dir) }),
+    false,
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("POST-MERGE PR RESOLUTION: an UNMERGED PR never binds (merge_commit_sha is a synthetic test-merge)", () => {
+  // An open PR reports a synthetic test-merge commit in merge_commit_sha; that is
+  // not evidence it merged anything.
+  const sha = "57ba6ad9f".padEnd(40, "0");
+  const openPr = { number: 2200, merge_commit_sha: sha, merged_at: null, head: { sha: "a".repeat(40) } };
+  assert.equal(resolveMergedPr({
+    commitSha: sha, message: "feat: x (#2200)", declaredPr: 2200,
+    listPullsForCommit: () => [openPr], getPr: () => openPr,
+  }).number, null);
+  // The same PR, once actually merged, binds.
+  assert.equal(resolveMergedPr({
+    commitSha: sha, message: "feat: x (#2200)", declaredPr: null,
+    listPullsForCommit: () => [{ ...openPr, merged_at: "2026-07-27T21:00:00Z" }], getPr: () => null,
+  }).number, 2200);
+});
+
+test("SELF-REFERENCE: a FORGED check-run that merely POINTS its url at this gate's run is NOT excluded (fail closed)", () => {
+  // codex-converge HIGH: the check-run url is App-controllable. Excluding on url
+  // agreement alone let any App with checks:write get a required context skipped.
+  const selfRun = "30335735831";
+  const ctx = { context: "source-leak-gate / source-leak-gate", workflow: "cinatra-ai/ci/.github/workflows/source-leak-gate.yml", pinned: SLG };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [ctx] } };
+  const forged = {
+    id: 4242, name: ctx.context, status: "completed", conclusion: "failure",
+    app: { slug: "github-actions" }, check_suite: { id: 111111 }, // NOT this run's suite
+    details_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${selfRun}/job/4242`,
+  };
+  // The real run for selfRun: different check_suite, job set does not contain 4242.
+  const resolver = (id) => (String(id) === selfRun
+    ? wrWith({ headSha: REVIEWED, checkSuiteId: 999, referencedWorkflows: [{ path: `cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@${TAG}`, sha: TAG }], status: "in_progress", conclusion: null }, ["999"])
+    : null);
+  const v = verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [forged], reviewedHeadSha: REVIEWED, runWorkflow: resolver, selfRunId: selfRun });
+  assert.ok(!v.ok, "a forged check-run must never be excluded as 'ours' and self-satisfied");
+  assert.equal(v.notes.length, 0, "nothing may be treated as self-referential here");
+});
+
+test("SELF-REFERENCE: the exclusion needs the FULL identity proof (head + check_suite + latest-attempt job + pinned workflow)", () => {
+  const selfRun = "30335735831";
+  const ctx = { context: "truthful-attribution-gate / truthful-attribution-gate", workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml", pinned: TAG };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [ctx] } };
+  const own = {
+    id: 999, name: ctx.context, status: "in_progress", conclusion: null,
+    app: { slug: "github-actions" }, check_suite: { id: 7777 },
+    html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${selfRun}/job/999`,
+    started_at: "2026-07-28T06:42:54Z",
+  };
+  const good = { headSha: REVIEWED, checkSuiteId: 7777, referencedWorkflows: [{ path: `${ctx.workflow}@${TAG}`, sha: TAG }], status: "in_progress", conclusion: null };
+  const run = (partial) => () => wrWith({ ...good, ...partial }, ["999"]);
+  const check = (partial, jobIds = ["999"]) => verifyGateArm(gateParsed(), {
+    suiteFile: suite, checkRuns: [own], reviewedHeadSha: REVIEWED,
+    runWorkflow: () => wrWith({ ...good, ...partial }, jobIds), selfRunId: selfRun,
+  });
+  assert.ok(check({}).ok, "the fully-proven own check-run is excluded");
+  assert.ok(!check({ headSha: "a".repeat(40) }).ok, "a run for a different head is not ours");
+  assert.ok(!check({ checkSuiteId: 8888 }).ok, "a check_suite mismatch is not ours");
+  assert.ok(!check({}, ["123"]).ok, "a check-run outside the latest-attempt job set is not ours");
+  assert.ok(!check({ referencedWorkflows: [{ path: `evil/evil/.github/workflows/x.yml@${TAG}`, sha: TAG }] }).ok, "a run that did not reference the pinned workflow is not ours");
+  assert.ok(!verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [own], reviewedHeadSha: REVIEWED, runWorkflow: run({}), selfRunId: null }).ok, "no self id => no exclusion");
+  assert.ok(!verifyGateArm(gateParsed(), { suiteFile: suite, checkRuns: [{ ...own, app: { slug: "other-app" } }], reviewedHeadSha: REVIEWED, runWorkflow: run({}), selfRunId: selfRun }).ok, "a non-github-actions App is never ours");
+});
+
+test("TREE-EQUALITY: the approved-tree fallback NEVER overrides a proven content mismatch", () => {
+  // codex-converge HIGH: blessing a tree approved at head A while the approvals
+  // and contexts bound to head B is a fail-open. The fallback only applies where
+  // the content bridge could not decide.
+  const message = [
+    "feat(x): a change (#2136)", "",
+    "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
+    "Assisted-by: Claude Code (claude-opus-5)",
+  ].join("\n");
+  const head = "61e7f1ba9".padEnd(40, "0");
+  const base = {
+    message, changedFiles: ["src/app.ts"], defaults: DEFAULTS_OK, repoSuite: SUITE_FILE,
+    apiBound: true, reviewedHeadSha: head, prAuthorLogin: "cinatra-agent-bot[bot]",
+    reviews: [{ state: "APPROVED", commit_id: head, submitted_at: "2026-07-27T17:28:03Z", user: { login: "groganz" } }],
+    permissionByLogin: { groganz: "admin" },
+    treeMatch: false, approvedTreeMatch: true,
+  };
+  const proven = analyzePostMerge({ ...base, contentMatch: false });
+  assert.ok(proven.findings.some((f) => f.code === "content-mismatch"),
+    "a proven content divergence must still red: " + JSON.stringify(proven.findings.map((f) => f.code)));
+  const undecidable = analyzePostMerge({ ...base, contentMatch: undefined });
+  assert.ok(!undecidable.findings.some((f) => ["content-mismatch", "tree-mismatch", "tree-unverifiable"].includes(f.code)),
+    "where the content bridge cannot decide, an approved-tree match binds: " + JSON.stringify(undecidable.findings.map((f) => f.code)));
+});
+
+test("SELF-REFERENCE: the suite's callerPath/allowedEvents constraints are enforced in the self proof too", () => {
+  // codex-converge round 2 HIGH: the self exclusion skips a context's OUTCOME,
+  // never its IDENTITY. A run from an alternate caller workflow or an alternate
+  // trigger event is NOT the run the suite pinned, so it must not be excluded —
+  // otherwise an existing alternate caller bypasses the constraint with no
+  // .github/** edit at all.
+  const selfRun = "30335735831";
+  const ctx = {
+    context: "truthful-attribution-gate / truthful-attribution-gate",
+    workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml",
+    pinned: TAG,
+    callerPath: ".github/workflows/truthful-attribution-gate.yml",
+    allowedEvents: ["pull_request", "push", "merge_group"],
+  };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [ctx] } };
+  const own = {
+    id: 999, name: ctx.context, status: "in_progress", conclusion: null,
+    app: { slug: "github-actions" }, check_suite: { id: 7777 },
+    html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${selfRun}/job/999`,
+    started_at: "2026-07-28T06:42:54Z",
+  };
+  const good = {
+    headSha: REVIEWED, checkSuiteId: 7777,
+    referencedWorkflows: [{ path: `${ctx.workflow}@${TAG}`, sha: TAG }],
+    status: "in_progress", conclusion: null,
+    path: ".github/workflows/truthful-attribution-gate.yml", event: "pull_request",
+  };
+  const run = (partial, suiteCtx = ctx) => verifyGateArm(gateParsed(), {
+    suiteFile: { ok: true, value: { ...WF_SUITE.value, requiredContexts: [suiteCtx] } },
+    checkRuns: [own], reviewedHeadSha: REVIEWED,
+    runWorkflow: () => wrWith({ ...good, ...partial }, ["999"]), selfRunId: selfRun,
+  });
+  assert.ok(run({}).ok, "the declared caller + event is ours");
+  assert.ok(!run({ path: ".github/workflows/untrusted.yml" }).ok, "an alternate CALLER workflow is not ours");
+  assert.ok(!run({ event: "workflow_dispatch" }).ok, "an alternate trigger EVENT is not ours");
+  // A malformed declaration fails closed here exactly as it does on the normal path.
+  assert.ok(!run({}, { ...ctx, allowedEvents: "pull_request" }).ok, "a malformed allowedEvents fails closed");
+  assert.ok(!run({}, { ...ctx, callerPath: [] }).ok, "a malformed callerPath fails closed");
+  assert.equal(suite.value.requiredContexts.length, 1);
 });
