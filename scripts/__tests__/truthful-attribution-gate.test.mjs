@@ -2854,3 +2854,44 @@ test("TREE-EQUALITY: the approved-tree fallback NEVER overrides a proven content
   assert.ok(!undecidable.findings.some((f) => ["content-mismatch", "tree-mismatch", "tree-unverifiable"].includes(f.code)),
     "where the content bridge cannot decide, an approved-tree match binds: " + JSON.stringify(undecidable.findings.map((f) => f.code)));
 });
+
+test("SELF-REFERENCE: the suite's callerPath/allowedEvents constraints are enforced in the self proof too", () => {
+  // codex-converge round 2 HIGH: the self exclusion skips a context's OUTCOME,
+  // never its IDENTITY. A run from an alternate caller workflow or an alternate
+  // trigger event is NOT the run the suite pinned, so it must not be excluded —
+  // otherwise an existing alternate caller bypasses the constraint with no
+  // .github/** edit at all.
+  const selfRun = "30335735831";
+  const ctx = {
+    context: "truthful-attribution-gate / truthful-attribution-gate",
+    workflow: "cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml",
+    pinned: TAG,
+    callerPath: ".github/workflows/truthful-attribution-gate.yml",
+    allowedEvents: ["pull_request", "push", "merge_group"],
+  };
+  const suite = { ok: true, value: { ...WF_SUITE.value, requiredContexts: [ctx] } };
+  const own = {
+    id: 999, name: ctx.context, status: "in_progress", conclusion: null,
+    app: { slug: "github-actions" }, check_suite: { id: 7777 },
+    html_url: `https://github.com/cinatra-ai/cinatra/actions/runs/${selfRun}/job/999`,
+    started_at: "2026-07-28T06:42:54Z",
+  };
+  const good = {
+    headSha: REVIEWED, checkSuiteId: 7777,
+    referencedWorkflows: [{ path: `${ctx.workflow}@${TAG}`, sha: TAG }],
+    status: "in_progress", conclusion: null,
+    path: ".github/workflows/truthful-attribution-gate.yml", event: "pull_request",
+  };
+  const run = (partial, suiteCtx = ctx) => verifyGateArm(gateParsed(), {
+    suiteFile: { ok: true, value: { ...WF_SUITE.value, requiredContexts: [suiteCtx] } },
+    checkRuns: [own], reviewedHeadSha: REVIEWED,
+    runWorkflow: () => wrWith({ ...good, ...partial }, ["999"]), selfRunId: selfRun,
+  });
+  assert.ok(run({}).ok, "the declared caller + event is ours");
+  assert.ok(!run({ path: ".github/workflows/untrusted.yml" }).ok, "an alternate CALLER workflow is not ours");
+  assert.ok(!run({ event: "workflow_dispatch" }).ok, "an alternate trigger EVENT is not ours");
+  // A malformed declaration fails closed here exactly as it does on the normal path.
+  assert.ok(!run({}, { ...ctx, allowedEvents: "pull_request" }).ok, "a malformed allowedEvents fails closed");
+  assert.ok(!run({}, { ...ctx, callerPath: [] }).ok, "a malformed callerPath fails closed");
+  assert.equal(suite.value.requiredContexts.length, 1);
+});

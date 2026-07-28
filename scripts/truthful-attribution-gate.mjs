@@ -1531,6 +1531,44 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
       return typeof e.sha === "string" && e.sha.toLowerCase() === pinnedLower; // and the resolved sha agrees
     });
   }
+  // The OUTCOME-INDEPENDENT caller constraints a required context may declare.
+  // Shared by verifyWorkflowIdentity AND the self-run identity proof: the self
+  // exclusion skips a context's OUTCOME, never its IDENTITY, so every predicate
+  // that says "this is the run the suite meant" must hold there too. Skipping
+  // these in the self proof would let an already-existing alternate caller or
+  // trigger event satisfy a context the suite pinned to one caller/event without
+  // touching .github/** (codex-converge round 2 HIGH).
+  //   - callerPath: the caller workflow file the run executed (run.path). GitHub
+  //     returns a BARE path or a "<path>@<ref>" form; we compare the PATH portion
+  //     case-sensitively and ignore a trailing @ref (the CALLEE pin already binds
+  //     the executed reusable-workflow commit).
+  //   - allowedEvents: the trigger events the caller may have run under (run.event).
+  // A context that OMITS a key (undefined) is unchanged (backward compatible).
+  // A key that is PRESENT-but-MALFORMED FAILS CLOSED, never silently behaving
+  // like "undeclared" (e.g. `allowedEvents: "pull_request"` as a string, or
+  // `callerPath: []`, would otherwise disable the check it was meant to add).
+  function verifyCallerConstraints(wr, ctx, runId) {
+    if (ctx.callerPath !== undefined) {
+      if (typeof ctx.callerPath !== "string" || ctx.callerPath === "") {
+        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'callerPath' (must be a non-empty string) — failing closed rather than skipping the caller check it was meant to add` };
+      }
+      const wrPath = typeof wr.path === "string" ? wr.path : "";
+      const at = wrPath.lastIndexOf("@");
+      const wrPathBare = at > 0 ? wrPath.slice(0, at) : wrPath;
+      if (wrPathBare !== ctx.callerPath) {
+        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} caller workflow '${wrPathBare || "?"}' != the declared callerPath '${ctx.callerPath}' (fail closed)` };
+      }
+    }
+    if (ctx.allowedEvents !== undefined) {
+      if (!Array.isArray(ctx.allowedEvents) || ctx.allowedEvents.length === 0 || !ctx.allowedEvents.every((e) => typeof e === "string" && e !== "")) {
+        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'allowedEvents' (must be a non-empty array of non-empty strings) — failing closed rather than skipping the caller-event check it was meant to add` };
+      }
+      if (typeof wr.event !== "string" || !ctx.allowedEvents.includes(wr.event)) {
+        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} event '${wr.event || "?"}' is not in the declared allowedEvents [${ctx.allowedEvents.join(", ")}] (fail closed)` };
+      }
+    }
+    return { ok: true, reason: null };
+  }
   function verifyWorkflowIdentity(run, ctx) {
     if (!ctx.pinned || !PINNED_RE.test(String(ctx.pinned))) {
       return { ok: false, reason: `required context '${ctx.context}' pins workflow '${ctx.workflow}' but gate-suite.json has no valid 40-hex 'pinned' SHA — cannot verify the workflow commit (fail closed)` };
@@ -1595,25 +1633,8 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     // behave like "undeclared" (codex-converge MEDIUM: e.g. `allowedEvents:
     // "pull_request"` (a string, not an array) or `callerPath: []` would
     // otherwise disable the check the engineer intended to add).
-    if (ctx.callerPath !== undefined) {
-      if (typeof ctx.callerPath !== "string" || ctx.callerPath === "") {
-        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'callerPath' (must be a non-empty string) — failing closed rather than skipping the caller check it was meant to add` };
-      }
-      const wrPath = typeof wr.path === "string" ? wr.path : "";
-      const at = wrPath.lastIndexOf("@");
-      const wrPathBare = at > 0 ? wrPath.slice(0, at) : wrPath;
-      if (wrPathBare !== ctx.callerPath) {
-        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} caller workflow '${wrPathBare || "?"}' != the declared callerPath '${ctx.callerPath}' (fail closed)` };
-      }
-    }
-    if (ctx.allowedEvents !== undefined) {
-      if (!Array.isArray(ctx.allowedEvents) || ctx.allowedEvents.length === 0 || !ctx.allowedEvents.every((e) => typeof e === "string" && e !== "")) {
-        return { ok: false, reason: `required context '${ctx.context}' declares a malformed 'allowedEvents' (must be a non-empty array of non-empty strings) — failing closed rather than skipping the caller-event check it was meant to add` };
-      }
-      if (typeof wr.event !== "string" || !ctx.allowedEvents.includes(wr.event)) {
-        return { ok: false, reason: `required context '${ctx.context}' — Actions run ${runId} event '${wr.event || "?"}' is not in the declared allowedEvents [${ctx.allowedEvents.join(", ")}] (fail closed)` };
-      }
-    }
+    const caller = verifyCallerConstraints(wr, ctx, runId);
+    if (!caller.ok) return caller;
     return { ok: true, reason: null };
   }
   // Latest run per context by the freshest available timestamp. A newer
@@ -1795,6 +1816,10 @@ export function verifyGateArm(parsed, { suiteFile, checkRuns, now = Date.now(), 
     if (csId === undefined || csId === null || wr.checkSuiteId === null || String(wr.checkSuiteId) !== String(csId)) return false;
     if (!(wr.latestAttemptJobIds instanceof Set) || !wr.latestAttemptJobIds.has(String(run.id))) return false;
     if (ctx.workflow && !referencesPinnedWorkflow(wr, ctx)) return false;
+    // The suite's declared caller/event constraints are part of the context's
+    // IDENTITY, not its outcome — enforce them here exactly as the normal path
+    // does, malformed-declaration fail-closed included.
+    if (!verifyCallerConstraints(wr, ctx, selfId).ok) return false;
     return true;
   }
   for (const ctx of suite.requiredContexts) {
