@@ -94,6 +94,17 @@ jobs:
             exit 1
           fi
 
+      - name: meta-commentary-gate multi-path mode widens the scan; single-dir mode is unchanged
+        # The multipath fixture pairs a clean docs/ tree with a violating sibling
+        # README.md: single-dir --docs must stay green (existing callers pass
+        # unchanged) while --paths docs+README must fail on the README.
+        run: |
+          node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/multipath/docs
+          if node scripts/check-meta-commentary.mjs --paths "scripts/__fixtures__/meta-commentary/multipath/docs,scripts/__fixtures__/meta-commentary/multipath/README.md"; then
+            echo "::error::meta-commentary-gate multi-path mode did not fail the violating README fixture" >&2
+            exit 1
+          fi
+
       - name: Design-system preset runs clean on its own repository
         run: npx eslint .
 

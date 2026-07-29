@@ -1,0 +1,2105 @@
+{
+  "$comment": "The docs#156 AC1 inventory — the closure set the meta-commentary sweep and gate rollout are measured against. 'Published surface' = Markdown a non-contributor is expected to read: a public repo's root README.md / CHANGELOG.md, any docs/ tree, and copy staged for an external listing (.wordpress-org/, .drupalorg/). Contributor-, maintainer-, and engineering-internal documentation is exempt by design; every exemption is RECORDED here per surface with a rationale, never implied. class values: 'published' (in scope; a caller of the reusable meta-commentary-gate should cover it), 'exempt-engineering-internal' (recorded exemption), 'staged-listing' (audited; per-file fix-vs-exempt ruling recorded on cinatra-ai/docs#156). Recorded from each PUBLIC, non-archived org repo's default branch as of recordedAt (enumerated via the GitHub API). Archived public repos are excluded (read-only; no callers can be added) and listed in excludedArchivedRepos. Private repos publish nothing and are out of scope by definition. Regenerate by re-enumerating public org repos and re-listing these surface path patterns on each default branch; update recordedAt when doing so.",
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-29",
+  "issue": "cinatra-ai/docs#156",
+  "surfacePatterns": [
+    "README.md",
+    "CHANGELOG.md",
+    "docs/**/*.md",
+    ".wordpress-org/**/*.md",
+    ".drupalorg/**/*.md"
+  ],
+  "excludedArchivedRepos": [
+    "cinatra-ai/auditor-agent",
+    "cinatra-ai/default-artifact",
+    "cinatra-ai/reviewer-agent",
+    "cinatra-ai/skill-recommender-agent",
+    "cinatra-ai/trigger-agent"
+  ],
+  "repoCount": 132,
+  "repos": [
+    {
+      "repo": "cinatra-ai/.github",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Org-shared GitHub config repo: README documents the org publish pipeline for maintainers."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/a2a-server-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/a2a-servers-dev",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Dev-only A2A peer-server fixtures for the local dev stack; README is contributor-facing."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/anthropic-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/apify-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/apollo-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/apollo-prospecting-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/assistant-skills",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/audio-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/author-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/automation-authoring-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-content-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-draft-writer-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-idea-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-idea-authoring-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-idea-generator-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-idea-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-image-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-image-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-image-prompt-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-linkedin-publish-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-linkedin-writer-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-pipeline-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-post-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-post-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-wordpress-publish-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-writing-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/brand-voice-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/brand-voice-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/chart-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/chat-assistant-core-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/ci",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Shared reusable CI for the org: every page serves engineers wiring gates into repos, not product users."
+        },
+        {
+          "path": "docs/release-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Shared reusable CI for the org: every page serves engineers wiring gates into repos, not product users."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/cinatra",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/architecture/skills-lifecycle.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/architecture/stateful-service-inventory.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/artifact-renderer-rsc-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/cms-review-adapter-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/default-off-flags.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/extension-clone-pinning.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/extension-library-closure.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/extension-server-entry-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/llm-provider-dependency-vocabulary.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/marketplace-moderation-credentials.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/schema-migrations-and-org-write-policy.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/widget-source-of-truth.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/wp-site-inventory-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/decisions/artifact-review-rejection-semantics-adr.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/decisions/artifact-ui-boundary-adr.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/decisions/no-sandbox-third-party-trust-adr.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/decisions/production-runtime-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/decisions/required-system-lock-invariant.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/decisions/skills-drift-decisions.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/governance/lifecycle-review-policy.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/governance/skills-drift-ack-9cb0ae1.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/governance/source-leak-gate-hardening.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/proofs/1785-a6/README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/proofs/1793-teardown/README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-05ed5e5b.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-09de0baa.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-13c12abe.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-2efb4f63.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-384e22e2.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-39c65b8.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-3a1e506f.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-452443e.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-5b2ed7a.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-6aa0275d.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-7152b8cc.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-729d9b11.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-7bbe1ab2.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-8512a00.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-a01adbd5.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-af6f5a84.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-b07a8a5.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-b8a6096.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-bd4778d.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-d262716a.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-d624a19.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-d76ae1b2.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-de45a1f4.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-e46ca827.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-f1750f18.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attribution-correction-306.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attribution-correction-485.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attribution-correction-546-556.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attribution-correction-763.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra-v016-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra150-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra158-227-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra1820-squash-body-clobber-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra1842-empty-squash-body-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra2189-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra234-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra246-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra346-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra351-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra437-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra482-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra601-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra638-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra658-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra660-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra672-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra685-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra686-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra719-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra724-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra733-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra804-skills-drift-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra820-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/cinatra844-attribution-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/skills-drift-correction-1778.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/skills-drift-correction-786.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/truthful-attribution-protocol-correction.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/audits/v0.1.5-release-record.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/workflows/agent-run-hitl-prompt-primitives.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/workflows/authoring-lifecycle-producers.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/workflows/upgrade-track.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/workflows/webhooks/authoring-inbound-webhooks.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/workflows/webhooks/outbound-delivery.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/cinatra-assistant",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/cinatra-cli",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/claude-assistant",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/claude-plugin",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/cms-snapshot-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/code-reviewer-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/company-discovery-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/company-research-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/competitive-analysis-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/competitive-analysis-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/contact-discovery-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/context-selection-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/contract-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/contract-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/crm-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/dashboard-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/docs",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published",
+          "note": "Covered by the docs repo's own repo-local blocking check (docs#114)."
+        },
+        {
+          "path": "guides/ + integrations/ + references/ + resources/ (the docs.cinatra.ai site tree)",
+          "class": "published",
+          "note": "The site's page tree; covered by the docs repo's own repo-local blocking check (docs#114), which skips two contributor-docs pages by design (recorded in that script's SKIP_PATHS)."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/document-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-artifacts",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-assistant",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-assistant-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-mcp-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-module",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": ".drupalorg/README.md",
+          "class": "staged-listing",
+          "note": "Audited in the docs#156 sweep; fix-vs-exempt is a per-file ruling recorded on that issue — staged listing dirs are NOT pre-exempted as a category."
+        },
+        {
+          "path": ".drupalorg/project-page.md",
+          "class": "staged-listing",
+          "note": "Audited in the docs#156 sweep; fix-vs-exempt is a per-file ruling recorded on that issue — staged listing dirs are NOT pre-exempted as a category."
+        },
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/advanced-and-reference.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/overview.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/quick-start.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/settings-and-permissions.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/troubleshooting.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/use-it.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/drupal-widget-chat-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-artifacts",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-body-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-body-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-delivery-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-drafting-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-follow-up-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-outreach-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-recipient-selection-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/email-test-delivery-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/extension-authoring-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/gemini-assistant",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/gemini-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/github-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/gmail-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/google-calendar-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/google-oauth-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/hitl-prompt-drive-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/image-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/json-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/linkedin-artifacts",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/linkedin-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/linkedin-oauth-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/lint-policy-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/list-curation-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/list-curator-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/marketing-icp-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/marketing-icp-authoring-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/marketing-icp-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/marketing-strategy-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/marketing-strategy-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/mcp-client-registry-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/mcp-server-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/advanced-and-reference.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/overview.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/quick-start.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/settings-and-permissions.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/troubleshooting.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/use-it.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/media-feed-lister-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/media-feeds-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/media-transcript-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/nango-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/openai-assistant",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/openai-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/USAGE.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/pdf-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/plane-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/advanced-and-reference.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/overview.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/quick-start.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/settings-and-permissions.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/troubleshooting.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/use-it.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/planner-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/product-portfolio-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/product-portfolio-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/project-manager-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/release-announcement-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/resend-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/sales-playbook-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/sales-playbook-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/screenshot-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/screenshot-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/security-reviewer-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/skill-prefill-generation-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/slide-deck-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/slide-deck-matcher-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/social-media-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/tailscale-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/text-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/twenty-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/advanced-and-reference.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/overview.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/quick-start.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/settings-and-permissions.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/troubleshooting.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/use-it.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/video-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/web-analytics-dashboard-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/web-research-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/web-research-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/web-scrape-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-artifacts",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-assistant",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-assistant-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-mcp-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/external-mcp-adapter-pages.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-plugin",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": ".wordpress-org/README.md",
+          "class": "staged-listing",
+          "note": "Audited in the docs#156 sweep; fix-vs-exempt is a per-file ruling recorded on that issue — staged listing dirs are NOT pre-exempted as a category."
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/advanced-and-reference.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/overview.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/quick-start.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/settings-and-permissions.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/troubleshooting.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/use-it.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/wordpress-widget-chat-skill",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/youtube-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/zip-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    }
+  ]
+}

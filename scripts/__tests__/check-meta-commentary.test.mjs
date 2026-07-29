@@ -167,3 +167,124 @@ test("a malformed allowlist entry (missing required key) is a config error (exit
     }
   );
 });
+
+// ---------------------------------------------------------------------------
+// Multi-path mode (cinatra-ai/docs#156): --paths widens the scan to a
+// configurable SET of directories and/or single Markdown files. --docs alone
+// keeps the original single-directory scope — the multipath fixture pairs a
+// clean docs/ tree with a violating sibling README.md, so the single-dir case
+// passing here IS the proof that existing callers' scope is unchanged.
+
+const MULTIPATH = "scripts/__fixtures__/meta-commentary/multipath";
+const MULTIPATH_README = `${MULTIPATH}/README.md`;
+const MULTIPATH_README_LINE = "This README is generated from the docs monorepo — edit it there, not here.";
+
+test("single-dir mode does NOT scan a sibling README (existing callers pass unchanged)", () => {
+  const { code, out } = run(["--docs", `${MULTIPATH}/docs`]);
+  assert.equal(code, 0, out);
+  assert.match(out, /OK — 0 violations/);
+});
+
+test("--paths catches the violating README next to a clean docs tree", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH}/docs,${MULTIPATH_README}`]);
+  assert.equal(code, 1, out);
+  assert.match(out, /\[generated_from\]/);
+  assert.match(out, /multipath\/README\.md:3/);
+});
+
+test("--paths with only clean surfaces passes and names the configured paths", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH}/docs,${MULTIPATH}/CHANGELOG.md`]);
+  assert.equal(code, 0, out);
+  assert.match(out, /OK — 0 violations/);
+  assert.match(out, /configured paths/);
+});
+
+test("a newline-separated --paths spec parses (the YAML block-scalar shape a caller passes)", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH}/docs\n${MULTIPATH}/CHANGELOG.md\n`]);
+  assert.equal(code, 0, out);
+});
+
+test("a missing configured path is a config error (exit 2)", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH}/docs,${MULTIPATH}/does-not-exist.md`]);
+  assert.equal(code, 2, out);
+  assert.match(out, /configured path not found/);
+});
+
+test("a configured path with no tracked Markdown is a config error (exit 2), not a silent no-op", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH}/docs,package.json`]);
+  assert.equal(code, 2, out);
+  assert.match(out, /matched no tracked Markdown/);
+});
+
+test("overlapping --paths entries scan a file once (no duplicate violations)", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH_README},${MULTIPATH}`]);
+  assert.equal(code, 1, out);
+  const hits = out.match(/\[generated_from\]/g) ?? [];
+  assert.equal(hits.length, 1, out);
+});
+
+test("the line-pinned allowlist works identically in multi-path mode (live entry suppresses)", () => {
+  withAllowlist(
+    [{
+      file: MULTIPATH_README,
+      pattern: "generated_from",
+      snippet: MULTIPATH_README_LINE,
+      owner: "groganz",
+      reviewBy: "2099-01-01",
+      note: "Fixture: proves allowlist parity in multi-path mode.",
+    }],
+    (allowPath) => {
+      const { code, out } = run(["--paths", `${MULTIPATH}/docs,${MULTIPATH_README}`, "--allowlist", allowPath]);
+      assert.equal(code, 0, out);
+      assert.match(out, /1 live entries/);
+    }
+  );
+});
+
+test("an EXPIRED allowlist entry stops suppressing in multi-path mode too", () => {
+  withAllowlist(
+    [{
+      file: MULTIPATH_README,
+      pattern: "generated_from",
+      snippet: MULTIPATH_README_LINE,
+      owner: "groganz",
+      reviewBy: "2000-01-01",
+      note: "Fixture: expiry parity in multi-path mode.",
+    }],
+    (allowPath) => {
+      const { code, out } = run([
+        "--paths", `${MULTIPATH}/docs,${MULTIPATH_README}`,
+        "--allowlist", allowPath,
+        "--now", "2026-07-29",
+      ]);
+      assert.equal(code, 1, out);
+      assert.match(out, /EXPIRED/);
+    }
+  );
+});
+
+test("a separator-only --paths spec is a config error (exit 2), never a silent fallback to --docs", () => {
+  const { code, out } = run(["--paths", ",,  \n", "--docs", CLEAN]);
+  assert.equal(code, 2, out);
+  assert.match(out, /parsed to zero entries/);
+});
+
+test("a valueless trailing --paths is a config error (exit 2)", () => {
+  const { code, out } = run(["--docs", CLEAN, "--paths"]);
+  assert.equal(code, 2, out);
+  assert.match(out, /parsed to zero entries/);
+});
+
+test("--paths takes precedence over an explicit --docs", () => {
+  // --docs points at the clean tree, --paths at the violating README: the
+  // violation must be reported, proving --paths won.
+  const { code, out } = run(["--docs", CLEAN, "--paths", MULTIPATH_README]);
+  assert.equal(code, 1, out);
+  assert.match(out, /\[generated_from\]/);
+});
+
+test("a glob-looking --paths entry is treated literally, not expanded (exit 2)", () => {
+  const { code, out } = run(["--paths", `${MULTIPATH}/*.md`]);
+  assert.equal(code, 2, out);
+  assert.match(out, /configured path not found/);
+});
