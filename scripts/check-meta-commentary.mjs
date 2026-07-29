@@ -23,6 +23,22 @@
 // contract with no docs-about-docs pages, so nothing is skipped (this is
 // stricter, never weaker, than the source gate on the same files).
 //
+// MULTI-PATH MODE (cinatra-ai/docs#156): published Markdown lives outside
+// `docs/` too — a top-level README.md, a CHANGELOG.md, staged listing copy — so
+// the gate also accepts a configurable SET of paths via `--paths <spec>`, where
+// <spec> is a newline- and/or comma-separated list of directories and/or single
+// Markdown files (e.g. "docs,README.md"). SUPPLYING `--paths` selects
+// multi-path mode and takes precedence over `--docs`; when it is absent the
+// gate behaves exactly as before (single `--docs` directory, default "docs"),
+// so existing callers pass unchanged. Multi-path mode is deliberately
+// FAIL-CLOSED where being new lets it be: a supplied spec that normalizes to
+// zero entries is a config error (never a silent fallback to `--docs`), every
+// configured path must exist AND yield at least one tracked Markdown file (a
+// typo'd or empty entry is a config error, exit 2, never a silent no-op scan),
+// and entries are LITERAL paths, never globs. Files listed twice (e.g.
+// "docs,docs/overview.md") are scanned once. Pattern list, allowlist pinning,
+// and reviewBy expiry are identical in both modes.
+//
 // Deliberately "cheap", not exhaustive:
 //   - Pattern-based phrase matching, not real NLP; a rephrased violation can
 //     slip through, and a legitimate sentence can coincidentally match.
@@ -39,7 +55,7 @@
 // so untracked/gitignored scratch never trips the gate.
 //
 // Usage (after checkout; run from the caller repo root):
-//   node check-meta-commentary.mjs [--docs <dir>] [--allowlist <path>] [--now <ISO-date>]
+//   node check-meta-commentary.mjs [--docs <dir>] [--paths <spec>] [--allowlist <path>] [--now <ISO-date>]
 //
 // Exit codes: 0 = clean, 1 = violation(s), 2 = usage/config error.
 // ---------------------------------------------------------------------------
@@ -114,10 +130,24 @@ const PATTERNS = [
   ],
 ];
 
+// A --paths spec is a newline- and/or comma-separated list of entries;
+// whitespace around entries is trimmed and empty entries are dropped (a YAML
+// block scalar arrives with a trailing newline). Repeating --paths appends.
+function parsePathsSpec(spec) {
+  return String(spec ?? "")
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function parseArgs(argv) {
-  const out = { docs: DEFAULT_DOCS_DIR, allowlist: DEFAULT_ALLOWLIST_PATH, now: new Date() };
+  const out = { docs: DEFAULT_DOCS_DIR, paths: [], pathsSupplied: false, allowlist: DEFAULT_ALLOWLIST_PATH, now: new Date() };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--docs" || argv[i] === "-d") out.docs = argv[++i];
+    else if (argv[i] === "--paths") {
+      out.pathsSupplied = true;
+      out.paths.push(...parsePathsSpec(argv[++i]));
+    }
     else if (argv[i] === "--allowlist") out.allowlist = argv[++i];
     else if (argv[i] === "--now") out.now = new Date(argv[++i]); // testability only
     else if (argv[i] === "--help" || argv[i] === "-h") out.help = true;
@@ -166,15 +196,18 @@ function loadAllowlist(path, now) {
   return { live, expired };
 }
 
-// Tracked Markdown files under the scoped docs dir. `git ls-files` respects
-// gitignore and returns only tracked files (so an untracked scratch file can
-// never trip the gate); scoping the pathspec to <docs> confines the scan to the
-// caller's docs tree. Paths are returned relative to CWD. `-z` handles unusual
-// filenames robustly.
+// Tracked Markdown files under one scan root (a directory, or — in multi-path
+// mode — possibly a single file; `git ls-files` handles both pathspec shapes).
+// `git ls-files` respects gitignore and returns only tracked files (so an
+// untracked scratch file can never trip the gate); scoping the pathspec
+// confines the scan to the configured tree. Paths are returned relative to
+// CWD. `-z` handles unusual filenames robustly.
 function listMarkdownFiles(docsDir) {
   let out;
   try {
-    out = execFileSync("git", ["ls-files", "-z", "--", docsDir], {
+    // --literal-pathspecs: configured entries are LITERAL paths, never globs —
+    // a "*"/"?"/"[" in an entry must not silently widen or shift the scan.
+    out = execFileSync("git", ["--literal-pathspecs", "ls-files", "-z", "--", docsDir], {
       cwd: CWD,
       encoding: "utf8",
     });
@@ -212,16 +245,37 @@ function lineTextAt(content, index) {
 }
 
 function main() {
-  const { docs, allowlist: allowlistPath, now, help } = parseArgs(process.argv.slice(2));
+  const { docs, paths, pathsSupplied, allowlist: allowlistPath, now, help } = parseArgs(process.argv.slice(2));
   if (help) {
-    console.log("Usage: check-meta-commentary [--docs <dir>] [--allowlist <path>] [--now <ISO-date>]");
+    console.log(
+      "Usage: check-meta-commentary [--docs <dir>] [--paths <newline/comma-separated dirs and/or .md files>] [--allowlist <path>] [--now <ISO-date>]"
+    );
+    console.log("A non-empty --paths takes precedence over --docs; without it the gate scans the single --docs directory.");
     process.exit(0);
   }
 
-  const docsAbs = resolveInCwd(docs);
-  if (!existsSync(docsAbs) || !statSync(docsAbs).isDirectory()) {
-    console.error(`[meta-commentary-gate] ERROR: docs directory not found: ${docs}`);
+  // Multi-path mode: SUPPLYING --paths selects it; a supplied spec that
+  // normalizes to zero entries (",," / whitespace / a missing value) is a
+  // config error, NEVER a silent fallback to the --docs scan (fail closed —
+  // a caller that asked for the widened scope must get it or fail loudly).
+  const multiPath = pathsSupplied;
+  if (multiPath && paths.length === 0) {
+    console.error(`[meta-commentary-gate] ERROR: --paths was supplied but parsed to zero entries — fix the paths spec.`);
     process.exit(2);
+  }
+  if (multiPath) {
+    for (const p of paths) {
+      if (!existsSync(resolveInCwd(p))) {
+        console.error(`[meta-commentary-gate] ERROR: configured path not found: ${p}`);
+        process.exit(2);
+      }
+    }
+  } else {
+    const docsAbs = resolveInCwd(docs);
+    if (!existsSync(docsAbs) || !statSync(docsAbs).isDirectory()) {
+      console.error(`[meta-commentary-gate] ERROR: docs directory not found: ${docs}`);
+      process.exit(2);
+    }
   }
 
   let live, expired;
@@ -239,7 +293,33 @@ function main() {
 
   let markdownFiles;
   try {
-    markdownFiles = listMarkdownFiles(docs);
+    if (multiPath) {
+      // Union of tracked Markdown under every configured path, dedup'd (an
+      // entry may be a directory or a single file; overlapping entries — e.g.
+      // "docs,docs/overview.md" — scan a file once). FAIL CLOSED per entry: a
+      // configured path that yields no tracked Markdown at all is a config
+      // error (a typo'd, untracked, or Markdown-free entry must surface, never
+      // silently narrow the scan).
+      const seen = new Set();
+      markdownFiles = [];
+      for (const p of paths) {
+        const files = listMarkdownFiles(p);
+        if (files.length === 0) {
+          console.error(
+            `[meta-commentary-gate] ERROR: configured path "${p}" matched no tracked Markdown files — fix the entry or drop it.`
+          );
+          process.exit(2);
+        }
+        for (const f of files) {
+          if (!seen.has(f)) {
+            seen.add(f);
+            markdownFiles.push(f);
+          }
+        }
+      }
+    } else {
+      markdownFiles = listMarkdownFiles(docs);
+    }
   } catch (e) {
     console.error(`[meta-commentary-gate] ERROR: ${e.message}`);
     process.exit(2);
@@ -269,11 +349,12 @@ function main() {
     }
   }
 
+  const scopeLabel = multiPath
+    ? `across ${markdownFiles.length} tracked Markdown file(s) under the configured paths (${paths.join(", ")})`
+    : `across tracked Markdown pages under "${docs}/"`;
+
   if (violations.length === 0) {
-    console.log(
-      `[meta-commentary-gate] OK — 0 violations across tracked Markdown pages under "${docs}/" ` +
-        `(allowlist: ${live.length} live entries).`
-    );
+    console.log(`[meta-commentary-gate] OK — 0 violations ${scopeLabel} (allowlist: ${live.length} live entries).`);
     if (expired.length > 0) {
       console.log(
         `[meta-commentary-gate] NOTE — ${expired.length} allowlist entry(ies) past their reviewBy ` +

@@ -27,6 +27,26 @@ name: meta-commentary-gate
 # handling as docs' own scripts/check-meta-commentary.mjs — the reusable enforces
 # exactly what the source repo does, scoped to one directory.
 #
+# MULTI-PATH MODE (cinatra-ai/docs#156): published Markdown lives outside
+# `docs/` too (a top-level README.md, a CHANGELOG.md, staged listing copy), so a
+# caller may instead pass `paths` — a newline- and/or comma-separated SET of
+# directories and/or single Markdown files to scan:
+#
+#       with:
+#         paths: |
+#           docs
+#           README.md
+#         ref: <same-sha>
+#
+# A non-empty `paths` takes precedence over `docs`; when it is omitted the gate
+# behaves exactly as before (single `docs` directory), so existing callers pass
+# unchanged. Multi-path mode is fail-closed: a spec that normalizes to zero
+# entries is a config error (never a silent fallback to `docs`), every
+# configured entry must exist and yield at least one tracked Markdown file (a
+# typo'd entry is a config error, never a silently narrower scan), and entries
+# are literal paths, never globs. Pattern list, per-repo line-pinned allowlist,
+# and reviewBy-expiry semantics are identical in both modes.
+#
 # ALLOWLIST (docs#119 step 3): the allowlist is OPTIONAL and per-repo — an ABSENT
 # file means an EMPTY allowlist. Integration `docs/` is product-only (the fixed
 # 6-page contract, no docs-about-docs pages), so no repo needs one today; a repo
@@ -39,9 +59,13 @@ on:
   workflow_call:
     inputs:
       docs:
-        description: "Path (in the caller repo) to the docs/ directory to scan."
+        description: "Path (in the caller repo) to the docs/ directory to scan. Ignored when `paths` is set."
         type: string
         default: "docs"
+      paths:
+        description: "Optional newline- and/or comma-separated set of paths (directories and/or single Markdown files, e.g. docs plus README.md) to scan instead of the single `docs` directory. Every entry must exist and yield at least one tracked Markdown file (fail-closed). Empty = single-directory `docs` behavior."
+        type: string
+        default: ""
       allowlist:
         description: "Optional path (in the caller repo) to the reviewed false-positive allowlist. Absent file = empty allowlist."
         type: string
@@ -85,11 +109,20 @@ jobs:
 
       - name: Run gate
         # Caller inputs are passed via ENV, never interpolated into the shell
-        # source, so a crafted `docs`/`allowlist` input cannot inject a command.
+        # source, so a crafted `docs`/`paths`/`allowlist` input cannot inject a
+        # command. A non-empty `paths` selects multi-path mode; otherwise the
+        # original single-directory `docs` scan runs unchanged.
         env:
           MCG_DOCS: ${{ inputs.docs }}
+          MCG_PATHS: ${{ inputs.paths }}
           MCG_ALLOWLIST: ${{ inputs.allowlist }}
         run: |
-          node .meta-commentary-gate/scripts/check-meta-commentary.mjs \
-            --docs "$MCG_DOCS" \
-            --allowlist "$MCG_ALLOWLIST"
+          if [ -n "$MCG_PATHS" ]; then
+            node .meta-commentary-gate/scripts/check-meta-commentary.mjs \
+              --paths "$MCG_PATHS" \
+              --allowlist "$MCG_ALLOWLIST"
+          else
+            node .meta-commentary-gate/scripts/check-meta-commentary.mjs \
+              --docs "$MCG_DOCS" \
+              --allowlist "$MCG_ALLOWLIST"
+          fi
