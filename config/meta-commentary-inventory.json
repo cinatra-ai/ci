@@ -1,5 +1,5 @@
 {
-  "$comment": "The docs#156 AC1 inventory — the closure set the meta-commentary sweep and gate rollout are measured against. 'Published surface' = Markdown a non-contributor is expected to read: a public repo's root README.md / CHANGELOG.md, any docs/ tree, and copy staged for an external listing (.wordpress-org/, .drupalorg/). Contributor-, maintainer-, and engineering-internal documentation is exempt by design; every exemption is RECORDED here per surface with a rationale, never implied. class values: 'published' (in scope; a caller of the reusable meta-commentary-gate should cover it), 'exempt-engineering-internal' (recorded exemption), 'staged-listing' (audited; per-file fix-vs-exempt ruling recorded on cinatra-ai/docs#156). Recorded from each PUBLIC, non-archived org repo's default branch as of recordedAt (enumerated via the GitHub API). Archived public repos are excluded (read-only; no callers can be added) and listed in excludedArchivedRepos. Private repos publish nothing and are out of scope by definition. Regenerate by re-enumerating public org repos and re-listing these surface path patterns on each default branch; update recordedAt when doing so.",
+  "$comment": "The docs#156 AC1 inventory — the closure set the meta-commentary sweep and gate rollout are measured against. 'Published surface' = Markdown a non-contributor is expected to read: a public repo's root README.md / CHANGELOG.md, any docs/ tree, and copy staged for an external listing (.wordpress-org/, .drupalorg/). Contributor-, maintainer-, and engineering-internal documentation is exempt by design; every exemption is RECORDED here per surface with a rationale, never implied. class values: 'published' (in scope; a caller of the reusable meta-commentary-gate should cover it), 'exempt-engineering-internal' (recorded exemption), 'staged-listing' (copy staged for an external directory listing; the docs#156 AC5 ruling makes it a PUBLISHED surface — asset-production notes are removed, not exempted, and its repo's caller scans the path). Recorded from each PUBLIC, non-archived org repo's default branch as of recordedAt (enumerated via the GitHub API). Archived public repos are excluded (read-only; no callers can be added) and listed in excludedArchivedRepos. Private repos publish nothing and are out of scope by definition. Regenerate by re-enumerating public org repos and re-listing these surface path patterns on each default branch; update recordedAt when doing so.",
   "schemaVersion": 1,
   "recordedAt": "2026-07-29",
   "issue": "cinatra-ai/docs#156",
@@ -1022,7 +1022,22 @@
           "note": "Covered by the docs repo's own repo-local blocking check (docs#114)."
         },
         {
-          "path": "guides/ + integrations/ + references/ + resources/ (the docs.cinatra.ai site tree)",
+          "path": "guides/**/*.md",
+          "class": "published",
+          "note": "The site's page tree; covered by the docs repo's own repo-local blocking check (docs#114), which skips two contributor-docs pages by design (recorded in that script's SKIP_PATHS)."
+        },
+        {
+          "path": "integrations/**/*.md",
+          "class": "published",
+          "note": "The site's page tree; covered by the docs repo's own repo-local blocking check (docs#114), which skips two contributor-docs pages by design (recorded in that script's SKIP_PATHS)."
+        },
+        {
+          "path": "references/**/*.md",
+          "class": "published",
+          "note": "The site's page tree; covered by the docs repo's own repo-local blocking check (docs#114), which skips two contributor-docs pages by design (recorded in that script's SKIP_PATHS)."
+        },
+        {
+          "path": "resources/**/*.md",
           "class": "published",
           "note": "The site's page tree; covered by the docs repo's own repo-local blocking check (docs#114), which skips two contributor-docs pages by design (recorded in that script's SKIP_PATHS)."
         }
@@ -1103,12 +1118,12 @@
         {
           "path": ".drupalorg/README.md",
           "class": "staged-listing",
-          "note": "Audited in the docs#156 sweep; fix-vs-exempt is a per-file ruling recorded on that issue — staged listing dirs are NOT pre-exempted as a category."
+          "note": "Staged listing copy is a PUBLISHED surface (docs#156 AC5 ruling): asset-production notes here are REMOVED, not exempted, and the repo's meta-commentary caller scans this path so the surface stays gated."
         },
         {
           "path": ".drupalorg/project-page.md",
           "class": "staged-listing",
-          "note": "Audited in the docs#156 sweep; fix-vs-exempt is a per-file ruling recorded on that issue — staged listing dirs are NOT pre-exempted as a category."
+          "note": "Staged listing copy is a PUBLISHED surface (docs#156 AC5 ruling): asset-production notes here are REMOVED, not exempted, and the repo's meta-commentary caller scans this path so the surface stays gated."
         },
         {
           "path": "CHANGELOG.md",
@@ -2029,7 +2044,7 @@
         {
           "path": ".wordpress-org/README.md",
           "class": "staged-listing",
-          "note": "Audited in the docs#156 sweep; fix-vs-exempt is a per-file ruling recorded on that issue — staged listing dirs are NOT pre-exempted as a category."
+          "note": "Staged listing copy is a PUBLISHED surface (docs#156 AC5 ruling): asset-production notes here are REMOVED, not exempted, and the repo's meta-commentary caller scans this path so the surface stays gated."
         },
         {
           "path": "README.md",

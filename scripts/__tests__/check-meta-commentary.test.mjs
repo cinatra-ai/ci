@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -287,4 +287,151 @@ test("a glob-looking --paths entry is treated literally, not expanded (exit 2)",
   const { code, out } = run(["--paths", `${MULTIPATH}/*.md`]);
   assert.equal(code, 2, out);
   assert.match(out, /configured path not found/);
+});
+
+// ---------------------------------------------------------------------------
+// docs#156 AC5 pattern classes: TRANSITION / in-flight narration, and PLANNING
+// PROVENANCE (internal decision-process vocabulary in published prose). Both
+// are precision-sensitive — "landed" and "ratified" are ordinary words — so
+// every positive is paired with the negative prose the RULED OUT policy pins.
+
+test("AC5 class 1: the staged-listing asset-production phrasings are caught (line-wrapped 'generated …ly from', 'never hand-edit')", () => {
+  // The two evasions the docs#156 staged-listing sweep actually found:
+  // "generated deterministically\nfrom the design system" (an adverb plus a
+  // hard wrap between the two words) and "never hand-edit the PNGs" (a
+  // negation the "do not" spelling missed). Ruling: those notes are REMOVED
+  // from a published surface, so the pattern has to be able to see them.
+  const { code, out } = run(["--docs", VIOLATING]);
+  assert.equal(code, 1, out);
+  assert.match(out, /\[generated_from\]/);
+  // Two distinct do_not_hand_edit hits: the original "do not" line and the
+  // "never hand-edit" line.
+  assert.equal((out.match(/\[do_not_hand_edit\]/g) ?? []).length, 2, out);
+});
+
+test("AC5 class 1 rule-out: 'no need to hand-edit' is advisory product prose, not a production instruction", () => {
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+test("AC5 class 1 negatives: ordinary 'generated' and 'hand-edit' product prose stays green", () => {
+  // "Reports are generated on demand" and "Records you hand-edit in Example"
+  // are product behaviour, not production instructions — the widened spellings
+  // must not reach them.
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+test("AC5 class 2 (transition/in-flight): every rephrased 'still landing' pattern trips the violating fixture", () => {
+  const { code, out } = run(["--docs", VIOLATING]);
+  assert.equal(code, 1, out);
+  for (const id of ["still_landing", "not_yet_landed", "landing_separately"]) {
+    assert.match(out, new RegExp(`\\[${id}\\]`), `expected transition pattern ${id} in output`);
+  }
+  // Both landing_separately spellings: the bare adverb and the lifecycle-noun
+  // form ("landing in a later release").
+  assert.equal((out.match(/\[landing_separately\]/g) ?? []).length, 2, out);
+});
+
+test("AC5 precision: the dropped transition candidates and the runtime-object phrasings stay green", () => {
+  // "yet to land" and "still in flight" were rejected as patterns (commoner in
+  // runtime prose than roadmap prose) and "landing in a separate bucket" lacks
+  // the required lifecycle noun. The clean fixture carries all three.
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+test("AC5 precision: proximity alone is not a planning-provenance violation", () => {
+  // "See issue #123 for troubleshooting. If the webhook has not landed after
+  // five minutes, retry it." and its reverse are in the clean fixture: a
+  // work-item number and the word "landed" on one line must NOT fail without
+  // the explicit binding relation.
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+test("AC5 precision: external-standards ratification, decision compounds, and list markers stay green", () => {
+  // The round-3 precision set, all in the clean fixture: "only ratified
+  // algorithms run in FIPS mode", the same claim across a hard wrap
+  // ("algorithms ratified\nby NIST"), "following the decision returned by the
+  // policy engine" (no finite compound blacklist can cover that — the pattern
+  // requires the reference to TERMINATE), and adjacent "+" / "1)" list items,
+  // which the "-"/"*"-only wrap guard would have joined.
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+test("AC5 precision: external-standards ratification and 'the decision tree' stay green", () => {
+  // "the ratified W3C proposal", "the security policy was ratified by the
+  // standards committee", "following the decision tree", and two adjacent
+  // bullets ("Access is ratified by administrators" / "Policy changes are
+  // logged") that a newline-crossing gap would otherwise join.
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+test("AC5 class 3 (planning provenance): work-item history and decision vocabulary trip the violating fixture", () => {
+  const { code, out } = run(["--docs", VIOLATING]);
+  assert.equal(code, 1, out);
+  for (const id of [
+    "planning_workitem_landed",
+    "planning_landed_workitem",
+    "ratified_decision_vocab",
+    "decision_was_ratified",
+    "ruling_reference",
+  ]) {
+    assert.match(out, new RegExp(`\\[${id}\\]`), `expected planning-provenance pattern ${id} in output`);
+  }
+  // Both relating-preposition spellings ("shipped under epic #N", "landed with
+  // issue #N") and both ruling spellings ("per the ruling", "per the owner
+  // ruling <date>").
+  assert.equal((out.match(/\[planning_landed_workitem\]/g) ?? []).length, 2, out);
+  assert.equal((out.match(/\[ruling_reference\]/g) ?? []).length, 2, out);
+  // Three forward-form spellings: the Markdown-linked reference, "Epic #123 was
+  // implemented", and "Epic #456, which was merged".
+  assert.equal((out.match(/\[planning_workitem_landed\]/g) ?? []).length, 3, out);
+});
+
+test("AC5 patterns are linear on adversarial input (no catastrophic backtracking)", () => {
+  // The planning-provenance patterns chain several optional groups; unbounded
+  // `\s*` runs between them backtrack quadratically. Every gap is a bounded
+  // space/tab run, so a 200k-space payload must complete in milliseconds.
+  const src = readFileSync(join(REPO_ROOT, "scripts", "check-meta-commentary.mjs"), "utf8");
+  const i = src.indexOf("const PATTERNS = [");
+  const j = src.indexOf("\n];", i) + 3;
+  // Reads the gate's OWN list so this guard cannot drift from it.
+  const patterns = (0, eval)(src.slice(i, j).replace("const PATTERNS =", "").replace(/;\s*$/, ""));
+  for (const payload of [`epic #1${" ".repeat(200_000)}x`, `landed in epic #1${" ".repeat(200_000)}x`]) {
+    const started = Date.now();
+    for (const [, rx] of patterns) new RegExp(rx.source, "gi").exec(payload);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 2000, `pattern scan took ${elapsed}ms on a 200k-space payload`);
+  }
+});
+
+test("AC5 class 3: the ratified/mode match survives a hard wrap between the two words", () => {
+  // The real docs instance is "the ratified **claim-only**\nmode" — the gap
+  // must cross one wrap, and the fixture reproduces the wrap exactly.
+  const { code, out } = run(["--docs", VIOLATING]);
+  assert.equal(code, 1, out);
+  assert.match(out, /\[ratified_decision_vocab\]/);
+});
+
+test("AC5 negatives: ordinary product prose using land/landed/ratified/not-yet stays green", () => {
+  // The clean fixture carries the sentences a broader pattern would have
+  // failed — "tells you when it lands", "if you are landing here", "an approval
+  // landed", "the ratified OAuth 2.1 specification", "not yet supported", a
+  // bare issue link, "per the settings". Green here IS the precision proof.
+  const { code, out } = run(["--docs", CLEAN]);
+  assert.equal(code, 0, out);
+  assert.match(out, /OK — 0 violations/);
+});
+
+test("AC5 ruling: released-version history in a CHANGELOG (non-guide context) is OUT of the class", () => {
+  // "Streaming support landed in 1.1" names a version a reader can install,
+  // not an internal work item — deliberately not a violation. Scanned in
+  // multi-path mode, which is how a caller covers a CHANGELOG at all.
+  const { code, out } = run(["--paths", `${MULTIPATH}/CHANGELOG.md`]);
+  assert.equal(code, 0, out);
+  assert.match(out, /OK — 0 violations/);
 });
