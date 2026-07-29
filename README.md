@@ -32,6 +32,7 @@ scripts/             Gate engine scripts (Node, no runtime deps)
   __fixtures__/      Deterministic fixtures for the test suite
   lib/vendor/        Vendored substrate (extension-ioc-gate)
 config/              Shared profiles, baselines, and JSON config files
+templates/           Copy-paste caller workflow templates for consuming repos
 docs/                Org-wide conventions (release contract)
 ```
 
@@ -450,6 +451,185 @@ Exit codes: `0` conform · `1` findings · `2` usage/internal error. The rule
 library lives in [`scripts/lib/docs-contract-rules.mjs`](scripts/lib/docs-contract-rules.mjs);
 tests + good/bad fixtures in
 [`scripts/__tests__/docs-contract-gate.test.mjs`](scripts/__tests__/docs-contract-gate.test.mjs).
+
+## meta-commentary-gate
+
+A reusable GitHub Actions workflow + standalone Node script
+(`node scripts/check-meta-commentary.mjs`, Node builtins only, fully offline)
+that fails CI when a repo's **published Markdown** carries commentary that
+belongs to the people producing the docs rather than to the people reading them.
+Three violation classes:
+
+1. **Docs-production meta** — how the page or its assets are produced:
+   "compiled from", "published from", "never hand-edit", "this page is
+   generated…", "canonical source".
+2. **Transition / in-flight notes** — "forthcoming", "coming soon",
+   "(pending)", "to be added", "still landing", "not yet landed", "is landing
+   in a later release". A published page states what the product does; a
+   roadmap state ages into a lie the moment the work ships.
+3. **Planning provenance** — a capability described by the internal work item
+   that produced it or the decision that approved it ("epic #123, landed", "the
+   ratified claim-only mode", "per the ruling") instead of by what it does. A
+   reader of a published page cannot resolve those references.
+
+The patterns are lexical heuristics, so the engine is as explicit about what it
+deliberately does **not** match — bare "landed", "still in flight", "no need to
+hand-edit", a released-version CHANGELOG entry, a bare work-item link with no
+history claim, "ratified" next to external-standards vocabulary, "the decision
+tree", "X is not yet supported". Every rule-out is recorded, with its reason, in
+the header of [`scripts/check-meta-commentary.mjs`](scripts/check-meta-commentary.mjs);
+read it before adding a pattern or filing a false positive.
+
+### Coverage — the inventory is the closure set
+
+[`config/meta-commentary-inventory.json`](config/meta-commentary-inventory.json)
+is the enumerated closure set this gate is measured against: every **public,
+non-archived** org repo's default branch, with each Markdown surface classified.
+Recorded on 2026-07-29: **132 repos, 295 surfaces** — 199 `published`,
+3 `staged-listing` (the `.wordpress-org/` and `.drupalorg/` copy staged for the
+external directory listings, which is a published surface: an asset-production
+note there is removed, not exempted), and 93 `exempt-engineering-internal`.
+Only three repos (`.github`, `a2a-servers-dev`, and this one) are exempt end to
+end. Five archived public repos are excluded and listed in
+`excludedArchivedRepos` — they are read-only, so no caller can be added.
+
+"Published surface" means Markdown a non-contributor is expected to read: a
+public repo's root `README.md` / `CHANGELOG.md`, any `docs/` tree, and copy
+staged for an external listing. Contributor-, maintainer-, and
+engineering-internal documentation is out of scope **by design**, and every such
+exemption is recorded per surface with a rationale rather than implied.
+
+Two rules follow from that:
+
+- **The inventory is the closure set, not a snapshot of adopters.** A repo whose
+  in-scope surfaces are not yet covered by a caller is a gap in the rollout, not
+  a repo outside the scope. Measure adoption against this file.
+- **A new public repo with published Markdown adopts the caller template.** Copy
+  [`templates/meta-commentary-gate.yml`](templates/meta-commentary-gate.yml),
+  set `paths` to literal files/directories that cover every `published` or
+  `staged-listing` surface recorded for it (the gate does not accept inventory
+  globs), and update the inventory in a coordinated `cinatra-ai/ci` change.
+  Regenerate by re-enumerating public org repos, re-listing the
+  `surfacePatterns` on each default branch, and bumping `recordedAt`.
+
+### Use it from another repo
+
+Copy [`templates/meta-commentary-gate.yml`](templates/meta-commentary-gate.yml)
+to `.github/workflows/meta-commentary-gate.yml` and fill in the two placeholders:
+
+```yaml
+name: meta-commentary-gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  meta-commentary-gate:
+    uses: cinatra-ai/ci/.github/workflows/meta-commentary-gate.yml@<sha> # vX.Y.Z
+    with:
+      paths: |
+        README.md
+        CHANGELOG.md
+        docs
+      ref: <sha>
+```
+
+**Pin BOTH refs to the same SHA.** The workflow ref (`@<sha>`) pins the YAML;
+the `ref:` input is what checks out the gate **engine**. A caller that pins only
+the workflow ref still runs whatever engine is on mutable `main`, which is
+exactly the drift the pin exists to prevent — so `ref` is REQUIRED and is
+rejected unless it is a 40-char commit SHA.
+
+**The version comment.** The org actions-pinned-gate validates its syntax
+(`# vX.Y.Z` / `# X.Y.Z`, including prerelease/build suffixes); it does not
+verify that the comment names an existing tag or that the tag points at the
+pinned SHA. For a tagged SHA, use the exact tag: `# v0.1.3`. For an
+intentionally between-tags SHA, the current org-local marker is the nearest
+preceding tag plus the pinned short SHA: `# v0.1.3-next.7e5f416`. That marker
+passes the format gate, but it is not literal `git describe --tags` output
+(`v0.1.3-5-g7e5f416` for this SHA) and is not a real tag for Renovate to
+resolve. If Renovate-managed updates are required, tag the commit and use that
+real tag. Older callers use `+<short-sha>`; that spelling also passes the
+format check.
+
+### Path scoping
+
+By default the gate scans a single directory: the `docs` input (default
+`docs/`). Most repos publish more than that — a root `README.md`, a
+`CHANGELOG.md`, staged listing copy — so the `paths` input takes a **set**
+instead: directories and/or single `.md` files, newline- and/or
+comma-separated. A non-empty `paths` takes precedence over `docs`; omitting it
+leaves the original single-directory behavior untouched, so existing callers
+pass unchanged.
+
+Scoping is deliberately **fail-closed**, because a scan that silently covers
+less than the caller asked for is worse than no scan:
+
+- A non-empty `paths` value that normalizes to zero entries (for example, only
+  commas or whitespace) is a config error (exit 2), never a silent fallback.
+  An omitted or empty workflow input selects the `docs` scan by design.
+- Every configured entry must exist **and** yield at least one tracked Markdown
+  file. A typo'd, untracked, or Markdown-free entry is a config error, not a
+  quietly narrower scan.
+- Entries are **literal paths, never globs** (`--literal-pathspecs`), so a `*`
+  in an entry cannot silently widen or shift the scan.
+- Only **tracked** files are read (`git ls-files`), so untracked scratch never
+  trips the gate. Overlapping entries (`docs,docs/overview.md`) scan once.
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `docs` | `docs` | Single directory to scan. Ignored when `paths` is set. |
+| `paths` | `""` | Newline- and/or comma-separated set of directories and/or `.md` files to scan instead. Fail-closed; literal paths only. |
+| `allowlist` | `.github/meta-commentary-gate-allowlist.json` | Reviewed false positives. An ABSENT file is an EMPTY allowlist. |
+| `ref` | _(required)_ | 40-char commit SHA of this repo to check out — the gate engine. Same SHA as the workflow ref. |
+
+### The allowlist
+
+Optional and **per-repo**: an absent file means an empty allowlist, which is
+what most repos want. There is deliberately no shared cross-repo allowlist —
+each repo owns and reviews its own exceptions. An entry pins the exact **full
+source line** the match sits on (not the bare matched phrase, so a second
+unrelated line matching the same phrase is not silently covered by the first
+line's sign-off) and carries `owner` + `reviewBy`. Once `reviewBy` passes the
+entry stops suppressing: the violation reds again until a human re-verifies and
+renews the date, or fixes the content. An exception never becomes permanent by
+being forgotten.
+
+### Run locally
+
+```sh
+# single directory (the default)
+node scripts/check-meta-commentary.mjs --docs docs
+
+# a set of published surfaces
+node scripts/check-meta-commentary.mjs --paths "docs,README.md,CHANGELOG.md"
+```
+
+Run it from the repo being scanned (paths resolve against the cwd). Exit codes:
+`0` clean · `1` violation(s) · `2` usage/config error.
+
+### Develop
+
+```sh
+node --test scripts/__tests__/check-meta-commentary.test.mjs
+```
+
+Positive and negative fixtures for every pattern id live in
+[`scripts/__fixtures__/meta-commentary/`](scripts/__fixtures__/meta-commentary/)
+(`clean/`, `violating/`, `multipath/`, `allowlisted/`), and `self-check.yml`
+runs the engine against them on every PR.
+
+**Twin.** `cinatra-ai/docs` runs a repo-local copy of this check over its whole
+tracked Markdown tree; the two files were byte-identical through docs#119 and
+have diverged since (scan scope, its contributor-docs skip paths, the CLI
+surface). The **pattern list and its documented policy are kept in sync**, and a
+widened list lands **here first** — caller repos enforce the list at the SHA
+they pin, so a widened pattern changes what a consumer enforces only once that
+consumer moves its pin.
 
 ## gitignore-gate
 
