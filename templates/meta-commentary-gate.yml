@@ -1,0 +1,73 @@
+# CALLER TEMPLATE — meta-commentary-gate (cinatra-ai/docs#156 AC6).
+#
+# Copy this file to `.github/workflows/meta-commentary-gate.yml` in a repo that
+# publishes Markdown, then do the two things the placeholders mark:
+#
+#   1. Replace BOTH `<sha>` occurrences with the SAME 40-char commit SHA of
+#      cinatra-ai/ci, and set the trailing comment to the version that SHA
+#      belongs to (see "Pinning" below).
+#   2. Set `paths` to literal files/directories that cover every `published` or
+#      `staged-listing` surface recorded for this repo in
+#      `config/meta-commentary-inventory.json`. Do NOT copy an inventory glob:
+#      this input accepts literal paths only. Use a directory only when its
+#      whole Markdown subtree is published. Delete the `paths` block entirely
+#      if the repo publishes only a `docs/` directory — that is the default.
+#
+# WHAT IT ENFORCES. Published Markdown states what the product does. It does not
+# narrate how the page (or its assets) is produced, what work is still in
+# flight, or which internal work item / decision a capability came from. The
+# pattern list and the deliberate rule-outs are documented at the top of
+# `scripts/check-meta-commentary.mjs` in cinatra-ai/ci; the README section
+# "meta-commentary-gate" covers coverage, inputs, and local runs.
+#
+# PINNING (the SHA double-pin). Pin BOTH the workflow ref (`@<sha>`) AND the
+# `ref:` input to the SAME commit SHA. The workflow ref alone pins only the YAML
+# — the `ref:` input is what checks out the gate ENGINE, so a caller that pins
+# only the workflow ref would still run whatever engine happens to be on
+# mutable `main`. `ref` is REQUIRED and is rejected unless it is a 40-char SHA.
+#
+# The trailing version comment must pass the org actions-pinned-gate's syntax
+# check; that gate does not verify SHA-to-tag correctness. If the SHA has a ci
+# release tag, use it exactly: `# vX.Y.Z`. For an intentionally between-tags
+# SHA, the current org-local marker is the nearest preceding tag plus the
+# pinned short SHA: `# vX.Y.Z-next.<short-sha>`. It passes the format gate, but
+# it is not literal `git describe` output or a real tag Renovate can resolve.
+# If Renovate-managed updates are required, tag the commit and use that real
+# tag. Worked examples are in the "meta-commentary-gate" README section.
+
+name: meta-commentary-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  meta-commentary-gate:
+    uses: cinatra-ai/ci/.github/workflows/meta-commentary-gate.yml@<sha> # vX.Y.Z
+    with:
+      # This repo's published Markdown surfaces. Directories and single .md
+      # files, newline- and/or comma-separated. LITERAL paths — never globs.
+      # Fail-closed: every entry must exist AND yield at least one TRACKED
+      # Markdown file, so a typo is a config error rather than a silently
+      # narrower scan.
+      #
+      # Drop this whole `paths:` block for the common single-directory repo and
+      # the gate scans `docs/` (the `docs` input, default "docs").
+      paths: |
+        README.md
+        CHANGELOG.md
+        docs
+
+      # OPTIONAL. Reviewed false positives — real product content a pattern
+      # misfires on — each pinned to the exact full source line, with an owner
+      # and a reviewBy date. An ABSENT file means an EMPTY allowlist, which is
+      # what most repos want; there is deliberately no shared cross-repo
+      # allowlist. Uncomment only when this repo actually has an exception.
+      # allowlist: .github/meta-commentary-gate-allowlist.json
+
+      # Same SHA as the workflow ref above. Required; must be a 40-char SHA.
+      ref: <sha>
