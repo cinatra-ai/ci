@@ -105,6 +105,31 @@ jobs:
             exit 1
           fi
 
+      - name: meta-commentary-gate AC5 classes fire, and the ruled-out prose stays green
+        # docs#156 AC5: the staged-listing asset-production phrasings
+        # ("generated deterministically\nfrom", "never hand-edit"), the
+        # transition ("still landing") and the planning-provenance
+        # ("epic #N … landed", "the ratified <X> mode") classes must FIRE on the
+        # violating fixture, while the clean fixture's ordinary product prose
+        # ("tells you when it lands", "an approval landed", "the ratified OAuth
+        # 2.1 specification", "not yet supported") and the CHANGELOG's
+        # released-version history ("support landed in 1.1") stay green. Both
+        # halves are the gate — a pattern that fires on real prose costs more
+        # than the violation it catches.
+        run: |
+          out="$(node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/violating/docs 2>&1 || true)"
+          for id in generated_from do_not_hand_edit \
+                    still_landing not_yet_landed landing_separately \
+                    planning_workitem_landed planning_landed_workitem ratified_decision_vocab \
+                    decision_was_ratified ruling_reference; do
+            if ! printf '%s' "$out" | grep -q "\[$id\]"; then
+              echo "::error::meta-commentary-gate AC5 pattern '$id' did not fire on the violating fixture" >&2
+              exit 1
+            fi
+          done
+          node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/clean/docs
+          node scripts/check-meta-commentary.mjs --paths "scripts/__fixtures__/meta-commentary/multipath/CHANGELOG.md"
+
       - name: Design-system preset runs clean on its own repository
         run: npx eslint .
 
