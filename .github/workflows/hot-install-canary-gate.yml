@@ -74,7 +74,7 @@ jobs:
         # No `repository:` — this gets the CALLER (the host) at the PR head, so
         # the harness + the clone-extensions composite + the workspace are the
         # exact branch-under-test copy.
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Assert the canary harness is present and not gutted (fail-closed)
         # The harness path + its keystone-oracle and source-wiring-guard markers
