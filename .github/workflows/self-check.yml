@@ -168,6 +168,13 @@ jobs:
             exit 1
           fi
 
+      - name: meta-commentary twin-parity — this engine reproduces the shared verdict
+        # docs#160 AC2: the docs-repo twin and this engine must agree on a corpus
+        # that is byte-identical in both repos. Each side runs its OWN engine over
+        # it and must reproduce one recorded expectation; a one-sided edit to the
+        # corpus, the expectation or the harness fails the digest check here.
+        run: node scripts/check-meta-commentary-parity.mjs
+
       - name: meta-commentary surface-coverage reconciles a recorded census (fail-closed)
         # docs#160 AC11: the new-surface detector. Green on a census the fixture
         # inventory fully accounts for; RED on a new public repo with no entry and
