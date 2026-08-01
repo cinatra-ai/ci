@@ -1,0 +1,47 @@
+{
+  "$comment": "The census the fixture inventory exactly accounts for: every public repo recorded, every published surface either behind a caller or carrying a recorded coverage escape, the archived repo excluded.",
+  "org": "fixture-org",
+  "fetchedAt": "2026-08-01",
+  "repos": [
+    {
+      "repo": "fixture-org/example-connector",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "CHANGELOG.md"],
+      "workflows": [".github/workflows/docs-meta-commentary.yml"]
+    },
+    {
+      "repo": "fixture-org/docs",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "references/design/reference.html"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/internal-tooling",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/retired-connector",
+      "archived": true,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/secret-lab",
+      "archived": false,
+      "private": true,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "docs/overview.md"],
+      "workflows": []
+    }
+  ]
+}

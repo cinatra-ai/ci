@@ -1,0 +1,65 @@
+name: meta-commentary-surface-coverage
+
+# NEW-SURFACE DETECTION for the meta-commentary rollout (cinatra-ai/docs#160
+# AC11). The published-surface inventory is a point-in-time census; nothing
+# re-derives it. A repo created after it was recorded, or a docs/ tree added to a
+# repo that previously published only a README, arrives with no inventory entry
+# and no gate caller — and every other check stays green, because each one only
+# ever looks at the paths it was already told about.
+#
+# This job enumerates the org's PUBLIC, NON-ARCHIVED repos and the published
+# surfaces they actually have, then reconciles that census against the inventory
+# and against caller presence. It runs on a SCHEDULE (drift arrives without a PR)
+# and on every change to the INVENTORY ITSELF (an edit that removes a repo or a
+# surface must be reconciled at the moment it is proposed).
+#
+# FAIL-CLOSED: no token, an API error, an empty enumeration and an unparseable
+# inventory are all failures. A coverage check that passes when it cannot see is
+# worse than no coverage check, because it reads as proof.
+#
+# TOKEN: only PUBLIC repo reads are needed, which the default GITHUB_TOKEN can
+# always do — so, unlike the org-wide release-pin gate, there is no dormant
+# "ships before the operator secret exists" mode to accommodate.
+
+on:
+  schedule:
+    # Weekly, offset off the hour so it does not contend with the daily sweeps.
+    - cron: "37 5 * * 1"
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      # The inventory (and the checker itself) only — this is a census of OTHER
+      # repos, so an unrelated PR here has nothing to reconcile. Note this is a
+      # trigger filter on the CHECKER's own repo, not a narrowing of what the
+      # meta-commentary gate scans (docs#160 AC7 governs that, and that gate
+      # carries no paths filter).
+      - "config/meta-commentary-inventory.json"
+      - "scripts/meta-commentary-surface-coverage.mjs"
+      - ".github/workflows/meta-commentary-surface-coverage.yml"
+  push:
+    branches: [main]
+    paths:
+      - "config/meta-commentary-inventory.json"
+      - "scripts/meta-commentary-surface-coverage.mjs"
+      - ".github/workflows/meta-commentary-surface-coverage.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  surface-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+
+      - name: Reconcile the org's published surfaces against the inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/meta-commentary-surface-coverage.mjs --live --org cinatra-ai

@@ -1,0 +1,38 @@
+{
+  "$comment": "Fixture inventory for the docs#160 AC11 surface-coverage check. Deliberately small and shaped like the real one: a published repo with a caller, a repo covered by its own repo-local check (the recorded `coverage` escape), an exempt engineering-internal repo, and an archived repo that is excluded rather than missing.",
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-01",
+  "issue": "cinatra-ai/docs#160",
+  "surfacePatterns": ["README.md", "CHANGELOG.md", "docs/**/*.md", "references/**/*.html"],
+  "excludedArchivedRepos": ["fixture-org/retired-connector"],
+  "repoCount": 3,
+  "repos": [
+    {
+      "repo": "fixture-org/example-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        { "path": "README.md", "class": "published" },
+        { "path": "CHANGELOG.md", "class": "published" }
+      ]
+    },
+    {
+      "repo": "fixture-org/docs",
+      "defaultBranch": "main",
+      "surfaces": [
+        { "path": "README.md", "class": "published", "coverage": "repo-local", "note": "Runs its own repo-local blocking check." },
+        { "path": "references/**/*.html", "class": "published", "coverage": "repo-local", "note": "Runs its own repo-local blocking check." }
+      ]
+    },
+    {
+      "repo": "fixture-org/internal-tooling",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor-facing tooling; the README serves engineers wiring the tool in, not product users."
+        }
+      ]
+    }
+  ]
+}

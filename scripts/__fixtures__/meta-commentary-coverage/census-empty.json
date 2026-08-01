@@ -1,0 +1,6 @@
+{
+  "$comment": "A degraded read: the enumeration returned nothing. Reconciling against it would be vacuously green, which is exactly the failure mode this check exists to prevent, so it is refused.",
+  "org": "fixture-org",
+  "fetchedAt": "2026-08-02",
+  "repos": []
+}

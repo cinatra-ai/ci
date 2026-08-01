@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Example reference page</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- OUT OF SCOPE: a <style> element is styling, never prose. Every phrase
+       below would be a violation in a text node and must stay green here. -->
+  <style>
+    /* The palette is generated from the design tokens — do not hand-edit. */
+    .banner::after { content: "canonical source"; }
+    .compiled-from { color: #1607aa; }
+  </style>
+
+  <!-- OUT OF SCOPE: a <script> element is code. A code comment about how the
+       bundle is produced is not a claim made to a reader of the page. -->
+  <script>
+    // This page is compiled from the design system — do not hand-edit.
+    // TODO: cache the widget list. Spec status — published. See ruling 4.
+    const canonicalSource = "generated from the build";
+    const issue = "cinatra#1607 AC6 · publish decision";
+  </script>
+</head>
+<body>
+  <h1>Example reference</h1>
+
+  <!-- OUT OF SCOPE: machine attributes. A class name, an id, a data attribute,
+       an inline style and a URL are addressing, not published prose. -->
+  <div class="compiled from canonical source"
+       id="generated-from-tokens"
+       data-note="This page is compiled from the design system — do not hand-edit."
+       style="--x: 'coming soon'">
+    <a href="/reference/overview.md#12">Widget overview</a>
+    <a href="./setup.html#3-install">Install steps</a>
+    <a href="https://example.com/issues?ref=cinatra%231607">Upstream tracker</a>
+  </div>
+
+  <p>Reports are generated on demand from the records you select, and the run
+    tells you when it lands. An approval landed while you were away.</p>
+
+  <p>Records you hand-edit in the connected app are re-read on the next sync.
+    There is no need to hand-edit the field mappings; the connector maintains
+    them.</p>
+
+  <p>See issue #123 for troubleshooting. If the webhook has not landed after
+    five minutes, retry it.</p>
+
+  <p>The connector implements the ratified OAuth 2.1 specification, and the
+    security policy was ratified by the standards committee.</p>
+
+  <p>Only ratified algorithms run in FIPS mode. Following the decision returned
+    by the policy engine, the run either continues or stops.</p>
+
+  <p>Scheduled exports are not yet supported. Requests still in flight are
+    allowed to complete during shutdown, and events yet to land remain queued.</p>
+
+  <p>The identifier <code>0xAC12</code> is a device address, not a criterion,
+    and the colour <code>#1607</code> is a palette entry.</p>
+
+  <!-- FILE ANCHORS AS VISIBLE TEXT (not inside href, which is out of scope
+       anyway): a fragment into a document is addressing, not a citation — at
+       any path depth, and whatever the file type. -->
+  <p>Jump to overview.md#12, to docs/overview.md#12, to guides/setup.html#3 and
+    to reference/deck.pdf#7 for the worked examples.</p>
+
+  <!-- The ANNOTATION patterns are narrowed to the annotation form; these are
+       ordinary product sentences using the same words. -->
+  <p>The publish decision is recorded on the run, the spec status of a connector
+    is shown on its card, and the design notes for this integration are in the
+    appendix.</p>
+
+  <!-- BLOCK BOUNDARY: adjacent blocks must never be joined into one match.
+       Read as one stream these would trip ratified_decision_vocab and
+       planning_workitem_landed; as separate blocks they cannot. -->
+  <ul>
+    <li>Access is ratified by administrators.</li>
+    <li>Mode changes are logged.</li>
+  </ul>
+  <table>
+    <tr><td>See epic #123</td></tr>
+    <tr><td>landed events are replayed</td></tr>
+  </table>
+
+  <!-- INLINE-TAG TRANSPARENCY, the false-positive side. Two adjacent inline
+       cells arrive as one token once the inline tags are elided, so an agent
+       name beside a run number reads as "Outreach#2,318". A run number is not
+       a work-item citation: the lower-case-slug and thousands-separator
+       exclusions in qualified_workitem_citation keep this green. -->
+  <div>
+    <span>Outreach</span><span>#2,318</span>
+    <span>Outreach</span><span>#2</span>
+    <span>Campaigns</span><span>#417</span>
+  </div>
+
+  <!-- A CI-directive comment is a short machine token. It is scanned like any
+       other comment and matches nothing, so retaining it costs nothing. -->
+  <footer>
+    <span>Example · Widget reference</span><!-- source-leak-allow -->
+  </footer>
+</body>
+</html>

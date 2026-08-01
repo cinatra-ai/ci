@@ -1,0 +1,31 @@
+{
+  "$comment": "docs#160 AC11 — the coverage half on its own: a recorded, published repo whose caller workflow has been deleted. The surfaces are still declared; nothing runs on them.",
+  "org": "fixture-org",
+  "fetchedAt": "2026-08-02",
+  "repos": [
+    {
+      "repo": "fixture-org/example-connector",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "CHANGELOG.md"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/docs",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "references/design/reference.html"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/internal-tooling",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md"],
+      "workflows": []
+    }
+  ]
+}
