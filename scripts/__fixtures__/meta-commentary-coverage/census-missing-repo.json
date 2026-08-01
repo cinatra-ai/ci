@@ -1,0 +1,39 @@
+{
+  "$comment": "docs#160 AC11 case 1 — a NEW public repo appears in the org after the inventory was recorded. It has published surfaces and no entry, so nothing classifies or scans them.",
+  "org": "fixture-org",
+  "fetchedAt": "2026-08-02",
+  "repos": [
+    {
+      "repo": "fixture-org/example-connector",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "CHANGELOG.md"],
+      "workflows": [".github/workflows/docs-meta-commentary.yml"]
+    },
+    {
+      "repo": "fixture-org/docs",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "references/design/reference.html"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/internal-tooling",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md"],
+      "workflows": []
+    },
+    {
+      "repo": "fixture-org/brand-new-connector",
+      "archived": false,
+      "private": false,
+      "defaultBranch": "main",
+      "surfaces": ["README.md", "CHANGELOG.md", "docs/overview.md"],
+      "workflows": []
+    }
+  ]
+}

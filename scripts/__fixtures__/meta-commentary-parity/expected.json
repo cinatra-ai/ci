@@ -1,0 +1,195 @@
+{
+  "$comment": "SHARED PARITY EXPECTATION (cinatra-ai/docs#160 AC2). Byte-identical in cinatra-ai/docs and cinatra-ai/ci: each repo runs ITS OWN meta-commentary engine over the shared corpus beside this file and must reproduce exactly this verdict. Regenerate with `node scripts/check-meta-commentary-parity.mjs --update`, then copy the corpus, this file, manifest.json and the parity script to the twin repo — a one-sided edit fails the digest check in manifest.json.",
+  "violations": [
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 6,
+      "id": "compiled_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 6,
+      "id": "self_referential_production"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 11,
+      "id": "design_note_annotation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 12,
+      "id": "canonical_source_label"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 13,
+      "id": "generated_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 13,
+      "id": "self_referential_production"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 14,
+      "id": "generated_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 16,
+      "id": "compiled_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 17,
+      "id": "canonical_source_label"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 18,
+      "id": "published_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 19,
+      "id": "coming_soon"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 19,
+      "id": "still_landing"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 20,
+      "id": "acceptance_criterion_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 20,
+      "id": "acceptance_criterion_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 20,
+      "id": "publish_decision"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 20,
+      "id": "qualified_workitem_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 21,
+      "id": "qualified_workitem_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 22,
+      "id": "numbered_ruling_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 23,
+      "id": "spec_status_annotation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 24,
+      "id": "owner_gated_publish"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 8,
+      "id": "canonical_source_label"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 8,
+      "id": "compiled_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 8,
+      "id": "self_referential_production"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 9,
+      "id": "generated_from"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 10,
+      "id": "do_not_hand_edit"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 11,
+      "id": "coming_soon"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 11,
+      "id": "forthcoming"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 12,
+      "id": "not_yet_landed"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 12,
+      "id": "still_landing"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 13,
+      "id": "landing_separately"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 14,
+      "id": "planning_workitem_landed"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 15,
+      "id": "planning_landed_workitem"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 16,
+      "id": "ratified_decision_vocab"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 17,
+      "id": "ruling_reference"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 18,
+      "id": "acceptance_criterion_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 18,
+      "id": "qualified_workitem_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 18,
+      "id": "qualified_workitem_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 19,
+      "id": "numbered_ruling_citation"
+    }
+  ]
+}

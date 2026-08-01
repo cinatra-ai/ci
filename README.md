@@ -456,9 +456,9 @@ tests + good/bad fixtures in
 
 A reusable GitHub Actions workflow + standalone Node script
 (`node scripts/check-meta-commentary.mjs`, Node builtins only, fully offline)
-that fails CI when a repo's **published Markdown** carries commentary that
-belongs to the people producing the docs rather than to the people reading them.
-Three violation classes:
+that fails CI when a repo's **published pages — Markdown and HTML** — carry
+commentary that belongs to the people producing the docs rather than to the
+people reading them. Four violation classes:
 
 1. **Docs-production meta** — how the page or its assets are produced:
    "compiled from", "published from", "never hand-edit", "this page is
@@ -468,49 +468,129 @@ Three violation classes:
    in a later release". A published page states what the product does; a
    roadmap state ages into a lie the moment the work ships.
 3. **Planning provenance** — a capability described by the internal work item
-   that produced it or the decision that approved it ("epic #123, landed", "the
-   ratified claim-only mode", "per the ruling") instead of by what it does. A
-   reader of a published page cannot resolve those references.
+   that produced it, the acceptance criterion it was reviewed against, or the
+   decision that approved it ("epic #123, landed", "cinatra#1607 AC6",
+   "ruling 4", "the ratified claim-only mode", "per the ruling") instead of by
+   what it does. A reader of a published page cannot resolve those references.
+4. **In-page authoring / publish-status annotation** — editorial scaffolding
+   that survived into the published bytes: "publish decision", "spec status",
+   "design note, outside the page mock", "a separate, owner-gated publish". The
+   same family as class 1, in the vocabulary a design spec accumulates.
 
 The patterns are lexical heuristics, so the engine is as explicit about what it
 deliberately does **not** match — bare "landed", "still in flight", "no need to
-hand-edit", a released-version CHANGELOG entry, a bare work-item link with no
-history claim, "ratified" next to external-standards vocabulary, "the decision
-tree", "X is not yet supported". Every rule-out is recorded, with its reason, in
-the header of [`scripts/check-meta-commentary.mjs`](scripts/check-meta-commentary.mjs);
+hand-edit", a released-version CHANGELOG entry, a **bare** `#123` cross-reference
+with no history claim, "ratified" next to external-standards vocabulary, "the
+decision tree", "X is not yet supported". Every rule-out is recorded, with its
+reason, in the header of [`scripts/check-meta-commentary.mjs`](scripts/check-meta-commentary.mjs);
 read it before adding a pattern or filing a false positive.
+
+**docs#160 re-decided one rule-out on evidence.** docs#156 ruled the whole
+work-item-link class out on precision grounds. The **repo-qualified** spelling
+(`cinatra#1607`, `cinatra-ai/cinatra#1795`) is now IN: it is structurally
+unambiguous, it was the form every real occurrence took across the corpus, and a
+reader of a published page cannot resolve it — the same defect that makes an
+acceptance-criterion or ruling citation a violation. The rule-out was
+**narrowed** to the bare `#123` form, not reaffirmed wholesale.
+
+### HTML surfaces
+
+Published documentation is not only Markdown, so the gate scans tracked
+`.html` / `.htm` under the configured paths with the same pattern list,
+line-pinned allowlist semantics and `reviewBy` expiry. HTML is not matched as raw
+source — it is first reduced to its **prose** by
+[`scripts/lib/html-text.mjs`](scripts/lib/html-text.mjs), whose header carries
+the full per-construct contract. In scope: visible text nodes, HTML **comments**
+(they ship in the published bytes and are where authoring annotations
+accumulate), and the human-readable attributes `title` / `alt` / `aria-label` /
+`aria-description` / `placeholder` / `summary` plus `content` on a
+`<meta name="description">`. Out of scope: `<script>` and `<style>` bodies
+entirely, and every machine attribute (`href`, `src`, `class`, `id`, `style`,
+`data-*`). Entities are decoded before matching (`&nbsp;` to a plain space, so it
+cannot defeat a pattern's `[ \t]` gap); inline tags are transparent so a phrase
+split by `<b>` still matches; block tags are a hard separator so prose from two
+different blocks can never be joined. Reporting stays on the **source** file and
+line — every extracted character carries the source offset it came from, and the
+allowlist still pins the full raw source line.
 
 ### Coverage — the inventory is the closure set
 
 [`config/meta-commentary-inventory.json`](config/meta-commentary-inventory.json)
 is the enumerated closure set this gate is measured against: every **public,
-non-archived** org repo's default branch, with each Markdown surface classified.
-Recorded on 2026-07-29: **132 repos, 295 surfaces** — 199 `published`,
-3 `staged-listing` (the `.wordpress-org/` and `.drupalorg/` copy staged for the
+non-archived** org repo's default branch, with each surface classified.
+Re-recorded on 2026-08-01 (docs#160): **132 repos**, classified `published`,
+`staged-listing` (the `.wordpress-org/` and `.drupalorg/` copy staged for the
 external directory listings, which is a published surface: an asset-production
-note there is removed, not exempted), and 93 `exempt-engineering-internal`.
+note there is removed, not exempted), or `exempt-engineering-internal`.
 Only three repos (`.github`, `a2a-servers-dev`, and this one) are exempt end to
 end. Five archived public repos are excluded and listed in
 `excludedArchivedRepos` — they are read-only, so no caller can be added.
 
-"Published surface" means Markdown a non-contributor is expected to read: a
-public repo's root `README.md` / `CHANGELOG.md`, any `docs/` tree, and copy
-staged for an external listing. Contributor-, maintainer-, and
-engineering-internal documentation is out of scope **by design**, and every such
-exemption is recorded per surface with a rationale rather than implied.
+"Published surface" means a page a non-contributor is expected to read: a public
+repo's root `README.md` / `CHANGELOG.md`, any `docs/` tree, copy staged for an
+external listing, and published HTML reference pages. Contributor-, maintainer-,
+and engineering-internal documentation is out of scope **by design**, and every
+such exemption is recorded per surface with a rationale rather than implied.
+
+That test governs how a surface is **classified here**. It is emphatically not
+something the scanner evaluates: at runtime the recorded paths are the sole
+source of truth, the engine receives an explicit list of literal paths, and it
+never discovers a repository root or infers an audience from a filename or from
+content. A tree is exempt exactly when the caller does not list it —
+`--print-files` prints the selected read set so that claim is checkable rather
+than asserted.
+
+A surface may record `"coverage": "repo-local"` when something other than a
+pinned caller enforces the gate on it (`cinatra-ai/docs` runs its own blocking
+check over its whole tracked tree). An **absent** `coverage` means a caller is
+required; the escape is recorded, never inferred.
 
 Two rules follow from that:
 
 - **The inventory is the closure set, not a snapshot of adopters.** A repo whose
   in-scope surfaces are not yet covered by a caller is a gap in the rollout, not
   a repo outside the scope. Measure adoption against this file.
-- **A new public repo with published Markdown adopts the caller template.** Copy
+- **A new public repo with published pages adopts the caller template.** Copy
   [`templates/meta-commentary-gate.yml`](templates/meta-commentary-gate.yml),
   set `paths` to literal files/directories that cover every `published` or
   `staged-listing` surface recorded for it (the gate does not accept inventory
   globs), and update the inventory in a coordinated `cinatra-ai/ci` change.
-  Regenerate by re-enumerating public org repos, re-listing the
-  `surfacePatterns` on each default branch, and bumping `recordedAt`.
+
+### New-surface detection (`meta-commentary-surface-coverage`)
+
+The inventory is a point-in-time census, and nothing re-derives it. A repo
+created after it was recorded, or a `docs/` tree added to a repo that previously
+published only a README, arrives with no entry and no caller — and every other
+check stays green, because each one only ever looks at the paths it was already
+told about. The absence is invisible by construction.
+
+[`scripts/meta-commentary-surface-coverage.mjs`](scripts/meta-commentary-surface-coverage.mjs)
+closes that. It enumerates the org's **public, non-archived** repos and the
+published-surface paths each one actually has, then reconciles that census
+against the inventory and against caller presence. Four finding kinds, all of
+them failing: `unknown-repo`, `undeclared-surface`, `missing-caller`,
+`stale-inventory-repo`.
+
+It is **fail-closed** end to end — no token, an API error, an empty enumeration,
+an unparseable inventory and an unreadable tree are all failures. A coverage
+check that passes when it cannot see is worse than none, because it reads as
+proof. The verdict core is pure and offline (`--census-json <file>`); `--live` is
+a thin `gh api` wrapper with no verdict logic in it.
+
+```sh
+# reconcile the live org against the committed inventory
+node scripts/meta-commentary-surface-coverage.mjs --live --org cinatra-ai
+
+# reconcile a recorded census (what the fixtures do)
+node scripts/meta-commentary-surface-coverage.mjs \
+  --census-json scripts/__fixtures__/meta-commentary-coverage/census-clean.json \
+  --inventory   scripts/__fixtures__/meta-commentary-coverage/inventory.json
+```
+
+`.github/workflows/meta-commentary-surface-coverage.yml` runs it weekly, on
+demand, and on every change to the inventory or the checker itself. Refreshing
+the inventory means running it `--live`, recording what it reports, and bumping
+`recordedAt`.
 
 ### Use it from another repo
 
@@ -559,10 +639,17 @@ format check.
 By default the gate scans a single directory: the `docs` input (default
 `docs/`). Most repos publish more than that — a root `README.md`, a
 `CHANGELOG.md`, staged listing copy — so the `paths` input takes a **set**
-instead: directories and/or single `.md` files, newline- and/or
+instead: directories and/or single `.md` / `.html` files, newline- and/or
 comma-separated. A non-empty `paths` takes precedence over `docs`; omitting it
 leaves the original single-directory behavior untouched, so existing callers
 pass unchanged.
+
+**Path selection is the only scoping mechanism.** The engine has no semantic
+notion of an "implementation-facing" or "internal" tree and must never acquire
+one. A caller configured with `README.md,CHANGELOG.md` is green even with a
+planted violation under `docs/**`, because `docs/**` is never selected and
+therefore never read — a fixture asserts exactly that, including with the
+planted tree made unreadable.
 
 Scoping is deliberately **fail-closed**, because a scan that silently covers
 less than the caller asked for is worse than no scan:
@@ -570,9 +657,9 @@ less than the caller asked for is worse than no scan:
 - A non-empty `paths` value that normalizes to zero entries (for example, only
   commas or whitespace) is a config error (exit 2), never a silent fallback.
   An omitted or empty workflow input selects the `docs` scan by design.
-- Every configured entry must exist **and** yield at least one tracked Markdown
-  file. A typo'd, untracked, or Markdown-free entry is a config error, not a
-  quietly narrower scan.
+- Every configured entry must exist **and** yield at least one tracked
+  Markdown/HTML file. A typo'd, untracked, or prose-free entry is a config
+  error, not a quietly narrower scan.
 - Entries are **literal paths, never globs** (`--literal-pathspecs`), so a `*`
   in an entry cannot silently widen or shift the scan.
 - Only **tracked** files are read (`git ls-files`), so untracked scratch never
@@ -583,7 +670,7 @@ less than the caller asked for is worse than no scan:
 | Input | Default | Meaning |
 |-------|---------|---------|
 | `docs` | `docs` | Single directory to scan. Ignored when `paths` is set. |
-| `paths` | `""` | Newline- and/or comma-separated set of directories and/or `.md` files to scan instead. Fail-closed; literal paths only. |
+| `paths` | `""` | Newline- and/or comma-separated set of directories and/or `.md` / `.html` files to scan instead. Fail-closed; literal paths only. |
 | `allowlist` | `.github/meta-commentary-gate-allowlist.json` | Reviewed false positives. An ABSENT file is an EMPTY allowlist. |
 | `ref` | _(required)_ | 40-char commit SHA of this repo to check out — the gate engine. Same SHA as the workflow ref. |
 
@@ -605,8 +692,11 @@ being forgotten.
 # single directory (the default)
 node scripts/check-meta-commentary.mjs --docs docs
 
-# a set of published surfaces
+# a set of published surfaces (Markdown and HTML)
 node scripts/check-meta-commentary.mjs --paths "docs,README.md,CHANGELOG.md"
+
+# print the exact read set the configured paths select, then scan
+node scripts/check-meta-commentary.mjs --print-files --paths "README.md,CHANGELOG.md"
 ```
 
 Run it from the repo being scanned (paths resolve against the cwd). Exit codes:
@@ -616,15 +706,19 @@ Run it from the repo being scanned (paths resolve against the cwd). Exit codes:
 
 ```sh
 node --test scripts/__tests__/check-meta-commentary.test.mjs
+node --test scripts/__tests__/meta-commentary-html.test.mjs
+node --test scripts/__tests__/meta-commentary-surface-coverage.test.mjs
 ```
 
 Positive and negative fixtures for every pattern id live in
 [`scripts/__fixtures__/meta-commentary/`](scripts/__fixtures__/meta-commentary/)
-(`clean/`, `violating/`, `multipath/`, `allowlisted/`), and `self-check.yml`
-runs the engine against them on every PR.
+(`clean/`, `violating/`, `multipath/`, `allowlisted/`, `html-clean/`,
+`html-violating/`, `boundary-guard/`), the coverage-check censuses in
+[`scripts/__fixtures__/meta-commentary-coverage/`](scripts/__fixtures__/meta-commentary-coverage/),
+and `self-check.yml` runs the engine against them on every PR.
 
 **Twin.** `cinatra-ai/docs` runs a repo-local copy of this check over its whole
-tracked Markdown tree; the two files were byte-identical through docs#119 and
+tracked Markdown **and HTML** tree; the two files were byte-identical through docs#119 and
 have diverged since (scan scope, its contributor-docs skip paths, the CLI
 surface). The **pattern list and its documented policy are kept in sync**, and a
 widened list lands **here first** — caller repos enforce the list at the SHA

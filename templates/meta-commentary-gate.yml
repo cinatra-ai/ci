@@ -1,7 +1,8 @@
 # CALLER TEMPLATE — meta-commentary-gate (cinatra-ai/docs#156 AC6).
 #
 # Copy this file to `.github/workflows/meta-commentary-gate.yml` in a repo that
-# publishes Markdown, then do the two things the placeholders mark:
+# publishes documentation pages (Markdown and/or HTML), then do the two things
+# the placeholders mark:
 #
 #   1. Replace BOTH `<sha>` occurrences with the SAME 40-char commit SHA of
 #      cinatra-ai/ci, and set the trailing comment to the version that SHA
@@ -13,9 +14,12 @@
 #      whole Markdown subtree is published. Delete the `paths` block entirely
 #      if the repo publishes only a `docs/` directory — that is the default.
 #
-# WHAT IT ENFORCES. Published Markdown states what the product does. It does not
+# WHAT IT ENFORCES. A published page states what the product does. It does not
 # narrate how the page (or its assets) is produced, what work is still in
-# flight, or which internal work item / decision a capability came from. The
+# flight, or which internal work item / acceptance criterion / decision a
+# capability came from. Tracked `.md` AND `.html`/`.htm` under the configured
+# paths are both scanned (docs#160); HTML is reduced to its prose first, and a
+# violation is reported at the source file and line. The
 # pattern list and the deliberate rule-outs are documented at the top of
 # `scripts/check-meta-commentary.mjs` in cinatra-ai/ci; the README section
 # "meta-commentary-gate" covers coverage, inputs, and local runs.
@@ -49,11 +53,17 @@ jobs:
   meta-commentary-gate:
     uses: cinatra-ai/ci/.github/workflows/meta-commentary-gate.yml@<sha> # vX.Y.Z
     with:
-      # This repo's published Markdown surfaces. Directories and single .md
+      # This repo's published surfaces. Directories and single .md / .html
       # files, newline- and/or comma-separated. LITERAL paths — never globs.
       # Fail-closed: every entry must exist AND yield at least one TRACKED
-      # Markdown file, so a typo is a config error rather than a silently
-      # narrower scan.
+      # Markdown or HTML file, so a typo is a config error rather than a
+      # silently narrower scan.
+      #
+      # LIST ONLY WHAT PUBLISHES. Path selection is the ONLY scoping mechanism:
+      # a tree the caller does not list is never selected and therefore never
+      # read. Never widen an entry to a directory that also holds an
+      # implementation-facing tree in the hope the engine will tell them apart —
+      # it has no such notion, by design.
       #
       # Drop this whole `paths:` block for the common single-directory repo and
       # the gate scans `docs/` (the `docs` input, default "docs").

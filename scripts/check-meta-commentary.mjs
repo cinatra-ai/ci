@@ -28,17 +28,40 @@
 // `docs/` too — a top-level README.md, a CHANGELOG.md, staged listing copy — so
 // the gate also accepts a configurable SET of paths via `--paths <spec>`, where
 // <spec> is a newline- and/or comma-separated list of directories and/or single
-// Markdown files (e.g. "docs,README.md"). SUPPLYING `--paths` selects
-// multi-path mode and takes precedence over `--docs`; when it is absent the
-// gate behaves exactly as before (single `--docs` directory, default "docs"),
-// so existing callers pass unchanged. Multi-path mode is deliberately
-// FAIL-CLOSED where being new lets it be: a supplied spec that normalizes to
-// zero entries is a config error (never a silent fallback to `--docs`), every
-// configured path must exist AND yield at least one tracked Markdown file (a
-// typo'd or empty entry is a config error, exit 2, never a silent no-op scan),
-// and entries are LITERAL paths, never globs. Files listed twice (e.g.
-// "docs,docs/overview.md") are scanned once. Pattern list, allowlist pinning,
-// and reviewBy expiry are identical in both modes.
+// files (e.g. "docs,README.md"). SUPPLYING `--paths` selects multi-path mode
+// and takes precedence over `--docs`; when it is absent the gate behaves
+// exactly as before (single `--docs` directory, default "docs"), so existing
+// callers pass unchanged. Multi-path mode is deliberately FAIL-CLOSED where
+// being new lets it be: a supplied spec that normalizes to zero entries is a
+// config error (never a silent fallback to `--docs`), every configured path
+// must exist AND yield at least one tracked scannable file (a typo'd or empty
+// entry is a config error, exit 2, never a silent no-op scan), and entries are
+// LITERAL paths, never globs. Files listed twice (e.g. "docs,docs/overview.md")
+// are scanned once. Pattern list, allowlist pinning, and reviewBy expiry are
+// identical in both modes.
+//
+// PATH SELECTION IS THE ONLY SCOPING MECHANISM (docs#160 AC12). The gate has no
+// semantic notion of an "implementation-facing" or "internal" tree and must
+// never acquire one: it does not discover a repository root, does not infer an
+// audience from a filename, and does not read anything outside the literal paths
+// it was handed. A tree is exempt exactly when the caller does not list it. That
+// is why a caller configured with `README.md,CHANGELOG.md` is green even with a
+// planted violation under `docs/**` — `docs/**` is never selected, so it is
+// never read. `--print-files` prints the selection so that claim is checkable.
+//
+// HTML SURFACES (cinatra-ai/docs#160). Published documentation is not only
+// Markdown: reference pages ship as HTML too, and the same policy applies to
+// them word for word. The gate therefore scans tracked `.html` / `.htm` files
+// under the configured paths alongside `.md`. HTML is not matched as raw source
+// — it is first reduced to its PROSE by scripts/lib/html-text.mjs, whose header
+// carries the full per-construct contract (visible text and HTML comments in
+// scope; `<script>`/`<style>` and machine attributes out; human-readable
+// attributes such as `title`/`alt`/`aria-label` in; entities decoded before
+// matching; inline tags transparent so a phrase split by `<b>` still matches;
+// block tags a hard separator so prose from two blocks is never joined).
+// Reporting stays deterministic on the SOURCE file and line: every extracted
+// character carries the source offset it came from, so a violation names a line
+// a human can open, and the allowlist still pins the full SOURCE line.
 //
 // WHAT THE PATTERN LIST COVERS, AND WHAT IT DELIBERATELY DOES NOT (docs#156
 // AC5). Three violation classes are enforced; the rule-outs are as much a part
@@ -97,11 +120,21 @@
 //     on a CHANGELOG as much as on a guide, is history tied to an INTERNAL
 //     work item ("landed with epic #123"): the reference is unresolvable to a
 //     reader either way.
-//   - A BARE work-item link with no history claim (a "see #123 for the design"
-//     cross-reference) is OUT: too many reference pages link an issue
-//     legitimately, and the violation is the historical narration, not the
-//     link. Such a link is still worth removing from a published guide in
-//     review — it is simply below the precision bar for a blocking pattern.
+//   - An UNQUALIFIED work-item link with no history claim (a "see #123 for the
+//     design" cross-reference) stays OUT: a bare `#123` is ambiguous — it is
+//     also a heading anchor, a CSS colour, a footnote — so a blocking pattern on
+//     it would fire on ordinary text. The violation there is the historical
+//     narration, not the link.
+//     SUPERSEDED IN PART (docs#160 AC4): the REPO-QUALIFIED spelling
+//     (`cinatra#1607`, `cinatra-ai/cinatra#1795`) is now IN — see
+//     `qualified_workitem_citation` below. docs#156 ruled the whole class out
+//     on precision grounds; docs#160 re-decided it on evidence. The qualified
+//     form is structurally unambiguous (a slug, `#`, digits, and nothing that
+//     continues the token), it is the exact form every real occurrence took
+//     across the corpus, and a reader of a published page cannot resolve it —
+//     which is the same defect that makes an acceptance-criterion or ruling
+//     citation a violation. The rule-out is therefore NARROWED to the bare
+//     `#123` form, not reaffirmed wholesale.
 //   - Bare "ratified", and "ratified" next to EXTERNAL-standards vocabulary.
 //     "The connector implements the ratified OAuth 2.1 specification" and "the
 //     security policy was ratified by the standards committee" are ordinary
@@ -144,6 +177,7 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isAbsolute, join } from "node:path";
+import { extractHtmlText, isHtmlPath } from "./lib/html-text.mjs";
 
 // The caller repo root: the cwd the gate is invoked from (the reusable workflow
 // runs it from the caller checkout's workspace root; the ci self-check runs it
@@ -330,6 +364,147 @@ const PATTERNS = [
     /\b(?:per|as per|following|under) the (?:owner |product )?(?:ruling|decision)\b(?=[ \t]{0,4}[,;:.)]|[ \t]{1,4}(?:that\b|\d{4}-\d{2}-\d{2})|[ \t]*(?:\r?\n|$))/i,
     '"per the ruling" / "per the decision"',
   ],
+
+  // --- Class: PLANNING PROVENANCE, docs#160 additions -----------------------
+  // The three citation shapes the HTML reference pages actually carried, and the
+  // in-page annotation vocabulary that sat beside them. Each names a capability
+  // by the internal artefact behind it — a work item, an acceptance criterion, a
+  // decision — instead of by what the product does; none is resolvable by a
+  // reader of the published site.
+  [
+    // REPO-QUALIFIED work-item citation: a slug (optionally org/repo-qualified),
+    // "#", digits, and nothing that continues the token. This is the docs#160
+    // AC4 decision, narrowing the docs#156 rule-out (see RULED OUT above).
+    //
+    // Precision is structural, not statistical. Five exclusions carry it:
+    //   - The leading negative LOOKBEHIND refuses a "#" that is already inside a
+    //     token or preceded by "/" or "." — so `cinatra-ai/cinatra#1795` matches
+    //     ONCE, at the start, rather than again at each path segment.
+    //   - The negative LOOKBEHIND IMMEDIATELY BEFORE THE "#" refuses a FILE
+    //     ANCHOR (`overview.md#12`, `docs/guide.html#3`, `deck.pdf#7`): a
+    //     fragment into a document is addressing, not a citation. It sits at the
+    //     "#" rather than at the start of the token because the path depth is
+    //     unbounded — a lookahead anchored at the token start cannot see past
+    //     the first "/", so `docs/overview.md#12` slipped through it.
+    //     The trailing `(?![\w-])` refuses a heading slug (`#12-installation`)
+    //     on the same grounds.
+    //   - The slug is LOWERCASE-only, and the pattern is case-SENSITIVE. A repo
+    //     slug is written lowercase everywhere in this corpus; a Capitalised
+    //     token immediately before a "#number" is a DISPLAY LABEL, not a repo.
+    //     The real false positive that forced this: a published components page
+    //     renders an agent-run table cell as `<span>Outreach</span><span>#2,318
+    //     </span>`, and inline tags are transparent by the extraction contract,
+    //     so the two cells arrive as the single token `Outreach#2,318`.
+    //   - `(?!,\d)` refuses a THOUSANDS SEPARATOR after the digits, the other
+    //     half of that same run-number shape.
+    //   - AT LEAST TWO DIGITS. `label#2` / `run#7` is a display ordinal, not a
+    //     work item; the lowest work-item number cited anywhere in this corpus is
+    //     three digits, and this org's issue numbering passed 99 long ago.
+    // RESIDUAL RISKS, recorded not hidden: a genuinely upper-case repo slug
+    // (`cinatra-ai/Cinatra#123`), a one- or two-digit work item, and a lower-case
+    // display label beside a 2+-digit ordinal (`invoice#42`) are all mis-called.
+    // That is the deliberate trade this whole pattern list makes — a pattern that
+    // fires on ordinary product prose costs more than the violation it catches.
+    // A bare `#123` cannot match at all — there is no slug before the "#" — so
+    // the deliberate docs#156 rule-out on the unqualified form is preserved
+    // exactly. Every gap is a BOUNDED character run, so the pattern stays linear
+    // on adversarial input.
+    "qualified_workitem_citation",
+    /(?<![\w./#-])[a-z][a-z0-9.-]{0,60}(?:\/[a-z0-9._-]{1,60}){0,2}(?<!\.(?:md|html?|json|ya?ml|toml|txt|pdf|zip|png|jpe?g|gif|svg|webp|css|js|mjs|cjs|ts|tsx|sh|py|rb|go|rs))#\d{2,}(?![\w-])(?!,\d)/,
+    'repo-qualified work-item citation, e.g. "cinatra#1607" / "cinatra-ai/cinatra#1795"',
+  ],
+  [
+    // ACCEPTANCE-CRITERION citation: "AC6", "AC2–AC5". Case-SENSITIVE and
+    // digit-terminated, which keeps it off ordinary words and off hex-ish
+    // identifiers (`0xAC12` has no word boundary before "AC"). An acceptance
+    // criterion is an artefact of the review that approved the work; naming one
+    // on a published page tells a reader nothing they can act on.
+    // RESIDUAL RISK, recorded: a product/model code spelled the same way ("the
+    // AC12 controller") would misfire. Nothing on the 202 inventoried surfaces
+    // does today; one that appears later is a line-pinned allowlist entry, which
+    // is exactly what that mechanism is for.
+    "acceptance_criterion_citation",
+    /\bAC\d{1,3}\b/,
+    'acceptance-criterion citation, e.g. "AC6"',
+  ],
+  [
+    // NUMBERED RULING citation: "ruling 4", "rulings 1–2". The unnumbered
+    // "per the ruling" spelling is already covered by ruling_reference above;
+    // this covers the numbered form those pages used as a shorthand index into
+    // an internal decision log. RESIDUAL RISK, recorded: a page citing an
+    // EXTERNAL numbered ruling (a regulator's "Ruling 4") would misfire; these
+    // are technical product pages, and no such citation exists on the corpus.
+    "numbered_ruling_citation",
+    /\brulings?[ \t]{1,3}\d{1,3}\b/i,
+    'numbered ruling citation, e.g. "ruling 4" / "rulings 1–2"',
+  ],
+
+  // --- Class: IN-PAGE AUTHORING / PUBLISH-STATUS ANNOTATION (docs#160) ------
+  // Editorial scaffolding that survived into the published bytes: a note about
+  // what the page decides to publish, what state the spec is in, what is
+  // "outside the mock", or how the next publish is scheduled. It is the same
+  // family as the class-1 production notes ("this page is compiled from…") —
+  // prose about the page rather than about the product — in the vocabulary a
+  // design spec accumulates.
+  //
+  // ALL THREE ARE DELIBERATELY NARROWED to the ANNOTATION form, because the bare
+  // phrases are ordinary product vocabulary in a product that itself publishes,
+  // reviews and versions things. "The publish decision is recorded on the run",
+  // "review each publish decision before release", "check the spec status before
+  // deploying" and "the design notes for this integration are in the appendix"
+  // are all legitimate published prose, and every one of them fails an
+  // unqualified pattern.
+  //
+  // The narrowing is POSITIVE, not a blacklist of continuations. A blacklist was
+  // tried first and rejected: any finite list of following words still leaves
+  // "…decision before release" and "…status before deploying" failing, and the
+  // list can never be completed. What actually separates the two is STRUCTURAL —
+  // an annotation TERMINATES (end of line, a separator glyph, a closing bracket,
+  // an em/en dash introducing its value) or POINTS at a location in the document
+  // ("publish decision in §VII"), whereas a sentence CONTINUES with the phrase as
+  // an ordinary noun. That is checkable rather than enumerable. A rephrased
+  // annotation is caught in review, not here — the same trade this list makes
+  // everywhere else.
+  //
+  // RESIDUAL RISK, recorded rather than hidden (Codex review, docs#160). The
+  // narrowing constrains what may FOLLOW the phrase, not what precedes it, so a
+  // sentence that ENDS on the phrase still fails:
+  //     "Before release, review the publish decision."
+  //     "Before deploying, check spec status."
+  //     "Please review the design notes for the mock."
+  // No local lexical rule separates those from an annotation, because a terminal
+  // noun phrase is exactly what an annotation is. They are left failing on
+  // purpose: the escape is a line-pinned allowlist entry — reviewed, owned, and
+  // expiring — which is preferable to an unenforced class. Nothing on the 202
+  // inventoried published surfaces is phrased this way today.
+  [
+    "publish_decision",
+    /\bpublish(?:ing)? decisions?(?=[ \t]*(?:[·•|)\]}—–─:]|\r?\n|$)|[ \t]+(?:in|per|recorded in)[ \t]*(?:§|section\b))/i,
+    '"publish decision" as a page annotation',
+  ],
+  [
+    "spec_status_annotation",
+    /\bspec status(?=[ \t]*(?:[·•|)\]}—–─:]|\r?\n|$))/i,
+    '"spec status" as a page annotation',
+  ],
+  [
+    // "design note, outside the page mock" and its authoring twin. Deliberately
+    // NOT extended to "review note" — a review note is a real Cinatra product
+    // object, and a pattern that fires on the product's own vocabulary costs
+    // more than the annotation it catches.
+    "design_note_annotation",
+    /\b(?:design|authoring) notes?\b[ \t]*[,;:—–-]?[ \t]*(?:outside\b|not (?:in|part of)\b|excluded from\b|for the mock\b)/i,
+    '"design note / authoring note, outside …" (page-scoping authoring annotation)',
+  ],
+  [
+    // Internal scheduling of a docs publish, stated on the published page ("a
+    // separate, owner-gated publish"). The gating NOUN is required: "owner" is
+    // an ordinary Cinatra role and "owner-gated" alone would reach real product
+    // prose about owner-approved actions.
+    "owner_gated_publish",
+    /\bowner-gated[ \t]{1,3}(?:publish|release|rollout|deploy|deployment|decision)\b/i,
+    '"owner-gated publish" (internal publish scheduling)',
+  ],
 ];
 
 // A --paths spec is a newline- and/or comma-separated list of entries;
@@ -343,13 +518,21 @@ function parsePathsSpec(spec) {
 }
 
 function parseArgs(argv) {
-  const out = { docs: DEFAULT_DOCS_DIR, paths: [], pathsSupplied: false, allowlist: DEFAULT_ALLOWLIST_PATH, now: new Date() };
+  const out = {
+    docs: DEFAULT_DOCS_DIR,
+    paths: [],
+    pathsSupplied: false,
+    allowlist: DEFAULT_ALLOWLIST_PATH,
+    now: new Date(),
+    printFiles: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--docs" || argv[i] === "-d") out.docs = argv[++i];
     else if (argv[i] === "--paths") {
       out.pathsSupplied = true;
       out.paths.push(...parsePathsSpec(argv[++i]));
     }
+    else if (argv[i] === "--print-files") out.printFiles = true;
     else if (argv[i] === "--allowlist") out.allowlist = argv[++i];
     else if (argv[i] === "--now") out.now = new Date(argv[++i]); // testability only
     else if (argv[i] === "--help" || argv[i] === "-h") out.help = true;
@@ -398,13 +581,17 @@ function loadAllowlist(path, now) {
   return { live, expired };
 }
 
-// Tracked Markdown files under one scan root (a directory, or — in multi-path
-// mode — possibly a single file; `git ls-files` handles both pathspec shapes).
-// `git ls-files` respects gitignore and returns only tracked files (so an
-// untracked scratch file can never trip the gate); scoping the pathspec
+// Tracked published-surface files under one scan root (a directory, or — in
+// multi-path mode — possibly a single file; `git ls-files` handles both pathspec
+// shapes). `git ls-files` respects gitignore and returns only tracked files (so
+// an untracked scratch file can never trip the gate); scoping the pathspec
 // confines the scan to the configured tree. Paths are returned relative to
 // CWD. `-z` handles unusual filenames robustly.
-function listMarkdownFiles(docsDir) {
+//
+// Both published formats are selected: Markdown (`.md`) and HTML (`.html` /
+// `.htm`, docs#160). Nothing else — an image, a stylesheet or a script is not a
+// prose surface, and a scan that guessed would be a scan nobody can predict.
+function listScanFiles(docsDir) {
   let out;
   try {
     // --literal-pathspecs: configured entries are LITERAL paths, never globs —
@@ -421,7 +608,7 @@ function listMarkdownFiles(docsDir) {
   return out
     .split("\0")
     .filter(Boolean)
-    .filter((f) => f.toLowerCase().endsWith(".md"));
+    .filter((f) => f.toLowerCase().endsWith(".md") || isHtmlPath(f));
 }
 
 function lineNumberAt(content, index) {
@@ -446,13 +633,27 @@ function lineTextAt(content, index) {
   return content.slice(start, end).trim();
 }
 
+// The text a file's patterns are matched against, plus the map back to source
+// offsets. Markdown IS its own prose, so the map is the identity (returned as
+// null, which the caller reads as "extracted index === source index"). HTML is
+// reduced by the documented extraction contract in lib/html-text.mjs, and the
+// returned map carries each extracted character's source offset so reporting
+// and allowlist pinning stay on the SOURCE line.
+function scannableText(file, source) {
+  if (!isHtmlPath(file)) return { text: source, map: null };
+  return extractHtmlText(source);
+}
+
 function main() {
-  const { docs, paths, pathsSupplied, allowlist: allowlistPath, now, help } = parseArgs(process.argv.slice(2));
+  const { docs, paths, pathsSupplied, allowlist: allowlistPath, now, help, printFiles } = parseArgs(
+    process.argv.slice(2)
+  );
   if (help) {
     console.log(
-      "Usage: check-meta-commentary [--docs <dir>] [--paths <newline/comma-separated dirs and/or .md files>] [--allowlist <path>] [--now <ISO-date>]"
+      "Usage: check-meta-commentary [--docs <dir>] [--paths <newline/comma-separated dirs and/or .md/.html files>] [--allowlist <path>] [--print-files] [--now <ISO-date>]"
     );
     console.log("A non-empty --paths takes precedence over --docs; without it the gate scans the single --docs directory.");
+    console.log("--print-files lists the files the configured paths selected (the exact read set) before scanning.");
     process.exit(0);
   }
 
@@ -493,57 +694,74 @@ function main() {
   // verified occurrence.
   const allowed = new Set(live.map((e) => `${e.file} ${e.pattern} ${e.snippet}`));
 
-  let markdownFiles;
+  let scanFiles;
   try {
     if (multiPath) {
-      // Union of tracked Markdown under every configured path, dedup'd (an
+      // Union of tracked Markdown/HTML under every configured path, dedup'd (an
       // entry may be a directory or a single file; overlapping entries — e.g.
       // "docs,docs/overview.md" — scan a file once). FAIL CLOSED per entry: a
-      // configured path that yields no tracked Markdown at all is a config
-      // error (a typo'd, untracked, or Markdown-free entry must surface, never
+      // configured path that yields no tracked page at all is a config
+      // error (a typo'd, untracked, or prose-free entry must surface, never
       // silently narrow the scan).
       const seen = new Set();
-      markdownFiles = [];
+      scanFiles = [];
       for (const p of paths) {
-        const files = listMarkdownFiles(p);
+        const files = listScanFiles(p);
         if (files.length === 0) {
           console.error(
-            `[meta-commentary-gate] ERROR: configured path "${p}" matched no tracked Markdown files — fix the entry or drop it.`
+            `[meta-commentary-gate] ERROR: configured path "${p}" matched no tracked Markdown or HTML files — fix the entry or drop it.`
           );
           process.exit(2);
         }
         for (const f of files) {
           if (!seen.has(f)) {
             seen.add(f);
-            markdownFiles.push(f);
+            scanFiles.push(f);
           }
         }
       }
     } else {
-      markdownFiles = listMarkdownFiles(docs);
+      scanFiles = listScanFiles(docs);
     }
   } catch (e) {
     console.error(`[meta-commentary-gate] ERROR: ${e.message}`);
     process.exit(2);
   }
 
+  // The exact read set the configured paths selected. Printed on request so the
+  // path-selection scoping rule (docs#160 AC12) is checkable rather than
+  // asserted: a path that does not appear here is never opened.
+  if (printFiles) {
+    for (const f of scanFiles) {
+      if (SKIP_PATHS.has(f)) continue;
+      console.log(`[meta-commentary-gate] selected: ${f}`);
+    }
+  }
+
   const violations = [];
-  for (const file of markdownFiles) {
+  for (const file of scanFiles) {
     if (SKIP_PATHS.has(file)) continue;
-    const content = readFileSync(resolveInCwd(file), "utf8");
+    const source = readFileSync(resolveInCwd(file), "utf8");
+    // For HTML the patterns run over the extracted PROSE; `map` translates a
+    // match position back to the source offset so the report and the allowlist
+    // key stay on the real file and line.
+    const { text, map } = scannableText(file, source);
     for (const [id, regex, description] of PATTERNS) {
       const flags = regex.flags.includes("g") ? regex.flags : `${regex.flags}g`;
       const re = new RegExp(regex.source, flags);
       let match;
-      while ((match = re.exec(content)) !== null) {
-        const lineText = lineTextAt(content, match.index);
+      while ((match = re.exec(text)) !== null) {
+        const sourceIndex = map ? (map[match.index] ?? source.length) : match.index;
+        const lineText = lineTextAt(source, sourceIndex);
         if (!allowed.has(`${file} ${id} ${lineText}`)) {
           violations.push({
             file,
-            line: lineNumberAt(content, match.index),
+            line: lineNumberAt(source, sourceIndex),
             id,
             description,
-            snippet: match[0],
+            // The matched text is reported from the EXTRACTED prose, so an
+            // entity-encoded or tag-split match reads as the phrase it is.
+            snippet: match[0].replace(/\s+/g, " ").trim(),
           });
         }
         if (match.index === re.lastIndex) re.lastIndex++; // zero-width guard
@@ -551,9 +769,16 @@ function main() {
     }
   }
 
+  // Deterministic order regardless of pattern-list order: file, then source
+  // line, then pattern id. An HTML page yields matches out of line order
+  // otherwise (each pattern sweeps the whole page in turn).
+  violations.sort(
+    (a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.id.localeCompare(b.id)
+  );
+
   const scopeLabel = multiPath
-    ? `across ${markdownFiles.length} tracked Markdown file(s) under the configured paths (${paths.join(", ")})`
-    : `across tracked Markdown pages under "${docs}/"`;
+    ? `across ${scanFiles.length} tracked Markdown/HTML file(s) under the configured paths (${paths.join(", ")})`
+    : `across tracked Markdown/HTML pages under "${docs}/"`;
 
   if (violations.length === 0) {
     console.log(`[meta-commentary-gate] OK — 0 violations ${scopeLabel} (allowlist: ${live.length} live entries).`);
@@ -581,8 +806,9 @@ function main() {
   console.error(
     `\nPublished integration docs describe Cinatra the product and how to use this integration: ` +
       `not how the documentation or its assets are authored, generated, compiled, mirrored or maintained; ` +
-      `not what is still in flight ("still landing", "forthcoming"); and not the internal work item or ` +
-      `decision a capability came from ("epic #123, landed", "the ratified <X> mode"). ` +
+      `not what is still in flight ("still landing", "forthcoming"); and not the internal work item, ` +
+      `acceptance criterion or decision a capability came from ("epic #123, landed", "cinatra#1607 AC6", ` +
+      `"ruling 4", "the ratified <X> mode"). This holds for HTML pages exactly as for Markdown, comments included. ` +
       `Remove the meta/transition/provenance content from the page and state the capability as it stands.` +
       `\nA genuine false positive (real product content this pattern misfires on) goes in ` +
       `${allowlistPath} with an owner, a reviewBy date, and the exact full line as the snippet — see cinatra-ai/docs#119.`

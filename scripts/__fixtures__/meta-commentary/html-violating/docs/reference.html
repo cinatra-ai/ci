@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Example reference page</title>
+  <meta name="description" content="This page is compiled from the design system, so the description is meta too.">
+</head>
+<body>
+  <!-- HTML COMMENT, in scope: an authoring annotation that ships in the published bytes. -->
+  <!-- Marketplace vendor registration — design note, outside the page mock -->
+
+  <h1>Example reference</h1>
+
+  <!-- Visible text node, plain. -->
+  <p>This page is compiled from the design system and is the canonical source for the widget contract.</p>
+
+  <!-- Inline tag boundary: the phrase is split by <b>, and must still match. -->
+  <p>This page is <b>generated</b> from the shared design tokens, so treat it as read-only.</p>
+
+  <!-- Hard wrap inside a text node: the same claim, wrapped mid-sentence. -->
+  <p>The banner images are generated deterministically
+    from the brand kit — never hand-edit the PNGs.</p>
+
+  <!-- Entity encoding: a named entity and a numeric entity inside the phrase. -->
+  <p>The chapter body is compiled&nbsp;from the upstream repository.</p>
+  <p>The widget list is the canonical&#32;source of truth for installed widgets.</p>
+
+  <!-- Human-readable attributes are prose and are scanned. -->
+  <img src="banner.png" alt="Diagram published from the internal design deck">
+  <button title="Export is coming soon" aria-label="Scheduled export is still landing">Export</button>
+
+  <!-- Transition / in-flight narration. -->
+  <p>Bulk import is not yet landed. The replay tool is landing in a later release.</p>
+
+  <!-- Planning provenance, existing classes. -->
+  <p>The renderer block (epic #1620, landed in the first wave) draws the widget.</p>
+  <p>Containment shipped under epic #1448.</p>
+  <p>Selection uses the ratified claim-only mode.</p>
+  <p>Per the ruling, the picker never widens a scope silently.</p>
+
+  <!-- Planning provenance: the citation classes (work item, criterion, ruling). -->
+  <div class="source">cinatra#1607 AC6/AC8 · publish decision</div>
+  <p>The access picker is specified separately in cinatra-ai/cinatra#1795; this page references it.</p>
+  <p>The base roster gained zip and text types (ruling 1) and the suggestion chips followed (rulings 1&ndash;2).</p>
+  <p>Requesting an install is a functional action (ruling 4).</p>
+
+  <!-- In-page authoring / publish-status annotation. -->
+  <div class="callout">
+    <span class="callout-label">Spec status — published</span>
+    <p>The retirement of the old inbox is a separate, owner-gated publish; this page is the contract it retires toward.</p>
+  </div>
+</body>
+</html>

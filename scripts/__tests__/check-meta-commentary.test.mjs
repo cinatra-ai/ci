@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -434,4 +434,107 @@ test("AC5 ruling: released-version history in a CHANGELOG (non-guide context) is
   const { code, out } = run(["--paths", `${MULTIPATH}/CHANGELOG.md`]);
   assert.equal(code, 0, out);
   assert.match(out, /OK — 0 violations/);
+});
+
+// ---------------------------------------------------------------------------
+// docs#160 AC4: the REPO-QUALIFIED work-item citation class, and the narrowed
+// rule-out on the bare `#123` form it replaces. Precision here is structural —
+// the pattern must separate a citation from a file anchor, a heading slug, a
+// palette entry and a bare cross-reference — so every positive is paired with
+// the negative the rule-out pins.
+
+const CITATION_CLEAN = "scripts/__fixtures__/meta-commentary/html-clean/docs";
+const CITATION_VIOLATING = "scripts/__fixtures__/meta-commentary/html-violating/docs";
+
+test("AC4 class: repo-qualified work-item citations, criteria and numbered rulings fire", () => {
+  const { code, out } = run(["--docs", CITATION_VIOLATING]);
+  assert.equal(code, 1, out);
+  for (const id of [
+    "qualified_workitem_citation",
+    "acceptance_criterion_citation",
+    "numbered_ruling_citation",
+    "publish_decision",
+    "spec_status_annotation",
+    "design_note_annotation",
+    "owner_gated_publish",
+  ]) {
+    assert.match(out, new RegExp(`\\[${id}\\]`), `expected docs#160 pattern ${id} in output`);
+  }
+  // Both spellings of the citation: bare-repo and org/repo-qualified.
+  assert.match(out, /qualified_workitem_citation\] matched[^\n]*"cinatra#1607"/);
+  assert.match(out, /qualified_workitem_citation\] matched[^\n]*"cinatra-ai\/cinatra#1795"/);
+});
+
+test("AC4 precision: a display label beside a run number is not a citation", () => {
+  // The real false positive this narrowing came from: a published components
+  // page renders an agent-run cell as two adjacent inline spans, and inline
+  // tags are transparent, so `Outreach` + `#2,318` arrives as one token.
+  const { code, out } = run(["--docs", CITATION_CLEAN]);
+  assert.equal(code, 0, out);
+  assert.doesNotMatch(out, /Outreach#/, out);
+});
+
+test("AC4 rule-out preserved: a bare #123, a file anchor and a heading slug stay green", () => {
+  // The clean HTML fixture carries "See issue #123 for troubleshooting",
+  // `overview.md#12`, `setup.html#3-install`, `0xAC12` and a `#1607` palette
+  // entry. Green here IS the proof that narrowing the docs#156 rule-out to the
+  // qualified form did not widen it to the bare form.
+  const { code, out } = run(["--docs", CITATION_CLEAN]);
+  assert.equal(code, 0, out);
+});
+
+// ---------------------------------------------------------------------------
+// docs#160 AC12: the boundary regression guard. The exemption of an
+// implementation-facing tree comes from EXACT PATH SELECTION and nothing else —
+// the engine must never learn a semantic notion of an "internal" tree.
+
+const GUARD = "scripts/__fixtures__/meta-commentary/boundary-guard";
+
+test("AC12: a caller configured with only README.md + CHANGELOG.md is green despite a planted docs/** violation", () => {
+  const { code, out } = run(["--paths", `${GUARD}/README.md,${GUARD}/CHANGELOG.md`]);
+  assert.equal(code, 0, out);
+  assert.match(out, /OK — 0 violations/);
+});
+
+test("AC12: the planted docs/** tree is never SELECTED, therefore never read", () => {
+  // --print-files prints the exact read set. The engine opens only files in that
+  // set, so a path absent from it is a path never opened.
+  const { code, out } = run(["--print-files", "--paths", `${GUARD}/README.md,${GUARD}/CHANGELOG.md`]);
+  assert.equal(code, 0, out);
+  const selected = [...out.matchAll(/selected: (.+)/g)].map((m) => m[1].trim());
+  assert.deepEqual(selected, [`${GUARD}/README.md`, `${GUARD}/CHANGELOG.md`]);
+  assert.equal(selected.some((f) => f.includes("/docs/")), false, out);
+});
+
+test("AC12: the same planted tree IS red the moment a caller selects it (the guard is not vacuous)", () => {
+  // Without this, a guard that passed because the fixture had no violation would
+  // look identical to one that passed because path selection worked.
+  const { code, out } = run(["--docs", `${GUARD}/docs`]);
+  assert.equal(code, 1, out);
+  assert.match(out, /internals\.md:\d+\s+\[compiled_from\]/, out);
+  assert.match(out, /internals\.html:\d+\s+\[qualified_workitem_citation\]/, out);
+});
+
+test("AC12: read-proof — the planted tree stays unread even when it is unreadable", () => {
+  // A stronger form of the claim above: make the planted files impossible to
+  // read, and the configured run must still be green. If selection ever leaked
+  // into the read set, this would throw instead. Skipped for root (which
+  // bypasses the permission bits) and on platforms without POSIX modes.
+  if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) {
+    return;
+  }
+  const planted = [
+    join(REPO_ROOT, GUARD, "docs", "internals.md"),
+    join(REPO_ROOT, GUARD, "docs", "internals.html"),
+  ];
+  const modes = planted.map((p) => statSync(p).mode);
+  try {
+    for (const p of planted) chmodSync(p, 0o000);
+    // Sanity: the tree really is unreadable now.
+    assert.throws(() => readFileSync(planted[0], "utf8"));
+    const { code, out } = run(["--paths", `${GUARD}/README.md,${GUARD}/CHANGELOG.md`]);
+    assert.equal(code, 0, out);
+  } finally {
+    planted.forEach((p, i) => chmodSync(p, modes[i]));
+  }
 });

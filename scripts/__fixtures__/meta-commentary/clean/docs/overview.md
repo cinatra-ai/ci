@@ -22,7 +22,7 @@ as skills any connected agent can call as slash commands.
 Every action runs with the permissions you grant during install, and nothing
 leaves your workspace unless you ask for it.
 
-## Ordinary prose the AC5 patterns must NOT match (docs#156)
+## Ordinary prose the transition and provenance patterns must NOT match
 
 Each sentence below is real published product prose that a broader pattern
 would have failed. They pin the RULED OUT decisions in the engine's policy
