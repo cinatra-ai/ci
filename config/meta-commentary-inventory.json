@@ -1,7 +1,7 @@
 {
   "$comment": "The docs#156 AC1 inventory — the closure set the meta-commentary sweep and gate rollout are measured against. 'Published surface' = a page a non-contributor is expected to read: a public repo's root README.md / CHANGELOG.md, any docs/ tree, copy staged for an external listing (.wordpress-org/, .drupalorg/), and (docs#160) published HTML reference pages. Contributor-, maintainer-, and engineering-internal documentation is exempt by design; every exemption is RECORDED here per surface with a rationale, never implied. class values: 'published' (in scope; a caller of the reusable meta-commentary-gate should cover it), 'exempt-engineering-internal' (recorded exemption), 'staged-listing' (copy staged for an external directory listing; the docs#156 AC5 ruling makes it a PUBLISHED surface — asset-production notes are removed, not exempted, and its repo's caller scans the path). An optional 'coverage' field records that something OTHER than a pinned caller enforces the gate on that surface ('repo-local' = the repo runs its own blocking check); scripts/meta-commentary-surface-coverage.mjs (docs#160 AC11) reads it and treats an ABSENT coverage as 'a caller is required' — the escape is recorded, never inferred. Recorded from each PUBLIC, non-archived org repo's default branch as of recordedAt (enumerated via the GitHub API). Archived public repos are excluded (read-only; no callers can be added) and listed in excludedArchivedRepos. Private repos publish nothing and are out of scope by definition. Regenerate by running scripts/meta-commentary-surface-coverage.mjs --live and recording what it reports; update recordedAt when doing so.",
   "schemaVersion": 1,
-  "recordedAt": "2026-08-01",
+  "recordedAt": "2026-08-03",
   "issue": "cinatra-ai/docs#156 · cinatra-ai/docs#160",
   "surfacePatterns": [
     "README.md",
@@ -20,7 +20,7 @@
     "cinatra-ai/skill-recommender-agent",
     "cinatra-ai/trigger-agent"
   ],
-  "repoCount": 132,
+  "repoCount": 133,
   "repos": [
     {
       "repo": "cinatra-ai/.github",
@@ -1362,6 +1362,50 @@
         {
           "path": "README.md",
           "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/google-appointment-schedules-connector",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/advanced-and-reference.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/overview.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/quick-start.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/settings-and-permissions.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/troubleshooting.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
+        },
+        {
+          "path": "docs/use-it.md",
+          "class": "published",
+          "note": "Gated today via the repo's thin meta-commentary caller (docs#119)."
         }
       ]
     },
