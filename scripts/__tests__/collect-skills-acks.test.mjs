@@ -313,6 +313,8 @@ test("ci#56 WORKFLOW LOCK: a push-only step resolves the merged PR body via the 
 // ===========================================================================
 
 const RESOLVE = path.join(HERE, "..", "resolve-pr-body.sh");
+// The engine step's name, matched by shape so this file does not restate it.
+const GATE_STEP = "Run skills-[a-z-]+ \\(WARN\\)";
 
 // The acknowledgement the author ADDS to the description after the first red run.
 const EDITED_BODY =
@@ -530,6 +532,9 @@ test("PR ARM: the shipped step runs the resolver from the gate checkout, and say
   try {
     const script = stepRunScript(stepBlock(fs.readFileSync(WORKFLOW, "utf8"), "Resolve PR description live"));
     const out = path.join(dir, "pr-body-live.txt");
+    // Where the step expects the resolver, read out of the step itself rather
+    // than restated here — the checkout path is the workflow's to choose.
+    const resolverRel = script.match(/GITHUB_WORKSPACE\/([^"]+\.sh)/)[1];
 
     // A gate checkout pinned OLDER than this workflow has no resolver in it. The
     // step must name the pin, not die on a command-not-found.
@@ -543,8 +548,8 @@ test("PR ARM: the shipped step runs the resolver from the gate checkout, and say
     // With the matching checkout present the step resolves and publishes both
     // outputs the collector and the engine consume.
     const workspace = fs.mkdtempSync(path.join(dir, "workspace-"));
-    fs.mkdirSync(path.join(workspace, ".skills-drift-gate", "scripts"), { recursive: true });
-    fs.copyFileSync(RESOLVE, path.join(workspace, ".skills-drift-gate", "scripts", "resolve-pr-body.sh"));
+    fs.mkdirSync(path.join(workspace, path.dirname(resolverRel)), { recursive: true });
+    fs.copyFileSync(RESOLVE, path.join(workspace, resolverRel));
     const ok = runStepScript(dir, script, {
       ghScript: GH_OK,
       env: { GITHUB_WORKSPACE: workspace, PR_NUMBER: "4212", MODE: "enforce", OUT: out, MOCK_BODY: EDITED_BODY, GH_ARGV_FILE: path.join(dir, "gh-argv-step.txt") },
@@ -562,7 +567,9 @@ test("GATE STEP: an event with no PR to read reports `unavailable`, never the pa
   // remediation about a payload copy this run never read.
   const { dir } = prRepo();
   try {
-    const script = stepRunScript(stepBlock(fs.readFileSync(WORKFLOW, "utf8"), "Run skills-drift-gate"));
+    const script = stepRunScript(stepBlock(fs.readFileSync(WORKFLOW, "utf8"), GATE_STEP));
+    // The engine path the step probes and invokes, taken from the step itself.
+    const engineRel = script.match(/\bnode (\S+\.mjs)/)[1];
     // A `node` stub records the argv the step builds; no gate runs here.
     const argvFile = path.join(dir, "node-argv.txt");
     const nodeStub = "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$NODE_ARGV_FILE\"\n";
@@ -571,9 +578,9 @@ test("GATE STEP: an event with no PR to read reports `unavailable`, never the pa
     fs.writeFileSync(path.join(bin, "node"), nodeStub, { mode: 0o755 });
 
     // The step probes the ENGINE it is about to run; stage a checkout of it.
-    const engineDir = path.join(dir, ".skills-drift-gate", "scripts");
-    fs.mkdirSync(engineDir, { recursive: true });
-    fs.copyFileSync(GATE, path.join(engineDir, "skills-drift-gate.mjs"));
+    const engineAt = path.join(dir, engineRel);
+    fs.mkdirSync(path.dirname(engineAt), { recursive: true });
+    fs.copyFileSync(GATE, engineAt);
 
     const run = (ackSource) => {
       const r = spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
@@ -597,7 +604,7 @@ test("GATE STEP: an event with no PR to read reports `unavailable`, never the pa
     // An ENGINE older than this workflow does not know the flag. Passing it
     // would abort the gate with "unknown flag" — on the arms that never gate,
     // the check must keep running on its old terms and say why.
-    fs.writeFileSync(path.join(engineDir, "skills-drift-gate.mjs"), "// an engine that predates the flag\n");
+    fs.writeFileSync(engineAt, "// an engine that predates the flag\n");
     const old = run("unavailable");
     assert.doesNotMatch(old.argv, /--ack-source/, "an engine that cannot take the flag must not be handed it");
     assert.match(old.stderr, /::warning::.*'ref' input points at a commit older than this workflow/);
@@ -723,7 +730,7 @@ test("PUSH ARM: every API failure stays FAIL-OPEN — exit 0, empty body, source
 
 test("WORKFLOW LOCK: the gate step forwards --ack-source so the remediation hint matches the run", () => {
   const text = fs.readFileSync(WORKFLOW, "utf8");
-  const block = stepBlock(text, "Run skills-drift-gate");
+  const block = stepBlock(text, GATE_STEP);
   assert.match(block, /ACK_SOURCE:.*steps\.prlive\.outputs\.source/);
   assert.match(block, /ACK_SOURCE:.*steps\.prbody\.outputs\.source/,
     "a post-merge run reports its own source too — it must not be described as reading the frozen payload");
