@@ -16,8 +16,12 @@ name: skills-drift-gate
 # unresolvable diff base, or a malformed `cinatra-watches` block.
 #
 # Acknowledge a declared-watch finding with ONE of (cinatra#188 §Acknowledgement):
-#   - `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked
-#     assistant-skills PR naming the impacted skill(s); or
+#   - `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked skills-repo
+#     PR naming the impacted skill(s). The ref is `#n` / `n` / `GH-n`, or a
+#     github.com PULL URL on `assistant-skills` (the retired single pack) or on
+#     any repo this caller PINS below (`skills_repos` / `skills_repo`) — so a
+#     successor-repo acknowledgement validates and the ambiguous bare-number
+#     workaround is no longer forced. Any other URL is rejected and reported; or
 #   - `Skills-reviewed: <note>`; or
 #   - `Skills-unaffected: <reason>` (reason REQUIRED — not `Skills-unaffected:` only).
 #
@@ -266,8 +270,27 @@ jobs:
           MODE: ${{ inputs.mode }}
           CONFIG: ${{ inputs.config }}
           ACK_FILE: ${{ steps.acks.outputs.file }}
+          # The caller's OWN pinned skills repos, handed to the engine so the
+          # `Skills-PR:` URL arm accepts a pull URL on the repos actually in the
+          # pinned skills universe (the successor repos of the retired single
+          # pack) instead of only the retired repo name. Passed verbatim: the
+          # engine parses `owner/name` / `owner/name@<ref>` entries and IGNORES
+          # anything else, so this can only ever widen the ack grammar to
+          # caller-pinned repos — never to an arbitrary URL a PR body names.
+          # Same trust level as `mode:` (pinned caller config, not PR input).
+          SKILLS_REPOS: ${{ inputs.skills_repos }}
+          SKILLS_REPO: ${{ inputs.skills_repo }}
         run: |
           args=( --skills-dir .assistant-skills/skills --mode "$MODE" )
           [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
           [ -n "$ACK_FILE" ] && args+=( --ack-file "$ACK_FILE" )
+          # Multi-repo mode pins the whole set; single-repo mode pins exactly one
+          # repo (skills_repo). Values reach the engine as ARRAY ELEMENTS via env
+          # — never interpolated into a shell line (the injection discipline this
+          # workflow follows throughout).
+          if [ -n "$SKILLS_REPOS" ]; then
+            args+=( --skills-repos "$SKILLS_REPOS" )
+          elif [ -n "$SKILLS_REPO" ]; then
+            args+=( --skills-repos "$SKILLS_REPO" )
+          fi
           node .skills-drift-gate/scripts/skills-drift-gate.mjs "${args[@]}"

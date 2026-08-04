@@ -22,6 +22,9 @@ import {
   skillSlug,
   validateWatchSurface,
   WatchParseError,
+  parseSkillsRepos,
+  resolveSkillsRepos,
+  isSkillsPRRef,
 } from "../skills-drift-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "skills-drift-gate.mjs");
@@ -51,9 +54,19 @@ function repoWithDiff(baseFile, headContent) {
   return dir;
 }
 
-function runGate(cwd, extraArgs) {
+function runGate(cwd, extraArgs, extraEnv = {}) {
   return spawnSync("node", [GATE, "--skills-dir", SKILLS, "--format", "json", ...extraArgs], {
-    cwd, encoding: "utf8", env: { ...process.env, GITHUB_ACTIONS: "" },
+    cwd,
+    encoding: "utf8",
+    // The skills-repo env inputs are cleared unless a test sets them, so an
+    // ambient value in the developer's shell can never make a test pass.
+    env: {
+      ...process.env,
+      GITHUB_ACTIONS: "",
+      SKILLS_DRIFT_PINNED_REF: "",
+      SKILLS_DRIFT_SKILLS_REPOS: "",
+      ...extraEnv,
+    },
   });
 }
 
@@ -190,17 +203,17 @@ test("ROUTE HIT: a changed route string flags the referencing skill", () => {
 
 test("parseAcks reads Skills-reviewed and Skills-unaffected trailers", () => {
   assert.deepEqual(parseAcks("body\n\nSkills-reviewed: checked chat-agent-dispatch"), {
-    reviewed: "checked chat-agent-dispatch", unaffected: null, linkedPRs: [],
+    reviewed: "checked chat-agent-dispatch", unaffected: null, linkedPRs: [], rejectedRefs: [],
   });
   assert.deepEqual(parseAcks("Skills-unaffected: rename is internal-only, no skill ref"), {
-    reviewed: null, unaffected: "rename is internal-only, no skill ref", linkedPRs: [],
+    reviewed: null, unaffected: "rename is internal-only, no skill ref", linkedPRs: [], rejectedRefs: [],
   });
-  assert.deepEqual(parseAcks("nothing here"), { reviewed: null, unaffected: null, linkedPRs: [] });
+  assert.deepEqual(parseAcks("nothing here"), { reviewed: null, unaffected: null, linkedPRs: [], rejectedRefs: [] });
 });
 
 test("parseAcks: a bare Skills-unaffected with no reason does NOT count (issue: not '...:' only)", () => {
-  assert.deepEqual(parseAcks("Skills-unaffected:   "), { reviewed: null, unaffected: null, linkedPRs: [] });
-  assert.deepEqual(parseAcks("Skills-unaffected:"), { reviewed: null, unaffected: null, linkedPRs: [] });
+  assert.deepEqual(parseAcks("Skills-unaffected:   "), { reviewed: null, unaffected: null, linkedPRs: [], rejectedRefs: [] });
+  assert.deepEqual(parseAcks("Skills-unaffected:"), { reviewed: null, unaffected: null, linkedPRs: [], rejectedRefs: [] });
 });
 
 test("parseAcks: an ack value must be on the SAME line — it does not swallow the next line (codex r3 MED)", () => {
@@ -234,8 +247,176 @@ test("parseAcks: a Skills-PR ref that is not a real PR reference is DROPPED (no 
   assert.equal(parseAcks("Skills-PR: 12 covers: x").linkedPRs.length, 1);
   assert.equal(parseAcks("Skills-PR: GH-12 covers: x").linkedPRs.length, 1);
   assert.equal(parseAcks("Skills-PR: https://github.com/cinatra-ai/assistant-skills/pull/12 covers: x").linkedPRs.length, 1);
-  // A PR URL for a DIFFERENT repo is not an assistant-skills PR — dropped.
+  // A PR URL for a DIFFERENT repo is not a pinned skills-repo PR — dropped.
   assert.equal(parseAcks("Skills-PR: https://github.com/cinatra-ai/cinatra/pull/12 covers: x").linkedPRs.length, 0);
+});
+
+// --- Pure: Skills-PR ref grammar over the caller-pinned skills-repo set ------
+//
+// The pinned set below mirrors the shape a real multi-repo caller passes: the
+// successor skill repos that replaced the single retired pack, each entry
+// `owner/name@<sha>` exactly as pinned in the caller's required-extensions lock.
+const PINNED_SPEC = [
+  "cinatra-ai/chat-assistant-core-skill@2cb491e1e3ccf7fe946b253254f2e7a4d509bc55",
+  "cinatra-ai/extension-authoring-skill@01c040e6453a08f8de128bc40b7b9047793fde1a",
+  "cinatra-ai/automation-authoring-skill@596afabf6a10b8f1f297521fcb7d1f78fb70213b",
+  "cinatra-ai/company-research-skill@639fdc073b7d600a8436900843bfd3ac42778743",
+  "cinatra-ai/blog-content-skill@163f73c05b441b61799a2db203f8ce873ec8aae7",
+  "cinatra-ai/hitl-prompt-drive-skill@81edce91254e677d7e68269503f3cf22fe7c9a2d",
+].join("\n");
+const PINNED = parseSkillsRepos(PINNED_SPEC);
+
+test("parseSkillsRepos: parses the caller pin spec in every separator form; ignores junk", () => {
+  // Newline-separated `owner/name@sha` (the multi-repo caller's literal block).
+  assert.deepEqual([...PINNED].sort(), [
+    "cinatra-ai/automation-authoring-skill",
+    "cinatra-ai/blog-content-skill",
+    "cinatra-ai/chat-assistant-core-skill",
+    "cinatra-ai/company-research-skill",
+    "cinatra-ai/extension-authoring-skill",
+    "cinatra-ai/hitl-prompt-drive-skill",
+  ]);
+  // Comma- and space-separated, and the bare `owner/name` (single-repo) form.
+  assert.deepEqual([...parseSkillsRepos("a/one-skill@abc,b/two-skill@def")].sort(), ["a/one-skill", "b/two-skill"]);
+  assert.deepEqual([...parseSkillsRepos("a/one-skill  b/two-skill")].sort(), ["a/one-skill", "b/two-skill"]);
+  assert.deepEqual([...parseSkillsRepos("cinatra-ai/assistant-skills")], ["cinatra-ai/assistant-skills"]);
+  // Case is normalized so the URL comparison is case-insensitive like GitHub.
+  assert.deepEqual([...parseSkillsRepos("Cinatra-AI/Chat-Assistant-Core-Skill@AB")], ["cinatra-ai/chat-assistant-core-skill"]);
+  // Empty / junk inputs register NO repo — they can only narrow the grammar.
+  assert.equal(parseSkillsRepos("").size, 0);
+  assert.equal(parseSkillsRepos(undefined).size, 0);
+  assert.equal(parseSkillsRepos(null).size, 0);
+  assert.equal(parseSkillsRepos("not-a-repo").size, 0);
+  assert.equal(parseSkillsRepos("too/many/segments@sha").size, 0);
+  assert.equal(parseSkillsRepos("/leading-slash@sha").size, 0);
+  assert.equal(parseSkillsRepos("owner/@sha").size, 0);
+  assert.equal(parseSkillsRepos("0123456789abcdef0123456789abcdef01234567").size, 0, "a bare SHA is not a repo");
+});
+
+test("resolveSkillsRepos: explicit caller pins win; the pinned-ref display value is the fallback", () => {
+  // (1) explicit `--skills-repos` / SKILLS_DRIFT_SKILLS_REPOS.
+  assert.deepEqual([...resolveSkillsRepos({ explicit: "a/one-skill@abc" })], ["a/one-skill"]);
+  // (2) fallback: multi-repo mode already publishes the pinned set as the display
+  // ref, so an older caller workflow that does not pass (1) still resolves.
+  assert.deepEqual([...resolveSkillsRepos({ pinnedRef: "a/one-skill@abc b/two-skill@def" })].sort(),
+    ["a/one-skill", "b/two-skill"]);
+  // explicit takes precedence over the fallback.
+  assert.deepEqual([...resolveSkillsRepos({ explicit: "a/one-skill@abc", pinnedRef: "b/two-skill@def" })],
+    ["a/one-skill"]);
+  // Single-repo mode publishes a BARE SHA as the display ref => no repo, legacy only.
+  assert.equal(resolveSkillsRepos({ pinnedRef: "0123456789abcdef0123456789abcdef01234567" }).size, 0);
+  // Nothing at all => empty (fail-closed to the legacy arm).
+  assert.equal(resolveSkillsRepos().size, 0);
+  assert.equal(resolveSkillsRepos({}).size, 0);
+});
+
+test("isSkillsPRRef: EVERY legacy-accepted form is still accepted, with or without a pinned set", () => {
+  for (const repos of [undefined, new Set(), PINNED]) {
+    // Repo-relative numbers.
+    assert.equal(isSkillsPRRef("#12", repos), true);
+    assert.equal(isSkillsPRRef("12", repos), true);
+    assert.equal(isSkillsPRRef("GH-12", repos), true);
+    assert.equal(isSkillsPRRef("gh-12", repos), true);
+    // The retired single pack's pull URL — ANY owner, http or https, as before.
+    assert.equal(isSkillsPRRef("https://github.com/cinatra-ai/assistant-skills/pull/12", repos), true);
+    assert.equal(isSkillsPRRef("http://github.com/cinatra-ai/assistant-skills/pull/12", repos), true);
+    assert.equal(isSkillsPRRef("https://github.com/someone-else/assistant-skills/pull/1", repos), true);
+    assert.equal(isSkillsPRRef("HTTPS://GitHub.com/Cinatra-AI/Assistant-Skills/PULL/12", repos), true);
+    // …and every legacy REJECTION still rejects.
+    assert.equal(isSkillsPRRef("nonsense", repos), false);
+    assert.equal(isSkillsPRRef("see the other repo", repos), false);
+    assert.equal(isSkillsPRRef("", repos), false);
+    assert.equal(isSkillsPRRef("https://github.com/cinatra-ai/cinatra/pull/12", repos), false);
+  }
+});
+
+test("isSkillsPRRef: a pull URL on EACH caller-pinned successor repo is accepted", () => {
+  for (const repo of PINNED) {
+    assert.equal(isSkillsPRRef(`https://github.com/${repo}/pull/5`, PINNED), true, repo);
+    assert.equal(isSkillsPRRef(`http://github.com/${repo}/pull/5`, PINNED), true, repo);
+    // Case-insensitive, like GitHub itself.
+    assert.equal(isSkillsPRRef(`https://GITHUB.com/${repo.toUpperCase()}/pull/5`, PINNED), true, repo);
+    // …and the SAME URL is rejected when that repo is not pinned (fail-closed:
+    // the grammar follows the caller's pins, it is not a standing allowance).
+    assert.equal(isSkillsPRRef(`https://github.com/${repo}/pull/5`, undefined), false, repo);
+    assert.equal(isSkillsPRRef(`https://github.com/${repo}/pull/5`, new Set()), false, repo);
+  }
+});
+
+test("isSkillsPRRef: lookalike and foreign URLs are REJECTED even with a pinned set", () => {
+  const bad = [
+    // A different repo in the same org (the classic laundering attempt).
+    "https://github.com/cinatra-ai/cinatra/pull/12",
+    // Repo-name lookalikes around a pinned entry.
+    "https://github.com/cinatra-ai/chat-assistant-core-skill-evil/pull/1",
+    "https://github.com/cinatra-ai/evil-chat-assistant-core-skill/pull/1",
+    // Right repo name, WRONG owner.
+    "https://github.com/evil-ai/chat-assistant-core-skill/pull/1",
+    // Host lookalikes (the anchor + literal host must hold).
+    "https://github.com.evil.example/cinatra-ai/chat-assistant-core-skill/pull/1",
+    "https://evil.example/cinatra-ai/chat-assistant-core-skill/pull/1",
+    "https://raw.github.com/cinatra-ai/chat-assistant-core-skill/pull/1",
+    "https://github.evil.example/cinatra-ai/chat-assistant-core-skill/pull/1",
+    // Not a PULL url, or a decorated pull url.
+    "https://github.com/cinatra-ai/chat-assistant-core-skill/issues/1",
+    "https://github.com/cinatra-ai/chat-assistant-core-skill/pulls/1",
+    "https://github.com/cinatra-ai/chat-assistant-core-skill/pull/1/files",
+    "https://github.com/cinatra-ai/chat-assistant-core-skill/pull/abc",
+    "https://github.com/cinatra-ai/chat-assistant-core-skill/pull/",
+    // Prose wrapped around a valid URL is not a bare ref.
+    "see https://github.com/cinatra-ai/chat-assistant-core-skill/pull/1",
+    // A pinned entry is a REPO, not a licence to name any URL on that org.
+    "https://github.com/cinatra-ai/pull/1",
+  ];
+  for (const ref of bad) assert.equal(isSkillsPRRef(ref, PINNED), false, ref);
+});
+
+test("isSkillsPRRef: a UNICODE case-fold lookalike cannot impersonate a repo (codex HIGH)", () => {
+  // U+212A KELVIN SIGN lowercases to ASCII "k", so a naive fold-and-compare
+  // would accept a repo name GitHub itself cannot resolve. Both the pinned arm
+  // and the legacy arm must reject it. U+017F LATIN SMALL LETTER LONG S folds to
+  // "s" the same way.
+  const KELVIN = "K";
+  const LONG_S = "ſ";
+  const foldLookalikes = [
+    `https://github.com/cinatra-ai/chat-assistant-core-s${KELVIN}ill/pull/1`,
+    `https://github.com/cinatra-ai/chat-a${LONG_S}sistant-core-skill/pull/1`,
+    `https://github.com/cinatra-ai/assistant-s${KELVIN}ills/pull/1`,
+    `https://github.com/someone-else/assistant-s${KELVIN}ills/pull/1`,
+  ];
+  for (const ref of foldLookalikes) {
+    assert.equal(isSkillsPRRef(ref, PINNED), false, ref);
+    assert.equal(isSkillsPRRef(ref, undefined), false, ref);
+  }
+  // …and an owner-side fold is rejected too.
+  assert.equal(isSkillsPRRef(`https://github.com/cinatra-ai/blog-content-s${KELVIN}ill/pull/1`, PINNED), false);
+});
+
+test("parseAcks: a successor-repo pull URL validates against the pinned set (the reported failure)", () => {
+  const line = "Skills-PR: https://github.com/cinatra-ai/chat-assistant-core-skill/pull/5 covers: chat-assistant-core";
+  // Without the pinned set the ref is dropped — the pre-fix behaviour.
+  const without = parseAcks(line);
+  assert.equal(without.linkedPRs.length, 0);
+  assert.deepEqual(without.rejectedRefs, ["https://github.com/cinatra-ai/chat-assistant-core-skill/pull/5"]);
+  // With it, the ack parses and carries its covers list.
+  const withSet = parseAcks(line, { skillsRepos: PINNED });
+  assert.equal(withSet.linkedPRs.length, 1);
+  assert.equal(withSet.linkedPRs[0].ref, "https://github.com/cinatra-ai/chat-assistant-core-skill/pull/5");
+  assert.deepEqual([...withSet.linkedPRs[0].covers], ["chat-assistant-core"]);
+  assert.deepEqual(withSet.rejectedRefs, []);
+  // A foreign URL stays rejected even WITH the pinned set (anti-laundering).
+  const foreign = parseAcks("Skills-PR: https://github.com/cinatra-ai/cinatra/pull/12 covers: chat-assistant-core", { skillsRepos: PINNED });
+  assert.equal(foreign.linkedPRs.length, 0);
+  assert.deepEqual(foreign.rejectedRefs, ["https://github.com/cinatra-ai/cinatra/pull/12"]);
+});
+
+test("findingSatisfied: a successor-repo Skills-PR clears a covered finding; a foreign one never does", () => {
+  const f = { class: "primitive", identifier: "workflow_draft_create", skills: ["skill-watched/SKILL.md"], source: "watch" };
+  const good = "Skills-PR: https://github.com/cinatra-ai/blog-content-skill/pull/5 covers: skill-watched";
+  assert.equal(findingSatisfied(f, parseAcks(good, { skillsRepos: PINNED })), true);
+  assert.equal(findingSatisfied(f, parseAcks(good)), false, "unpinned => the ref is not accepted");
+  const foreign = "Skills-PR: https://github.com/cinatra-ai/cinatra/pull/5 covers: skill-watched";
+  assert.equal(findingSatisfied(f, parseAcks(foreign, { skillsRepos: PINNED })), false);
 });
 
 test("skillSlug normalizes a relpath or a slug to the directory slug", () => {
@@ -348,6 +529,114 @@ test("CLI enforce mode: a linked Skills-PR that covers the impacted skill clears
     fs.writeFileSync(ack, "Skills-PR: https://github.com/cinatra-ai/assistant-skills/pull/9 covers: skill-watched\n");
     assert.equal(runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-file", ack]).status, 0,
       "a Skills-PR naming the impacted skill clears the finding");
+  } finally { rm(dir); }
+});
+
+test("CLI enforce mode: a successor-repo Skills-PR URL clears the finding once the caller pins that repo", () => {
+  const dir = repoWithDiff("// initial\n", "moved workflow_draft_create\n");
+  const ack = path.join(dir, "ack.txt");
+  const url = "https://github.com/cinatra-ai/chat-assistant-core-skill/pull/5";
+  try {
+    fs.writeFileSync(ack, `Skills-PR: ${url} covers: skill-watched\n`);
+    const base = ["--diff-base", "main", "--mode", "enforce", "--ack-file", ack];
+
+    // (0) No pinned set anywhere: the URL is not a recognized ref — the finding
+    // stays open AND the rejection is reported (not silently "no linked PR").
+    const unpinned = runGate(dir, base);
+    assert.equal(unpinned.status, 1, "an unrecognized ref must leave the finding unacknowledged");
+    const unpinnedOut = JSON.parse(unpinned.stdout);
+    assert.deepEqual(unpinnedOut.skillsRepos, []);
+    assert.deepEqual(unpinnedOut.acknowledgements.rejectedRefs, [url]);
+
+    // (1) --skills-repos (what the reusable workflow passes) clears it.
+    const viaFlag = runGate(dir, [...base, "--skills-repos", PINNED_SPEC]);
+    assert.equal(viaFlag.status, 0, `pinned successor-repo URL must clear the gate; stderr: ${viaFlag.stderr}`);
+    const flagOut = JSON.parse(viaFlag.stdout);
+    assert.equal(flagOut.unacknowledgedWatchFindingCount, 0);
+    assert.equal(flagOut.acknowledgements.linkedPRs.length, 1);
+    assert.deepEqual(flagOut.acknowledgements.rejectedRefs, []);
+    assert.ok(flagOut.skillsRepos.includes("cinatra-ai/chat-assistant-core-skill"),
+      "the effective ack grammar must be reported");
+
+    // (2) the env form resolves identically.
+    assert.equal(runGate(dir, base, { SKILLS_DRIFT_SKILLS_REPOS: PINNED_SPEC }).status, 0);
+
+    // (3) fallback: multi-repo mode already publishes the pinned set as the
+    // display ref, so an older caller workflow resolves without (1)/(2).
+    assert.equal(runGate(dir, base, { SKILLS_DRIFT_PINNED_REF: PINNED_SPEC.replace(/\n/g, " ") }).status, 0);
+
+    // (4) a bare-SHA display ref (single-repo mode) grants nothing.
+    assert.equal(runGate(dir, base, { SKILLS_DRIFT_PINNED_REF: "0123456789abcdef0123456789abcdef01234567" }).status, 1);
+  } finally { rm(dir); }
+});
+
+test("CLI enforce mode: an ARBITRARY repo's PR URL never clears the finding, even with pins", () => {
+  const dir = repoWithDiff("// initial\n", "moved workflow_draft_create\n");
+  const ack = path.join(dir, "ack.txt");
+  try {
+    for (const url of [
+      "https://github.com/cinatra-ai/cinatra/pull/2319",
+      "https://github.com/evil-ai/chat-assistant-core-skill/pull/1",
+      "https://github.com/cinatra-ai/chat-assistant-core-skill-evil/pull/1",
+      "https://evil.example/cinatra-ai/chat-assistant-core-skill/pull/1",
+      "https://github.com/cinatra-ai/chat-assistant-core-skill/pull/1/files",
+    ]) {
+      fs.writeFileSync(ack, `Skills-PR: ${url} covers: skill-watched\n`);
+      const res = runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-file", ack, "--skills-repos", PINNED_SPEC]);
+      assert.equal(res.status, 1, `a foreign PR URL must not launder the finding clear: ${url}`);
+      assert.deepEqual(JSON.parse(res.stdout).acknowledgements.rejectedRefs, [url]);
+    }
+  } finally { rm(dir); }
+});
+
+test("CLI: --skills-repos never widens the OTHER ack forms, and junk pins grant nothing", () => {
+  const dir = repoWithDiff("// initial\n", "moved workflow_draft_create\n");
+  const ack = path.join(dir, "ack.txt");
+  try {
+    // Prose is still not a ref, whatever is pinned.
+    fs.writeFileSync(ack, "Skills-PR: the successor repo covers: skill-watched\n");
+    assert.equal(runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-file", ack, "--skills-repos", PINNED_SPEC]).status, 1);
+    // An unparseable pin spec registers no repo => the URL arm stays legacy-only.
+    fs.writeFileSync(ack, "Skills-PR: https://github.com/cinatra-ai/chat-assistant-core-skill/pull/5 covers: skill-watched\n");
+    const junk = runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-file", ack, "--skills-repos", "not-a-repo ///"]);
+    assert.equal(junk.status, 1, "a junk pin spec must not widen the grammar");
+    assert.deepEqual(JSON.parse(junk.stdout).skillsRepos, []);
+    // …while the legacy assistant-skills URL still clears it with pins present.
+    fs.writeFileSync(ack, "Skills-PR: https://github.com/cinatra-ai/assistant-skills/pull/9 covers: skill-watched\n");
+    assert.equal(runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-file", ack, "--skills-repos", PINNED_SPEC]).status, 0);
+  } finally { rm(dir); }
+});
+
+test("CLI: a rejected Skills-PR ref is REPORTED, but neutralized and bounded in the step summary", () => {
+  // The rejected ref is arbitrary PR-author text, and it is newly echoed into a
+  // Markdown step summary — so the code-span delimiter must not survive, each
+  // ref is length-bounded, and the list is capped (codex LOW).
+  const dir = repoWithDiff("// initial\n", "moved workflow_draft_create\n");
+  const ack = path.join(dir, "ack.txt");
+  const summaryFile = path.join(dir, "summary.md");
+  try {
+    const crafted = "`](https://evil.example) **spoofed**" + "x".repeat(300);
+    const lines = [];
+    for (let i = 0; i < 15; i++) lines.push(`Skills-PR: ${crafted}${i} covers: skill-watched`);
+    fs.writeFileSync(ack, lines.join("\n") + "\n");
+    const res = spawnSync("node", [GATE, "--skills-dir", SKILLS, "--diff-base", "main", "--mode", "enforce", "--ack-file", ack], {
+      cwd: dir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "",
+        SKILLS_DRIFT_PINNED_REF: "",
+        SKILLS_DRIFT_SKILLS_REPOS: "",
+        GITHUB_STEP_SUMMARY: summaryFile,
+      },
+    });
+    assert.equal(res.status, 1, "a rejected ack must never clear the finding");
+    const reported = fs.readFileSync(summaryFile, "utf8").split("\n").filter((l) => l.startsWith("REJECTED"));
+    assert.equal(reported.length, 10, "the rejected list is capped");
+    for (const line of reported) {
+      assert.ok(!line.includes("`]("), `the code-span delimiter must be neutralized: ${line}`);
+      assert.ok(line.length <= 240, `each reported ref must be length-bounded: ${line.length}`);
+    }
   } finally { rm(dir); }
 });
 

@@ -465,6 +465,10 @@ function run() {
 
   // Engine parse for the linked-PR form (covers: is already per-skill); the
   // sweep's stricter per-surface scoped resolver reads reviewed/unaffected.
+  // Called with NO skills-repo set on purpose: the sweep is single-pin by
+  // construction (one --skills-dir checked out at one --skills-ref), so its
+  // Skills-PR URL arm stays exactly as it is today. Widening it the way the
+  // per-PR gate was widened is a separate, separately-audited change.
   const acks = parseAcks(ackSource);
   const scoped = parseScopedDecisions(ackSource);
 

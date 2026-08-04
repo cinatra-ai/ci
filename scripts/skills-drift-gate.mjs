@@ -52,10 +52,26 @@
  * ACKNOWLEDGEMENT / OVERRIDE (cinatra#188 §Acknowledgement) — a flagged PR clears
  * an enforce finding with ONE of:
  *   (a) `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked
- *       assistant-skills PR that NAMES the impacted skill(s) it updates. A bare PR
+ *       skills-repo PR that NAMES the impacted skill(s) it updates. A bare PR
  *       link with no `covers:` list satisfies nothing (coverage can't be verified
  *       offline; documented honest-limitation — only the recorded decision is
  *       enforced, never content correctness). This ack is PER-SKILL.
+ *
+ *       REF GRAMMAR (fail-closed — an unrecognized ref acknowledges nothing):
+ *         - `#123`, `123`, `GH-123` — repo-relative number. Accepted for
+ *           compatibility, but AMBIGUOUS in a cinatra PR body (`#5` reads as
+ *           cinatra#5 to a human); the URL form below is the recommended one.
+ *         - a `https://github.com/<owner>/<repo>/pull/<n>` URL where `<repo>` is
+ *           `assistant-skills` (the retired single pack — any owner, exactly the
+ *           pre-split arm) OR `<owner>/<repo>` is one of the CALLER-PINNED skills
+ *           repos. Since the multi-repo split the watch-bearing SKILL.mds live in
+ *           successor repos, so their pull URLs must validate; the accepted set is
+ *           DERIVED from the caller's own pins (`--skills-repos` /
+ *           `SKILLS_DRIFT_SKILLS_REPOS`, falling back to the pinned-ref display
+ *           value the multi-repo arm already publishes), never hardcoded here.
+ *         - anything else — arbitrary prose, and a pull URL on ANY other repo —
+ *           is REJECTED and reported, so a foreign PR link can never launder a
+ *           finding clear.
  *   (b) `Skills-reviewed: <note>` — a recorded "checked + updated" assertion over
  *       the whole PR (covers all impacted skills).
  *   (c) `Skills-unaffected: <reason>` — a recorded override; REASON REQUIRED (the
@@ -72,13 +88,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const GATE_VERSION = "0.2.0";
+const GATE_VERSION = "0.3.0";
 const DEFAULT_DIFF_BASE_ENV = "SKILLS_DRIFT_DIFF_BASE";
 const VALID_FORMATS = ["text", "json"];
 const VALID_MODES = ["warn", "enforce"];
 
 const VALUE_FLAGS = new Set([
   "skills-dir", "diff-base", "diff-base-env", "format", "ack-file", "config",
+  // The caller's pinned skills-repo set — see resolveSkillsRepos. Whitespace/
+  // comma/newline-separated `owner/name` or `owner/name@<ref>` entries; the
+  // reusable workflow passes its own `skills_repos` / `skills_repo` input
+  // through verbatim. Widens ONLY the `Skills-PR:` URL arm.
+  "skills-repos",
 ]);
 const BOOLEAN_FLAGS = new Set(["quiet"]);
 
@@ -805,15 +826,116 @@ export function intersect(diffIds, skillIndex) {
 // SAME LINE only.
 const SKILLS_REVIEWED_RE = /^Skills-reviewed:[^\S\r\n]*(.+)$/im;
 const SKILLS_UNAFFECTED_RE = /^Skills-unaffected:[^\S\r\n]*(.+)$/im;
-// Linked assistant-skills PR ack. Format (the `covers:` list is REQUIRED for it
-// to satisfy anything — HIGH-3): `Skills-PR: <url-or-#n> covers: <slug>[, <slug>]`.
+// Linked skills-repo PR ack. Format (the `covers:` list is REQUIRED for it to
+// satisfy anything — HIGH-3): `Skills-PR: <url-or-#n> covers: <slug>[, <slug>]`.
 // Multiple `Skills-PR:` lines are allowed (one per linked PR).
 const SKILLS_PR_RE = /^Skills-PR:[^\S\r\n]*(.+)$/gim;
 const COVERS_RE = /\bcovers:\s*(.+)$/i;
-// A Skills-PR ref must be a REAL assistant-skills PR reference, not arbitrary
-// text — `#123`, `123`, `GH-123`, or an assistant-skills PR URL. Otherwise
-// `Skills-PR: nonsense covers: <skill>` would clear the gate (codex LOW).
-const SKILLS_PR_REF_RE = /^(?:#\d+|gh-\d+|\d+|https?:\/\/github\.com\/[^/\s]+\/assistant-skills\/pull\/\d+)$/i;
+
+// A Skills-PR ref must be a REAL skills-repo PR reference, not arbitrary text —
+// otherwise `Skills-PR: nonsense covers: <skill>` would clear the gate (codex
+// LOW). TWO arms, tested in order; everything else is rejected (fail-closed):
+//   1. the LEGACY grammar (below), unchanged;
+//   2. a github.com PULL URL on a repo in the CALLER-PINNED skills-repo set —
+//      the same `skills_repos` / `skills_repo` entries the caller already pins
+//      in its required-extensions lock and hands this gate. Since the multi-repo
+//      split the watch-bearing SKILL.mds live in successor repos, so their pull
+//      URLs must validate (see resolveSkillsRepos below).
+//
+// The LEGACY arm, kept VERBATIM (not re-derived) so every ref the pre-split
+// grammar accepted is still accepted, bit for bit: `#123` / `123` / `GH-123`,
+// or a pull URL on the retired `assistant-skills` pack under any owner.
+const LEGACY_SKILLS_PR_REF_RE = /^(?:#\d+|gh-\d+|\d+|https?:\/\/github\.com\/[^/\s]+\/assistant-skills\/pull\/\d+)$/i;
+// The NEW arm is DECOMPOSED rather than baked into one pattern: the repo is
+// checked by SET MEMBERSHIP, so the caller's pinned repo names are never
+// interpolated into a regex (no pattern injection from caller config) and the
+// grammar tracks the live skills universe instead of a hardcoded repo list.
+//
+// Owner/repo are ASCII GitHub name characters ONLY — deliberately NOT the
+// legacy `[^/\s]+`. An unrestricted class fed through toLowerCase() would let a
+// UNICODE CASE-FOLD LOOKALIKE impersonate a pinned repo: U+212A KELVIN SIGN
+// lowercases to ASCII "k", so `…/chat-assistant-core-sKill/pull/1` would fold
+// onto a pinned name while pointing at a repo GitHub cannot even resolve
+// (codex HIGH). A JS regex `i` flag does NOT fold U+212A onto `k`, so an
+// ASCII-only class closes the hole; the legacy arm above is likewise a regex
+// test, never a fold-and-compare.
+const GITHUB_PULL_URL_RE = /^https?:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/\d+$/i;
+
+// A caller-pinned skills-repo entry: `owner/name` or `owner/name@<ref>` (the
+// multi-repo arm pins `owner/name@<40-hex-sha>`; only the `owner/name` half is
+// meaningful here). Anchored + conservative on both halves so a stray token can
+// never register a repo.
+const SKILLS_REPO_ENTRY_RE = /^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:@[^\s]+)?$/;
+
+/**
+ * Parse a caller-supplied skills-repo spec into a Set of lowercased
+ * `owner/name`. Accepts EXACTLY the strings the caller already pins:
+ * whitespace/comma/newline-separated `owner/name` or `owner/name@<ref>` entries
+ * (`skills_repos` in multi-repo mode; the bare `skills_repo` in single-repo
+ * mode).
+ *
+ * An unparseable token is IGNORED rather than fatal, and that direction is
+ * deliberate: a token that does not parse simply registers no repo, so it can
+ * only make the Skills-PR grammar STRICTER (an ack is rejected and the finding
+ * stays open) — never weaker, and never a new way to red an otherwise-good run.
+ * The resolved set is echoed in the report/step summary so the effective
+ * grammar is observable rather than silent.
+ *
+ * TRUST: this is CALLER CONFIG (the pinned workflow inputs), the same trust
+ * level as `mode:` itself — NOT PR-author input. The anti-laundering property
+ * that matters is over the ack text, which is author-controlled: an author
+ * cannot name a repo here.
+ */
+export function parseSkillsRepos(spec) {
+  const repos = new Set();
+  if (!spec) return repos;
+  for (const token of String(spec).split(/[\s,]+/)) {
+    if (!token) continue;
+    const m = SKILLS_REPO_ENTRY_RE.exec(token);
+    if (!m) continue;
+    repos.add(`${m[1].toLowerCase()}/${m[2].toLowerCase()}`);
+  }
+  return repos;
+}
+
+/**
+ * Resolve the skills-repo set the Skills-PR URL arm accepts, from where the gate
+ * ALREADY knows it:
+ *   1. `explicit` — the caller's own pinned `skills_repos` (multi-repo) or
+ *      `skills_repo` (single-repo) input, passed through as `--skills-repos` /
+ *      `SKILLS_DRIFT_SKILLS_REPOS`. Preferred: it is the caller's config, not a
+ *      list maintained here.
+ *   2. `pinnedRef` — fallback. The multi-repo arm already publishes the caller's
+ *      pinned set as the display ref (`SKILLS_DRIFT_PINNED_REF` =
+ *      `owner/name@<sha> owner/name@<sha> …`), so an older caller workflow that
+ *      does not pass (1) yet still resolves correctly. Single-repo mode publishes
+ *      a BARE SHA there, which parses to no repo — legacy-only, unchanged.
+ * Neither source present => empty set => the legacy any-owner assistant-skills
+ * arm is the only URL form accepted, i.e. exactly today's behaviour
+ * (fail-closed).
+ */
+export function resolveSkillsRepos({ explicit, pinnedRef } = {}) {
+  const fromExplicit = parseSkillsRepos(explicit);
+  if (fromExplicit.size) return fromExplicit;
+  return parseSkillsRepos(pinnedRef);
+}
+
+/**
+ * True iff `ref` is a real skills-repo PR reference under the grammar above.
+ * `skillsRepos` is the resolved caller-pinned set (a Set of lowercased
+ * `owner/name`); absent/empty => legacy arm only.
+ */
+export function isSkillsPRRef(ref, skillsRepos) {
+  const value = String(ref ?? "").trim();
+  if (!value) return false;
+  if (LEGACY_SKILLS_PR_REF_RE.test(value)) return true;
+  if (!skillsRepos || !skillsRepos.size) return false;
+  const m = GITHUB_PULL_URL_RE.exec(value);
+  if (!m) return false;
+  // Both halves matched an ASCII-only class above, so lowercasing them cannot
+  // fold a non-ASCII lookalike onto a pinned name.
+  return skillsRepos.has(`${m[1].toLowerCase()}/${m[2].toLowerCase()}`);
+}
 
 /**
  * Normalize a skill reference (a slug or a SKILL.md relpath) to its slug — the
@@ -830,22 +952,32 @@ export function skillSlug(ref) {
 
 /**
  * Parse ack markers from a text blob (PR body / commit messages / ack file).
+ *
+ * `opts.skillsRepos` is the resolved caller-pinned skills-repo set (see
+ * resolveSkillsRepos); omitting it keeps the pre-split behaviour — the URL arm
+ * then accepts only an any-owner assistant-skills pull URL.
+ *
  * Returns:
  *   - reviewed:   string|null  — non-empty note asserting checked+updated.
  *   - unaffected: string|null  — recorded override; only a NON-EMPTY reason counts
  *                                (the issue: not `Skills-unaffected:` only).
- *   - linkedPRs:  [{ ref, covers: Set<slug> }]  — linked assistant-skills PRs and
- *                 the skill slugs each declares it covers (empty covers => covers
+ *   - linkedPRs:  [{ ref, covers: Set<slug> }]  — linked skills-repo PRs and the
+ *                 skill slugs each declares it covers (empty covers => covers
  *                 nothing; recorded but satisfies no finding).
+ *   - rejectedRefs: [string]   — `Skills-PR:` refs DROPPED for failing the ref
+ *                 grammar. Reported so a rejected ack is visible instead of
+ *                 reading as "no linked PR" (the failure mode this grammar fix
+ *                 was filed for).
  */
-export function parseAcks(text) {
-  if (!text) return { reviewed: null, unaffected: null, linkedPRs: [] };
+export function parseAcks(text, { skillsRepos } = {}) {
+  if (!text) return { reviewed: null, unaffected: null, linkedPRs: [], rejectedRefs: [] };
   const r = text.match(SKILLS_REVIEWED_RE);
   const u = text.match(SKILLS_UNAFFECTED_RE);
   const reviewed = r && r[1].trim() ? r[1].trim() : null;
   const unaffected = u && u[1].trim() ? u[1].trim() : null;
 
   const linkedPRs = [];
+  const rejectedRefs = [];
   for (const m of text.matchAll(SKILLS_PR_RE)) {
     const value = m[1].trim();
     const cm = COVERS_RE.exec(value);
@@ -857,12 +989,15 @@ export function parseAcks(text) {
         if (slug) covers.add(slug);
       }
     }
-    // Only record a linked PR whose ref is a REAL assistant-skills PR reference;
+    // Only record a linked PR whose ref is a REAL skills-repo PR reference;
     // arbitrary text must not be able to satisfy a finding (codex LOW). An
-    // invalid ref is dropped (reported as no linked PR) so the finding stays open.
-    if (ref && SKILLS_PR_REF_RE.test(ref)) linkedPRs.push({ ref, covers });
+    // invalid ref is dropped so the finding stays open — but it is also RECORDED
+    // in rejectedRefs and surfaced, so a rejected ack no longer looks identical
+    // to no ack at all.
+    if (ref && isSkillsPRRef(ref, skillsRepos)) linkedPRs.push({ ref, covers });
+    else if (ref) rejectedRefs.push(ref);
   }
-  return { reviewed, unaffected, linkedPRs };
+  return { reviewed, unaffected, linkedPRs, rejectedRefs };
 }
 
 /**
@@ -929,13 +1064,29 @@ function annotate(level, msg) {
   if (GH) process.stdout.write(`::${level}::${msg}\n`);
 }
 
+// A REJECTED Skills-PR ref is arbitrary PR-author text (an accepted one is
+// constrained by the grammar). It is echoed to the log and the Markdown step
+// summary, so neutralize the code-span delimiter, flatten control/format
+// characters, and bound the length; the list itself is capped. The JSON report
+// keeps the raw value (JSON.stringify escapes it) so machine consumers see the
+// exact ref. codex LOW.
+const MAX_REPORTED_REJECTED_REFS = 10;
+const MAX_REPORTED_REF_LENGTH = 120;
+function displayRef(ref) {
+  const flat = String(ref).replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/`/g, "'");
+  return flat.length > MAX_REPORTED_REF_LENGTH ? `${flat.slice(0, MAX_REPORTED_REF_LENGTH)}…` : flat;
+}
+function reportedRejectedRefs(acks) {
+  return acks.rejectedRefs.slice(0, MAX_REPORTED_REJECTED_REFS).map(displayRef);
+}
+
 function emitStepSummary(lines) {
   const f = process.env.GITHUB_STEP_SUMMARY;
   if (!f) return;
   try { fs.appendFileSync(f, lines.join("\n") + "\n"); } catch { /* non-fatal */ }
 }
 
-function buildReport({ watchFindings, heuristicFindings, mode, skillCount, declaredCount, acks, skillsRef }) {
+function buildReport({ watchFindings, heuristicFindings, mode, skillCount, declaredCount, acks, skillsRef, skillsRepos }) {
   const allFindings = [...watchFindings, ...heuristicFindings];
   const bySkill = new Map();
   for (const f of allFindings) for (const s of f.skills) {
@@ -949,6 +1100,10 @@ function buildReport({ watchFindings, heuristicFindings, mode, skillCount, decla
     gateVersion: GATE_VERSION,
     mode,
     skillsRef: skillsRef || null,
+    // The effective `Skills-PR:` URL allowlist (beyond the legacy
+    // assistant-skills arm), so the grammar in force is observable in the report
+    // rather than implicit.
+    skillsRepos: skillsRepos ? [...skillsRepos].sort() : [],
     skillsScanned: skillCount,
     skillsWithWatches: declaredCount,
     findingCount: allFindings.length,
@@ -1022,10 +1177,17 @@ function main() {
   if (args["ack-file"]) {
     try { ackText = fs.readFileSync(args["ack-file"], "utf8"); } catch { ackText = ""; }
   }
-  const acks = parseAcks(ackText);
-
   const skillsRef = process.env.SKILLS_DRIFT_PINNED_REF || null;
-  const report = buildReport({ watchFindings, heuristicFindings, mode, skillCount: skillFiles.length, declaredCount: declaredSkills.size, acks, skillsRef });
+  // The skills-repo set the `Skills-PR:` URL arm accepts — the caller's OWN
+  // pinned repos (never a list maintained in this engine). Empty => legacy
+  // assistant-skills URLs only, i.e. the pre-split behaviour.
+  const skillsRepos = resolveSkillsRepos({
+    explicit: args["skills-repos"] || process.env.SKILLS_DRIFT_SKILLS_REPOS,
+    pinnedRef: skillsRef,
+  });
+  const acks = parseAcks(ackText, { skillsRepos });
+
+  const report = buildReport({ watchFindings, heuristicFindings, mode, skillCount: skillFiles.length, declaredCount: declaredSkills.size, acks, skillsRef, skillsRepos });
 
   const MODE_LABEL = mode.toUpperCase();
   const allFindings = report.findings;
@@ -1049,12 +1211,16 @@ function main() {
         process.stderr.write(`  [heuristic, advisory] ${f.class}: ${f.identifier}  ->  ${f.skills.join(", ")}\n`);
       }
       process.stderr.write("\nResolve a declared-watch finding by one of:\n");
-      process.stderr.write("  (a) 'Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]' — a linked assistant-skills PR naming the impacted skill(s); or\n");
+      process.stderr.write("  (a) 'Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]' — a linked skills-repo PR naming the impacted skill(s); or\n");
       process.stderr.write("  (b) 'Skills-reviewed: <note>' — recorded checked + updated assertion; or\n");
       process.stderr.write("  (c) 'Skills-unaffected: <reason>' — recorded override (reason REQUIRED).\n");
+      process.stderr.write(`      Skills-PR URL form: a github.com pull URL on assistant-skills or on a pinned skills repo${report.skillsRepos.length ? ` (${report.skillsRepos.join(", ")})` : " (none pinned — pass --skills-repos)"}.\n`);
       if (acks.reviewed) process.stderr.write(`  [ack] Skills-reviewed: ${acks.reviewed}\n`);
       if (acks.unaffected) process.stderr.write(`  [ack] Skills-unaffected: ${acks.unaffected}\n`);
       for (const pr of acks.linkedPRs) process.stderr.write(`  [ack] Skills-PR: ${pr.ref} covers: ${[...pr.covers].join(", ") || "(none — covers nothing)"}\n`);
+      // A ref that failed the grammar is REPORTED, not silently absent — an
+      // author whose truthful ack was rejected must be able to see why.
+      for (const bad of reportedRejectedRefs(acks)) process.stderr.write(`  [ack REJECTED — not a recognized skills-repo PR reference] Skills-PR: ${bad}\n`);
       if (mode === "enforce") {
         process.stderr.write(unackWatch > 0
           ? `\nenforce: ${unackWatch} unacknowledged declared-watch finding(s) — FAILING. Heuristic findings are advisory and do not gate.\n`
@@ -1088,9 +1254,11 @@ function main() {
       for (const f of report.heuristicFindings) summary.push(`| \`${f.identifier}\` | ${f.class} | ${f.skills.map((s) => `\`${s}\``).join(", ")} |`);
     }
     summary.push("", "Resolve a declared-watch finding by: a linked `Skills-PR: <pr> covers: <skill>`, a `Skills-reviewed:` trailer, or a `Skills-unaffected: <reason>` trailer.");
+    summary.push("", `A \`Skills-PR:\` ref is \`#n\` / \`n\` / \`GH-n\`, or a github.com **pull URL** on \`assistant-skills\` or on a pinned skills repo${report.skillsRepos.length ? ` (${report.skillsRepos.map((r) => `\`${r}\``).join(", ")})` : " (none pinned)"}. Any other URL is rejected.`);
     if (acks.reviewed) summary.push("", `Acknowledged: \`Skills-reviewed: ${acks.reviewed}\``);
     if (acks.unaffected) summary.push("", `Acknowledged: \`Skills-unaffected: ${acks.unaffected}\``);
     for (const pr of acks.linkedPRs) summary.push("", `Acknowledged: \`Skills-PR: ${pr.ref}\` covers ${[...pr.covers].map((s) => `\`${s}\``).join(", ") || "(none)"}`);
+    for (const bad of reportedRejectedRefs(acks)) summary.push("", `REJECTED (not a recognized skills-repo PR reference, so it acknowledges nothing): \`Skills-PR: ${bad}\``);
     emitStepSummary(summary);
   } else {
     emitStepSummary([`## skills-drift-gate (${MODE_LABEL})`, "", `Clean — no cinatra change touched an assistant-skills surface. ${scannedNote}.`]);
