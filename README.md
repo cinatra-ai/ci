@@ -1355,7 +1355,7 @@ A flagged **declared-watch** finding resolves by one of (mirroring
 `source-leak-gate`'s override ergonomics):
 
 - **(a)** `Skills-PR: <url-or-#n> covers: <skill-slug>[, …]` — a linked
-  `assistant-skills` PR that **names** the impacted skill(s) it updates. A bare PR
+  **skills-repo** PR that **names** the impacted skill(s) it updates. A bare PR
   link with no `covers:` list satisfies nothing (coverage can't be verified
   offline — only the recorded decision is enforced, never content correctness).
   This ack is **per-skill**; a finding touching multiple skills needs all of them
@@ -1365,6 +1365,28 @@ A flagged **declared-watch** finding resolves by one of (mirroring
 - **(c)** `Skills-unaffected: <reason>` — a recorded override. The **reason is
   required**: a bare `Skills-unaffected:` satisfies nothing (the issue: "not
   `Skills-unaffected:` only").
+
+#### The `Skills-PR:` ref grammar (fail-closed)
+
+An unrecognized ref acknowledges **nothing** — arbitrary text (or a foreign PR
+link) must never launder a finding clear. Accepted:
+
+| Form | Example | Notes |
+|------|---------|-------|
+| repo-relative number | `#5`, `5`, `GH-5` | Accepted for compatibility, but **ambiguous** — in a cinatra PR body `#5` reads as cinatra#5 to a human. Prefer the URL form. |
+| pull URL on `assistant-skills` | `https://github.com/cinatra-ai/assistant-skills/pull/5` | The retired single pack, any owner — the pre-split arm, unchanged. |
+| pull URL on a **pinned skills repo** | `https://github.com/cinatra-ai/<a pinned skill repo>/pull/5` | **Recommended** (unambiguous). Valid for exactly the repos this caller pins in `skills_repos` (or `skills_repo`). |
+
+Anything else — prose, a pull URL on any other repo, a lookalike host — is
+rejected, **reported** as rejected (so a bad ack never reads as "no ack at all"),
+and leaves the finding open.
+
+The accepted repo set is **derived from the caller's own pins**, never a list
+maintained inside the gate: the reusable workflow hands its `skills_repos` /
+`skills_repo` input to the engine (`--skills-repos`), so the ack grammar tracks
+the pinned skills universe automatically as repos are added or retired. With no
+pins reaching the engine the URL arm falls back to `assistant-skills` only. The
+effective set is echoed in the JSON report (`skillsRepos`) and the step summary.
 
 The caller concatenates the PR body + commit messages into an ack file; the gate
 parses these trailers and reports them. In `warn` mode they never change the exit
@@ -1418,8 +1440,9 @@ whole release diff.
 
 | Input | Default | Meaning |
 |-------|---------|---------|
-| `skills_ref` | _(required)_ | `assistant-skills` git ref to check out — pin to the SHA in cinatra's required-extensions lock. Empty fails loud. |
-| `skills_repo` | `cinatra-ai/assistant-skills` | The skills repository. |
+| `skills_ref` | _(none)_ | SINGLE-repo mode: skills git ref to check out — pin to the SHA in cinatra's required-extensions lock. Exactly one of `skills_ref` / `skills_repos` must be set; an empty pair fails loud. |
+| `skills_repo` | `cinatra-ai/assistant-skills` | SINGLE-repo mode: the skills repository. Also the repo whose pull URLs the `Skills-PR:` ack accepts. |
+| `skills_repos` | _(none)_ | MULTI-repo mode: whitespace/comma/newline-separated `owner/name@<40-hex-sha>` entries, each pinned to that repo's `resolvedSha` in the caller's lock. The union of every repo's `skills/<slug>/` bundles is scanned in ONE job (one stable required-check context), and these repos are the ones whose pull URLs the `Skills-PR:` ack accepts. Mutually exclusive with `skills_ref`. |
 | `mode` | `warn` | `warn` (non-failing) or `enforce` (gates an unacknowledged **declared-watch** finding; heuristic findings stay advisory). |
 | `config` | _(none)_ | Per-repo JSON config (e.g. `primitiveStopwords` to tune the primitive matcher). |
 | `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
@@ -1448,7 +1471,12 @@ skill, an empty watch block falling back to the heuristic, a **path-only** findi
 (a watched source file edited with no watched string), enforce gating only
 unacknowledged watch findings (heuristic findings advisory), the `Skills-PR:
 covers:` per-skill ack, a reasonless `Skills-unaffected:` not clearing the gate,
-and fail-loud on a bad pin / diff base.
+and fail-loud on a bad pin / diff base. The `Skills-PR:` **ref grammar** carries
+its own matrix: every previously-accepted form still accepted (with and without
+pins), a pull URL on each pinned skills repo accepted, and the anti-laundering
+rejections pinned — a foreign repo, an owner/repo-name lookalike, a lookalike
+host, a non-pull or decorated URL, prose, and a successor-repo URL when the
+caller pins nothing.
 
 ## truthful-attribution-gate
 
