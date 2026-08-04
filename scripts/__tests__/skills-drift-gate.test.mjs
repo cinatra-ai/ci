@@ -1117,3 +1117,124 @@ test("CLI: a declared PATH watch flags via a real source-file edit (param-shape 
       `expected a path watch finding; got ${JSON.stringify(out.watchFindings)}`);
   } finally { rm(dir); }
 });
+
+// ===========================================================================
+// REMEDIATION HINT (`--ack-source`) — an acknowledgement an author puts in the
+// PR DESCRIPTION only counts on a run that reads the CURRENT description. A
+// caller that reads it from the event payload reads a snapshot frozen when the
+// run was triggered, so re-running a failed check replays the pre-edit
+// description and the check stays red however the author edits it. The failure
+// message must therefore tell THIS run's author what actually works — which
+// differs by where the description came from — and must never tell a live-reading
+// run to push empty commits, nor tell a payload-reading run that a re-run
+// suffices. The hint is emitted on stderr AND in the step summary; the value is
+// recorded in the report so the artifact answers "was this judged against the
+// current description?".
+// ===========================================================================
+
+const HINT_LABEL = /Making it count:/;
+// The three remediations, each keyed on a phrase that only its own arm can emit.
+const RERUN_WORKS = /takes effect on a plain re-run/;
+const RERUN_REPLAYS = /re-running this check replays that snapshot/;
+const NOT_READ = /read NO PR description/;
+
+// A failing enforce run in TEXT format (the human-facing arm — `--format json`
+// gives the JSON report sole ownership of stdout and prints no prose).
+function runGateTextFailing(cwd, extraArgs, extraEnv = {}) {
+  return spawnSync("node", [GATE, "--skills-dir", SKILLS, "--diff-base", "main", "--mode", "enforce", ...extraArgs], {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, GITHUB_ACTIONS: "", SKILLS_DRIFT_PINNED_REF: "", SKILLS_DRIFT_SKILLS_REPOS: "", ...extraEnv },
+  });
+}
+// A watched surface (`workflow_draft_create`) changes and nothing acknowledges it.
+function repoWithUnacknowledgedWatchFinding() {
+  return repoWithDiff("// a\n", "renamed workflow_draft_create here\n");
+}
+
+test("HINT --ack-source live: the failure says a plain RE-RUN picks up an edited description", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  try {
+    const res = runGateTextFailing(dir, ["--ack-source", "live"]);
+    assert.equal(res.status, 1, `the unacknowledged watch finding must gate; stderr: ${res.stderr}`);
+    assert.match(res.stderr, HINT_LABEL, "the failure must carry the remediation hint");
+    assert.match(res.stderr, RERUN_WORKS);
+    // Must NOT send an author of a live-reading run pushing commits or reopening.
+    assert.doesNotMatch(res.stderr, RERUN_REPLAYS);
+    assert.doesNotMatch(res.stderr, /close-and-reopen/);
+  } finally { rm(dir); }
+});
+
+test("HINT default (no --ack-source): the failure warns that a re-run replays the pre-edit description, and names what does work", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  try {
+    const res = runGateTextFailing(dir, []);
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, HINT_LABEL);
+    assert.match(res.stderr, RERUN_REPLAYS, "a payload-reading run must not be told a re-run suffices");
+    assert.match(res.stderr, /close-and-reopen the PR/, "it must name the escape hatch that does work");
+    assert.doesNotMatch(res.stderr, RERUN_WORKS);
+  } finally { rm(dir); }
+});
+
+test("HINT --ack-source unavailable: the failure says the description was not read at all", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  try {
+    const res = runGateTextFailing(dir, ["--ack-source", "unavailable"]);
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, HINT_LABEL);
+    assert.match(res.stderr, NOT_READ, "an unavailable description must not read as 'no acknowledgement'");
+    assert.doesNotMatch(res.stderr, RERUN_REPLAYS);
+    // Not every unreadable description leaves a diagnostic (a commit with no PR
+    // has nothing to report), so the hint must not promise one.
+    assert.doesNotMatch(res.stderr, /warning in the run log/);
+  } finally { rm(dir); }
+});
+
+test("HINT: the step summary carries the same remediation as stderr", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  const summaryFile = path.join(dir, "step-summary.md");
+  try {
+    const res = runGateTextFailing(dir, ["--ack-source", "live"], { GITHUB_STEP_SUMMARY: summaryFile });
+    assert.equal(res.status, 1);
+    const summary = fs.readFileSync(summaryFile, "utf8");
+    assert.match(summary, /Making it count/);
+    assert.match(summary, RERUN_WORKS);
+  } finally { rm(dir); }
+});
+
+test("HINT: an unknown --ack-source FAILS LOUD (exit 2) rather than guessing a remediation", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  try {
+    for (const mode of ["warn", "enforce"]) {
+      const res = runGate(dir, ["--diff-base", "main", "--mode", mode, "--ack-source", "stale"]);
+      assert.equal(res.status, 2, `unknown --ack-source must fail loud in ${mode}; stderr: ${res.stderr}`);
+      assert.match(res.stderr, /unknown --ack-source/);
+    }
+  } finally { rm(dir); }
+});
+
+test("HINT: the JSON report records ackSource (default `event`; the passed value otherwise)", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  try {
+    assert.equal(JSON.parse(runGate(dir, ["--diff-base", "main", "--mode", "enforce"]).stdout).ackSource, "event");
+    for (const source of ["live", "event", "unavailable"]) {
+      const out = JSON.parse(runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-source", source]).stdout);
+      assert.equal(out.ackSource, source);
+    }
+  } finally { rm(dir); }
+});
+
+test("HINT: --ack-source changes only the reported remediation, never which findings gate", () => {
+  const dir = repoWithUnacknowledgedWatchFinding();
+  const ackFile = path.join(dir, "ack.txt");
+  try {
+    fs.writeFileSync(ackFile, "Skills-unaffected: identifier only moved, watched semantics unchanged\n");
+    for (const source of ["live", "event", "unavailable"]) {
+      const gated = runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-source", source]);
+      assert.equal(gated.status, 1, `an unacknowledged finding gates under ack-source ${source}`);
+      const cleared = runGate(dir, ["--diff-base", "main", "--mode", "enforce", "--ack-source", source, "--ack-file", ackFile]);
+      assert.equal(cleared.status, 0, `a recorded ack clears under ack-source ${source}; stderr: ${cleared.stderr}`);
+    }
+  } finally { rm(dir); }
+});

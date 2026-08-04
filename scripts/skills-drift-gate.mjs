@@ -78,6 +78,27 @@
  *       issue: "not `Skills-unaffected:` only"). A bare/empty reason satisfies
  *       nothing. Covers all impacted skills.
  *
+ * REMEDIATION HINT / `--ack-source` — an ack the author adds to the PR
+ * DESCRIPTION only takes effect on a run that reads the CURRENT description. A
+ * workflow that reads it from the `pull_request` event payload reads a FROZEN
+ * snapshot, and re-running a failed check replays that payload: the ack is
+ * invisible to the re-run and the check stays red however the author edits the
+ * description; only a new push or a close/reopen delivers a fresh payload. The
+ * caller therefore tells the engine where the description came from, and the
+ * failure prints the remediation that actually works for THIS run:
+ *   `live`        the description was read from the API at run time — editing it
+ *                 and re-running the check is enough.
+ *   `unavailable` no description was read at all — no PR is associated with the
+ *                 run (a direct push, a merge-queue candidate), or the read failed
+ *                 in a non-gating run; the acks listed may be incomplete.
+ *   `event`       (default) the frozen payload copy, i.e. a caller pinned to a
+ *                 gate that predates the live read — after editing the
+ *                 description, push a commit or close/reopen so a fresh event is
+ *                 delivered; a plain re-run replays the pre-edit description.
+ * The value is recorded in the report (`ackSource`); it never changes which
+ * findings gate. An unknown value fails loud (exit 2) rather than degrading to a
+ * guess.
+ *
  * Scope: this gate is wired ONLY into the cinatra repo. It is NOT part of the
  * org-wide min-repo-config rollout; no other repo calls it (cinatra#188 §Scope).
  *
@@ -88,13 +109,24 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const GATE_VERSION = "0.3.0";
+const GATE_VERSION = "0.4.0";
 const DEFAULT_DIFF_BASE_ENV = "SKILLS_DRIFT_DIFF_BASE";
 const VALID_FORMATS = ["text", "json"];
 const VALID_MODES = ["warn", "enforce"];
+// Where the PR DESCRIPTION in the ack file came from — see `--ack-source` and
+// the REMEDIATION HINT block in the header. Reported, and the only thing it
+// changes is which remediation sentence the failure prints.
+const VALID_ACK_SOURCES = ["live", "event", "unavailable"];
+const DEFAULT_ACK_SOURCE = "event";
 
 const VALUE_FLAGS = new Set([
   "skills-dir", "diff-base", "diff-base-env", "format", "ack-file", "config",
+  // How the caller obtained the PR description it concatenated into --ack-file:
+  // `live` (read from the API at run time), `unavailable` (none was read — no PR
+  // is associated with the run, or the read failed in a non-gating run), or
+  // `event` (the copy frozen into the workflow's event payload — the default,
+  // and the only possibility for a caller whose workflow predates the live read).
+  "ack-source",
   // The caller's pinned skills-repo set — see resolveSkillsRepos. Whitespace/
   // comma/newline-separated `owner/name` or `owner/name@<ref>` entries; the
   // reusable workflow passes its own `skills_repos` / `skills_repo` input
@@ -1086,7 +1118,24 @@ function emitStepSummary(lines) {
   try { fs.appendFileSync(f, lines.join("\n") + "\n"); } catch { /* non-fatal */ }
 }
 
-function buildReport({ watchFindings, heuristicFindings, mode, skillCount, declaredCount, acks, skillsRef, skillsRepos }) {
+// The one actionable sentence a flagged author needs: how to make an ack they
+// put in the PR DESCRIPTION actually count on THIS gate run. Which sentence is
+// true depends on where this run read the description (see `--ack-source`), so
+// the hint is derived from that rather than stated flatly — a run whose caller
+// still reads the frozen event payload must NOT be told "just re-run", and a run
+// that reads live must not send the author pushing empty commits.
+function ackSourceHint(ackSource) {
+  switch (ackSource) {
+    case "live":
+      return "This run read the PR description from the API, so an acknowledgement added to the description takes effect on a plain re-run of this check — no new commit and no close/reopen needed.";
+    case "unavailable":
+      return "This run read NO PR description — either none is associated with it, or the read failed. Only commit messages were read, so an acknowledgement recorded in a description is not listed above; if one is recorded there, put it in a commit message or re-run this check once the description can be read.";
+    default:
+      return "This run read the PR description from the workflow's event payload, which is a SNAPSHOT taken when the run was triggered: re-running this check replays that snapshot, so an acknowledgement added to the description afterwards is invisible to the re-run. Put it in a commit message, or push a commit / close-and-reopen the PR so a fresh event carries the edited description. (A caller pinned to a gate that reads the description live does not have this restriction.)";
+  }
+}
+
+function buildReport({ watchFindings, heuristicFindings, mode, skillCount, declaredCount, acks, skillsRef, skillsRepos, ackSource }) {
   const allFindings = [...watchFindings, ...heuristicFindings];
   const bySkill = new Map();
   for (const f of allFindings) for (const s of f.skills) {
@@ -1099,6 +1148,10 @@ function buildReport({ watchFindings, heuristicFindings, mode, skillCount, decla
   return {
     gateVersion: GATE_VERSION,
     mode,
+    // Where the PR description in the ack file came from. Observable in the
+    // report so "was this verdict computed against the CURRENT description?" is
+    // answerable from the artifact, not inferred from the caller's pin.
+    ackSource,
     skillsRef: skillsRef || null,
     // The effective `Skills-PR:` URL allowlist (beyond the legacy
     // assistant-skills arm), so the grammar in force is observable in the report
@@ -1124,6 +1177,8 @@ function main() {
   if (!VALID_MODES.includes(mode)) fail(`unknown --mode '${mode}' (valid: ${VALID_MODES.join(", ")})`);
   const format = args.format || "text";
   if (!VALID_FORMATS.includes(format)) fail(`unknown --format '${format}' (valid: ${VALID_FORMATS.join(", ")})`);
+  const ackSource = args["ack-source"] || DEFAULT_ACK_SOURCE;
+  if (!VALID_ACK_SOURCES.includes(ackSource)) fail(`unknown --ack-source '${ackSource}' (valid: ${VALID_ACK_SOURCES.join(", ")})`);
   const quiet = Boolean(args.quiet);
 
   const skillsDir = args["skills-dir"];
@@ -1187,7 +1242,7 @@ function main() {
   });
   const acks = parseAcks(ackText, { skillsRepos });
 
-  const report = buildReport({ watchFindings, heuristicFindings, mode, skillCount: skillFiles.length, declaredCount: declaredSkills.size, acks, skillsRef, skillsRepos });
+  const report = buildReport({ watchFindings, heuristicFindings, mode, skillCount: skillFiles.length, declaredCount: declaredSkills.size, acks, skillsRef, skillsRepos, ackSource });
 
   const MODE_LABEL = mode.toUpperCase();
   const allFindings = report.findings;
@@ -1215,6 +1270,9 @@ function main() {
       process.stderr.write("  (b) 'Skills-reviewed: <note>' — recorded checked + updated assertion; or\n");
       process.stderr.write("  (c) 'Skills-unaffected: <reason>' — recorded override (reason REQUIRED).\n");
       process.stderr.write(`      Skills-PR URL form: a github.com pull URL on assistant-skills or on a pinned skills repo${report.skillsRepos.length ? ` (${report.skillsRepos.join(", ")})` : " (none pinned — pass --skills-repos)"}.\n`);
+      // Where to put the marker so THIS run picks it up — the difference between
+      // an author clearing the finding in one re-run and re-running forever.
+      process.stderr.write(`\nMaking it count: ${ackSourceHint(report.ackSource)}\n`);
       if (acks.reviewed) process.stderr.write(`  [ack] Skills-reviewed: ${acks.reviewed}\n`);
       if (acks.unaffected) process.stderr.write(`  [ack] Skills-unaffected: ${acks.unaffected}\n`);
       for (const pr of acks.linkedPRs) process.stderr.write(`  [ack] Skills-PR: ${pr.ref} covers: ${[...pr.covers].join(", ") || "(none — covers nothing)"}\n`);
@@ -1254,6 +1312,7 @@ function main() {
       for (const f of report.heuristicFindings) summary.push(`| \`${f.identifier}\` | ${f.class} | ${f.skills.map((s) => `\`${s}\``).join(", ")} |`);
     }
     summary.push("", "Resolve a declared-watch finding by: a linked `Skills-PR: <pr> covers: <skill>`, a `Skills-reviewed:` trailer, or a `Skills-unaffected: <reason>` trailer.");
+    summary.push("", `**Making it count:** ${ackSourceHint(report.ackSource)}`);
     summary.push("", `A \`Skills-PR:\` ref is \`#n\` / \`n\` / \`GH-n\`, or a github.com **pull URL** on \`assistant-skills\` or on a pinned skills repo${report.skillsRepos.length ? ` (${report.skillsRepos.map((r) => `\`${r}\``).join(", ")})` : " (none pinned)"}. Any other URL is rejected.`);
     if (acks.reviewed) summary.push("", `Acknowledged: \`Skills-reviewed: ${acks.reviewed}\``);
     if (acks.unaffected) summary.push("", `Acknowledged: \`Skills-unaffected: ${acks.unaffected}\``);
@@ -1285,4 +1344,7 @@ export {
   GATE_VERSION,
   DEFAULT_PRIMITIVE_STOPWORDS,
   WATCH_KEYS,
+  VALID_ACK_SOURCES,
+  DEFAULT_ACK_SOURCE,
+  ackSourceHint,
 };
