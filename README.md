@@ -1393,6 +1393,44 @@ parses these trailers and reports them. In `warn` mode they never change the exi
 code; in `enforce` mode an unacknowledged watch finding gates and a matching
 recorded ack clears it.
 
+#### Editing the PR description and re-running the check
+
+The PR description is read **from the API at run time**, not from the workflow's
+event payload. That distinction is the difference between a check an author can
+clear and one they cannot:
+
+- `github.event.pull_request.body` is a **snapshot** taken when the run was
+  triggered. Re-running a failed check replays that same payload, so an
+  acknowledgement the author adds to the description **after** the first red run
+  is invisible to every re-run — the check stays red however they edit it, and
+  only a new push or a close/reopen (which delivers a fresh event) clears it.
+- Reading the description live means the obvious move works: **edit the
+  description, re-run the check**. Only the PR's *identity* (repository + number)
+  comes from the payload, and no edit can change either.
+
+The read **fails closed**. If the API read fails there is no fall back to the
+payload copy — that fallback is the trap itself, and it would decide a run
+against a stale description with nothing in the log saying so:
+
+| Mode | API read fails |
+|------|----------------|
+| `enforce` | the job **fails** with an error annotation naming the likely cause (most often: the **calling** workflow does not grant `pull-requests: read`, which caps what this reusable workflow can request). |
+| `warn` | a warning annotation; the staged description is left **empty** (never partial, never stale) and the run continues — a non-gating mode must not become a gate because of an API hiccup. |
+
+The failure message then states the remediation **that is true for that run**: the
+engine is told where the description came from (`--ack-source live | event |
+unavailable`, recorded in the JSON report as `ackSource`), so a live-reading run
+says "re-run the check", while a run whose caller is pinned to an older gate —
+which still reads the payload copy — says a re-run replays the pre-edit
+description and names the escape hatches that do work. `--ack-source` changes
+only that sentence; it never changes which findings gate. An unknown value fails
+loud (exit 2).
+
+> **Caller requirement.** Both description reads (this one, and the push arm's
+> merged-PR body) need `pull-requests: read`. A reusable workflow's permissions
+> are **capped by the caller**, so the calling workflow must grant that scope too
+> — see the caller example below.
+
 ### Use it from cinatra
 
 ```yaml
@@ -1403,6 +1441,11 @@ on:
     branches: [main]
 permissions:
   contents: read
+  # REQUIRED: the gate reads the PR description from the API (the pull_request
+  # arm reads the current one; the push arm resolves the merged PR's body). A
+  # reusable workflow's scope is capped by its caller, so granting it here is
+  # what makes those reads possible — without it the enforce run fails closed.
+  pull-requests: read
 jobs:
   # The JOB name is the required-check context prefix (see below) — keep it
   # stable as `skills-drift-gate`.
@@ -1455,10 +1498,16 @@ node scripts/skills-drift-gate.mjs \
   --diff-base origin/main --mode warn --format json
 ```
 
+Add `--ack-file <path>` to feed acknowledgements (a PR description + commit
+messages concatenated), and `--ack-source live|event|unavailable` to say where
+the description in that file came from — it selects the remediation the failure
+prints and is echoed as `ackSource` in the report.
+
 ### Develop
 
 ```sh
 node --test scripts/__tests__/skills-drift-gate.test.mjs
+node --test scripts/__tests__/collect-skills-acks.test.mjs
 ```
 
 The test harness covers the heuristic matcher cases on fixture `SKILL.md`s — a
@@ -1477,6 +1526,17 @@ pins), a pull URL on each pinned skills repo accepted, and the anti-laundering
 rejections pinned — a foreign repo, an owner/repo-name lookalike, a lookalike
 host, a non-pull or decorated URL, prose, and a successor-repo URL when the
 caller pins nothing.
+
+The **description-source** matrix lives alongside the ack-collector tests: a
+mocked API read whose edited description clears a finding the payload copy would
+keep red (and the payload copy ignored even when it is the one carrying a
+marker), the collector refusing to fall back when a live read is claimed but no
+description is staged, an unreadable description staying empty rather than
+becoming the stale one, a caller with no live read still reading the payload copy
+(so an older workflow pin keeps working), the resolver failing closed on an API
+error / a non-numeric PR number while an empty description stays a *successful*
+read, each remediation sentence appearing for exactly its own `--ack-source`, and
+workflow locks pinning the wiring end to end.
 
 ## truthful-attribution-gate
 

@@ -19,18 +19,39 @@
 # resolves the merged PR out-of-band (the commit->PR association) and stages that
 # body in PR_BODY_FILE, which this script folds into the push arm — the SAME
 # trust source the pull_request arm reads (the ack is an unbound self-attestation
-# recorded on the PR; it is not approval-bound in either arm). PR_BODY_FILE is a
-# RECOVERY source: unset/empty (a direct push with no PR, or an API miss) leaves
-# only the commit trailers, i.e. the prior fail-closed behaviour, unchanged.
+# recorded on the PR; it is not approval-bound in either arm). On the push arm
+# PR_BODY_FILE is a RECOVERY source: unset/empty (a direct push with no PR, or an
+# API miss) leaves only the commit trailers, i.e. the prior fail-closed
+# behaviour, unchanged.
+#
+# ACK_SOURCE — where the pull_request arm's DESCRIPTION comes from. The event
+# payload's description is a FROZEN snapshot: re-running a failed check replays
+# it, so a description the author edited after the first run is invisible to the
+# re-run and a marker added there can never clear the check (only a new push or a
+# close/reopen delivers a fresh payload). The workflow therefore reads the
+# description from the API at run time and stages it in PR_BODY_FILE:
+#   live         the staged file IS the current description. It is the ONLY
+#                description source used — the payload copy is deliberately
+#                ignored, and a missing/unreadable file FAILS (never a silent
+#                fall back to the stale copy, which is the very trap being
+#                closed).
+#   unavailable  the live read failed in a non-gating run: the staged file is
+#                empty and the payload copy is still NOT used, so the run reports
+#                the commit range only.
+#   (unset)      no live read was wired by the caller — read the payload copy,
+#                the long-standing behaviour. This keeps a caller whose workflow
+#                pin predates the live read working unchanged instead of losing
+#                every description marker.
 #
 # Inputs (all via env; branch names, PR bodies, and SHAs are
 # attacker-influenceable, so every value is passed via env and never
 # interpolated into a shell line — no command injection via a crafted ref):
 #   EVENT_NAME    github.event_name ("pull_request" or "push")
-#   PR_BODY       github.event.pull_request.body         (pull_request arm)
+#   PR_BODY       github.event.pull_request.body          (pull_request arm)
 #   BASE_REF      github.event.pull_request.base.ref      (pull_request arm)
 #   EVENT_BEFORE  github.event.before                     (push arm)
-#   PR_BODY_FILE  path to the resolved merged-PR body     (push arm; optional)
+#   PR_BODY_FILE  path to the staged PR description       (both arms; optional)
+#   ACK_SOURCE    live | unavailable | (unset)            (pull_request arm)
 #
 # Output: the concatenated ack text on stdout.
 set -euo pipefail
@@ -40,24 +61,52 @@ PR_BODY="${PR_BODY:-}"
 BASE_REF="${BASE_REF:-}"
 EVENT_BEFORE="${EVENT_BEFORE:-}"
 PR_BODY_FILE="${PR_BODY_FILE:-}"
+ACK_SOURCE="${ACK_SOURCE:-}"
+
+# A readable REGULAR file (`-f` excludes a directory, `-r` an unreadable one).
+readable_body_file() {
+  [ -n "$PR_BODY_FILE" ] && [ -f "$PR_BODY_FILE" ] && [ -r "$PR_BODY_FILE" ]
+}
 
 ZERO_SHA="0000000000000000000000000000000000000000"
 
 if [ "$EVENT_NAME" = "pull_request" ]; then
-  # Concatenate the PR body and every commit message in the range so the gate
-  # reads Skills-* markers from either.
-  printf '%s\n' "$PR_BODY"
+  # Concatenate the PR description and every commit message in the range so the
+  # gate reads Skills-* markers from either. Which copy of the description is
+  # used is decided by ACK_SOURCE (see the header).
+  case "$ACK_SOURCE" in
+    live)
+      if ! readable_body_file; then
+        echo "::error::the live pull request description was reported as read, but the staged file is missing or unreadable. Failing closed rather than reading the description carried in the event payload — that copy is a pre-re-run snapshot, so using it would silently judge this run against a stale description." >&2
+        exit 1
+      fi
+      cat -- "$PR_BODY_FILE"
+      printf '\n'
+      ;;
+    unavailable)
+      # The live read failed in a non-gating run: the staged file is empty by
+      # construction. Emit it (a no-op) rather than the payload copy — this arm
+      # never falls back to the stale description.
+      if readable_body_file; then
+        cat -- "$PR_BODY_FILE"
+        printf '\n'
+      fi
+      ;;
+    *)
+      # No live read wired by the caller — the payload copy is all there is.
+      printf '%s\n' "$PR_BODY"
+      ;;
+  esac
   git log --format='%B' "origin/$BASE_REF...HEAD" 2>/dev/null || true
 else
   # push (e.g. squash merge): the marker may live in the merged PR's body
   # (staged in PR_BODY_FILE by the workflow) AND/OR the squash commit body (HEAD).
   # Emit the PR body FIRST (empty/unset => nothing) so a PR-body-only ack is
   # collected even when the squash body did not repeat it as a trailer; then the
-  # pushed commit range. Require a REGULAR, readable file (`-f` excludes a
-  # directory path; `-r` excludes an unreadable one) and `cat --` so a missing or
-  # odd path is inert rather than tripping errexit — the file is produced by the
-  # trusted workflow, but keep the collector total.
-  if [ -n "$PR_BODY_FILE" ] && [ -f "$PR_BODY_FILE" ] && [ -r "$PR_BODY_FILE" ]; then
+  # pushed commit range. `readable_body_file` + `cat --` keep a missing or odd
+  # path inert rather than tripping errexit — the file is produced by the trusted
+  # workflow, but keep the collector total.
+  if readable_body_file; then
     cat -- "$PR_BODY_FILE"
     printf '\n'
   fi
