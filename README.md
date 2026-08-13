@@ -1552,11 +1552,33 @@ versioned required-check set ran green, owned by a named accountable engineer).
 is anti-fabrication of the **verification** claim — that is where a lie does
 damage.
 
-Three arms: **pre-merge** (PR claims), **post-merge** (the synthesized squash
-record itself), and a scheduled **org watchdog**. It currently runs in **WARN**
+Three arms: **pre-merge** (PR claims), **post-merge** (the landed record itself —
+a squash message, or each commit of a rebase landing), and a scheduled **org
+watchdog**. It currently runs in **WARN**
 mode (computes + annotates every finding, always green); the ENFORCE flip is
 gated on the dedicated machine identity for agent-opened PRs (spec §8.5), tracked
 as an `[owner]` issue — it is **not** a gate-config change.
+
+### Landed shape: squash vs rebase merges (§7)
+
+A **squash** merge lands one commit carrying the whole reviewed change, so the
+post-merge arm binds that commit's own diff to the PR's reviewed change. A
+**rebase** merge lands the PR's commits *individually* and reports the **last**
+of them as `merge_commit_sha` — so binding that one commit's diff to the PR's
+whole reviewed change can never match (cinatra-ai/ci#94). The arm therefore
+classifies the landing first, from facts it asserts rather than assumes: the PR
+merged at this commit, it has 2..249 commits, the local first-parent walk yields
+those N single-parent commits plus the commit they landed on, and each landed
+commit carries the corresponding reviewed commit's message **verbatim** (a rebase
+preserves messages; a squash synthesizes one). Only then is the content binding
+taken over the whole landed range (`base..tip`) against the PR's full reviewed
+change, and **each landed commit's own record is judged per-commit** — its own
+grammar/arm, its own `Reviewed-by`/`Gate-suite` claims against the PR's real
+approvals and contexts, its own high-risk surface, its own check 5. Anything
+unproven classifies as a single-commit landing and binds exactly as before (fail
+closed), and a tampered rebased range still has to re-derive the reviewed
+fingerprint over the whole range, so any altered commit still reds. The JSON
+report names the shape it bound over in `landing`.
 
 ### High-risk classification (§3)
 
