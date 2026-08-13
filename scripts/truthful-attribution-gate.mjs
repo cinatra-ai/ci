@@ -49,6 +49,19 @@
  * workflow. This script implements the per-run analysis for the pre-merge and
  * post-merge arms; the arm is selected by --arm.
  *
+ * ======================= §6 — CORRECTION DISCOVERY ==========================
+ * The spec defines `Correction-for: <sha>` repair commits, but re-checking an old
+ * commit used to read only that commit's OWN message — so a landed repair was
+ * INERT and the re-verify verdict never moved. When (and only when) a specific
+ * commit is named with --commit — the re-verify path — the post-merge arm now
+ * discovers `Correction-for: X` records that later landed on the default
+ * branch's first-parent history and validates the LATEST valid one IN X's STEAD,
+ * using X's own verification context (X's PR, approvals, reviewed head,
+ * check-runs), because a correction RESTATES X's record. The push-HEAD default
+ * path does not opt in and is unchanged. Fail-closed throughout: a correction can
+ * only move a verdict by being a fully VALID record whose own claims verify
+ * against X's context. See the §6 sections below for the rule and its edges.
+ *
  * Zero runtime dependencies (node builtins only). GitHub API access is via an
  * injectable client (default: `gh api` through execFileSync), so the entire
  * analysis is unit-testable offline with a stub client.
@@ -59,7 +72,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const GATE_VERSION = "0.1.0";
+export const GATE_VERSION = "0.2.0";
 
 const VALID_MODES = ["warn", "enforce"];
 const VALID_ARMS = ["pre-merge", "post-merge"];
@@ -71,6 +84,9 @@ const VALUE_FLAGS = new Set([
   // This gate's own Actions run id (defaults to GITHUB_RUN_ID) and the re-poll
   // budget for required contexts that have not concluded yet.
   "self-run-id", "gate-arm-wait-ms",
+  // Optional override for the branch whose first-parent history the §6
+  // correction discovery scans (default: auto-resolved origin/HEAD -> main).
+  "default-branch",
 ]);
 const BOOLEAN_FLAGS = new Set(["quiet"]);
 
@@ -609,6 +625,143 @@ export function commitMessage(commit, cwd = process.cwd()) {
   return execFileSync("git", ["--literal-pathspecs", "log", "-1", "--format=%B", "--end-of-options", commit], {
     encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
   });
+}
+
+// ===========================================================================
+// §6 — CORRECTION DISCOVERY: the git-walking collector (the impure half).
+//
+// The spec defines `Correction-for: <sha>` repair commits, but nothing DISCOVERS
+// them: re-checking an old commit X read only X's OWN message, so a landed
+// repair was inert — the re-verify verdict never moved. This collector walks the
+// default branch's FIRST-PARENT history AFTER X and hands the candidate commits
+// to the pure selector (selectGoverningCorrection), which owns every rule.
+//
+// BOUNDED, and bounded at the RIGHT END. A correction lands shortly AFTER the
+// commit it repairs, i.e. at the OLD end of `X..<default>`. `git log --max-count`
+// truncates from the TIP, which would drop exactly the commits we need whenever X
+// is old, so the window here is taken from the X end (oldest-first) instead.
+// Consequence, disclosed rather than hidden: when the range exceeds the bound,
+// "latest-wins" is latest-WITHIN-THE-WINDOW, and the caller emits a
+// `correction-scan-truncated` warning naming the bound.
+//
+// Every failure path returns an EMPTY candidate list with a reason: no discovery
+// means X's own verdict stands unchanged, which is the fail-closed direction.
+// ===========================================================================
+
+/**
+ * How many commits after X are scanned for corrections. Generous: a repair that
+ * lands more than this many first-parent commits after its target is beyond the
+ * window (and the truncation is reported, never silently assumed absent).
+ */
+export const CORRECTION_SCAN_MAX_COMMITS = 1000;
+
+/** 40-hex or null (lowercased). The only sha shape this engine will act on. */
+function asFullSha(v) {
+  const s = String(v ?? "");
+  return /^[0-9a-fA-F]{40}$/.test(s) ? s.toLowerCase() : null;
+}
+
+/** Short display form for findings; falls back to the raw value. */
+function shortSha(v) {
+  const s = String(v ?? "");
+  return /^[0-9a-fA-F]{7,}$/.test(s) ? s.slice(0, 8) : s;
+}
+
+/**
+ * The ref whose first-parent history a correction must land on to govern.
+ * Explicit override first (--default-branch), then the remote's own HEAD
+ * symref, then the conventional names. Returns null when none resolves (=> no
+ * discovery, X's own verdict stands).
+ */
+export function resolveDefaultBranchRef({ explicit } = {}, cwd = process.cwd()) {
+  if (explicit) {
+    try { verifyGitRef(explicit, cwd); return explicit; } catch { return null; }
+  }
+  try {
+    const out = execFileSync("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (out) { verifyGitRef(out, cwd); return out; }
+  } catch { /* fall through to the conventional names */ }
+  for (const c of ["origin/main", "origin/master", "main", "master"]) {
+    try { verifyGitRef(c, cwd); return c; } catch { /* next */ }
+  }
+  return null;
+}
+
+/**
+ * Collect the commits that could correct `targetSha`: the default branch's
+ * first-parent commits AFTER it, OLDEST-FIRST (the order the pure selector
+ * treats as authoritative — the last entry is nearest the branch tip).
+ *
+ * Returns { candidates: [{ sha, message }], scanned, truncated, reason }.
+ * Candidates are NOT filtered here — whether a commit is a correction for X (and
+ * whether it is well-formed, self-referential, or superseded) is decided by
+ * selectGoverningCorrection, so every rule stays unit-testable without git.
+ * Never throws.
+ */
+export function collectCorrectionCandidates({
+  targetSha, defaultRef, maxCommits = CORRECTION_SCAN_MAX_COMMITS, cwd = process.cwd(),
+} = {}) {
+  const empty = (reason) => ({ candidates: [], scanned: 0, truncated: false, reason });
+  const target = asFullSha(targetSha);
+  if (!target) return empty("the target commit did not resolve to a full sha — correction discovery skipped");
+  if (!defaultRef) return empty("no default-branch ref resolved — correction discovery skipped");
+
+  // X must be ON the default branch's history. Without this an off-branch commit
+  // (a PR head, a dropped branch) would make `X..<default>` enumerate the WHOLE
+  // branch — an unbounded walk that could also surface commits that do not
+  // descend from X at all.
+  try {
+    execFileSync("git", ["--literal-pathspecs", "merge-base", "--is-ancestor", "--end-of-options", target, defaultRef], { stdio: "ignore", cwd });
+  } catch {
+    return empty(`commit ${shortSha(target)} is not an ancestor of ${defaultRef} — no landed correction can govern it`);
+  }
+
+  // Shas only (cheap, ~41 bytes/commit) so the window can be taken from the X
+  // end BEFORE any message is read. --reverse => oldest-first.
+  let shas;
+  try {
+    const out = execFileSync(
+      "git",
+      ["--literal-pathspecs", "rev-list", "--first-parent", "--reverse", "--end-of-options", `${target}..${defaultRef}`],
+      { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 },
+    );
+    shas = out.split("\n").map((s) => s.trim()).filter((s) => asFullSha(s));
+  } catch (e) {
+    return empty(`git rev-list ${shortSha(target)}..${defaultRef} failed (${e.message}) — correction discovery skipped`);
+  }
+  if (!shas.length) return { candidates: [], scanned: 0, truncated: false, reason: null };
+
+  const truncated = shas.length > maxCommits;
+  const window = truncated ? shas.slice(0, maxCommits) : shas;
+
+  // One batched read for the window. `--no-walk=unsorted` keeps git from
+  // re-ordering by date; we re-key by %H anyway so the output order is not load-
+  // bearing — the returned order is the first-parent order computed above.
+  let out;
+  try {
+    out = execFileSync(
+      "git",
+      ["--literal-pathspecs", "log", "--no-walk=unsorted", "--format=%H%x1f%B%x00", "--end-of-options", ...window],
+      { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 },
+    );
+  } catch (e) {
+    return empty(`git log for the correction window failed (${e.message}) — correction discovery skipped`);
+  }
+  const messageBySha = new Map();
+  for (const rec of out.split("\0")) {
+    const r = rec.replace(/^\n+/, "");
+    if (!r) continue;
+    const sep = r.indexOf("\x1f");
+    if (sep === -1) continue;
+    const sha = asFullSha(r.slice(0, sep).trim());
+    if (sha) messageBySha.set(sha, r.slice(sep + 1).replace(/\n+$/, ""));
+  }
+  const candidates = window
+    .filter((sha) => messageBySha.has(sha))
+    .map((sha) => ({ sha, message: messageBySha.get(sha) }));
+  return { candidates, scanned: window.length, truncated, reason: null };
 }
 
 /**
@@ -2240,6 +2393,106 @@ export function analyzePreMerge(ctx) {
   return { findings, highRisk: hr.highRisk, highRiskMatched: hr.matched };
 }
 
+// ===========================================================================
+// §6 — CORRECTION DISCOVERY: the pure selection rule (the testable half).
+//
+// THE RULE. When the engine re-verifies an EXPLICITLY GIVEN commit X, a
+// `Correction-for: X` record that later landed on the default branch governs X's
+// verdict IN X'S STEAD — validated with X's OWN verification context (X's
+// resolved PR, approvals, reviewed head, check-runs). That context substitution
+// is the whole point: a correction RESTATES X's record, so its Reviewed-by /
+// Gate-suite claims are claims ABOUT X and must verify against X's PR, not
+// against whatever trivial PR merged the correction itself.
+//
+// DIRECT-ONLY (the chained-correction rule). Discovery follows ONLY records
+// whose Correction-for equals X. It NEVER walks a chain: a commit that corrects
+// a CORRECTION (Correction-for: C, where C corrects X) is not a candidate for X.
+// Two consequences, both intended:
+//   - a corrected correction loses latest-wins NATURALLY — to supersede C as X's
+//     record, a commit must name X itself, and then it simply wins on recency;
+//   - no traversal means no cycle, no depth bound, and no transitive trust: the
+//     record that governs X is always one a human/gate wrote ABOUT X.
+//
+// FAIL-CLOSED. Selection can only ever REPLACE the record text that gets
+// validated; it never relaxes a check. The governing correction is re-validated
+// through the full post-merge machinery in X's context, so discovery cannot turn
+// an invalid verdict valid except through a fully VALID correction record whose
+// own claims verify. A malformed correction does not govern; a self-referential
+// pointer is ignored; an unknown target matches nothing.
+// ===========================================================================
+
+/**
+ * Select the correction record that governs `targetSha`, purely.
+ *
+ * `candidates` are `{ sha, message }` (or a pre-`parsed` record) in FIRST-PARENT
+ * OLDEST-FIRST order — the order collectCorrectionCandidates emits. That order is
+ * authoritative and is the whole of "latest": the LAST valid direct correction
+ * wins. First-parent history is a total order, so this is deterministic; ties are
+ * impossible by construction (a commit appears once).
+ *
+ * Returns { governing, superseded, findings } where `governing` is
+ * { sha, message, parsed } | null, `superseded` lists the valid corrections that
+ * lost latest-wins (reported, never silently dropped), and `findings` carries the
+ * warnings for the records that were REFUSED (malformed / self-referential).
+ */
+export function selectGoverningCorrection({ targetSha, targetParsed = null, candidates = [] } = {}) {
+  const findings = [];
+  const target = asFullSha(targetSha);
+  if (!target) return { governing: null, superseded: [], findings };
+
+  // Self-reference on the TARGET's own record: a record cannot correct itself.
+  // Ignored with a warning (and, at the call site, denied the non-PR-correction
+  // tree-bridge exemption — "ignored" means the pointer buys nothing).
+  if (targetParsed && targetParsed.correctionFor === target) {
+    findings.push({
+      code: "correction-self-reference",
+      severity: "warning",
+      message: `commit ${shortSha(target)} carries Correction-for pointing at ITSELF — a record cannot correct itself; the pointer is ignored`,
+    });
+  }
+
+  const valid = [];
+  for (const c of candidates || []) {
+    if (!c) continue;
+    const sha = asFullSha(c.sha);
+    const parsed = c.parsed || parseTrailers(c.message ?? "");
+    const points = parsed.correctionFor;
+    if (!points) continue; // an ordinary commit, not a correction — not a candidate.
+    if (sha && points === sha) {
+      findings.push({
+        code: "correction-self-reference",
+        severity: "warning",
+        message: `commit ${shortSha(sha)} carries Correction-for pointing at ITSELF — a record cannot correct itself; ignored`,
+      });
+      continue;
+    }
+    // Direct-only: a correction aimed at a DIFFERENT commit (a chained
+    // correction, or a repair whose target sha is unknown/never landed) has no
+    // effect on THIS commit's verdict.
+    if (points !== target) continue;
+    // A correction whose OWN record is not a valid §1 record cannot be the record
+    // of truth for X. It does not govern; the next-latest valid one is tried, and
+    // failing that X's own verdict stands.
+    const errors = [...parsed.errors, ...classifyArm(parsed).errors];
+    if (errors.length) {
+      findings.push({
+        code: "correction-malformed",
+        severity: "warning",
+        message: `correction ${shortSha(sha || c.sha)} names ${shortSha(target)} but its own record is invalid (${errors[0]}) — it does NOT govern`,
+      });
+      continue;
+    }
+    valid.push({ sha, message: c.message ?? "", parsed });
+  }
+
+  if (!valid.length) return { governing: null, superseded: [], findings };
+  return {
+    governing: valid[valid.length - 1],
+    superseded: valid.slice(0, -1).map((v) => v.sha),
+    findings,
+  };
+}
+
 /**
  * Post-merge analysis: validate the synthesized squash message — the RECORD
  * itself. §5 checks 1–4 on the merge commit. The tree-identity bridge (§5) and
@@ -2247,7 +2500,9 @@ export function analyzePreMerge(ctx) {
  *
  * ctx: { message, changedFiles, defaults, repoSuite, treeMatch, approvedTreeMatch,
  *        reviews, prAuthorLogin, reviewedHeadSha, permissionByLogin,
- *        suiteFile, checkRuns, selfRunId, verifyGateArm }
+ *        suiteFile, checkRuns, selfRunId, verifyGateArm,
+ *        // §6 correction discovery (re-verify path ONLY — see the scope guard):
+ *        correctionDiscovery, targetSha, correctionCandidates, correctionScan }
  */
 export function analyzePostMerge(ctx) {
   const findings = [];
@@ -2259,13 +2514,30 @@ export function analyzePostMerge(ctx) {
   // pass it — that is the fail-open hole. We emit an "unverifiable-claim"
   // finding so the record is never blessed without its claims being checked.
   const apiBound = Boolean(ctx.apiBound);
+
+  // §6 SCOPE GUARD. Correction discovery runs ONLY when main() explicitly opted
+  // this analysis in — i.e. the re-verify path, where a specific commit was named
+  // with --commit. On the push-HEAD default path ctx.correctionDiscovery is never
+  // set, so every line below is inert and that arm's behavior is byte-for-byte
+  // what it was: a bad record on the pushed commit is never rescued by anything.
+  const discoveryInScope = ctx.correctionDiscovery === true;
+  const targetSha = discoveryInScope ? asFullSha(ctx.targetSha) : null;
+  const discovery = discoveryInScope
+    ? selectGoverningCorrection({ targetSha, targetParsed: parsed, candidates: ctx.correctionCandidates || [] })
+    : null;
+  // "Ignored" for a self-referential pointer is literal: it does not even buy the
+  // non-PR-correction exemption below. (Scope-guarded, so the push arm is
+  // untouched; and inert in practice, since a record with no reviewed head has no
+  // tree to bridge to in the first place.)
+  const selfCorrecting = Boolean(targetSha && parsed.correctionFor === targetSha);
+
   // A correction (§5) skips the tree bridge ONLY when it is a genuine NON-PR
   // correction: an empty/direct-push attestation with NO associated PR (no
   // reviewedHeadSha to compare a tree against). A correction that DOES carry a
   // PR + reviewed head (a "PR-merge correction", §5) is validated exactly like
   // a merge record — tree identity included. So `Correction-for:` alone never
   // buys a tree-bridge bypass; only the absence of a reviewed head does.
-  const isNonPrCorrection = Boolean(parsed.correctionFor) && !ctx.reviewedHeadSha;
+  const isNonPrCorrection = Boolean(parsed.correctionFor) && !selfCorrecting && !ctx.reviewedHeadSha;
 
   // check 1: a valid §1 record must be present (grammar + structure + an arm).
   for (const e of parsed.errors) findings.push({ code: "no-record", severity: "error", message: `record invalid: ${e}` });
@@ -2372,7 +2644,62 @@ export function analyzePostMerge(ctx) {
     }
   }
 
-  return { findings, parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched };
+  if (!discoveryInScope) return { findings, parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched };
+
+  // ---- §6 correction discovery: applied AFTER X's own verdict is computed ----
+  const discoveryFindings = [...discovery.findings];
+  if (ctx.correctionScan && ctx.correctionScan.truncated) {
+    discoveryFindings.push({
+      code: "correction-scan-truncated",
+      severity: "warning",
+      message: `the correction scan was bounded to the first ${ctx.correctionScan.scanned} first-parent commit(s) after ${shortSha(targetSha)} — a correction landing beyond that window would not be seen, so "latest" here is latest-within-the-window`,
+    });
+  }
+  if (ctx.correctionScan && ctx.correctionScan.reason) {
+    // A DISCLOSURE, not a defect in the record: the scan could not run, so this
+    // verdict is the commit's own — the pre-discovery behavior. Kept at `notice`
+    // so it never adds noise to a verdict it did not change (and so the push
+    // arm, which also passes --commit but has an empty range, stays quiet).
+    discoveryFindings.push({ code: "correction-scan-skipped", severity: "notice", message: ctx.correctionScan.reason });
+  }
+
+  if (!discovery.governing) {
+    // Nothing governs: X's own verdict stands, plus any refusal warnings.
+    return { findings: [...findings, ...discoveryFindings], parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched, governedBy: null, supersededCorrections: [] };
+  }
+
+  // The correction's record is validated IN X's STEAD but IN X's CONTEXT: the
+  // same ctx (X's PR, approvals, reviewed head, check-runs, changed files, tree
+  // and content bridges) with only the MESSAGE substituted. Discovery is switched
+  // off for that pass — the governing record is evaluated on its own terms, and
+  // direct-only selection already means there is no chain left to follow.
+  const governed = analyzePostMerge({
+    ...ctx,
+    message: discovery.governing.message,
+    correctionDiscovery: false,
+    correctionCandidates: null,
+    correctionScan: null,
+  });
+  const supersededNote = discovery.superseded.length
+    ? `; superseded by recency: ${discovery.superseded.map(shortSha).join(", ")}`
+    : "";
+  return {
+    findings: [
+      {
+        code: "correction-governs",
+        severity: "notice",
+        message: `the record for ${shortSha(targetSha)} is governed by correction ${shortSha(discovery.governing.sha)}, validated against ${shortSha(targetSha)}'s own PR/approval/check-run context (${shortSha(targetSha)}'s own record produced ${findings.length} finding(s), superseded by the correction)${supersededNote}`,
+      },
+      ...discoveryFindings,
+      ...governed.findings,
+    ],
+    parsed: governed.parsed,
+    highRisk: governed.highRisk,
+    highRiskMatched: governed.highRiskMatched,
+    governedBy: discovery.governing.sha,
+    supersededCorrections: discovery.superseded,
+    ownFindings: findings,
+  };
 }
 
 // ===========================================================================
@@ -2546,6 +2873,28 @@ function main() {
     // and the required contexts to the wrong PR yields an internally consistent
     // verdict about a different change.
     const mergedSha = resolveCommitSha(commit) || commit;
+
+    // §6 CORRECTION DISCOVERY — collected here beside the other post-merge
+    // collectors, and SCOPE-GUARDED to the re-verify path: only when --commit was
+    // EXPLICITLY given. The push-HEAD default (`args.commit` absent => "HEAD")
+    // never opts in, so that arm keeps its exact previous behavior.
+    //
+    // Honest note on the push arm: the reusable workflow's push job also passes
+    // --commit (GITHUB_SHA), so it is "explicit" by this test. Discovery is
+    // nonetheless inert there — the scan range is `<pushed commit>..<default
+    // branch>`, which at push time is empty, so there is nothing to discover. The
+    // guard below is the mechanical one the rule specifies; the empty-range
+    // property is what makes it safe in practice.
+    const commitExplicit = Object.prototype.hasOwnProperty.call(args, "commit");
+    if (commitExplicit) {
+      const defaultRef = resolveDefaultBranchRef({ explicit: args["default-branch"] });
+      const scan = collectCorrectionCandidates({ targetSha: mergedSha, defaultRef });
+      ctx.correctionDiscovery = true;
+      ctx.targetSha = mergedSha;
+      ctx.correctionCandidates = scan.candidates;
+      ctx.correctionScan = { ...scan, defaultRef };
+    }
+
     const prResolution = client
       ? resolveMergedPr({
         commitSha: mergedSha,
@@ -2646,6 +2995,9 @@ function main() {
     repo: repo || null,
     highRisk: Boolean(result.highRisk),
     apiSkippedReason,
+    // §6: the landed correction whose record governed this verdict (re-verify
+    // path only; null when the commit's own record was the record of truth).
+    governedBy: result.governedBy || null,
     findingCount: findings.length,
     findings,
   };

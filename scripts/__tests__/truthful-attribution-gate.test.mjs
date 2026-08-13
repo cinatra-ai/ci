@@ -43,6 +43,10 @@ import {
   CONCLUDED_NON_SUCCESS_PHRASE,
   GATE_ARM_SETTLE_MAX_MS,
   treeOf,
+  selectGoverningCorrection,
+  collectCorrectionCandidates,
+  resolveDefaultBranchRef,
+  CORRECTION_SCAN_MAX_COMMITS,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -2894,4 +2898,322 @@ test("SELF-REFERENCE: the suite's callerPath/allowedEvents constraints are enfor
   assert.ok(!run({}, { ...ctx, allowedEvents: "pull_request" }).ok, "a malformed allowedEvents fails closed");
   assert.ok(!run({}, { ...ctx, callerPath: [] }).ok, "a malformed callerPath fails closed");
   assert.equal(suite.value.requiredContexts.length, 1);
+});
+
+// =========================================================================
+// §6 — CORRECTION DISCOVERY (the re-verify path).
+//
+// A `Correction-for: X` record that later lands on the default branch governs
+// X's verdict IN X's STEAD, validated in X's OWN verification context. These
+// cover the seven failure modes: duplicate, chained, conflicting, malformed,
+// missing target, self-reference, and the untouched push-HEAD path.
+// =========================================================================
+
+const CD_X = "1".repeat(40);
+const CD_OTHER = "9".repeat(40);
+const cdSha = (prefix) => prefix.padEnd(40, "0");
+const CD_C1 = cdSha("c1");
+const CD_C2 = cdSha("c2");
+const CD_C3 = cdSha("c3");
+
+const CD_MAINTAINER = "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)";
+
+/** A well-formed correction record aimed at `target`. */
+function cdMsg(target, { subject = "record: restate the record", arm = CD_MAINTAINER, extra = [] } = {}) {
+  return [subject, "", "Assisted-by: Claude Code (claude-opus-5)", arm, ...extra, `Correction-for: ${target}`].join("\n");
+}
+/** Candidates are supplied first-parent OLDEST-FIRST, as the collector emits them. */
+function cdCand(sha, message) { return { sha, message }; }
+
+test("§6 selectGoverningCorrection: DUPLICATE corrections for X => latest-wins, deterministically", () => {
+  const candidates = [
+    cdCand(CD_C1, cdMsg(CD_X)),
+    cdCand(CD_C2, cdMsg(CD_X)), // byte-identical restatement, nearer the tip
+  ];
+  const runs = [1, 2, 3, 4, 5].map(() => selectGoverningCorrection({ targetSha: CD_X, candidates }));
+  for (const r of runs) {
+    assert.equal(r.governing.sha, CD_C2, "the correction nearest the branch tip governs");
+    assert.deepEqual(r.superseded, [CD_C1]);
+  }
+  assert.equal(new Set(runs.map((r) => r.governing.sha)).size, 1, "selection must be stable across invocations");
+});
+
+test("§6 selectGoverningCorrection: a CHAINED correction (correcting the CORRECTION) is not followed — direct-only", () => {
+  const candidates = [
+    cdCand(CD_C1, cdMsg(CD_X)),  // corrects X
+    cdCand(CD_C2, cdMsg(CD_C1)), // corrects the CORRECTION, not X
+  ];
+  const forX = selectGoverningCorrection({ targetSha: CD_X, candidates });
+  assert.equal(forX.governing.sha, CD_C1, "X's discovery follows only direct Correction-for:X entries");
+  assert.deepEqual(forX.superseded, [], "a chained correction is not even a candidate for X, so it cannot supersede");
+  // The chain is only ever one hop, resolved from the target that is being verified.
+  const forC1 = selectGoverningCorrection({ targetSha: CD_C1, candidates });
+  assert.equal(forC1.governing.sha, CD_C2, "verifying the CORRECTION itself finds the record that corrects IT");
+});
+
+test("§6 selectGoverningCorrection: a corrected correction loses latest-wins NATURALLY (name X directly to supersede)", () => {
+  const candidates = [
+    cdCand(CD_C1, cdMsg(CD_X, { subject: "record: first attempt" })),
+    cdCand(CD_C2, cdMsg(CD_C1, { subject: "record: correct the correction" })),
+    cdCand(CD_C3, cdMsg(CD_X, { subject: "record: restate X properly" })),
+  ];
+  const r = selectGoverningCorrection({ targetSha: CD_X, candidates });
+  assert.equal(r.governing.sha, CD_C3, "to supersede C1 as X's record a commit must name X itself — then recency decides");
+  assert.deepEqual(r.superseded, [CD_C1]);
+});
+
+test("§6 selectGoverningCorrection: a Correction-for CYCLE governs nothing for X (no traversal, no loop)", () => {
+  const candidates = [cdCand(CD_C1, cdMsg(CD_C2)), cdCand(CD_C2, cdMsg(CD_C1))];
+  const r = selectGoverningCorrection({ targetSha: CD_X, candidates });
+  assert.equal(r.governing, null);
+  assert.deepEqual(r.superseded, []);
+});
+
+test("§6 selectGoverningCorrection: CONFLICTING corrections => latest-wins and the superseded one is REPORTED", () => {
+  const candidates = [
+    cdCand(CD_C1, cdMsg(CD_X, { subject: "record: names groganz" })),
+    cdCand(CD_C2, cdMsg(CD_X, { subject: "record: different content entirely", arm: "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=peer)" })),
+  ];
+  const r = selectGoverningCorrection({ targetSha: CD_X, candidates });
+  assert.equal(r.governing.sha, CD_C2);
+  assert.equal(r.governing.parsed.reviewed[0].tier, "peer", "the governing record is the LATEST one's content, not a merge of both");
+  assert.deepEqual(r.superseded, [CD_C1], "the loser is reported, never silently dropped");
+});
+
+test("§6 selectGoverningCorrection: a MALFORMED correction does not govern — falls back to the next-latest VALID one", () => {
+  const malformed = [
+    "record: broken restatement", "",
+    "Assisted-by: Claude Code (claude-opus-5)",
+    "Reviewed-by: not-an-identity-line",           // owned key, invalid grammar
+    `Correction-for: ${CD_X}`,
+  ].join("\n");
+  const r = selectGoverningCorrection({
+    targetSha: CD_X,
+    candidates: [cdCand(CD_C1, cdMsg(CD_X)), cdCand(CD_C2, malformed)],
+  });
+  assert.equal(r.governing.sha, CD_C1, "the latest VALID correction governs; a malformed one is skipped");
+  assert.ok(r.findings.some((f) => f.code === "correction-malformed" && /c2/.test(f.message)), JSON.stringify(r.findings));
+});
+
+test("§6 selectGoverningCorrection: a malformed correction with no valid predecessor governs NOTHING (X's own verdict stands)", () => {
+  const noArm = ["record: no verification arm", "", "Assisted-by: none", `Correction-for: ${CD_X}`].join("\n");
+  const r = selectGoverningCorrection({ targetSha: CD_X, candidates: [cdCand(CD_C1, noArm)] });
+  assert.equal(r.governing, null, "a record with no verification arm is not a record of truth");
+  assert.ok(r.findings.some((f) => f.code === "correction-malformed" && f.severity === "warning"));
+});
+
+test("§6 selectGoverningCorrection: a correction naming an UNKNOWN sha has no effect on any other commit's verdict", () => {
+  const candidates = [cdCand(CD_C1, cdMsg(CD_OTHER))];
+  assert.equal(selectGoverningCorrection({ targetSha: CD_X, candidates }).governing, null);
+  assert.deepEqual(selectGoverningCorrection({ targetSha: CD_X, candidates }).findings, [],
+    "a repair aimed elsewhere is silent here — it is simply not this commit's business");
+  // ...and it still governs the commit it actually names, if that one is verified.
+  assert.equal(selectGoverningCorrection({ targetSha: CD_OTHER, candidates }).governing.sha, CD_C1);
+});
+
+test("§6 selectGoverningCorrection: a SELF-REFERENTIAL Correction-for is ignored with a warning (candidate side)", () => {
+  const r = selectGoverningCorrection({ targetSha: CD_X, candidates: [cdCand(CD_C1, cdMsg(CD_C1))] });
+  assert.equal(r.governing, null);
+  assert.ok(r.findings.some((f) => f.code === "correction-self-reference"), JSON.stringify(r.findings));
+});
+
+test("§6 selectGoverningCorrection: a SELF-REFERENTIAL Correction-for is ignored with a warning (target side)", () => {
+  const r = selectGoverningCorrection({ targetSha: CD_X, targetParsed: parseTrailers(cdMsg(CD_X)), candidates: [] });
+  assert.equal(r.governing, null);
+  assert.ok(r.findings.some((f) => f.code === "correction-self-reference" && /ITSELF/.test(f.message)));
+});
+
+// ---- analyzePostMerge integration: the correction is validated in X's context ----
+
+function cdCtx(extra = {}) {
+  return {
+    message: ["feat: the change", "", "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n"), // no Assisted-by => invalid
+    changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: null,
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }],
+    prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
+    apiBound: true, treeMatch: true,
+    correctionDiscovery: true, targetSha: CD_X,
+    ...extra,
+  };
+}
+
+test("§6 analyzePostMerge: a landed correction REPAIRS an invalid record, validated in X's own PR context", () => {
+  const own = analyzePostMerge({ ...cdCtx(), correctionDiscovery: false });
+  assert.ok(own.findings.some((f) => f.code === "no-record"), "precondition: X's own record is invalid");
+
+  const r = analyzePostMerge(cdCtx({ correctionCandidates: [cdCand(CD_C1, cdMsg(CD_X))] }));
+  assert.equal(r.governedBy, CD_C1);
+  assert.ok(!r.findings.some((f) => f.severity === "error"), JSON.stringify(r.findings));
+  assert.ok(r.findings.some((f) => f.code === "correction-governs" && f.severity === "notice"));
+  assert.ok(r.ownFindings.some((f) => f.code === "no-record"), "X's own findings are preserved for transparency, not returned as the verdict");
+});
+
+test("§6 analyzePostMerge: the notice NAMES the governing correction and the superseded ones", () => {
+  const r = analyzePostMerge(cdCtx({
+    correctionCandidates: [cdCand(CD_C1, cdMsg(CD_X)), cdCand(CD_C2, cdMsg(CD_X))],
+  }));
+  const notice = r.findings.find((f) => f.code === "correction-governs");
+  assert.ok(notice.message.includes(CD_C2.slice(0, 8)), notice.message);
+  assert.ok(notice.message.includes(CD_C1.slice(0, 8)), "the superseded correction is named: " + notice.message);
+  assert.deepEqual(r.supersededCorrections, [CD_C1]);
+});
+
+test("§6 analyzePostMerge: FAIL-CLOSED — a correction whose Reviewed-by is FABRICATED governs but does NOT pass", () => {
+  const fabricated = cdMsg(CD_X, { arm: "Reviewed-by: I. Mposter <impostor@example.com> (@impostor, tier=maintainer)" });
+  const r = analyzePostMerge(cdCtx({ correctionCandidates: [cdCand(CD_C1, fabricated)] }));
+  assert.equal(r.governedBy, CD_C1, "it is the record of truth...");
+  assert.ok(r.findings.some((f) => f.code === "reviewed-by-fabricated"), "...and its claims are verified against X's PR: " + JSON.stringify(r.findings));
+});
+
+test("§6 analyzePostMerge: FAIL-CLOSED — the physical facts stay X's (a tree-mismatch is not rescued by a correction)", () => {
+  const r = analyzePostMerge(cdCtx({
+    treeMatch: false, contentMatch: undefined,
+    correctionCandidates: [cdCand(CD_C1, cdMsg(CD_X))],
+  }));
+  assert.equal(r.governedBy, CD_C1);
+  assert.ok(r.findings.some((f) => f.code === "tree-mismatch"),
+    "a correction restates the RECORD; it cannot restate what landed: " + JSON.stringify(r.findings));
+});
+
+test("§6 analyzePostMerge: FAIL-CLOSED — high-risk still demands a maintainer arm in the GOVERNING record", () => {
+  const peerOnly = cdMsg(CD_X, { arm: "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=peer)" });
+  const r = analyzePostMerge(cdCtx({
+    changedFiles: [".github/workflows/ci.yml"],
+    correctionCandidates: [cdCand(CD_C1, peerOnly)],
+  }));
+  assert.equal(r.governedBy, CD_C1);
+  assert.ok(r.findings.some((f) => f.code === "high-risk-without-maintainer"), JSON.stringify(r.findings));
+});
+
+test("§6 analyzePostMerge: a MALFORMED correction leaves X's own verdict standing, plus the warning", () => {
+  const broken = ["record: broken", "", "Assisted-by: Claude Code (claude-opus-5)", "Gate-suite: nope", `Correction-for: ${CD_X}`].join("\n");
+  const r = analyzePostMerge(cdCtx({ correctionCandidates: [cdCand(CD_C1, broken)] }));
+  assert.equal(r.governedBy, null);
+  assert.ok(r.findings.some((f) => f.code === "no-record"), "X's own invalid record still fails");
+  assert.ok(r.findings.some((f) => f.code === "correction-malformed"));
+});
+
+test("§6 analyzePostMerge: a bounded scan DISCLOSES its window (latest-wins is latest-within-the-window)", () => {
+  const r = analyzePostMerge(cdCtx({
+    correctionCandidates: [cdCand(CD_C1, cdMsg(CD_X))],
+    correctionScan: { truncated: true, scanned: CORRECTION_SCAN_MAX_COMMITS, reason: null },
+  }));
+  assert.equal(r.governedBy, CD_C1);
+  assert.ok(r.findings.some((f) => f.code === "correction-scan-truncated"), JSON.stringify(r.findings));
+});
+
+test("§6 analyzePostMerge: a scan that could not run is DISCLOSED (notice) and leaves X's own verdict standing", () => {
+  const r = analyzePostMerge(cdCtx({
+    correctionCandidates: [],
+    correctionScan: { truncated: false, scanned: 0, reason: "no default-branch ref resolved — correction discovery skipped" },
+  }));
+  assert.equal(r.governedBy, null);
+  const skipped = r.findings.find((f) => f.code === "correction-scan-skipped");
+  assert.equal(skipped.severity, "notice", "an un-runnable scan is a detection-limit disclosure, not a record defect");
+  assert.ok(r.findings.some((f) => f.code === "no-record"), "the commit's own verdict is unchanged");
+});
+
+test("§6 MODE 7: the push-HEAD path is UNCHANGED — a bad record is not rescued by any correction", () => {
+  // Same ctx, same candidates — only the scope flag differs. Nothing is discovered,
+  // no correction finding is emitted, and the invalid record still fails.
+  const candidates = [cdCand(CD_C1, cdMsg(CD_X)), cdCand(CD_C2, cdMsg(CD_X))];
+  const pushHead = analyzePostMerge({ ...cdCtx({ correctionCandidates: candidates }), correctionDiscovery: false });
+  assert.ok(pushHead.findings.some((f) => f.code === "no-record"), "the pushed commit's own record is the whole verdict");
+  assert.ok(!pushHead.findings.some((f) => String(f.code).startsWith("correction-")), JSON.stringify(pushHead.findings));
+  assert.equal(pushHead.governedBy, undefined, "the push-HEAD result shape is untouched");
+  // ...and byte-for-byte identical to the same analysis with no candidates at all.
+  const noCandidates = analyzePostMerge({ ...cdCtx(), correctionDiscovery: false, correctionCandidates: undefined });
+  assert.deepEqual(pushHead.findings, noCandidates.findings);
+});
+
+// ---- collectCorrectionCandidates: the git walk (real repos) ----
+
+function cdRepo() {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "seed.txt"), "seed");
+  g("add", "-A"); g("commit", "-q", "-m", "chore: seed");
+  return { dir, g };
+}
+function cdCommit(dir, g, file, body, msg) {
+  fs.writeFileSync(path.join(dir, file), body);
+  g("add", "-A"); g("commit", "-q", "-m", msg);
+  return g("rev-parse", "HEAD").stdout.trim();
+}
+
+test("§6 collectCorrectionCandidates: first-parent commits AFTER X, oldest-first; X itself is never a candidate", () => {
+  const { dir, g } = cdRepo();
+  const x = cdCommit(dir, g, "x.txt", "x", "feat: x");
+  const after1 = cdCommit(dir, g, "a.txt", "a", "chore: unrelated");
+  const after2 = cdCommit(dir, g, "b.txt", "b", cdMsg(x, { subject: "record: correct x" }));
+  const scan = collectCorrectionCandidates({ targetSha: x, defaultRef: resolveDefaultBranchRef({}, dir), cwd: dir });
+  assert.deepEqual(scan.candidates.map((c) => c.sha), [after1, after2], "oldest-first, and X is excluded");
+  assert.equal(scan.truncated, false);
+  assert.equal(scan.reason, null);
+  const sel = selectGoverningCorrection({ targetSha: x, candidates: scan.candidates });
+  assert.equal(sel.governing.sha, after2, "the walk feeds the selector end-to-end");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§6 collectCorrectionCandidates: a commit NOT on the default branch yields no candidates, with a reason", () => {
+  const { dir, g } = cdRepo();
+  g("checkout", "-q", "-b", "side");
+  const off = cdCommit(dir, g, "s.txt", "s", "feat: never merged");
+  g("checkout", "-q", "main");
+  const scan = collectCorrectionCandidates({ targetSha: off, defaultRef: "main", cwd: dir });
+  assert.deepEqual(scan.candidates, []);
+  assert.match(scan.reason, /not an ancestor of main/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§6 collectCorrectionCandidates: the bounded window is taken from the X END (a repair right after X survives the bound)", () => {
+  const { dir, g } = cdRepo();
+  const x = cdCommit(dir, g, "x.txt", "x", "feat: x");
+  const fix = cdCommit(dir, g, "f.txt", "f", cdMsg(x, { subject: "record: correct x immediately" }));
+  for (let i = 0; i < 6; i++) cdCommit(dir, g, `n${i}.txt`, String(i), `chore: later work ${i}`);
+  const scan = collectCorrectionCandidates({ targetSha: x, defaultRef: "main", maxCommits: 2, cwd: dir });
+  assert.equal(scan.truncated, true, "the range exceeded the bound, and that is disclosed");
+  assert.equal(scan.scanned, 2);
+  assert.ok(scan.candidates.some((c) => c.sha === fix),
+    "git --max-count truncates from the TIP, which would have dropped exactly this commit");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§6 collectCorrectionCandidates: never throws — a bad target/ref returns an empty scan with a reason", () => {
+  assert.deepEqual(collectCorrectionCandidates({ targetSha: "HEAD", defaultRef: "main" }).candidates, []);
+  assert.match(collectCorrectionCandidates({ targetSha: "HEAD", defaultRef: "main" }).reason, /full sha/);
+  assert.match(collectCorrectionCandidates({ targetSha: CD_X }).reason, /no default-branch ref/);
+});
+
+// ---- CLI: the scope guard end-to-end ----
+
+const CD_HRD = path.join(import.meta.dirname, "..", "..", "config", "high-risk-defaults.json");
+function cdRunGate(dir, extraArgs) {
+  const res = spawnSync("node", [GATE, "--arm", "post-merge", "--mode", "warn", "--format", "json", "--high-risk-defaults", CD_HRD, ...extraArgs], {
+    cwd: dir, encoding: "utf8", env: { ...process.env, GITHUB_ACTIONS: "", GITHUB_REPOSITORY: "" },
+  });
+  assert.equal(res.status, 0, res.stderr);
+  return JSON.parse(res.stdout);
+}
+
+test("§6 CLI: --commit <X> discovers the landed correction and it governs X's verdict", () => {
+  const { dir, g } = cdRepo();
+  const x = cdCommit(dir, g, "x.txt", "x", ["feat: x", "", CD_MAINTAINER].join("\n")); // no Assisted-by => no-record
+  const fix = cdCommit(dir, g, "f.txt", "f", cdMsg(x, { subject: "record: restate the record for x" }));
+  const report = cdRunGate(dir, ["--commit", x]);
+  assert.equal(report.governedBy, fix);
+  assert.equal(report.findings.filter((f) => f.code === "no-record").length, 0, JSON.stringify(report.findings));
+  assert.ok(report.findings.some((f) => f.code === "correction-governs"));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§6 CLI MODE 7: the push-HEAD default does NOT discover corrections (the bad record stands)", () => {
+  const { dir, g } = cdRepo();
+  const x = cdCommit(dir, g, "x.txt", "x", ["feat: x", "", CD_MAINTAINER].join("\n"));
+  cdCommit(dir, g, "f.txt", "f", cdMsg(x, { subject: "record: restate the record for x" }));
+  g("checkout", "-q", x); // HEAD is the broken commit; no --commit is passed
+  const report = cdRunGate(dir, []);
+  assert.equal(report.governedBy, null);
+  assert.ok(report.findings.some((f) => f.code === "no-record"), JSON.stringify(report.findings));
+  assert.ok(!report.findings.some((f) => String(f.code).startsWith("correction-")));
+  fs.rmSync(dir, { recursive: true, force: true });
 });
