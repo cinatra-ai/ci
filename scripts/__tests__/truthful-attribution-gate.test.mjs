@@ -47,6 +47,9 @@ import {
   collectCorrectionCandidates,
   resolveDefaultBranchRef,
   CORRECTION_SCAN_MAX_COMMITS,
+  classifyLandedShape,
+  collectLandedChain,
+  PR_COMMITS_API_CAP,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -3215,5 +3218,538 @@ test("§6 CLI MODE 7: the push-HEAD default does NOT discover corrections (the b
   assert.equal(report.governedBy, null);
   assert.ok(report.findings.some((f) => f.code === "no-record"), JSON.stringify(report.findings));
   assert.ok(!report.findings.some((f) => String(f.code).startsWith("correction-")));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// =========================================================================
+// §7 — MULTI-COMMIT REBASE LANDING (the push arm's range binding, ci#94).
+//
+// A rebase merge lands the PR's commits INDIVIDUALLY and names the LAST of them
+// as merge_commit_sha, so binding that one commit's own diff against the PR's
+// whole reviewed change is a content-mismatch BY CONSTRUCTION. These cover the
+// positive shape test, the range binding, the per-commit record judgement, the
+// fail-closed keystones, and the untouched squash / single-commit paths. The
+// anchor fixture is the live cinatra#2709 landing: six repair commits, rebased.
+// =========================================================================
+
+const RL_TIP = "e".repeat(40);
+const rlSha = (prefix) => prefix.padEnd(40, "0");
+const RL_BASE = rlSha("ba5e");
+const RL_MAINTAINER = "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)";
+const RL_AGENT = {
+  authorName: "cinatra-agent-bot[bot]",
+  authorEmail: "293224031+cinatra-agent-bot[bot]@users.noreply.github.com",
+  committerName: "cinatra-agent-bot[bot]",
+  committerEmail: "293224031+cinatra-agent-bot[bot]@users.noreply.github.com",
+};
+const RL_HUMAN = {
+  authorName: "Sandro Groganz", authorEmail: "sandro@cinatra.ai",
+  committerName: "Sandro Groganz", committerEmail: "sandro@cinatra.ai",
+};
+
+/** One repair commit's record, the cinatra#2709 shape (agent work, human arm). */
+function rlRepairMsg(i, { assisted = "Assisted-by: Claude Code (claude-opus-5)", arm = RL_MAINTAINER } = {}) {
+  return [`record: restate the record (${i}/6)`, "", assisted, arm, `Correction-for: ${rlSha(`7ad${i}`)}`].join("\n");
+}
+
+/** The six landed commits, NEWEST-FIRST as collectLandedChain emits them. */
+function rlChain({ messages = null, identities = null, parentCounts = null } = {}) {
+  const msgs = messages || [1, 2, 3, 4, 5, 6].map((i) => rlRepairMsg(i));
+  const oldestFirst = msgs.map((message, idx) => ({
+    sha: idx === msgs.length - 1 ? RL_TIP : rlSha(`c${idx + 1}`),
+    parentCount: parentCounts ? parentCounts[idx] : 1,
+    message,
+    ...((identities && identities[idx]) || RL_AGENT),
+  }));
+  return [...oldestFirst].reverse().concat([{ sha: RL_BASE, parentCount: 1, message: "chore: the commit the range landed on", ...RL_HUMAN }]);
+}
+
+/** The reviewed commits as GitHub returns them: OLDEST-FIRST messages. */
+function rlReviewed(messages = null) {
+  return messages || [1, 2, 3, 4, 5, 6].map((i) => rlRepairMsg(i));
+}
+
+test("§7 classifyLandedShape: the cinatra#2709 SHAPE — six rebased commits bind as a rebase landing over base..tip", () => {
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: rlReviewed(), landedChain: rlChain(),
+  });
+  assert.equal(r.shape, "rebase", r.reason);
+  assert.equal(r.head, RL_TIP);
+  assert.equal(r.base, RL_BASE, "the base is the commit the rebased set landed on, not the tip's own parent");
+  assert.equal(r.commits.length, 6);
+  assert.equal(r.commits[0].sha, rlSha("c1"), "commits are returned OLDEST-FIRST");
+  assert.equal(r.commits[5].sha, RL_TIP);
+  assert.equal(r.reason, null);
+});
+
+test("§7 classifyLandedShape: a SQUASH landing is NOT a rebase — the synthesized message is what separates them", () => {
+  const chain = rlChain();
+  // GitHub's squash: ONE landed commit whose message is synthesized from the PR.
+  const squashChain = [
+    { sha: RL_TIP, parentCount: 1, message: "feat: the whole change (#2709)\n\n* record: restate the record (1/6)\n* record: restate the record (2/6)", ...RL_AGENT },
+    ...chain.slice(1),
+  ];
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: rlReviewed(), landedChain: squashChain,
+  });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /does not carry reviewed commit 6\/6's message verbatim/);
+});
+
+test("§7 classifyLandedShape: a single-commit PR is never a rebase landing (that binding already compares like with like)", () => {
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP,
+    prCommitMessages: [rlRepairMsg(1)],
+    landedChain: [{ sha: RL_TIP, parentCount: 1, message: rlRepairMsg(1), ...RL_AGENT }, { sha: RL_BASE, parentCount: 1, message: "base", ...RL_HUMAN }],
+  });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /fewer than two commits/);
+});
+
+test("§7 classifyLandedShape: a merge_commit_sha that is not this commit => single (the PR did not merge HERE)", () => {
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: rlSha("dead"), prCommitMessages: rlReviewed(), landedChain: rlChain(),
+  });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /not a rebase tip/);
+  // ...and a PR that reports no merge commit at all is likewise refused.
+  assert.equal(classifyLandedShape({ mergedSha: RL_TIP, prMergeCommitSha: null, prCommitMessages: rlReviewed(), landedChain: rlChain() }).shape, "single");
+});
+
+test("§7 classifyLandedShape: a MERGE commit inside the candidate set disproves the rebase (single-parent only)", () => {
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: rlReviewed(),
+    landedChain: rlChain({ parentCounts: [1, 1, 2, 1, 1, 1] }),
+  });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /has 2 parent\(s\) — a rebase lands only single-parent commits/);
+});
+
+test("§7 classifyLandedShape: a short first-parent walk (shallow checkout) => single, naming what was needed", () => {
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: rlReviewed(),
+    landedChain: rlChain().slice(0, 6),   // the six landed commits but NOT the base they landed on
+  });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /only 6 first-parent commit\(s\) resolved locally; 7 are needed/);
+});
+
+test("§7 classifyLandedShape: FAIL-CLOSED — a landed message that is not the reviewed one verbatim => the old binding stands", () => {
+  const tampered = [1, 2, 3, 4, 5, 6].map((i) => rlRepairMsg(i));
+  tampered[2] = ["record: a message nobody reviewed", "", "Assisted-by: none", RL_MAINTAINER].join("\n");
+  const r = classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: rlReviewed(), landedChain: rlChain({ messages: tampered }),
+  });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /reviewed commit 3\/6's message verbatim/);
+});
+
+test("§7 classifyLandedShape: message identity ignores CRLF and trailing spaces, never content", () => {
+  const reviewed = rlReviewed();
+  const landedMsgs = reviewed.map((m) => m.replace(/$/gm, "  ").replace(/\n/g, "\r\n") + "\r\n\r\n");
+  assert.equal(classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: reviewed, landedChain: rlChain({ messages: landedMsgs }),
+  }).shape, "rebase", "line endings and trailing whitespace are not content");
+  const oneCharOff = reviewed.map((m, i) => (i === 4 ? m.replace("tier=maintainer", "tier=peer") : m));
+  assert.equal(classifyLandedShape({
+    mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: reviewed, landedChain: rlChain({ messages: oneCharOff }),
+  }).shape, "single", "a single differing character in a RECORD is content, and disproves the shape");
+});
+
+test("§7 classifyLandedShape: a PR at GitHub's 250-commit list cap is refused (the reviewed set cannot be enumerated)", () => {
+  const many = Array.from({ length: PR_COMMITS_API_CAP }, (_, i) => `chore: commit ${i}`);
+  const r = classifyLandedShape({ mergedSha: RL_TIP, prMergeCommitSha: RL_TIP, prCommitMessages: many, landedChain: rlChain() });
+  assert.equal(r.shape, "single");
+  assert.match(r.reason, /250-commit list cap/);
+});
+
+// ---- analyzePostMerge: the range binding + each landed commit's own record ----
+
+/**
+ * A six-commit rebase landing in the shape main() assembles it: the PR's real
+ * verification context (approvals at the reviewed head, permissions), the
+ * RANGE-level physical binding, and each landed commit's own record, identity
+ * and changed files.
+ */
+function rlCtx({ commits = null, contentMatch = true, changedFiles = ["src/repair.ts"], message = null } = {}) {
+  const landed = commits || [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: rlRepairMsg(i),
+    changedFiles: ["src/repair.ts"],
+    ...RL_AGENT,
+  }));
+  return {
+    message: message || landed[landed.length - 1].message,
+    changedFiles, defaults: DEFAULTS_OK, repoSuite: null,
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-08-13T10:00:00Z" }],
+    prAuthorLogin: "cinatra-agent-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
+    apiBound: true,
+    // The tree moved (the base moved under the rebase) — the RANGE content bridge
+    // is what binds, exactly as main() computes it with rangeBase.
+    treeMatch: false, contentMatch,
+    agentTokens: DEFAULT_AGENT_NAME_TOKENS,
+    landedRange: { shape: "rebase", base: RL_BASE, head: RL_TIP, commits: landed },
+  };
+}
+
+test("§7 AC1: a six-commit rebase landing with a real approval and per-commit valid records concludes GREEN", () => {
+  const r = analyzePostMerge(rlCtx());
+  assert.deepEqual(r.findings.filter((f) => f.severity === "error"), [], JSON.stringify(r.findings));
+  const notice = r.findings.find((f) => f.code === "rebase-landing");
+  assert.ok(notice && notice.severity === "notice", JSON.stringify(r.findings));
+  assert.match(notice.message, /6-commit rebase landing/);
+  assert.deepEqual(r.landing, { shape: "rebase", base: RL_BASE, head: RL_TIP, commits: 6 });
+});
+
+test("§7 AC1 (the bug): the same landing WITHOUT the range binding is a content-mismatch by construction", () => {
+  // What the push arm saw before ci#94: the tip's own one-commit diff compared
+  // against the PR's six-commit reviewed change => contentMatch false.
+  const r = analyzePostMerge({ ...rlCtx({ contentMatch: false }), landedRange: null });
+  assert.ok(r.findings.some((f) => f.code === "content-mismatch"), JSON.stringify(r.findings));
+  assert.equal(r.landing ?? null, null, "no landing was classified, so nothing about the old path changed");
+});
+
+test("§7 AC1 FAIL-CLOSED: a TAMPERED rebased range still reds — the range must re-derive the reviewed change", () => {
+  const r = analyzePostMerge(rlCtx({ contentMatch: false }));
+  assert.ok(r.findings.some((f) => f.code === "content-mismatch"), JSON.stringify(r.findings));
+  assert.equal(r.findings.filter((f) => f.code === "content-mismatch").length, 1,
+    "the range's physical binding is ONE fact, reported once — not once per landed commit");
+});
+
+test("§7 each landed commit's OWN record is judged: a sibling with no verification arm reds, attributed to it", () => {
+  const commits = [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: i === 3 ? ["record: no arm at all", "", "Assisted-by: Claude Code (claude-opus-5)"].join("\n") : rlRepairMsg(i),
+    changedFiles: ["src/repair.ts"], ...RL_AGENT,
+  }));
+  const r = analyzePostMerge(rlCtx({ commits }));
+  const bad = r.findings.filter((f) => f.code === "no-record");
+  assert.equal(bad.length, 1, JSON.stringify(r.findings));
+  assert.match(bad[0].message, new RegExp(`^landed commit ${rlSha("c3").slice(0, 8)}: `), bad[0].message);
+});
+
+test("§7 check 5 per-commit: an AGENT-authored landed commit carrying 'Assisted-by: none' reds, naming that commit", () => {
+  const commits = [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: i === 2 ? rlRepairMsg(i, { assisted: "Assisted-by: none" }) : rlRepairMsg(i),
+    changedFiles: ["src/repair.ts"], ...RL_AGENT,
+  }));
+  const r = analyzePostMerge(rlCtx({ commits }));
+  const f = r.findings.filter((x) => x.code === "agent-commit-no-assisted");
+  assert.equal(f.length, 1, JSON.stringify(r.findings));
+  assert.match(f[0].message, new RegExp(`^landed commit ${rlSha("c2").slice(0, 8)}: this landed commit is authored/committed by a known agent`), f[0].message);
+});
+
+test("§7 check 5 is NOT the squash aggregate rule here: a HUMAN tip carrying a truthful 'none' stays green", () => {
+  const commits = [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: i === 6 ? rlRepairMsg(i, { assisted: "Assisted-by: none" }) : rlRepairMsg(i),
+    changedFiles: ["src/repair.ts"],
+    ...(i === 6 ? RL_HUMAN : RL_AGENT),
+  }));
+  const r = analyzePostMerge(rlCtx({ commits }));
+  assert.deepEqual(r.findings.filter((f) => f.severity === "error"), [],
+    "the tip's own record answers for the tip's own authorship; the agent siblings carry their own records");
+  // The squash rule (one record answering for the whole source range) still reds
+  // exactly this record when the landing IS a squash.
+  const asSquash = analyzePostMerge({
+    ...rlCtx({ commits }), landedRange: null, contentMatch: true,
+    message: rlRepairMsg(6, { assisted: "Assisted-by: none" }),
+    rangeIdentities: [{ sha: rlSha("c1"), ...RL_AGENT }],
+  });
+  assert.ok(asSquash.findings.some((f) => f.code === "agent-commit-no-assisted" && /squash range/.test(f.message)),
+    JSON.stringify(asSquash.findings));
+});
+
+test("§7 FAIL-CLOSED: a sibling's FABRICATED Reviewed-by reds — the landing shares the PR's real approvals", () => {
+  const commits = [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: i === 4
+      ? rlRepairMsg(i, { arm: "Reviewed-by: Someone Else <nobody@cinatra.ai> (@nobody, tier=maintainer)" })
+      : rlRepairMsg(i),
+    changedFiles: ["src/repair.ts"], ...RL_AGENT,
+  }));
+  const r = analyzePostMerge(rlCtx({ commits }));
+  const f = r.findings.filter((x) => x.code === "reviewed-by-fabricated");
+  assert.equal(f.length, 1, JSON.stringify(r.findings));
+  assert.match(f[0].message, new RegExp(`^landed commit ${rlSha("c4").slice(0, 8)}: Reviewed-by @nobody`), f[0].message);
+});
+
+test("§7 high-risk is judged per landed commit, on that commit's OWN surface (what the re-verify path will judge it on)", () => {
+  const commits = [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    // commit 5 touches a high-risk path and carries the GATE arm only.
+    message: i === 5
+      ? ["record: wire the workflow", "", "Assisted-by: Claude Code (claude-opus-5)", "Gate-suite: cinatra-core@2026.08", "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)"].join("\n")
+      : rlRepairMsg(i),
+    changedFiles: i === 5 ? [".github/workflows/ci.yml"] : ["src/repair.ts"],
+    ...RL_AGENT,
+  }));
+  const r = analyzePostMerge(rlCtx({ commits }));
+  const hr = r.findings.filter((f) => f.code === "high-risk-without-maintainer");
+  assert.equal(hr.length, 1, JSON.stringify(r.findings.map((f) => f.code)));
+  assert.match(hr[0].message, new RegExp(`^landed commit ${rlSha("c5").slice(0, 8)}: high-risk change`), hr[0].message);
+  // ...and the SAME commit with a maintainer arm on its own record is accepted.
+  const fixed = commits.map((c, idx) => (idx === 4 ? { ...c, message: rlRepairMsg(5) } : c));
+  assert.deepEqual(analyzePostMerge(rlCtx({ commits: fixed })).findings.filter((f) => f.severity === "error"), []);
+});
+
+test("§7 the landing is disclosed ONCE, and the per-commit passes never recurse", () => {
+  const r = analyzePostMerge(rlCtx());
+  assert.equal(r.findings.filter((f) => f.code === "rebase-landing").length, 1, JSON.stringify(r.findings));
+});
+
+test("§7 SQUASH / SINGLE-COMMIT byte-identity: a landing that classified as 'single' changes nothing", () => {
+  const base = { ...rlCtx(), landedRange: null, rangeIdentities: [{ sha: rlSha("c1"), ...RL_AGENT }] };
+  const withSingle = analyzePostMerge({ ...base, landedRange: classifyLandedShape({ mergedSha: RL_TIP, prMergeCommitSha: rlSha("dead"), prCommitMessages: rlReviewed(), landedChain: rlChain() }) });
+  const without = analyzePostMerge(base);
+  assert.deepEqual(withSingle.findings, without.findings, "a 'single' classification is inert — no §7 line runs");
+  assert.equal(withSingle.landing ?? null, null);
+  assert.ok(!without.findings.some((f) => String(f.code).startsWith("rebase-")));
+});
+
+test("§7 the §6 re-verify path still governs a rebase tip's record, and the siblings are judged in that verdict", () => {
+  const commits = [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: i === 3 ? ["record: no arm at all", "", "Assisted-by: Claude Code (claude-opus-5)"].join("\n") : rlRepairMsg(i),
+    changedFiles: ["src/repair.ts"], ...RL_AGENT,
+  }));
+  const ctx = {
+    ...rlCtx({ commits, message: ["feat: the tip", "", "Assisted-by: Claude Code (claude-opus-5)"].join("\n") }),  // tip: no arm => invalid
+    treeMatch: true, correctionDiscovery: true, targetSha: RL_TIP,
+    correctionCandidates: [{ sha: rlSha("f1"), message: [`record: restate the record for the tip`, "", "Assisted-by: Claude Code (claude-opus-5)", RL_MAINTAINER, `Correction-for: ${RL_TIP}`].join("\n") }],
+  };
+  const r = analyzePostMerge(ctx);
+  assert.equal(r.governedBy, rlSha("f1"), JSON.stringify(r.findings));
+  // the correction repairs the TIP's record; the broken SIBLING is still reported.
+  assert.ok(r.findings.some((f) => f.code === "no-record" && f.message.startsWith(`landed commit ${rlSha("c3").slice(0, 8)}:`)),
+    JSON.stringify(r.findings.map((f) => `${f.code}:${f.message.slice(0, 40)}`)));
+  assert.deepEqual(r.landing, { shape: "rebase", base: RL_BASE, head: RL_TIP, commits: 6 });
+});
+
+// ---- the collector + the range binding against REAL git (the ci#94 fixture) ----
+
+/**
+ * The live cinatra#2709 landing, reproduced: six repair commits reviewed on a
+ * branch, main moves on underneath them, and the PR is REBASE-merged so all six
+ * land as first-parent commits with the last one reported as merge_commit_sha.
+ */
+function rlRealLanding({ tamperAt = 0 } = {}) {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "base.txt"), "base\n");
+  g("add", "-A"); g("commit", "-q", "-m", "chore: base");
+  const forkPoint = g("rev-parse", "HEAD").stdout.trim();
+
+  // the reviewed branch: six repair commits, each with its own record
+  g("checkout", "-q", "-b", "repair");
+  for (let i = 1; i <= 6; i += 1) {
+    fs.writeFileSync(path.join(dir, `repair-${i}.txt`), `repair ${i}\n`);
+    g("add", "-A"); g("commit", "-q", "-m", rlRepairMsg(i));
+  }
+  const prHead = g("rev-parse", "HEAD").stdout.trim();
+  const reviewedMessages = g("log", "--reverse", "--format=%B%x00", `${forkPoint}..HEAD`)
+    .stdout.split("\0").map((s) => s.replace(/^\n+|\n+$/g, "")).filter(Boolean);
+
+  // main moves on underneath the branch — this is what makes tree(tip) differ
+  // from tree(reviewed head) and forces the CONTENT bridge to decide.
+  g("checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "moved.txt"), "main moved on\n");
+  g("add", "-A"); g("commit", "-q", "-m", "chore: main moves on");
+  const movedBase = g("rev-parse", "HEAD").stdout.trim();
+
+  // GitHub's "Rebase and merge": the six commits are replayed onto the moved
+  // base, messages verbatim, and main fast-forwards to the last of them.
+  g("checkout", "-q", "-b", "landed", movedBase);
+  for (let i = 1; i <= 6; i += 1) {
+    const extra = i === tamperAt ? "and one line nobody reviewed\n" : "";
+    fs.writeFileSync(path.join(dir, `repair-${i}.txt`), `repair ${i}\n${extra}`);
+    g("add", "-A"); g("commit", "-q", "-m", rlRepairMsg(i));
+  }
+  g("checkout", "-q", "main");
+  g("merge", "-q", "--ff-only", "landed");
+  const tip = g("rev-parse", "HEAD").stdout.trim();
+  return { dir, g, forkPoint, prHead, reviewedMessages, movedBase, tip };
+}
+
+test("§7 REGRESSION (cinatra#2709): six rebased commits bind over the RANGE — the single-commit comparison cannot", () => {
+  const { dir, prHead, reviewedMessages, movedBase, tip } = rlRealLanding();
+  // What the push arm did before ci#94: the tip's OWN diff vs the reviewed change.
+  assert.equal(resolveContentMatch({ commit: tip, reviewedHeadSha: prHead, cwd: dir }), false,
+    "one landed commit's change can never equal a six-commit reviewed change — the mismatch was by construction");
+  // What it does now: the whole landed range vs the whole reviewed change.
+  assert.equal(resolveContentMatch({ commit: tip, reviewedHeadSha: prHead, rangeBase: movedBase, cwd: dir }), true,
+    "the six landed commits carry exactly the reviewed change, replayed on a moved base");
+
+  // ...and the shape is classified from real first-parent facts, not assumed.
+  const { chain } = collectLandedChain({ commit: tip, depth: reviewedMessages.length + 1, cwd: dir });
+  const landing = classifyLandedShape({ mergedSha: tip, prMergeCommitSha: tip, prCommitMessages: reviewedMessages, landedChain: chain });
+  assert.equal(landing.shape, "rebase", landing.reason);
+  assert.equal(landing.base, movedBase);
+  assert.equal(landing.head, tip);
+  assert.equal(landing.commits.length, 6);
+  assert.equal(landing.commits[5].sha, tip, "oldest-first: the pushed commit is last");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§7 REGRESSION FAIL-CLOSED: a TAMPERED rebased range (one commit's content altered) does NOT bind", () => {
+  const { dir, prHead, reviewedMessages, movedBase, tip } = rlRealLanding({ tamperAt: 3 });
+  const { chain } = collectLandedChain({ commit: tip, depth: reviewedMessages.length + 1, cwd: dir });
+  // The messages are verbatim, so the SHAPE still classifies — the shape test
+  // decides WHICH change is compared, never whether it matches.
+  assert.equal(classifyLandedShape({ mergedSha: tip, prMergeCommitSha: tip, prCommitMessages: reviewedMessages, landedChain: chain }).shape, "rebase");
+  assert.equal(resolveContentMatch({ commit: tip, reviewedHeadSha: prHead, rangeBase: movedBase, cwd: dir }), false,
+    "a line nobody reviewed changes the range's fingerprint — the landing does not bind");
+  // ...and that is what the arm reports.
+  const r = analyzePostMerge({
+    ...rlCtx({ contentMatch: false }),
+    landedRange: { shape: "rebase", base: movedBase, head: tip, commits: chain.slice(0, 6).reverse().map((c) => ({ ...c, changedFiles: ["src/repair.ts"] })) },
+  });
+  assert.ok(r.findings.some((f) => f.code === "content-mismatch"), JSON.stringify(r.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§7 collectLandedChain: first-parent, newest-first, with parent counts, identities and verbatim messages", () => {
+  const { dir, g, movedBase, tip } = rlRealLanding();
+  const { chain, reason } = collectLandedChain({ commit: tip, depth: 7, cwd: dir });
+  assert.equal(reason, null);
+  assert.equal(chain.length, 7, "six landed commits plus the commit they landed on");
+  assert.equal(chain[0].sha, tip);
+  assert.equal(chain[6].sha, movedBase);
+  assert.ok(chain.every((c) => c.parentCount === 1));
+  assert.equal(chain[0].message, rlRepairMsg(6), "the message is carried verbatim (it is the record)");
+  assert.equal(chain[0].authorEmail, "sandro@cinatra.ai");
+  // the walk is bounded from the TIP (the landed set is the NEWEST commits)
+  assert.equal(collectLandedChain({ commit: tip, depth: 3, cwd: dir }).chain.length, 3);
+  // a merge commit's parent count REACHES the caller (it is what disproves a rebase)
+  g("checkout", "-q", "-b", "side", movedBase);
+  fs.writeFileSync(path.join(dir, "side.txt"), "side\n");
+  g("add", "-A"); g("commit", "-q", "-m", "chore: side");
+  g("checkout", "-q", "main");
+  g("merge", "-q", "--no-ff", "side", "-m", "Merge side into main");
+  const merged = collectLandedChain({ commit: g("rev-parse", "HEAD").stdout.trim(), depth: 2, cwd: dir });
+  assert.equal(merged.chain[0].parentCount, 2, "merge commits are NOT filtered away here");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§7 collectLandedChain: never throws — a bad commit/depth returns an empty chain with a reason", () => {
+  const { dir } = tmpRepo();
+  assert.equal(collectLandedChain({ commit: "f".repeat(40), depth: 5, cwd: dir }).chain.length, 0);
+  assert.match(collectLandedChain({ commit: "f".repeat(40), depth: 5, cwd: dir }).reason, /git log --first-parent/);
+  assert.match(collectLandedChain({ commit: "HEAD", depth: 0, cwd: dir }).reason, /non-positive walk depth/);
+  assert.match(collectLandedChain({ cwd: dir }).reason, /no commit given/);
+  // and the walk is bounded by the API cap even when a caller asks for more
+  assert.ok(PR_COMMITS_API_CAP >= 250);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---- the push arm END-TO-END: the CLI, a real rebase landing, a stub `gh` ----
+
+/**
+ * A `gh` stand-in on PATH so the CLI's own client (which shells out to `gh api`)
+ * can be driven offline. It answers exactly the endpoints the post-merge arm
+ * calls, in the `--paginate --slurp` shape the real client parses (a top-level
+ * array of per-page bodies for the paginated ones).
+ */
+function rlStubGh(dir, { pr, reviews, prCommits }) {
+  const bin = path.join(dir, "stub-bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const script = `#!/usr/bin/env node
+const endpoint = process.argv[process.argv.length - 1];
+const pr = ${JSON.stringify(pr)};
+const reviews = ${JSON.stringify(reviews)};
+const prCommits = ${JSON.stringify(prCommits)};
+const send = (v) => { process.stdout.write(JSON.stringify(v)); process.exit(0); };
+if (/\\/commits\\/[0-9a-f]+\\/pulls$/.test(endpoint)) send([[pr]]);
+if (/\\/pulls\\/\\d+$/.test(endpoint)) send(pr);
+if (/\\/pulls\\/\\d+\\/reviews$/.test(endpoint)) send([reviews]);
+if (/\\/pulls\\/\\d+\\/commits$/.test(endpoint)) send([prCommits]);
+if (/\\/collaborators\\/[^/]+\\/permission$/.test(endpoint)) send({ permission: "admin" });
+if (/\\/check-runs/.test(endpoint)) send([{ total_count: 0, check_runs: [] }]);
+process.stderr.write("stub gh: unexpected endpoint " + endpoint + "\\n");
+process.exit(1);
+`;
+  fs.writeFileSync(path.join(bin, "gh"), script, { mode: 0o755 });
+  return bin;
+}
+
+function rlRunPushArm(dir, bin, sha) {
+  const res = spawnSync("node", [
+    GATE, "--arm", "post-merge", "--mode", "enforce", "--format", "json",
+    "--repo", "cinatra-ai/cinatra", "--commit", sha, "--gate-arm-wait-ms", "0",
+    "--high-risk-defaults", path.join(import.meta.dirname, "..", "..", "config", "high-risk-defaults.json"),
+  ], {
+    cwd: dir, encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_ACTIONS: "", GITHUB_REPOSITORY: "cinatra-ai/cinatra", GH_TOKEN: "stub" },
+  });
+  return { res, report: res.stdout ? JSON.parse(res.stdout) : null };
+}
+
+test("§7 PUSH ARM (ci#94 AC1): a six-commit rebase merge concludes GREEN end-to-end, in ENFORCE", () => {
+  const { dir, g, prHead, movedBase, tip } = rlRealLanding();
+  const prCommits = g("log", "--reverse", "--format=%H%x1f%B%x00", `${movedBase}..${tip}`).stdout
+    .split("\0").map((r) => r.replace(/^\n+/, "")).filter(Boolean)
+    .map((r) => {
+      const [, message] = [r.slice(0, r.indexOf("\x1f")), r.slice(r.indexOf("\x1f") + 1).replace(/\n+$/, "")];
+      // the PR's SOURCE commits: same messages, pre-rebase shas + identities
+      return { sha: "0".repeat(40), commit: { message, author: { name: "cinatra-agent-bot[bot]", email: "293224031+cinatra-agent-bot[bot]@users.noreply.github.com" }, committer: { name: "cinatra-agent-bot[bot]", email: "293224031+cinatra-agent-bot[bot]@users.noreply.github.com" } } };
+    });
+  const bin = rlStubGh(dir, {
+    pr: { number: 2709, merged: true, merge_commit_sha: tip, head: { sha: prHead }, user: { login: "cinatra-agent-bot" }, body: "" },
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
+    prCommits,
+  });
+
+  const { res, report } = rlRunPushArm(dir, bin, tip);
+  assert.equal(res.status, 0, `expected GREEN; stderr=${res.stderr}\n${res.stdout}`);
+  assert.equal(report.apiSkippedReason, null, res.stderr);
+  assert.deepEqual(report.findings.filter((f) => f.severity === "error"), [], JSON.stringify(report.findings, null, 1));
+  assert.deepEqual(report.landing, { shape: "rebase", base: movedBase, head: tip, commits: 6 });
+  assert.ok(report.findings.some((f) => f.code === "rebase-landing"), JSON.stringify(report.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§7 PUSH ARM FAIL-CLOSED: the same landing with one commit's content tampered still reds", () => {
+  const { dir, g, prHead, movedBase, tip } = rlRealLanding({ tamperAt: 4 });
+  // The REVIEWED set is the untampered branch; the landed set carries the extra
+  // line. Messages are verbatim either way, so only the content can tell.
+  const prCommits = g("log", "--reverse", "--format=%B%x00", `${movedBase}..${tip}`).stdout
+    .split("\0").map((s) => s.replace(/^\n+|\n+$/g, "")).filter(Boolean)
+    .map((message) => ({ sha: "0".repeat(40), commit: { message, author: { name: "Sandro Groganz", email: "sandro@cinatra.ai" }, committer: { name: "Sandro Groganz", email: "sandro@cinatra.ai" } } }));
+  const bin = rlStubGh(dir, {
+    pr: { number: 2709, merged: true, merge_commit_sha: tip, head: { sha: prHead }, user: { login: "cinatra-agent-bot" }, body: "" },
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
+    prCommits,
+  });
+
+  const { res, report } = rlRunPushArm(dir, bin, tip);
+  assert.equal(res.status, 1, `expected a RED enforce verdict; stdout=${res.stdout}`);
+  assert.ok(report.findings.some((f) => f.code === "content-mismatch"), JSON.stringify(report.findings));
+  assert.equal(report.landing.shape, "rebase", "the shape still classifies — it decides WHICH change is compared, not whether it matches");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§7 PUSH ARM: a SQUASH landing of the same PR is bound exactly as before (report.landing stays null)", () => {
+  const { dir, g, forkPoint, prHead, reviewedMessages, movedBase } = rlRealLanding();
+  // GitHub's squash: ONE commit on the moved base carrying the whole change and a
+  // synthesized message.
+  g("checkout", "-q", "-b", "squashed", movedBase);
+  g("checkout", "-q", prHead, "--", ".");
+  for (let i = 1; i <= 6; i += 1) fs.writeFileSync(path.join(dir, `repair-${i}.txt`), `repair ${i}\n`);
+  g("add", "-A");
+  g("commit", "-q", "-m", ["feat: the whole repair (#2709)", "", "Assisted-by: Claude Code (claude-opus-5)", RL_MAINTAINER].join("\n"));
+  const squash = g("rev-parse", "HEAD").stdout.trim();
+  const prCommits = reviewedMessages.map((message) => ({ sha: "0".repeat(40), commit: { message, author: { name: "Sandro Groganz", email: "sandro@cinatra.ai" }, committer: { name: "Sandro Groganz", email: "sandro@cinatra.ai" } } }));
+  const bin = rlStubGh(dir, {
+    pr: { number: 2709, merged: true, merge_commit_sha: squash, head: { sha: prHead }, user: { login: "cinatra-agent-bot" }, body: "" },
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
+    prCommits,
+  });
+
+  const { res, report } = rlRunPushArm(dir, bin, squash);
+  assert.equal(res.status, 0, `expected GREEN; stderr=${res.stderr}\n${res.stdout}`);
+  assert.equal(report.landing, null, "a squash is not a rebase landing — §7 never engages");
+  assert.ok(!report.findings.some((f) => f.code === "rebase-landing"));
+  assert.deepEqual(report.findings.filter((f) => f.severity === "error"), [], JSON.stringify(report.findings));
+  assert.ok(forkPoint);
   fs.rmSync(dir, { recursive: true, force: true });
 });
