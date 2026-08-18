@@ -16,8 +16,12 @@ name: skills-drift-gate
 # unresolvable diff base, or a malformed `cinatra-watches` block.
 #
 # Acknowledge a declared-watch finding with ONE of (cinatra#188 §Acknowledgement):
-#   - `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked
-#     assistant-skills PR naming the impacted skill(s); or
+#   - `Skills-PR: <url-or-#n> covers: <skill-slug>[, ...]` — a linked skills-repo
+#     PR naming the impacted skill(s). The ref is `#n` / `n` / `GH-n`, or a
+#     github.com PULL URL on `assistant-skills` (the retired single pack) or on
+#     any repo this caller PINS below (`skills_repos` / `skills_repo`) — so a
+#     successor-repo acknowledgement validates and the ambiguous bare-number
+#     workaround is no longer forced. Any other URL is rejected and reported; or
 #   - `Skills-reviewed: <note>`; or
 #   - `Skills-unaffected: <reason>` (reason REQUIRED — not `Skills-unaffected:` only).
 #
@@ -76,15 +80,23 @@ on:
 
 permissions:
   contents: read
-  # pull-requests:read lets the PUSH arm resolve the merged PR via the commit->PR
-  # association (GET /commits/{sha}/pulls) and read its body, so a PR-body-only
+  # pull-requests:read serves BOTH description reads, and no further scope is
+  # needed for either. (1) The PULL_REQUEST arm reads the PR's CURRENT
+  # description (GET /repos/{repo}/pulls/{number}) instead of the copy frozen
+  # into the event payload, so re-running a failed check picks up a description
+  # the author edited in the meantime — see the resolve step below. (2) The PUSH
+  # arm resolves the merged PR via the commit->PR association
+  # (GET /commits/{sha}/pulls) and reads its body, so a PR-body-only
   # acknowledgement greens the post-merge run even when the squash body did not
   # repeat the marker as a trailer. Read-only; no write scope. NOTE (rollout): a
   # reusable workflow's permissions are capped by the CALLER — the caller's own
   # `permissions:` block must ALSO grant `pull-requests: read`, and requesting a
   # scope the caller lacks fails the run at startup. So bump the caller's pin and
-  # add this scope to the caller ATOMICALLY. Until then the resolve step below
-  # degrades to an empty body (commit-trailers-only, the prior behaviour).
+  # add this scope to the caller ATOMICALLY. If a read fails anyway, the two arms
+  # diverge deliberately: the pull_request arm FAILS CLOSED in `enforce` (a
+  # verdict computed from a stale description is worse than no verdict), while
+  # the push arm keeps degrading to commit trailers (it is a recovery source for
+  # an already-merged commit, and failing there would red the default branch).
   pull-requests: read
 
 jobs:
@@ -224,10 +236,66 @@ jobs:
           PR_NUMBER="$(gh api "/repos/$REPO/commits/$MERGE_SHA/pulls" \
             --jq '[ .[] | select(.merge_commit_sha == env.MERGE_SHA) | .number ] | if length == 1 then .[0] else empty end' \
             2>/dev/null || true)"
+          # `source` records whether a description was actually read, so the
+          # engine's remediation hint describes THIS run (a post-merge run that
+          # read the merged PR's body live vs a direct push with no PR to read).
+          # It does not change this arm's fail-open contract: any miss still
+          # leaves the body empty and falls back to commit trailers.
+          source=unavailable
           if [ -n "$PR_NUMBER" ]; then
-            gh api "/repos/$REPO/pulls/$PR_NUMBER" --jq '.body // empty' > "$out" 2>/dev/null || : > "$out"
+            if gh api "/repos/$REPO/pulls/$PR_NUMBER" --jq '.body // empty' > "$out" 2>/dev/null; then
+              source=live
+            else
+              # Say so rather than degrade in silence: an acknowledgement that
+              # lived only in the PR description is now unreadable, so a finding
+              # can red the default branch with no visible reason.
+              echo "::warning::could not read the merged pull request's description (PR #$PR_NUMBER). Falling back to commit trailers: an acknowledgement recorded only in the description is not visible to this run." >&2
+              : > "$out"
+            fi
           fi
           echo "file=$out" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+
+      # THE RE-RUN TRAP, CLOSED. `github.event.pull_request.body` is a FROZEN
+      # snapshot of the description: "Re-run failed jobs" replays the original
+      # payload, so an acknowledgement the author ADDS to the description after a
+      # red run is invisible to every re-run — the check stays red no matter what
+      # they write, and only a new push or a close/reopen (a fresh event) clears
+      # it. This step reads the description from the API at run time instead, so
+      # a plain re-run sees the edit. Only the IDENTITY (repository + PR number)
+      # comes from the payload; neither can be changed by editing the PR.
+      #
+      # It FAILS CLOSED: on a read failure the script never falls back to the
+      # payload copy (that fallback IS the trap) — in `enforce` it exits 1 with
+      # an error annotation; in `warn` (which never gates) it warns, stages an
+      # EMPTY file and reports `unavailable`. The body is written to a FILE, and
+      # `source` is forwarded so the engine's remediation hint matches how this
+      # run actually read the description.
+      #
+      # No trust change: the description is author-controlled either way. The ack
+      # is an unbound self-attestation recorded on the PR, before and after —
+      # reading it live changes FRESHNESS, not authority.
+      - name: Resolve PR description live (pull_request)
+        id: prlive
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MODE: ${{ inputs.mode }}
+          OUT: ${{ runner.temp }}/pr-body-live.txt
+        run: |
+          resolver="$GITHUB_WORKSPACE/.skills-drift-gate/scripts/resolve-pr-body.sh"
+          # The gate CODE comes from the 'ref' input while this workflow comes
+          # from the caller's `uses:` ref. Pinning 'ref' to an older commit than
+          # the workflow leaves no resolver here; say so instead of dying on a
+          # command-not-found, which reads like a gate bug rather than a pin one.
+          if [ ! -f "$resolver" ]; then
+            echo "::error::this gate checkout has no live description resolver — the 'ref' input points at a commit older than this workflow. Pin the 'ref' input and the caller's 'uses:' ref to the SAME cinatra-ai/ci commit." >&2
+            exit 1
+          fi
+          bash "$resolver" >> "$GITHUB_OUTPUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
 
       # Runs on BOTH pull_request AND push (e.g. squash-merge to main). The
       # acknowledgement marker (Skills-PR / Skills-reviewed / Skills-unaffected)
@@ -242,12 +310,26 @@ jobs:
         id: acks
         env:
           EVENT_NAME: ${{ github.event_name }}
+          # The payload copy of the description — UNUSED by this pin (whenever a
+          # live read is wired, ACK_SOURCE decides and the collector reads the
+          # staged file). It is still passed because the collector's legacy arm
+          # reads this variable, and that arm is what keeps a caller running an
+          # OLDER workflow against a newer gate checkout ('ref' defaults to the
+          # default branch) reading descriptions at all.
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           EVENT_BEFORE: ${{ github.event.before }}
-          # Empty on pull_request (the step above is push-only); the collector
-          # ignores an empty PR_BODY_FILE, so the pull_request arm is unchanged.
-          PR_BODY_FILE: ${{ steps.prbody.outputs.file }}
+          # Exactly ONE of the two resolve steps runs per event (pull_request vs
+          # push), so the skipped one contributes an empty string: on a PR this is
+          # the live-read description, on a push the merged-PR body, and on any
+          # other event neither (the collector ignores an empty PR_BODY_FILE).
+          PR_BODY_FILE: ${{ steps.prbody.outputs.file }}${{ steps.prlive.outputs.file }}
+          # How the description reaching the collector was obtained (live |
+          # unavailable) — from whichever resolve step ran, empty on any other
+          # event. It tells the pull_request arm which copy is authoritative (and
+          # that the payload copy is never a fallback), and reaches the engine as
+          # --ack-source below.
+          ACK_SOURCE: ${{ steps.prbody.outputs.source }}${{ steps.prlive.outputs.source }}
         run: |
           # The collection logic lives in a single shared script so the push-arm
           # behaviour shipped here and the behaviour under test
@@ -266,8 +348,53 @@ jobs:
           MODE: ${{ inputs.mode }}
           CONFIG: ${{ inputs.config }}
           ACK_FILE: ${{ steps.acks.outputs.file }}
+          # The caller's OWN pinned skills repos, handed to the engine so the
+          # `Skills-PR:` URL arm accepts a pull URL on the repos actually in the
+          # pinned skills universe (the successor repos of the retired single
+          # pack) instead of only the retired repo name. Passed verbatim: the
+          # engine parses `owner/name` / `owner/name@<ref>` entries and IGNORES
+          # anything else, so this can only ever widen the ack grammar to
+          # caller-pinned repos — never to an arbitrary URL a PR body names.
+          # Same trust level as `mode:` (pinned caller config, not PR input).
+          SKILLS_REPOS: ${{ inputs.skills_repos }}
+          SKILLS_REPO: ${{ inputs.skills_repo }}
+          # How this run read the PR description (live | unavailable), so the
+          # engine's remediation hint describes what actually happened. Empty
+          # only when neither resolve step ran, where the engine's conservative
+          # default is the honest answer.
+          ACK_SOURCE: ${{ steps.prbody.outputs.source }}${{ steps.prlive.outputs.source }}
         run: |
+          # Neither resolve step ran (an event with no pull request to read from,
+          # e.g. a merge-queue candidate): this run read NO description, which is
+          # `unavailable` — never the payload copy. Passing it explicitly leaves
+          # the engine's `event` default reachable only from a workflow that
+          # predates the live read, which is exactly what that default describes.
+          # Such a run has always seen commit messages only, so an acknowledgement
+          # recorded solely in a description does not reach it — unchanged here,
+          # and now stated in the failure rather than left to be guessed at.
+          [ -n "$ACK_SOURCE" ] || ACK_SOURCE=unavailable
           args=( --skills-dir .assistant-skills/skills --mode "$MODE" )
           [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
           [ -n "$ACK_FILE" ] && args+=( --ack-file "$ACK_FILE" )
+          # The ENGINE comes from the 'ref' checkout while this workflow comes
+          # from the caller's `uses:` ref. An engine older than this workflow
+          # rejects an unknown flag and exits, so probe the engine about to run
+          # rather than assume the pins match: on a skewed pin this check keeps
+          # working (on its old, payload-reading terms) and says why, instead of
+          # aborting with "unknown flag". The pull_request arm has already failed
+          # loud by this point — there, a stale description could decide a verdict.
+          if grep -q -- '"ack-source"' .skills-drift-gate/scripts/skills-drift-gate.mjs; then
+            args+=( --ack-source "$ACK_SOURCE" )
+          else
+            echo "::warning::this gate checkout predates the live description read — the 'ref' input points at a commit older than this workflow. Pin the 'ref' input and the caller's 'uses:' ref to the SAME cinatra-ai/ci commit. Until then this check reads the description from the event payload, so re-running it after editing the description replays the pre-edit copy." >&2
+          fi
+          # Multi-repo mode pins the whole set; single-repo mode pins exactly one
+          # repo (skills_repo). Values reach the engine as ARRAY ELEMENTS via env
+          # — never interpolated into a shell line (the injection discipline this
+          # workflow follows throughout).
+          if [ -n "$SKILLS_REPOS" ]; then
+            args+=( --skills-repos "$SKILLS_REPOS" )
+          elif [ -n "$SKILLS_REPO" ]; then
+            args+=( --skills-repos "$SKILLS_REPO" )
+          fi
           node .skills-drift-gate/scripts/skills-drift-gate.mjs "${args[@]}"

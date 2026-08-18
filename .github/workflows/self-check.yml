@@ -130,6 +130,71 @@ jobs:
           node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/clean/docs
           node scripts/check-meta-commentary.mjs --paths "scripts/__fixtures__/meta-commentary/multipath/CHANGELOG.md"
 
+      - name: meta-commentary-gate scans HTML, and the benign HTML twin stays green
+        # docs#160 AC1/AC6: the HTML arm is enforced end to end, one fixture per
+        # documented extraction decision. RED on the planted-violation page for
+        # every docs#160 pattern class; GREEN on its benign twin, which carries
+        # the same phrases inside <script>/<style>, machine attributes, file and
+        # heading anchors, a bare "#123" and adjacent blocks that must not join.
+        run: |
+          out="$(node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/html-violating/docs 2>&1 || true)"
+          for id in qualified_workitem_citation acceptance_criterion_citation \
+                    numbered_ruling_citation publish_decision spec_status_annotation \
+                    design_note_annotation owner_gated_publish; do
+            if ! printf '%s' "$out" | grep -q "\[$id\]"; then
+              echo "::error::meta-commentary-gate docs#160 pattern '$id' did not fire on the violating HTML fixture" >&2
+              exit 1
+            fi
+          done
+          node scripts/check-meta-commentary.mjs --docs scripts/__fixtures__/meta-commentary/html-clean/docs
+
+      - name: meta-commentary-gate exempts a tree by PATH SELECTION only, never by inference
+        # docs#160 AC12: a caller configured with exactly README.md + CHANGELOG.md
+        # is green despite a planted violation under docs/**, and --print-files
+        # shows docs/** was never selected — therefore never read. The last leg
+        # proves the guard is not vacuous: the same tree IS red once selected.
+        run: |
+          guard=scripts/__fixtures__/meta-commentary/boundary-guard
+          selected="$(node scripts/check-meta-commentary.mjs --print-files --paths "$guard/README.md,$guard/CHANGELOG.md")"
+          printf '%s\n' "$selected"
+          if printf '%s' "$selected" | grep -q "/docs/"; then
+            echo "::error::meta-commentary-gate selected a docs/** path the caller never configured" >&2
+            exit 1
+          fi
+          if ! node scripts/check-meta-commentary.mjs --docs "$guard/docs"; then
+            echo "meta-commentary-gate correctly fails the planted tree once it IS selected"
+          else
+            echo "::error::the boundary-guard fixture is vacuous — its planted docs/** tree does not fail the gate" >&2
+            exit 1
+          fi
+
+      - name: meta-commentary twin-parity — this engine reproduces the shared verdict
+        # docs#160 AC2: the docs-repo twin and this engine must agree on a corpus
+        # that is byte-identical in both repos. Each side runs its OWN engine over
+        # it and must reproduce one recorded expectation; a one-sided edit to the
+        # corpus, the expectation or the harness fails the digest check here.
+        run: node scripts/check-meta-commentary-parity.mjs
+
+      - name: meta-commentary surface-coverage reconciles a recorded census (fail-closed)
+        # docs#160 AC11: the new-surface detector. Green on a census the fixture
+        # inventory fully accounts for; RED on a new public repo with no entry and
+        # on a newly declared surface with no caller; exit 2 on an empty census,
+        # which must never read as coverage.
+        run: |
+          cov="scripts/__fixtures__/meta-commentary-coverage"
+          node scripts/meta-commentary-surface-coverage.mjs --inventory "$cov/inventory.json" --census-json "$cov/census-clean.json"
+          for bad in census-missing-repo census-missing-caller census-caller-removed; do
+            if node scripts/meta-commentary-surface-coverage.mjs --inventory "$cov/inventory.json" --census-json "$cov/$bad.json"; then
+              echo "::error::surface-coverage did not fail the $bad fixture" >&2
+              exit 1
+            fi
+          done
+          node scripts/meta-commentary-surface-coverage.mjs --inventory "$cov/inventory.json" --census-json "$cov/census-empty.json" && rc=0 || rc=$?
+          if [ "$rc" != "2" ]; then
+            echo "::error::surface-coverage must exit 2 on an empty census (got $rc)" >&2
+            exit 1
+          fi
+
       - name: Design-system preset runs clean on its own repository
         run: npx eslint .
 
@@ -154,7 +219,9 @@ jobs:
             scripts/__tests__/secrets-required-gate.test.mjs \
             scripts/__tests__/governance-drift-gate.test.mjs \
             scripts/__tests__/release-workflow-pin-drift-gate.test.mjs \
-            scripts/__tests__/check-meta-commentary.test.mjs
+            scripts/__tests__/check-meta-commentary.test.mjs \
+            scripts/__tests__/meta-commentary-html.test.mjs \
+            scripts/__tests__/meta-commentary-surface-coverage.test.mjs
 
       - name: gate-suite index is deterministic + matches a fresh scan (offline)
         # The org-wide gate-suite audit index (config/gate-suite-index.json,

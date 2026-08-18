@@ -22,15 +22,27 @@ name: meta-commentary-gate
 #         docs: "docs"        # the docs/ directory to scan (default "docs")
 #         ref: <same-sha>
 #
-# Scans the caller's `docs/` tree (tracked Markdown only, via `git ls-files`) with
-# the SAME pattern list, line-pinned allowlist semantics, and expired-entry
+# Scans the caller's `docs/` tree (tracked Markdown AND HTML, via `git ls-files`)
+# with the SAME pattern list, line-pinned allowlist semantics, and expired-entry
 # handling as docs' own scripts/check-meta-commentary.mjs — the reusable enforces
 # exactly what the source repo does, scoped to one directory.
+#
+# HTML SURFACES (cinatra-ai/docs#160): published documentation is not only
+# Markdown, so tracked `.html`/`.htm` under the configured paths is scanned too.
+# HTML is reduced to its PROSE first (visible text, comments and human-readable
+# attributes IN; <script>/<style> and machine attributes OUT; entities decoded),
+# and a violation is still reported at the SOURCE file and line. The full
+# per-construct contract is in scripts/lib/html-text.mjs.
+#
+# PATH SELECTION IS THE ONLY SCOPING MECHANISM (docs#160 AC12): the engine has no
+# semantic notion of an "implementation-facing" tree. A tree is exempt exactly
+# when the caller does not list it — so a caller configured with
+# `README.md,CHANGELOG.md` never selects, and therefore never reads, `docs/**`.
 #
 # MULTI-PATH MODE (cinatra-ai/docs#156): published Markdown lives outside
 # `docs/` too (a top-level README.md, a CHANGELOG.md, staged listing copy), so a
 # caller may instead pass `paths` — a newline- and/or comma-separated SET of
-# directories and/or single Markdown files to scan:
+# directories and/or single Markdown/HTML files to scan:
 #
 #       with:
 #         paths: |
@@ -42,8 +54,8 @@ name: meta-commentary-gate
 # behaves exactly as before (single `docs` directory), so existing callers pass
 # unchanged. Multi-path mode is fail-closed: a spec that normalizes to zero
 # entries is a config error (never a silent fallback to `docs`), every
-# configured entry must exist and yield at least one tracked Markdown file (a
-# typo'd entry is a config error, never a silently narrower scan), and entries
+# configured entry must exist and yield at least one tracked Markdown/HTML file
+# (a typo'd entry is a config error, never a silently narrower scan), and entries
 # are literal paths, never globs. Pattern list, per-repo line-pinned allowlist,
 # and reviewBy-expiry semantics are identical in both modes.
 #
@@ -63,7 +75,7 @@ on:
         type: string
         default: "docs"
       paths:
-        description: "Optional newline- and/or comma-separated set of paths (directories and/or single Markdown files, e.g. docs plus README.md) to scan instead of the single `docs` directory. Every entry must exist and yield at least one tracked Markdown file (fail-closed). Empty = single-directory `docs` behavior."
+        description: "Optional newline- and/or comma-separated set of paths (directories and/or single Markdown/HTML files, e.g. docs plus README.md) to scan instead of the single `docs` directory. Every entry must exist and yield at least one tracked Markdown or HTML file (fail-closed). Empty = single-directory `docs` behavior."
         type: string
         default: ""
       allowlist:
