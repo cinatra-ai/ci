@@ -100,7 +100,7 @@ jobs:
           fi
 
       - name: Checkout the RELEASE repository (full history + tags for the range)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           # EXPLICIT release repo. This workflow lives in cinatra-ai/ci; a bare
           # checkout would clone ci, not the release repo being swept.
@@ -111,14 +111,14 @@ jobs:
           fetch-tags: true
 
       - name: Checkout gate (cinatra-ai/ci)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: cinatra-ai/ci
           ref: ${{ inputs.ref }}
           path: gate
 
       - name: Checkout assistant-skills at the release-current ref (the bumped pin)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: ${{ inputs.skills_repo }}
           ref: ${{ inputs.skills_ref }}
