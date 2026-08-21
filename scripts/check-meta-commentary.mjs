@@ -163,8 +163,8 @@
 //     assistants in ordinary product prose — a page on connecting one to
 //     Cinatra, a comparison of two of them, a quick-start that opens by naming
 //     the assistant it is written for. A name is never the violation: only a
-//     NUMBERED review round BOUND to it is.
-//   - An UNNUMBERED review round ("approval rounds repeat until the reviewer
+//     NUMBERED review round BOUND to it is.  // source-leak-allow: detector vocabulary
+//   - An UNNUMBERED review round ("approval rounds repeat until the reviewer  // source-leak-allow: detector vocabulary
 //     signs off") and a NUMBERED round carrying no derivation claim ("round 2
 //     of the rollout adds the CRM connector"). Unnumbered, it is an ordinary
 //     process noun; unclaimed, a numbered round is an ordinary programme noun.
@@ -483,7 +483,7 @@ const PATTERNS = [
   // own is ordinary published product prose on the surfaces this engine scans —
   // integration docs explain connecting a named assistant to Cinatra, compare
   // named assistant products, and open quick-starts by naming one. None of that
-  // can match, because a NUMBERED review round has to be bound to the name: the
+  // can match, because a NUMBERED review round has to be bound to the name: the  // source-leak-allow: detector vocabulary
   // same BOUND-ADJACENCY proxy the work-item and ruling patterns use, never bare
   // same-line proximity.
   //
@@ -513,7 +513,7 @@ const PATTERNS = [
   //     A closed list is the deliberate trade: the alternative (any capitalised
   //     token before a round citation) fires on ordinary product prose.
   //   - A PRODUCT-OWNED numbered round bound to a derivation noun would misfire:
-  //     "the evaluation dashboard displays review round 2 findings" is about a
+  //     "the evaluation dashboard displays review round 2 findings" is about a  // source-leak-allow: detector vocabulary
   //     product surface, not about how the page was written, and it is
   //     structurally identical to "round-12 lesson". No local lexical rule
   //     separates them. This engine runs over CALLER repos' surfaces, which are
@@ -532,7 +532,7 @@ const PATTERNS = [
     // The named-agent shapes: the name, then EITHER nothing but the round
     // citation ("<agent> round-12") or an EXPLICIT CREDIT — a crediting verb,
     // optionally an object, optionally a preposition ("<agent> found in round
-    // 7", "<agent> flagged this in review round 2").
+    // 7", "<agent> flagged this in review round 2").  // source-leak-allow: detector vocabulary
     //
     // The preposition lives INSIDE the verb branch on purpose. Allowing a bare
     // preposition made "use <agent-a> in round 2 and <agent-b> in round 3" fail,
@@ -569,8 +569,8 @@ const PATTERNS = [
     // round 3".
     //
     // Only `from` / `during` / `after` — never `in`, `of` or `at`. Those are
-    // CONTAINMENT prepositions: "compare findings in review round 2 with
-    // findings in review round 3" locates product findings, it does not claim
+    // CONTAINMENT prepositions: "compare findings in review round 2 with  // source-leak-allow: detector vocabulary
+    // findings in review round 3" locates product findings, it does not claim  // source-leak-allow: detector vocabulary
     // published guidance was derived from them. Requiring a derivational
     // preposition is what keeps "Lessons from earlier releases are captured as
     // reusable skills" and "the findings list" green too — the noun has to point
