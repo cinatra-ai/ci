@@ -1,9 +1,0 @@
-{
- "$comment": "Per-repo source-leak-gate config. skipDirPrefixes exempts the meta-commentary parity fixture corpus: planted detector test input must carry the very phrasings the gate bans.",
- "lineExcludes": [
-  "source-leak-allow"
- ],
- "skipDirPrefixes": [
-  "scripts/__fixtures__/meta-commentary-parity/"
- ]
-}

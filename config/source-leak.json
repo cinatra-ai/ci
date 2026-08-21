@@ -1,7 +1,13 @@
 {
-  "$comment": "Per-repo config for THIS repo's own ratcheted PR/push source-leak run (self-source-leak-gate.yml passes it via the reusable gate's `config` input; consuming repos never receive it). ONE exemption class, the same self-referential false positive config/self-check.json documents at length: files that must carry a gate's OWN literal name, which the SLG_PLANNING_DOC rule reads as a planning-artifact marker. skills-drift-gate.yml is the gate's own reusable workflow \u2014 its steps invoke scripts out of the gate checkout directory named after the gate, an irreducible reference (all rephraseable prose mentions on changed lines are reworded instead, per the rephrase-first doctrine). self-check.json is the hermetic self-check's exemption ledger \u2014 its entries LIST such gate filenames verbatim, so any edit to the ledger line would otherwise trip the ratchet that this config exists to calibrate. This file itself is self-exempt (the engine exempts the --config path).",
-  "exemptFileBasenames": [
-    "skills-drift-gate.yml",
-    "self-check.json"
-  ]
+ "$comment": "Per-repo config for THIS repo's own ratcheted PR/push source-leak run (self-source-leak-gate.yml passes it via the reusable gate's `config` input; consuming repos never receive it). ONE exemption class, the same self-referential false positive config/self-check.json documents at length: files that must carry a gate's OWN literal name, which the SLG_PLANNING_DOC rule reads as a planning-artifact marker. skills-drift-gate.yml is the gate's own reusable workflow — its steps invoke scripts out of the gate checkout directory named after the gate, an irreducible reference (all rephraseable prose mentions on changed lines are reworded instead, per the rephrase-first doctrine). self-check.json is the hermetic self-check's exemption ledger — its entries LIST such gate filenames verbatim, so any edit to the ledger line would otherwise trip the ratchet that this config exists to calibrate. This file itself is self-exempt (the engine exempts the --config path). The parity fixture corpus is skipped by prefix and lines marked source-leak-allow are exempt: planted detector test input and the engine's own rationale comments must be able to carry the phrasings the gate bans.",
+ "exemptFileBasenames": [
+  "skills-drift-gate.yml",
+  "self-check.json"
+ ],
+ "lineExcludes": [
+  "source-leak-allow"
+ ],
+ "skipDirPrefixes": [
+  "scripts/__fixtures__/meta-commentary-parity/"
+ ]
 }
