@@ -17,3 +17,12 @@ Selection uses the ratified claim-only mode.
 Per the ruling, a scope is never widened silently.
 Containment is specified in cinatra#1607 AC6 and cinatra-ai/cinatra#1795.
 The list order follows ruling 4.
+The full table object is required (Codex round-12 lesson - a destructured column-bag crashes it).
+Retries stop at five; lesson from round 3.
+Codex found in round 7 that the token must stay opaque.
+Codex discovered in round 7 that the cache key needs the organization id.
+Claude flagged this in review round 2.
+Round-4 finding: the cache key includes the organization id.
+The takeaway from convergence round 9 is that the queue drains in order.
+Round 12's lesson is that the queue drains in order.
+The lesson came from round 3: retries stop at five.

@@ -13,9 +13,10 @@
 // works is explicitly NOT in scope — that is what the optional allowlist covers.
 //
 // This is the ci-vendored twin of docs' scripts/check-meta-commentary.mjs. The
-// line-pinned allowlist semantics and the expired-entry handling are IDENTICAL,
-// and the pattern list is the twin's plus the docs#156 AC5 additions (see TWIN
-// RELATIONSHIP below) — the only other adaptation is directory scoping: instead of
+// line-pinned allowlist semantics, the expired-entry handling and the pattern
+// list are IDENTICAL (see TWIN RELATIONSHIP below for what holds the two lists
+// together, and for why neither side is the privileged one) — the adaptation is
+// directory scoping: instead of
 // deriving a fixed repo root from its own location and scanning the whole tree,
 // it scans a caller-supplied `--docs <dir>` (default "docs") relative to the
 // process cwd (the caller repo checkout), so an integration repo runs it over
@@ -91,6 +92,12 @@
 //      ruling") instead of by what it does. A reader of a published guide is
 //      not a participant in the planning process and cannot resolve those
 //      references.
+//      Since cinatra-ai/docs#171 the same class also covers DERIVATION
+//      provenance — the numbered review or convergence round a constraint came
+//      out of, with or without the tool or agent that ran it ("<agent> round-12
+//      lesson", "lesson from round 3", "<agent> found in round 7"). It is the
+//      same defect one step earlier in the process: the sentence says where the
+//      constraint came from instead of stating the constraint.
 //
 // These are lexical heuristics, not semantic judgements. The engine cannot know
 // that "#1620" names a work item, that "landed" describes it, or that a
@@ -152,6 +159,16 @@
 //     available", "not yet shipped". These describe what the product does
 //     TODAY, which is exactly what a published page is for; only the in-flight
 //     narration ("… because the work is still landing") is the violation.
+//   - A TOOL OR AGENT NAME on its own (docs#171). Integration docs name coding
+//     assistants in ordinary product prose — a page on connecting one to
+//     Cinatra, a comparison of two of them, a quick-start that opens by naming
+//     the assistant it is written for. A name is never the violation: only a
+//     NUMBERED review round BOUND to it is.  // source-leak-allow: detector vocabulary
+//   - An UNNUMBERED review round ("approval rounds repeat until the reviewer  // source-leak-allow: detector vocabulary
+//     signs off") and a NUMBERED round carrying no derivation claim ("round 2
+//     of the rollout adds the CRM connector"). Unnumbered, it is an ordinary
+//     process noun; unclaimed, a numbered round is an ordinary programme noun.
+//     It is the derivation claim that makes either one provenance.
 //
 // Deliberately "cheap", not exhaustive:
 //   - Pattern-based phrase matching, not real NLP; a rephrased violation can
@@ -203,14 +220,28 @@ const SKIP_PATHS = new Set([]);
 // product/technical content (OAS compilation, connector sync, dashboard
 // mirroring, and the like).
 //
-// TWIN RELATIONSHIP: docs' repo-local scripts/check-meta-commentary.mjs carries
-// a DIFFERENT list as of this commit. It was byte-identical through docs#119;
-// the docs#156 AC5
-// additions below (the transition and planning-provenance classes) land HERE
-// first, because this engine is what every caller repo runs. The docs twin
-// carries the pre-AC5 list until it is synced, exactly as caller repos enforce
-// the pattern list at the SHA they pin — a widened list changes what any given
-// consumer enforces only once that consumer moves to it.
+// TWIN RELATIONSHIP: docs' repo-local scripts/check-meta-commentary.mjs is this
+// engine's twin. The two files are NOT byte-identical — they were only through
+// docs#119, and their scan scopes, CLIs and operator messages have differed
+// since — but they carry the SAME pattern list, and
+// scripts/check-meta-commentary-parity.mjs is what keeps them honest about it:
+// each repo runs its OWN engine over one byte-identical corpus and must
+// reproduce one byte-identical verdict.
+//
+// THAT IS BEHAVIOURAL EVIDENCE ON A FINITE CORPUS, not a proof the two lists are
+// identical: a pattern added to one side that no corpus line exercises would
+// still pass on both. Widening the list therefore means widening the CORPUS in
+// the same change — that is what makes the evidence worth anything, and it is
+// why the corpus travels with every widening, this one included.
+//
+// WHICH SIDE A WIDENING LANDS ON FIRST VARIES, and neither order is privileged.
+// The docs#156 AC5 additions below (the transition and planning-provenance
+// classes) landed HERE first, because this engine is what every caller repo
+// runs. The docs#171 derivation-provenance patterns landed in the DOCS twin
+// first, because the page that slipped through was a docs page, and are
+// mirrored here with the shared corpus in the same change. Either way a caller
+// repo enforces the pattern list at the SHA it pins — a widened list changes
+// what any given consumer enforces only once that consumer moves to it.
 const PATTERNS = [
   // docs#156 AC5: tolerate a single -ly adverb and AT MOST ONE hard wrap between
   // the two words — "generated deterministically\nfrom the design system" is the
@@ -437,6 +468,116 @@ const PATTERNS = [
     "numbered_ruling_citation",
     /\brulings?[ \t]{1,3}\d{1,3}\b/i,
     'numbered ruling citation, e.g. "ruling 4" / "rulings 1–2"',
+  ],
+
+  // --- Class: TOOL / REVIEW-ROUND PROVENANCE (docs#171) --------------------
+  // The planning-provenance class one step earlier in the process: not the work
+  // item or decision a capability came from, but the numbered review or
+  // convergence round a CONSTRAINT ON THE PAGE was derived in — "(<agent>
+  // round-12 lesson — …)", "lesson from round 3", "<agent> found in round 7".
+  // Same defect, same remedy: the sentence describes where the guidance came
+  // from rather than stating it, and a reader of a published page has no round
+  // 12 to consult.
+  //
+  // THE BINDING IS THE ROUND CITATION, NOT THE NAME. A tool or agent name on its
+  // own is ordinary published product prose on the surfaces this engine scans —
+  // integration docs explain connecting a named assistant to Cinatra, compare
+  // named assistant products, and open quick-starts by naming one. None of that
+  // can match, because a NUMBERED review round has to be bound to the name: the  // source-leak-allow: detector vocabulary
+  // same BOUND-ADJACENCY proxy the work-item and ruling patterns use, never bare
+  // same-line proximity.
+  //
+  // AND "ROUND" ALONE IS NEVER ENOUGH. "round trip", "round-robin", "rounded",
+  // "approval rounds repeat until…" are ordinary technical prose, so every
+  // pattern here requires DIGITS directly against the round noun, and then
+  // EITHER a named tool/agent bound to it by adjacency or an explicit credit, OR
+  // a derivation noun ("lesson", "learning", "takeaway", "finding", "verdict")
+  // bound to it by adjacency or a derivational preposition. A numbered round
+  // with neither stays green.
+  //
+  // SINGLE LINE ONLY, deliberately. The `generated_from` and `ratified` patterns
+  // tolerate one hard wrap with a lookahead that rejects a continuation line
+  // starting with a list, quote or table marker. That guard cannot be reused
+  // honestly here: it only inspects the START of the SECOND line, so it cannot
+  // see that the FIRST line was a heading or a table row, and a wrap-tolerant
+  // `review_round_lesson` really does join "# Round 2" to a following paragraph
+  // beginning "Findings are displayed…". Rather than ship a guard whose comment
+  // would have to overclaim, this class does not cross a newline at all. Every
+  // gap is a bounded run of spaces/tabs, so the patterns stay linear.
+  //
+  // RESIDUAL RISKS, recorded rather than hidden:
+  //   - The name list is a CLOSED enumeration of publicly named coding agents
+  //     and assistants. An unlisted or newly named one in the bare
+  //     "<agent> round-N" shape is missed — unless a derivation noun is present,
+  //     in which case `review_round_lesson` catches it whatever the name was.
+  //     A closed list is the deliberate trade: the alternative (any capitalised
+  //     token before a round citation) fires on ordinary product prose.
+  //   - A PRODUCT-OWNED numbered round bound to a derivation noun would misfire:
+  //     "the evaluation dashboard displays review round 2 findings" is about a  // source-leak-allow: detector vocabulary
+  //     product surface, not about how the page was written, and it is
+  //     structurally identical to "round-12 lesson". No local lexical rule
+  //     separates them. This engine runs over CALLER repos' surfaces, which are
+  //     not swept from here, so nothing is claimed about how many are phrased
+  //     that way today: a genuine one is a line-pinned allowlist entry, which is
+  //     exactly what that mechanism is for. The same goes for an EXTERNAL
+  //     numbered round ("the standards body's round 2 findings").
+  //   - A violation SPLIT ACROSS A HARD WRAP ("The learnings\nfrom round 11 …")
+  //     is missed, per the single-line decision above.
+  //   - Rephrasings outside the three shapes are missed — "round 12 produced a
+  //     lesson", "what round 7 taught us". Widening to those means matching a
+  //     numbered round against an open verb phrase, which is where the
+  //     product-owned-round misfire above stops being hypothetical. Caught in
+  //     review, not here, exactly as this list trades everywhere else.
+  [
+    // The named-agent shapes: the name, then EITHER nothing but the round
+    // citation ("<agent> round-12") or an EXPLICIT CREDIT — a crediting verb,
+    // optionally an object, optionally a preposition ("<agent> found in round
+    // 7", "<agent> flagged this in review round 2").  // source-leak-allow: detector vocabulary
+    //
+    // The preposition lives INSIDE the verb branch on purpose. Allowing a bare
+    // preposition made "use <agent-a> in round 2 and <agent-b> in round 3" fail,
+    // and that sentence credits nobody with anything — it assigns a model to a
+    // numbered round, which is ordinary product prose for an AI workspace. With
+    // the verb required, adjacency ("<agent> round-12") or a credit is the only
+    // way in, and the bare-adjacency form is the one the docs#171 live miss used.
+    //
+    // Case-SENSITIVE, because these are proper nouns in the crediting shape.
+    // Lower-case handles that a product surface may list (`@claude`, `@chatgpt`,
+    // `@gemini`) are display identifiers, not a credit, and they do not carry a
+    // round citation either way.
+    //
+    // Every gap is a BOUNDED run of spaces/tabs — never `\s*`, which would cross
+    // a blank line and join a sentence ending on an agent name to a following
+    // paragraph starting "Round 3 of the rollout…".
+    "tool_review_round_citation",
+    /\b(?:Codex|Claude(?:[ \t]Code)?|ChatGPT|Gemini|Copilot|Cursor|Devin|Aider)\b[ \t]{0,3}[,;:—–-]?[ \t]{0,3}(?:(?:found|flagged|caught|raised|noted|spotted|surfaced|rejected|challenged|suggested|recommended|reviewed|converged|discovered|identified|observed)[ \t]{1,3}(?:(?:this|it|that|them)[ \t]{1,3})?(?:(?:in|at|during|on)[ \t]{1,3})?)?(?:the[ \t]{1,3})?(?:(?:review|convergence|feedback|audit|grading)[ \t-]{1,2})?rounds?[ \t-]{1,2}#?\d{1,3}\b/,
+    'tool/agent credited with a numbered review round, e.g. "<agent> round-12" / "<agent> found in round 7"',
+  ],
+  [
+    // The round citation carrying its derivation noun, directly or across one
+    // separator glyph: "round-12 lesson", "Round-4 finding:", "convergence
+    // round 9 takeaway", "Round 12's lesson". No name is required — the
+    // derivation claim is the violation, and the commonest spelling of it
+    // credits no tool at all.
+    "review_round_lesson",
+    /\b(?:(?:review|convergence|feedback|audit|grading)[ \t-]{1,2})?rounds?[ \t-]{1,2}#?\d{1,3}(?:['’]s)?\b[ \t]{0,3}[,;:—–-]?[ \t]{1,3}(?:lessons?|learnings?|takeaways?|findings?|verdicts?)\b/i,
+    'numbered review round cited as the source of the guidance, e.g. "round-12 lesson"',
+  ],
+  [
+    // The reverse order, bound by a DERIVATIONAL preposition: "lesson from
+    // round 3", "the takeaway from convergence round 9", "the lesson came from
+    // round 3".
+    //
+    // Only `from` / `during` / `after` — never `in`, `of` or `at`. Those are
+    // CONTAINMENT prepositions: "compare findings in review round 2 with  // source-leak-allow: detector vocabulary
+    // findings in review round 3" locates product findings, it does not claim  // source-leak-allow: detector vocabulary
+    // published guidance was derived from them. Requiring a derivational
+    // preposition is what keeps "Lessons from earlier releases are captured as
+    // reusable skills" and "the findings list" green too — the noun has to point
+    // AT a numbered round, not merely precede one.
+    "lesson_from_review_round",
+    /\b(?:lessons?|learnings?|takeaways?|findings?|verdicts?)\b(?:[ \t]{1,3}(?:learned|captured|recorded|carried|came|come|comes|emerged|resulted))?[ \t]{1,3}(?:from|during|after)[ \t]{1,3}(?:the[ \t]{1,3})?(?:(?:review|convergence|feedback|audit|grading)[ \t-]{1,2})?rounds?[ \t-]{1,2}#?\d{1,3}\b/i,
+    'guidance pinned to a numbered review round, e.g. "lesson from round 3"',
   ],
 
   // --- Class: IN-PAGE AUTHORING / PUBLISH-STATUS ANNOTATION (docs#160) ------
@@ -808,7 +949,9 @@ function main() {
       `not how the documentation or its assets are authored, generated, compiled, mirrored or maintained; ` +
       `not what is still in flight ("still landing", "forthcoming"); and not the internal work item, ` +
       `acceptance criterion or decision a capability came from ("epic #123, landed", "cinatra#1607 AC6", ` +
-      `"ruling 4", "the ratified <X> mode"). This holds for HTML pages exactly as for Markdown, comments included. ` +
+      `"ruling 4", "the ratified <X> mode"); and not the review round a constraint came out of ` +
+      `("<agent> round-12 lesson", "lesson from round 3"). ` +
+      `This holds for HTML pages exactly as for Markdown, comments included. ` +
       `Remove the meta/transition/provenance content from the page and state the capability as it stands.` +
       `\nA genuine false positive (real product content this pattern misfires on) goes in ` +
       `${allowlistPath} with an owner, a reviewBy date, and the exact full line as the snippet — see cinatra-ai/docs#119.`
