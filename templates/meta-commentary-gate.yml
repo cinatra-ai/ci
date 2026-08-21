@@ -17,8 +17,9 @@
 # WHAT IT ENFORCES. A published page states what the product does. It does not
 # narrate how the page (or its assets) is produced, what work is still in
 # flight, or which internal work item / acceptance criterion / decision a
-# capability came from. Tracked `.md` AND `.html`/`.htm` under the configured
-# paths are both scanned (docs#160); HTML is reduced to its prose first, and a
+# capability came from, or the numbered review round a constraint came out of.
+# Tracked `.md` AND `.html`/`.htm` under the configured paths are both scanned
+# (docs#160); HTML is reduced to its prose first, and a
 # violation is reported at the source file and line. The
 # pattern list and the deliberate rule-outs are documented at the top of
 # `scripts/check-meta-commentary.mjs` in cinatra-ai/ci; the README section

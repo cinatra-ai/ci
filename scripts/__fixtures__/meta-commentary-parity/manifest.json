@@ -1,11 +1,11 @@
 {
   "$comment": "SHA-256 of every artifact the twin-parity harness shares between cinatra-ai/docs and cinatra-ai/ci. Identical in both repos. A one-sided edit to the corpus, the expectation or the parity script fails this check in the repo that made it, so parity can only be changed deliberately and in both places.",
   "digests": {
-    "scripts/__fixtures__/meta-commentary-parity/corpus/clean.html": "a78ea2542f2a3fd4670971e5fc8f0aa57210e3a750da10bb6dabb7c21103ce4f",
-    "scripts/__fixtures__/meta-commentary-parity/corpus/clean.md": "94555e1588295489d3f56280833c071dc47bc896bf637577adf52c2aa1dbc8f9",
-    "scripts/__fixtures__/meta-commentary-parity/corpus/page.html": "4ec93e32da8c1b0b84f9e6b663a10b4d5990a6d1f50d663e313b302c53779935",
-    "scripts/__fixtures__/meta-commentary-parity/corpus/page.md": "0965f4131872c5da105354f1788a57819afe42a94ddb06c1adf7cfc720c413bd",
-    "scripts/__fixtures__/meta-commentary-parity/expected.json": "0ffe55088ae6f320d1e3798758c450a3cdf443729163a9d9e3e11fdc7ac4be38",
+    "scripts/__fixtures__/meta-commentary-parity/corpus/clean.html": "c3bbffc32a992a2b05d057626adad013e6e1ecb86fabd0b57d200c6907c2e623",
+    "scripts/__fixtures__/meta-commentary-parity/corpus/clean.md": "8d07689e63a9babe263a8b0301cff9bf53c6cbb6626df155d66a32c108fcb814",
+    "scripts/__fixtures__/meta-commentary-parity/corpus/page.html": "326c313941eeb1bf889080061e5dc264edac74a799a85a18d252d6f3afb37519",
+    "scripts/__fixtures__/meta-commentary-parity/corpus/page.md": "75d1bb44badecc33ad2cab1cf3f8c925e67193ede29ace892fa147449efa6675",
+    "scripts/__fixtures__/meta-commentary-parity/expected.json": "8a30b36ca6538a55a4afd6bc9044b7cc31725b361f5b4726911a673e0e2683d6",
     "scripts/check-meta-commentary-parity.mjs": "90b028bab9f1eee3adbad09a6e9860087a5c20c7d54dd1fadb0aafb5db74a6a9"
   }
 }

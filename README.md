@@ -472,6 +472,12 @@ people reading them. Four violation classes:
    decision that approved it ("epic #123, landed", "cinatra#1607 AC6",
    "ruling 4", "the ratified claim-only mode", "per the ruling") instead of by
    what it does. A reader of a published page cannot resolve those references.
+   Since docs#171 the class also covers **derivation** provenance — the numbered
+   review or convergence round a constraint came out of, with or without the tool
+   or agent that ran it ("<agent> round-12 lesson", "lesson from round 3",
+   "<agent> found in round 7"). The binding is the numbered round, never the
+   name: a tool or agent name on its own is ordinary product prose and can never
+   match.
 4. **In-page authoring / publish-status annotation** — editorial scaffolding
    that survived into the published bytes: "publish decision", "spec status",
    "design note, outside the page mock", "a separate, owner-gated publish". The
@@ -481,8 +487,12 @@ The patterns are lexical heuristics, so the engine is as explicit about what it
 deliberately does **not** match — bare "landed", "still in flight", "no need to
 hand-edit", a released-version CHANGELOG entry, a **bare** `#123` cross-reference
 with no history claim, "ratified" next to external-standards vocabulary, "the
-decision tree", "X is not yet supported". Every rule-out is recorded, with its
-reason, in the header of [`scripts/check-meta-commentary.mjs`](scripts/check-meta-commentary.mjs);
+decision tree", "X is not yet supported", a tool or agent **name** with no
+numbered round bound to it, an **unnumbered** review round ("approval rounds
+repeat until the reviewer signs off"), and a numbered round carrying no
+derivation claim ("round 2 of the rollout adds the CRM connector"). Every
+rule-out is recorded, with its reason, in the header of
+[`scripts/check-meta-commentary.mjs`](scripts/check-meta-commentary.mjs);
 read it before adding a pattern or filing a false positive.
 
 **docs#160 re-decided one rule-out on evidence.** docs#156 ruled the whole

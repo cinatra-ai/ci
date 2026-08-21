@@ -102,6 +102,31 @@
       "id": "owner_gated_publish"
     },
     {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 25,
+      "id": "review_round_lesson"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 25,
+      "id": "tool_review_round_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 26,
+      "id": "lesson_from_review_round"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 26,
+      "id": "review_round_lesson"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.html",
+      "line": 27,
+      "id": "tool_review_round_citation"
+    },
+    {
       "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
       "line": 8,
       "id": "canonical_source_label"
@@ -190,6 +215,56 @@
       "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
       "line": 19,
       "id": "numbered_ruling_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 20,
+      "id": "review_round_lesson"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 20,
+      "id": "tool_review_round_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 21,
+      "id": "lesson_from_review_round"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 22,
+      "id": "tool_review_round_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 23,
+      "id": "tool_review_round_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 24,
+      "id": "tool_review_round_citation"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 25,
+      "id": "review_round_lesson"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 26,
+      "id": "lesson_from_review_round"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 27,
+      "id": "review_round_lesson"
+    },
+    {
+      "file": "scripts/__fixtures__/meta-commentary-parity/corpus/page.md",
+      "line": 28,
+      "id": "lesson_from_review_round"
     }
   ]
 }
