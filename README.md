@@ -259,7 +259,38 @@ repository name:
 
 See [`config/example-config.json`](config/example-config.json). A config may add
 `reqIdSinglePrefixes`, `extraRules`, `lineExcludes`, `scanExtensions`,
-`skipDirs`, and `exemptDirPrefixes`. Keep your config in your own repo.
+`skipDirs`, `exemptDirPrefixes`, `exemptFileBasenames`, and
+`exemptFileBasenamesExpiry`. Keep your config in your own repo.
+
+### Time-boxed basename exemptions
+
+A whole-file exemption that exists only because some *other*, pinned copy of the
+engine lacks a fix is a debt, not a rule — and an undated debt is never paid.
+`exemptFileBasenamesExpiry` keys such an entry to the pin that justifies it:
+
+```json
+"exemptFileBasenames": ["some-fixture.txt"],
+"exemptFileBasenamesExpiry": {
+  "some-fixture.txt": {
+    "untilPin": {
+      "file": ".github/workflows/my-caller.yml",
+      "sha": "<the 40-character commit sha that file pins today>"
+    },
+    "why": "one sentence: what the pinned engine cannot do yet"
+  }
+}
+```
+
+Before every scan the gate reads `untilPin.file` out of the **scanned** tree and
+takes the sha its `uses: <ref>@<sha>` line pins. Same sha, and the exemption is
+live and the gate says nothing about it. A different sha, and the exemption has
+EXPIRED: the run exits 1 and names the basename, the file, both shas, and the
+fix — **the pull request that moves the pin deletes the basename and its expiry
+entry in the same change.** A basename listed in the map but not in
+`exemptFileBasenames`, an entry of the wrong shape, a pin file that cannot be
+read, and a pin file carrying no single `uses: <ref>@<sha>` commit sha are all
+config errors (exit 1): an exemption whose expiry cannot be evaluated must never
+stay quietly in force.
 
 ### Run locally
 

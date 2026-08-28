@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,7 @@ import {
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
+  readUsesPins,
 } from "../source-leak-gate.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
@@ -609,12 +611,12 @@ test("probe: resolveRepoVisibility never returns public without an explicit publ
   assert.equal((await resolveRepoVisibility("some-new-repo", probeCtx())).state, "public");
 });
 
-test("this repo's own gate configs never exempt the ENGINE or its FIXTURE whole-file", () => {
+test("this repo's own gate configs never exempt the ENGINE whole-file", () => {
   // A whole-file exemption on the engine defeats the sentinel-scoped
   // self-protection it already has: the rule-definition region is skipped by
   // design, and everything OUTSIDE it must still be scanned, or a future leak
-  // anywhere else in the file would be silently discarded. The fixture needs no
-  // exemption either — the engine skips it by real path on every walk.
+  // anywhere else in the file would be silently discarded. This one never comes
+  // back — unlike the fixture's, which is time-boxed (next test).
   for (const cfgName of ["source-leak.json", "self-check.json"]) {
     const cfg = JSON.parse(fs.readFileSync(
       path.join(import.meta.dirname, "..", "..", "config", cfgName), "utf8",
@@ -622,9 +624,33 @@ test("this repo's own gate configs never exempt the ENGINE or its FIXTURE whole-
     const exempt = new Set(cfg.exemptFileBasenames || []);
     assert.equal(exempt.has("source-leak-gate.mjs"), false,
       `${cfgName} must not exempt the engine whole-file (the sentinel region is the exemption)`);
-    assert.equal(exempt.has("source-leak.fixture.txt"), false,
-      `${cfgName} must not exempt the fixture whole-file (the engine path-skips it)`);
   }
+});
+
+test("a FIXTURE basename exemption exists only while a pin-keyed expiry justifies it", () => {
+  // The hermetic self-check runs the CURRENT engine, which skips the fixture by
+  // real path — so self-check.json must never carry the exemption at all. The
+  // PR/push config drives a PINNED engine out of a separate checkout, where that
+  // real-path skip lands on the pinned checkout's own copy; there the exemption
+  // is allowed, but only as a debt keyed to the pin that creates it.
+  const readCfg = (n) => JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "..", "config", n), "utf8"));
+  assert.equal(new Set(readCfg("self-check.json").exemptFileBasenames || []).has("source-leak.fixture.txt"), false,
+    "self-check.json must not exempt the fixture (the engine it runs path-skips it)");
+
+  const cfg = readCfg("source-leak.json");
+  const exempt = new Set(cfg.exemptFileBasenames || []);
+  const expiry = cfg.exemptFileBasenamesExpiry || {};
+  if (!exempt.has("source-leak.fixture.txt")) {
+    assert.equal(Object.hasOwn(expiry, "source-leak.fixture.txt"), false,
+      "the exemption is gone, so its expiry entry must be gone too");
+    return;
+  }
+  const entry = expiry["source-leak.fixture.txt"];
+  assert.ok(entry && entry.untilPin, "the fixture exemption must be keyed to a pin, never open-ended");
+  const pinFile = path.join(import.meta.dirname, "..", "..", entry.untilPin.file);
+  const { shas } = readUsesPins(fs.readFileSync(pinFile, "utf8"));
+  assert.deepEqual(shas, [String(entry.untilPin.sha).toLowerCase()],
+    `${entry.untilPin.file} no longer pins the sha the exemption is keyed to — delete the basename AND the expiry entry`);
 });
 
 test("the committed public-repos cache parses and holds only confirmed-public names", () => {
@@ -1216,4 +1242,164 @@ test("a refresh that changes nothing rewrites nothing", async () => {
     assert.equal(r.changed, false, "same day, same entries => no drift");
     assert.equal(fs.readFileSync(f, "utf8"), before);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// Pin-keyed expiry of a file-basename exemption (exemptFileBasenamesExpiry).
+//
+// These run the gate as a subprocess over a throwaway tree, because the
+// behaviour under test is an exit code and an operator-facing message, not a
+// return value. The marker payload is assembled at runtime so this file carries
+// no intact example of it.
+// ---------------------------------------------------------------------------
+const EXPIRY_SCANNER = path.join(import.meta.dirname, "..", "source-leak-gate.mjs");
+const EXPIRY_MARKER = "see " + "Phase " + "530 here";
+const PIN_A = "83ca29ef8df0a33d11ba02568c61f2fdc56a3eaf";
+const PIN_B = "0123456789abcdef0123456789abcdef01234567";
+
+function expiryTree(files) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-expiry-")));
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content);
+  }
+  return dir;
+}
+function workflowPinning(sha) {
+  return `name: caller\njobs:\n  gate:\n    uses: some-org/ci/.github/workflows/gate.yml@${sha} # v0.0.0\n`;
+}
+// One tree, one knob: `notes.txt` carries a marker, and the config exempts it by
+// basename under an expiry keyed to `.github/workflows/caller.yml`.
+function expiryCase({ pinnedSha = PIN_A, config }) {
+  const files = {
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml": workflowPinning(pinnedSha),
+    "config/gate.json": JSON.stringify(config, null, 1),
+  };
+  if (pinnedSha === null) delete files[".github/workflows/caller.yml"];
+  return expiryTree(files);
+}
+function runExpiryGate(dir) {
+  const res = spawnSync(
+    "node",
+    [EXPIRY_SCANNER, "--profile", "default", "--ratchet-mode", "off", "--config", "config/gate.json", "--exit-on-match"],
+    { cwd: dir, encoding: "utf8", env: { ...process.env, GITHUB_TOKEN: "", GH_TOKEN: "" } },
+  );
+  return { status: res.status, err: res.stderr, out: res.stdout };
+}
+const liveConfig = {
+  exemptFileBasenames: ["notes.txt"],
+  exemptFileBasenamesExpiry: {
+    "notes.txt": { untilPin: { file: ".github/workflows/caller.yml", sha: PIN_A }, why: "keyed to the pinned engine" },
+  },
+};
+
+test("expiry: while the file still pins the keyed sha the exemption is live and silent", () => {
+  const dir = expiryCase({ config: liveConfig });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 0, `expected a clean run, got ${r.status}: ${r.err}`);
+    assert.equal(/EXPIRED|config error/.test(r.err), false, `a live exemption says nothing: ${r.err}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: the live case is not vacuous — the same tree without the exemption is red", () => {
+  const dir = expiryCase({ config: { exemptFileBasenames: [], exemptFileBasenamesExpiry: {} } });
+  try {
+    assert.equal(runExpiryGate(dir).status, 1, "the marker file must be a finding when nothing exempts it");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a moved pin EXPIRES the exemption — exit 1 naming both shas and the pair to delete", () => {
+  const dir = expiryCase({ pinnedSha: PIN_B, config: liveConfig });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /EXPIRED/);
+    assert.match(r.err, /notes\.txt/);
+    assert.match(r.err, /\.github\/workflows\/caller\.yml/);
+    assert.ok(r.err.includes(PIN_B), "the message must name the sha the file pins NOW");
+    assert.ok(r.err.includes(PIN_A), "the message must name the sha the exemption was keyed to");
+    assert.match(r.err, /exemptFileBasenames AND its exemptFileBasenamesExpiry entry/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: an unreadable pin file is a config error, never a silent exemption", () => {
+  const dir = expiryCase({ pinnedSha: null, config: liveConfig });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /not readable/);
+    assert.match(r.err, /\.github\/workflows\/caller\.yml/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a pin file with no `uses: <ref>@<sha>` line is a config error", () => {
+  const dir = expiryCase({ config: liveConfig });
+  try {
+    fs.writeFileSync(path.join(dir, ".github/workflows/caller.yml"), "name: caller\njobs:\n  gate:\n    uses: some-org/ci/.github/workflows/gate.yml@main\n");
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /no `uses: <ref>@<sha>` line/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a file pinning several different shas cannot key an exemption", () => {
+  const dir = expiryCase({ config: liveConfig });
+  try {
+    fs.appendFileSync(path.join(dir, ".github/workflows/caller.yml"), `    steps:\n      - uses: actions/checkout@${PIN_B}\n`);
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /different shas/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a malformed entry is a config error, named", () => {
+  for (const [label, entry] of [
+    ["no untilPin", { why: "x" }],
+    ["untilPin is a string", { untilPin: ".github/workflows/caller.yml" }],
+    ["no sha", { untilPin: { file: ".github/workflows/caller.yml" } }],
+    ["sha is a branch", { untilPin: { file: ".github/workflows/caller.yml", sha: "main" } }],
+    ["no file", { untilPin: { sha: PIN_A } }],
+  ]) {
+    const dir = expiryCase({ config: { exemptFileBasenames: ["notes.txt"], exemptFileBasenamesExpiry: { "notes.txt": entry } } });
+    try {
+      const r = runExpiryGate(dir);
+      assert.equal(r.status, 1, `${label}: expected exit 1`);
+      assert.match(r.err, /config error/, label);
+      assert.match(r.err, /untilPin must be/, label);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("expiry: an entry for a basename that is NOT exempt is a config error", () => {
+  const dir = expiryCase({ config: { exemptFileBasenames: [], exemptFileBasenamesExpiry: liveConfig.exemptFileBasenamesExpiry } });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /'notes\.txt', which is not listed in exemptFileBasenames/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: the expiry map itself must be an object", () => {
+  const dir = expiryCase({ config: { exemptFileBasenames: ["notes.txt"], exemptFileBasenamesExpiry: ["notes.txt"] } });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /must be an object mapping a file basename/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("readUsesPins: deduplicates identical pins and reports refs that are not commit shas", () => {
+  const { shas, unpinned } = readUsesPins(
+    `jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    steps:\n      - uses: o/a@${PIN_A}\n      - uses: o/b@v4\n`,
+  );
+  assert.deepEqual(shas, [PIN_A]);
+  assert.deepEqual(unpinned, ["o/b@v4"]);
 });

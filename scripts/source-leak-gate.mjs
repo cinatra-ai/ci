@@ -634,6 +634,95 @@ function loadConfig(configPath) {
   catch (e) { return fail(`config is not valid JSON (${configPath}): ${e.message}`); }
 }
 
+// ---------------------------------------------------------------------------
+// Pin-keyed expiry for file-basename exemptions.
+//
+// A basename exemption that exists only because some OTHER, pinned copy of this
+// engine lacks a fix is a debt, not a rule: the pinned engine that judges this
+// repository's own pull requests is checked out at a fixed sha, so a carve-out
+// the current engine no longer needs can still be required by that one. Such an
+// exemption is keyed to the pin that justifies it through
+// `exemptFileBasenamesExpiry`: the entry names a file in the SCANNED tree and
+// the sha that file's `uses: ...@<sha>` line pins today. While the file still
+// pins that sha the exemption is live and the gate says nothing; the moment the
+// pin moves the gate fails and names the pair to delete. The exemption cannot
+// outlive its reason, and nobody has to remember it.
+//
+// An expiry entry only ever time-boxes a LIVE exemption, so a basename listed
+// here but absent from exemptFileBasenames is a config error, as is an entry
+// whose shape is wrong or whose pin file cannot be read: an exemption whose
+// expiry cannot be evaluated must never quietly stay in force.
+// ---------------------------------------------------------------------------
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function expiryFail(msg) {
+  console.error(`[source-leak-gate] ${msg}`);
+  process.exit(1);
+}
+
+// Every `uses: <ref>@<sha>` pin in a workflow file, deduplicated. A file that
+// carries more than one DISTINCT sha cannot key an expiry (which sha would it
+// be?), so the caller rejects that rather than guessing.
+function readUsesPins(text) {
+  const shas = new Set();
+  const unpinned = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)/);
+    if (!m) continue;
+    const at = m[1].lastIndexOf("@");
+    const ref = at === -1 ? "" : m[1].slice(at + 1);
+    if (FULL_SHA_RE.test(ref)) shas.add(ref.toLowerCase());
+    else unpinned.push(m[1]);
+  }
+  return { shas: [...shas], unpinned };
+}
+
+function enforceBasenameExpiries(config, exemptFiles, configPath) {
+  const map = config.exemptFileBasenamesExpiry;
+  if (map === undefined || map === null) return;
+  const where = `exemptFileBasenamesExpiry${configPath ? ` in ${configPath}` : ""}`;
+  if (typeof map !== "object" || Array.isArray(map)) {
+    expiryFail(`config error: ${where} must be an object mapping a file basename to its expiry entry`);
+  }
+  for (const [basename, entry] of Object.entries(map)) {
+    if (!exemptFiles.has(basename)) {
+      expiryFail(`config error: ${where} keys '${basename}', which is not listed in exemptFileBasenames — `
+        + "an expiry entry only ever time-boxes a live exemption; list the basename or delete the expiry entry");
+    }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      expiryFail(`config error: ${where}['${basename}'] must be an object carrying untilPin { file, sha }`);
+    }
+    const pin = entry.untilPin;
+    if (!pin || typeof pin !== "object" || Array.isArray(pin)
+      || typeof pin.file !== "string" || !pin.file.trim()
+      || typeof pin.sha !== "string" || !FULL_SHA_RE.test(pin.sha)) {
+      expiryFail(`config error: ${where}['${basename}'].untilPin must be `
+        + "{ file: <path in the scanned repository>, sha: <40-character commit sha> }");
+    }
+    let text;
+    try { text = fs.readFileSync(pin.file, "utf8"); }
+    catch {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not readable in the scanned repository — an exemption whose expiry cannot be checked does not stay in force");
+    }
+    const { shas, unpinned } = readUsesPins(text);
+    if (shas.length === 0) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + `which carries no \`uses: <ref>@<sha>\` line pinning a commit sha${unpinned.length ? ` (unpinned: ${unpinned.join(", ")})` : ""}`);
+    }
+    if (shas.length > 1) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + `which pins ${shas.length} different shas (${shas.join(", ")}) — key the exemption to a file with a single pin`);
+    }
+    const pinned = shas[0];
+    if (pinned === pin.sha.toLowerCase()) continue; // live: the reason still holds
+    expiryFail(`the '${basename}' file-basename exemption has EXPIRED: ${pin.file} now pins ${pinned}, `
+      + `not ${pin.sha.toLowerCase()}, the sha the exemption was keyed to. `
+      + `Delete "${basename}" from exemptFileBasenames AND its exemptFileBasenamesExpiry entry `
+      + "in the same change that moved the pin.");
+  }
+}
+
 // `options.probe` opts the DYNAMIC lane in. Probe rules are gated by MODE, not
 // by profile: they are useless without a resolver, and their regex nominates
 // public repositories too, so leaving them in the static rule set would turn
@@ -1325,6 +1414,7 @@ async function main() {
   const skipFilePatterns = [...DEFAULT_SKIP_FILE_PATTERNS, ...((config.skipFilePatterns) || []).map((s) => new RegExp(s))];
   const exemptDirs = [...EXEMPT_DIR_PREFIXES, ...((config.exemptDirPrefixes) || [])];
   const exemptFiles = new Set([...EXEMPT_FILE_BASENAMES, ...((config.exemptFileBasenames) || [])]);
+  enforceBasenameExpiries(config, exemptFiles, args.config);
 
   // The gate's own config / legacy-allowlist / baseline artifacts necessarily
   // contain the very tokens (and leaky path strings) they describe — never scan
@@ -1453,6 +1543,7 @@ export {
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
+  readUsesPins,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,
