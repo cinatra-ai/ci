@@ -54,6 +54,26 @@ MISS:SLG_PRIVATE_REPO_REF:import { x } from "@cinatra-ai/design";
 MISS:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/.github/workflows/deploy.yml
 MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/design-system-foo for the helper
 MISS:SLG_PRIVATE_REPO_REF:public ref cinatra-ai/cinatra#231 stays
+HIT:SLG_PRIVATE_REPO_REF:shots filed in cinatra-ai/engineering-proofs-private
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/engineering-proofs-private/blob/main/shot.png
+HIT:SLG_PRIVATE_REPO_REF:https://raw.githubusercontent.com/cinatra-ai/engineering-proofs-private/main/shot.png
+HIT:SLG_PRIVATE_REPO_REF:the pack in cinatra-ai/engineering-claude-plugin
+HIT:SLG_PRIVATE_REPO_REF:assets under cinatra-ai/marketing-explainer-video
+MISS:SLG_PRIVATE_REPO_REF:public host cinatra-ai/engineering-proofs is cited freely
+MISS:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/engineering-proofs/blob/main/shot.png
+MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/engineering-proofs-private-foo instead
+MISS:SLG_PRIVATE_REPO_REF:the cinatra-ai/wp-theme staging remote
+HIT:SLG_PRIVATE_PROOFS_REF:pictures pushed to engineering-proofs-private
+HIT:SLG_PRIVATE_PROOFS_REF:opened engineering-proofs-private#4 for the shots
+HIT:SLG_PRIVATE_PROOFS_REF:see engineering-proofs-private/issues/4 directly
+MISS:SLG_PRIVATE_PROOFS_REF:public host engineering-proofs is cited freely
+MISS:SLG_PRIVATE_PROOFS_REF:the myengineering-proofs-private token is unrelated
+MISS:SLG_PRIVATE_PROOFS_REF:see engineering-proofs-private-foo instead
+HIT:SLG_PRIVATE_REPO_REF:retired in cinatra-ai/major-release-workflow
+HIT:SLG_PRIVATE_REPO_REF:retired in cinatra-ai/blog-content-workflow
+HIT:SLG_PRIVATE_PROOFS_REF:import x from "@cinatra-ai/engineering-proofs-private";
+MISS:SLG_PRIVATE_PROOFS_REF:import x from "@cinatra-ai/engineering-proofs";
+MISS:SLG_PRIVATE_PROOFS_REF:cinatra-ai/engineering-proofs-private is the path form
 MISS:SLG_MILESTONE_NUMBER:Phase 1 of the project
 MISS:SLG_MILESTONE_NUMBER:phased rollout is enabled
 MISS:SLG_MILESTONE_NUMBER:if (NEXT_PHASE=phase-production-build) return;

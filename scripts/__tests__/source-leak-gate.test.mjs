@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildRules, scanFile, RULES } from "../source-leak-gate.mjs";
+import {
+  buildRules, scanFile, RULES,
+  setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
+  loadKnownPublicRepos, PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES,
+  PROBE_RULE_ID, PROBE_ERROR_RULE_ID,
+} from "../source-leak-gate.mjs";
 
 // Replicates the scanner's per-line matching for a single rule on a string.
 function matchRule(rule, line) {
@@ -165,6 +170,9 @@ test("removing the default short-circuit does NOT drop any built-in rule under d
   // (carries "default"), so the `default` profile still runs the full base set.
   const defaultIds = new Set(active.map((r) => r.id));
   for (const r of RULES) {
+    // Probe rules are gated by MODE, not by profile — they are opted in with
+    // buildRules(..., { probe: true }) and asserted separately.
+    if (r.probe) continue;
     // RULES entries with no explicit `profiles` default to universal (incl. default).
     if (!r.profiles || r.profiles.includes("default")) {
       assert.ok(defaultIds.has(r.id), `base rule ${r.id} must stay active under default`);
@@ -276,6 +284,323 @@ test("SLG_PRIVATE_REPO_REF does NOT flag the @cinatra-ai npm scope, cinatra-ai/o
   ];
   for (const line of misses) {
     assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_REPO_REF flags the private proof-image twin and the other private repos", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  const hits = [
+    "shots filed in cinatra-ai/engineering-proofs-private",
+    "https://github.com/cinatra-ai/engineering-proofs-private/blob/main/shot.png",
+    "https://raw.githubusercontent.com/cinatra-ai/engineering-proofs-private/main/shot.png",
+    "see cinatra-ai/engineering-proofs-private#4 for the shots",
+    "the pack in cinatra-ai/engineering-claude-plugin",
+    "assets under cinatra-ai/marketing-explainer-video",
+    "retired in cinatra-ai/major-release-workflow",
+    "retired in cinatra-ai/blog-content-workflow",
+  ];
+  for (const line of hits) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_REPO_REF does NOT flag the PUBLIC proof-image twin or the functional theme target", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  const misses = [
+    // The PUBLIC twin of the proof-image host: public repos cite it constantly.
+    "public host cinatra-ai/engineering-proofs is cited freely",
+    "https://github.com/cinatra-ai/engineering-proofs/blob/main/shot.png",
+    "https://github.com/cinatra-ai/engineering-proofs/issues/4",
+    "see cinatra-ai/engineering-proofs#4 for the picture",
+    // Trailing-boundary look-alikes on the private twin's own name:
+    "see cinatra-ai/engineering-proofs-private-foo instead",
+    "the cinatra-ai/engineering-proofs-private_bak dir",
+    // The npm-scope carve-out holds for the added members too:
+    'import x from "@cinatra-ai/engineering-claude-plugin";',
+    // Deliberately excluded, same functional class as the ops dispatch target:
+    "the cinatra-ai/wp-theme staging remote",
+    "REMOTE=https://github.com/cinatra-ai/wp-theme.git",
+  ];
+  for (const line of misses) {
+    assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_PROOFS_REF ships in the default profile (universal, not strict-only)", () => {
+  // The bare name has no sanctioned use in committed source anywhere, so unlike
+  // SLG_PRIVATE_ENG_REF_STRICT it is NOT confined to `public-strict`.
+  assert.ok(byId.has("SLG_PRIVATE_PROOFS_REF"), "must be a default rule (no config needed)");
+  for (const p of ["default", "ops-docs", "ts-monorepo", "php-wp-plugin", "drupal-module", "public-strict"]) {
+    const ids = new Set(buildRules({}, p, null).map((r) => r.id));
+    assert.ok(ids.has("SLG_PRIVATE_PROOFS_REF"), `must be active under ${p}`);
+  }
+});
+
+test("SLG_PRIVATE_PROOFS_REF flags the bare private proof-image repository name", () => {
+  const rule = byId.get("SLG_PRIVATE_PROOFS_REF");
+  const hits = [
+    "pictures pushed to engineering-proofs-private",
+    "opened engineering-proofs-private#4 for the shots",
+    "see engineering-proofs-private/issues/4 directly",
+    "engineering-proofs-private holds the originals",
+    "(engineering-proofs-private) is where they land",
+    // The one deliberate exception to the npm-scope carve-out: no package will
+    // ever carry this name, so the @-scoped literal is a leak like any other.
+    'import x from "@cinatra-ai/engineering-proofs-private";',
+    "@cinatra-ai/engineering-proofs-private in a dependency list",
+  ];
+  for (const line of hits) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_PROOFS_REF does NOT flag the public twin, look-alikes, or the path form the sibling rule owns", () => {
+  const rule = byId.get("SLG_PRIVATE_PROOFS_REF");
+  const misses = [
+    // The PUBLIC twin — the whole point of demanding the full suffix:
+    "public host engineering-proofs is cited freely",
+    "https://github.com/cinatra-ai/engineering-proofs/blob/main/shot.png",
+    // Longer identifiers on either boundary:
+    "the myengineering-proofs-private token is unrelated",
+    "a re-engineering-proofs-private marker",
+    "see engineering-proofs-private-foo instead",
+    "the engineering-proofs-private_bak dir",
+    // The org-path form belongs SOLELY to SLG_PRIVATE_REPO_REF -> no double-flag:
+    "cinatra-ai/engineering-proofs-private is the path form",
+    "https://github.com/cinatra-ai/engineering-proofs-private/blob/main/shot.png",
+    // The carve-out is narrowed by ONE literal, not opened: every other
+    // @-scoped package name is still untouched, including the public twin's.
+    'import x from "@cinatra-ai/engineering-proofs";',
+    'import x from "@cinatra-ai/engineering-proofs-private-foo";',
+    // The ordinary word, and the private tracker the eng rules own:
+    "the engineering team shipped it",
+    "filed under cinatra-ai/engineering tracker",
+  ];
+  for (const line of misses) {
+    assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("exactly ONE rule owns each private proof-image reference form (no double-flag)", () => {
+  // The path form is SLG_PRIVATE_REPO_REF's; the bare name is
+  // SLG_PRIVATE_PROOFS_REF's. Neither may claim the other's form, under either
+  // the base profile or the strict superset.
+  for (const profile of ["default", "public-strict"]) {
+    const rules = buildRules({}, profile, null);
+    for (const form of [
+      "cinatra-ai/engineering-proofs-private",
+      "engineering-proofs-private",
+      "@cinatra-ai/engineering-proofs-private",
+    ]) {
+      const total = rules.reduce((n, r) => n + matchRule(r, form), 0);
+      assert.equal(total, 1, `exactly one rule must flag ${JSON.stringify(form)} under ${profile}`);
+    }
+  }
+});
+
+test("the PUBLIC proof-image twin passes ALL rules under every profile", () => {
+  // It is public and cited constantly; no profile may flag it, in any form.
+  const publicForms = [
+    "cinatra-ai/engineering-proofs",
+    "engineering-proofs",
+    "https://github.com/cinatra-ai/engineering-proofs/blob/main/shot.png",
+    "https://github.com/cinatra-ai/engineering-proofs/issues/4",
+    "embed the picture from cinatra-ai/engineering-proofs",
+  ];
+  for (const profile of ["default", "ops-docs", "public-strict"]) {
+    const rules = buildRules({}, profile, null);
+    for (const form of publicForms) {
+      const total = rules.reduce((n, r) => n + matchRule(r, form), 0);
+      assert.equal(total, 0, `no rule may flag ${JSON.stringify(form)} under ${profile}`);
+    }
+  }
+});
+
+test("SLG_PRIVATE_PROOFS_REF can be allowlisted on a single line via config.lineExcludes", () => {
+  const withAllow = buildRules(
+    { lineExcludes: ["^// PUBLIC-OK: the twin of engineering-proofs-private$"] },
+    "default",
+    null,
+  );
+  const rule = withAllow.find((r) => r.id === "SLG_PRIVATE_PROOFS_REF");
+  assert.equal(matchRule(rule, "// PUBLIC-OK: the twin of engineering-proofs-private"), 0, "allowlisted line is excused");
+  assert.ok(matchRule(rule, "a different engineering-proofs-private reference") >= 1, "a different line still flags");
+});
+
+// --------------------------------------------------------------------------
+// The DYNAMIC lane: the repository-visibility probe.
+// Every test here installs a stub fetch, so the suite makes no network call and
+// stays dependency-free. `calls` records what the stub was actually asked.
+// --------------------------------------------------------------------------
+
+function stubFetch(responder) {
+  const calls = [];
+  setProbeFetch(async (url, init) => {
+    calls.push({ url, init });
+    return responder(url, init);
+  });
+  return calls;
+}
+function apiResponse(status, body) {
+  return { status, json: async () => body };
+}
+// One nominated candidate, shaped exactly as scanFile emits it.
+function candidate(name, extra = {}) {
+  return { rule: PROBE_RULE_ID, file: "note.ts", line: 7, column: 1, match: `cinatra-ai/${name}`, snippet: `see cinatra-ai/${name}`, ...extra };
+}
+function probeCtx(overrides = {}) {
+  return makeProbeContext({ token: "t0ken", knownPublic: new Set(), apiBase: "https://api.example.test", ...overrides });
+}
+
+test("the probe rule is MODE-gated, never profile-gated", () => {
+  // Absent from every profile's static rule set — its regex nominates public
+  // repositories too, so it must not run without a resolver behind it.
+  for (const p of ["default", "ops-docs", "ts-monorepo", "public-strict"]) {
+    const ids = new Set(buildRules({}, p, null).map((r) => r.id));
+    assert.equal(ids.has(PROBE_RULE_ID), false, `must be absent under ${p} without the probe opt-in`);
+    const probeIds = new Set(buildRules({}, p, null, { probe: true }).map((r) => r.id));
+    assert.ok(probeIds.has(PROBE_RULE_ID), `must be present under ${p} with the probe opt-in`);
+  }
+});
+
+test("the probe rule nominates any org path form, but never the npm scope", () => {
+  const rule = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  for (const line of [
+    "a brand new cinatra-ai/some-new-repo reference",
+    "https://github.com/cinatra-ai/some-new-repo/issues/4",
+    "see cinatra-ai/some-new-repo#4 for context",
+    "public ref cinatra-ai/cinatra#231 stays",           // nominated, cleared by the API
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `should nominate: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    'import { x } from "@cinatra-ai/design";',           // the load-bearing npm-scope carve-out
+    'const m = require("@cinatra-ai/marketplace-sdk");',
+    "just the cinatra-ai org name with no path",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `should NOT nominate: ${JSON.stringify(line)}`);
+  }
+  // Sentence-final punctuation is not part of the name (it would 404 as a
+  // repository that does not exist), but an internal dot is.
+  const nameOf = (line) => {
+    const re = new RegExp(rule.re.source, rule.re.flags);
+    return re.exec(line)[0].split("/")[1];
+  };
+  assert.equal(nameOf("shipped in cinatra-ai/ci."), "ci");
+  assert.equal(nameOf("shipped in cinatra-ai/ci, then."), "ci");
+  assert.equal(nameOf("see cinatra-ai/some.repo.js for it"), "some.repo.js");
+  assert.equal(nameOf("see cinatra-ai/some-new-repo#4"), "some-new-repo");
+});
+
+test("probe: a PUBLIC repository produces no finding", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: false }));
+  const out = await resolveProbeFindings([candidate("some-new-repo")], probeCtx());
+  assert.deepEqual(out, []);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/repos\/cinatra-ai\/some-new-repo$/);
+  assert.equal(calls[0].init.headers.authorization, "Bearer t0ken");
+});
+
+test("probe: a PRIVATE repository (200 private:true) produces a finding", async () => {
+  stubFetch(() => apiResponse(200, { private: true }));
+  const out = await resolveProbeFindings([candidate("some-new-repo")], probeCtx());
+  assert.equal(out.length, 1);
+  assert.equal(out[0].rule, PROBE_RULE_ID);
+  assert.equal(out[0].match, "cinatra-ai/some-new-repo");
+  assert.match(out[0].reason, /private/i);
+});
+
+test("probe: a 404 produces a finding (private or nonexistent for this token)", async () => {
+  stubFetch(() => apiResponse(404, { message: "Not Found" }));
+  const out = await resolveProbeFindings([candidate("invisible-repo")], probeCtx());
+  assert.equal(out.length, 1);
+  assert.equal(out[0].rule, PROBE_RULE_ID);
+  assert.match(out[0].reason, /404/);
+});
+
+test("probe: a network error is FAIL-CLOSED, as its own finding naming the cause", async () => {
+  stubFetch(() => { throw new Error("ECONNRESET"); });
+  const out = await resolveProbeFindings([candidate("some-new-repo")], probeCtx());
+  assert.equal(out.length, 1, "a run that cannot verify must never pass the reference");
+  assert.equal(out[0].rule, PROBE_ERROR_RULE_ID, "unresolved is a DISTINCT finding, not a leak verdict");
+  assert.match(out[0].reason, /ECONNRESET/);
+  assert.match(out[0].snippet, /unresolved/);
+});
+
+test("probe: a rate limit and a malformed response are fail-closed the same way", async () => {
+  for (const [status, body, cause] of [[403, {}, /rate limit/i], [429, {}, /rate limit/i], [200, { name: "x" }, /malformed/i]]) {
+    stubFetch(() => apiResponse(status, body));
+    const out = await resolveProbeFindings([candidate("some-new-repo")], probeCtx());
+    assert.equal(out.length, 1, `status ${status} must produce a finding`);
+    assert.equal(out[0].rule, PROBE_ERROR_RULE_ID, `status ${status} must be an unresolved finding`);
+    assert.match(out[0].reason, cause);
+  }
+});
+
+test("probe: a committed-cache hit clears the reference with NO API call", async () => {
+  const calls = stubFetch(() => apiResponse(500, {}));
+  const ctx = probeCtx({ knownPublic: new Set(["cinatra"]) });
+  const out = await resolveProbeFindings([candidate("cinatra")], ctx);
+  assert.deepEqual(out, []);
+  assert.equal(calls.length, 0, "the cache must be consulted BEFORE any call");
+  assert.equal(ctx.calls, 0);
+});
+
+test("probe: each distinct name costs exactly one call (memoised per run)", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: true }));
+  const ctx = probeCtx();
+  const out = await resolveProbeFindings(
+    [candidate("repo-a"), candidate("repo-a", { line: 9 }), candidate("repo-b")],
+    ctx,
+  );
+  assert.equal(out.length, 3, "every reference is still reported");
+  assert.equal(calls.length, 2, "but only distinct names are fetched");
+  assert.equal(ctx.calls, 2);
+});
+
+test("probe: the offline rules' names and the functional targets are never probed", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: true }));
+  // `ops` and `wp-theme` are named on purpose; every PRIVATE_REPO_NAMES member is
+  // already owned by SLG_PRIVATE_REPO_REF, so probing would double-flag it.
+  const skipped = ["ops", "wp-theme", "engineering", ...PRIVATE_REPO_NAMES];
+  const out = await resolveProbeFindings(skipped.map((n) => candidate(n)), probeCtx());
+  assert.deepEqual(out, [], "no probe finding for an exempt or already-owned name");
+  assert.equal(calls.length, 0, "and not one API call spent on them");
+});
+
+test("PROBE_EXEMPT_NAMES covers the whole offline list (the two stay in step)", () => {
+  for (const n of PRIVATE_REPO_NAMES) {
+    assert.ok(PROBE_EXEMPT_NAMES.has(n), `${n} is on the offline list but not exempt from the probe`);
+  }
+  for (const n of ["ops", "wp-theme", "engineering"]) {
+    assert.ok(PROBE_EXEMPT_NAMES.has(n), `${n} must stay exempt from the probe`);
+  }
+});
+
+test("probe: an unauthenticated run sends no authorization header", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: false }));
+  await resolveProbeFindings([candidate("some-new-repo")], probeCtx({ token: "" }));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].init.headers.authorization, undefined);
+});
+
+test("probe: resolveRepoVisibility never returns public without an explicit public answer", async () => {
+  for (const [status, body] of [[404, {}], [200, { private: true }], [500, {}], [403, {}], [200, null]]) {
+    stubFetch(() => apiResponse(status, body));
+    const v = await resolveRepoVisibility("some-new-repo", probeCtx());
+    assert.notEqual(v.state, "public", `status ${status} must not resolve public`);
+  }
+  stubFetch(() => apiResponse(200, { private: false }));
+  assert.equal((await resolveRepoVisibility("some-new-repo", probeCtx())).state, "public");
+});
+
+test("the committed public-repos cache parses and holds only confirmed-public names", () => {
+  const loaded = loadKnownPublicRepos(path.join(import.meta.dirname, "..", "..", "config", "public-repos.json"));
+  assert.ok(loaded.names.size >= 1, "the cache must load");
+  // It is a latency cache, never an authority for "private": nothing the offline
+  // list calls private, and nothing the probe exempts, may sit in it.
+  for (const n of loaded.names) {
+    assert.equal(PROBE_EXEMPT_NAMES.has(n), false, `${n} cannot be both cached-public and privately owned`);
   }
 });
 

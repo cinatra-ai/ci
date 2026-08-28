@@ -14,6 +14,22 @@
  *     very markers it detects) is bracketed by sentinel comments and skipped on
  *     the gate's own file; dedicated fixtures + baselines are path-exempt.
  *
+ * Repository-visibility detection runs in ONE of two modes:
+ *   - OFFLINE (the default, and what `--offline` forces): the hard-coded
+ *     PRIVATE_REPO_NAMES list is the whole authority. Chosen automatically when
+ *     no token is present, because unauthenticated API calls are rate-limited
+ *     hard enough that a fail-closed probe would red every caller. This is also
+ *     the only mode that can judge the BARE-name forms, which carry no org path
+ *     for an API to resolve.
+ *   - PROBE (a token in GITHUB_TOKEN / GH_TOKEN, or `--probe` to force it
+ *     unauthenticated): the list still runs, and every OTHER `<org>/<name>`
+ *     token on a gated line is additionally resolved against the GitHub API —
+ *     so a repository created after the last list edit is caught. Public => no
+ *     finding. Private, 404 (what a private-or-absent repo returns to a token
+ *     without access), or ANY unresolved answer => a finding. The probe never
+ *     guesses "public": a network error, a rate limit and a malformed response
+ *     are all fail-closed, reported with their cause.
+ *
  * Zero runtime dependencies (node builtins only).
  */
 import { execFileSync, execSync } from "node:child_process";
@@ -72,6 +88,28 @@ const PRIVATE_EXACT = new Set([".github/CODEOWNERS"]);
 // Doc files are scanned but findings dropped (they legitimately reference history).
 const EXEMPT_FILE_BASENAMES = new Set(["CLAUDE.md", "AGENTS.md", "MEMORY.md", "README.md", "CHANGELOG.md"]);
 const EXEMPT_DIR_PREFIXES = ["docs/"];
+
+// The OFFLINE authority for repository visibility: private cinatra-ai repository
+// names, used to build SLG_PRIVATE_REPO_REF's alternation below. It is ONE list
+// so the probe lane can subtract it mechanically (PROBE_EXEMPT_NAMES) instead of
+// trusting a second hand-maintained copy to stay in step.
+const PRIVATE_REPO_NAMES = [
+  "design", "marketplace", "website", "cinatra-business", "create-cinatra-extension",
+  "dev-skills-store", "extension-release-tooling", "legal-archive-skills", "renovate-config",
+  "dev-internal-archive", "cinatra-poc", "cinatra-oss-transit", "cinatra-claude-memory",
+  "engineering-claude-plugin", "engineering-proofs-private", "marketing-explainer-video",
+  "major-release-workflow", "blog-content-workflow",
+];
+
+// Names the visibility PROBE must never resolve, and why:
+//   - every PRIVATE_REPO_NAMES member — SLG_PRIVATE_REPO_REF already owns it
+//     offline, so probing would double-flag the same token.
+//   - `engineering` — owned by SLG_PRIVATE_ENG_REF, same reason.
+//   - `ops` and `wp-theme` — private, but REQUIRED functional targets (a
+//     `uses:`/`repository:` dispatch target; a git remote an installation token
+//     is scoped to). They are named on purpose, so neither the offline list nor
+//     the probe may flag them; the probe would otherwise undo that carve-out.
+const PROBE_EXEMPT_NAMES = new Set([...PRIVATE_REPO_NAMES, "engineering", "ops", "wp-theme"]);
 
 const RULES = [
   {
@@ -277,13 +315,92 @@ const RULES = [
     //     in many public workflows (`uses: cinatra-ai/ops/...`, `repository:
     //     cinatra-ai/ops`). Flagging it would be all-false-positive, so it is
     //     omitted from the regex entirely.
+    //   - `wp-theme` — the same functional class as `ops`: the staging pipeline
+    //     names `cinatra-ai/wp-theme` as a git remote, as the repository an
+    //     installation token is scoped to, and in its own operator error text.
+    //     Those references are load-bearing, not leaks.
+    //   - the PUBLIC proof-image host — public repos cite it constantly, so only
+    //     its private twin (the same name plus a `-private` suffix) is in the
+    //     alternation. The trailing `(?![A-Za-z0-9_-])` is what keeps the two
+    //     apart: the public name can never match the private alternative,
+    //     because that alternative demands the whole suffix.
+    // A member whose name merely BEGINS with the tracker's name is not the
+    // tracker: SLG_PRIVATE_ENG_REF closes that name with `(?![A-Za-z0-9_-])`,
+    // so it never claims a hyphen-extended sibling. Those repos belong here,
+    // and nothing is double-flagged.
     // The trailing `(?![A-Za-z0-9_-])` keeps look-alikes like
     // `cinatra-ai/design-system-foo` from tripping. Deliberately-public refs (if
     // any ever arise) use the same config.lineExcludes / config.exemptFileBasenames
     // allowlist mechanism the other rules honor.
     id: "SLG_PRIVATE_REPO_REF",
     description: "Reference to a private cinatra-ai repository (bare GitHub path-form)",
-    re: /(?<![@A-Za-z0-9_-])cinatra-ai\/(design|marketplace|website|cinatra-business|create-cinatra-extension|dev-skills-store|extension-release-tooling|legal-archive-skills|renovate-config|dev-internal-archive|cinatra-poc|cinatra-oss-transit|cinatra-claude-memory)(?![A-Za-z0-9_-])/gi,
+    re: new RegExp(`(?<![@A-Za-z0-9_-])cinatra-ai\\/(${PRIVATE_REPO_NAMES.join("|")})(?![A-Za-z0-9_-])`, "gi"),
+  },
+  {
+    // The DYNAMIC lane. The list above can only know the repositories someone
+    // remembered to add; this rule catches EVERY other `cinatra-ai/<name>` token
+    // and asks GitHub whether that repository is actually public, so a private
+    // repository created after the last list edit is still caught.
+    //
+    // The regex only NOMINATES a candidate — it deliberately matches public
+    // repositories too. Nothing here is a finding until resolveProbeFindings()
+    // has a verdict, and a candidate that resolves PUBLIC is dropped. See that
+    // function for the fail-closed contract; a candidate is only ever probed
+    // after the ratchet, so the cost is bounded by the lines a change adds.
+    //
+    // Boundaries mirror SLG_PRIVATE_REPO_REF exactly, including the load-bearing
+    // `@` in the lookbehind that keeps the vendored `@cinatra-ai/<x>` npm scope
+    // out, and the trailing `(?![A-Za-z0-9_-])` that still admits the `#<n>` /
+    // `/issues/<n>` tails. The name shape is GitHub's, minus a trailing `.`:
+    // a repository name may CONTAIN a dot, so `<org>/<name>.js` must resolve
+    // whole, but a name may not END in one — without that the sentence-final
+    // period in prose ("… see <org>/<repo>.") would be probed as part of the
+    // name and 404 as a repository that does not exist.
+    // PROBE_EXEMPT_NAMES (subtracted in the resolver, not here, so the skip
+    // reason survives in one readable place) keeps the offline rules' tokens and
+    // the functional dispatch targets out of this lane.
+    id: "SLG_PRIVATE_REPO_PROBE",
+    description: "Reference to a repository this token cannot see as public",
+    re: /(?<![@A-Za-z0-9_-])cinatra-ai\/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?)(?![A-Za-z0-9_-])/gi,
+    probe: true,
+  },
+  {
+    // Bare-NAME form of the private proof-image repository, with no org prefix —
+    // the sibling of SLG_PRIVATE_REPO_REF's path form, and the reason that form
+    // alone is not enough. The org runs a TWIN pair: a PUBLIC image host that
+    // public repos cite constantly, and a PRIVATE repository whose name is the
+    // public one plus a `-private` suffix. Only the private name is a leak, and
+    // unlike the bare `engineering#<n>` tracker citation that
+    // SLG_PRIVATE_ENG_REF_STRICT has to confine to `public-strict`, this name has
+    // NO sanctioned use that writes it into committed source anywhere. So the
+    // rule is UNIVERSAL — every profile runs it — and needs no strict-only twin.
+    //
+    // Boundaries are LOAD-BEARING and follow SLG_PRIVATE_ENG_REF_STRICT exactly.
+    // The negative lookbehind `(?<![@A-Za-z0-9_/-])` rejects an alnum / `_` / `-`
+    // immediately before the token, so a longer identifier that merely ENDS in
+    // the name does not trip; it also rejects `/` and `@`, which is what leaves
+    // the org-path form SOLELY to SLG_PRIVATE_REPO_REF (no double-flag) and keeps
+    // the vendored `@cinatra-ai/<x>` npm scope out, the same carve-out that rule
+    // documents. The trailing `(?![A-Za-z0-9_-])` keeps a longer name that merely
+    // STARTS with it from tripping, while still admitting the `#<n>` and
+    // `/issues/<n>` tails. Because the regex demands the whole `-private` suffix,
+    // the PUBLIC twin never matches — citing it stays free, which is the point of
+    // splitting the pair. A deliberately-public reference (if one ever arises)
+    // uses the same config.lineExcludes / config.exemptFileBasenames allowlist
+    // mechanism every other rule honors.
+    //
+    // The FIRST alternative is the one deliberate exception to the npm-scope
+    // carve-out, and it is written as a LITERAL rather than as a hole in the
+    // lookbehind: the carve-out exists because `@<org>/<x>` names a real vendored
+    // workspace package, and no package will ever carry THIS name. Spelling the
+    // one exception out leaves the general rule — every other `@<org>/<x>` is a
+    // package scope, never a repo reference — exactly as strict as it was. It
+    // shares the trailing lookahead, so `@<org>/<name>-foo` still does not trip,
+    // and because it consumes the whole token the bare alternative cannot also
+    // match inside it: one form, one finding.
+    id: "SLG_PRIVATE_PROOFS_REF",
+    description: "Bare name of the private proof-image repository",
+    re: /(?:@cinatra-ai\/engineering-proofs-private|(?<![@A-Za-z0-9_/-])engineering-proofs-private)(?![A-Za-z0-9_-])/gi,
   },
   {
     // Descriptive prose naming the private design repository (the human-readable
@@ -295,6 +412,9 @@ const RULES = [
 ];
 // Single-prefix requirement IDs are project-specific; supply via config.reqIdSinglePrefixes.
 const REQ_ID_SINGLE_RULE_ID = "SLG_REQ_ID_SINGLE";
+// The organization the probe resolves names against. Held as a constant so no
+// literal org path form appears OUTSIDE this self-exempt region.
+const PROBE_ORG = "cinatra-ai";
 // ===================== SOURCE_LEAK_RULES_END =====================
 
 const RULE_DEFS_MARKER_BEGIN = "SOURCE_LEAK_RULES" + "_BEGIN";
@@ -332,8 +452,14 @@ function loadConfig(configPath) {
   catch (e) { return fail(`config is not valid JSON (${configPath}): ${e.message}`); }
 }
 
-function buildRules(config, profile, onlyRules) {
-  const rules = RULES.map((r) => ({ ...r, profiles: r.profiles || VALID_PROFILES }));
+// `options.probe` opts the DYNAMIC lane in. Probe rules are gated by MODE, not
+// by profile: they are useless without a resolver, and their regex nominates
+// public repositories too, so leaving them in the static rule set would turn
+// every ordinary public reference into a finding.
+function buildRules(config, profile, onlyRules, options = {}) {
+  const rules = RULES
+    .filter((r) => (options.probe ? true : !r.probe))
+    .map((r) => ({ ...r, profiles: r.profiles || VALID_PROFILES }));
 
   const singlePrefixes = Array.isArray(config.reqIdSinglePrefixes) ? config.reqIdSinglePrefixes : [];
   if (singlePrefixes.length) {
@@ -386,6 +512,133 @@ function buildRules(config, profile, onlyRules) {
     });
   }
   return active;
+}
+
+// ---------------------------------------------------------------------------
+// The visibility probe (the DYNAMIC lane).
+//
+// A caller runs this gate with its OWN repository's GITHUB_TOKEN, which cannot
+// enumerate the organization's private repositories — so there is no list to
+// fetch. The probe asks a different, answerable question, once per distinct
+// name: "can this token see that repository as public?". Only an explicit
+// public answer clears a reference.
+// ---------------------------------------------------------------------------
+const PROBE_RULE_ID = "SLG_PRIVATE_REPO_PROBE";
+const PROBE_ERROR_RULE_ID = "SLG_PRIVATE_REPO_PROBE_ERROR";
+const DEFAULT_API_BASE = "https://api.github.com";
+// A gate that hangs is worse than a gate that blocks: an unanswered request
+// times out into the same fail-closed branch as a refused one.
+const PROBE_TIMEOUT_MS = 10_000;
+
+// Module-level injection point for the probe's one HTTP call. Production leaves
+// it null and uses the global fetch; the tests install a stub so the suite stays
+// hermetic and dependency-free.
+let probeFetchImpl = null;
+function setProbeFetch(fn) { probeFetchImpl = fn || null; }
+function probeFetch(url, init) {
+  const impl = probeFetchImpl || globalThis.fetch;
+  if (typeof impl !== "function") throw new Error("no fetch implementation available");
+  return impl(url, init);
+}
+
+// The committed known-PUBLIC cache, consulted BEFORE any call. It is a latency
+// cache, never an authority for "private": a name absent from it is resolved
+// live, and only names that are public by construction (the OSS product repos)
+// belong in it — a repository that later turns private would keep clearing while
+// its entry stands, so entries are removed, not accumulated.
+function loadKnownPublicRepos(explicitPath) {
+  const p = explicitPath
+    || (SCANNER_REAL ? path.join(path.dirname(SCANNER_REAL), "..", "config", "public-repos.json") : "");
+  if (!p) return { names: new Set(), path: "", note: "no cache path resolved" };
+  let raw;
+  try { raw = fs.readFileSync(p, "utf8"); }
+  catch { return { names: new Set(), path: p, note: "cache absent (every reference resolves live)" }; }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (e) { return fail(`public-repos cache is not valid JSON (${p}): ${e.message}`); }
+  const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.public) ? parsed.public : null);
+  if (!list) return fail(`public-repos cache must be an array, or an object with a "public" array (${p})`);
+  return { names: new Set(list.map((s) => String(s).toLowerCase())), path: p, note: `${list.length} cached public name(s)` };
+}
+
+function makeProbeContext({ token, knownPublic, apiBase, timeoutMs }) {
+  return {
+    token: token || "", knownPublic: knownPublic || new Set(),
+    apiBase: apiBase || DEFAULT_API_BASE, timeoutMs: timeoutMs || PROBE_TIMEOUT_MS,
+    cache: new Map(), calls: 0,
+  };
+}
+
+// One verdict per distinct name: { state: "public" | "private" | "error", reason }.
+// Every non-public branch — including every branch that failed to produce an
+// answer — is a blocking state. There is no path that returns "public" without
+// the API having said so (or the committed cache vouching for it).
+async function resolveRepoVisibility(name, ctx) {
+  if (ctx.knownPublic.has(name)) return { state: "public", reason: "listed in the committed public-repos cache" };
+  if (ctx.cache.has(name)) return ctx.cache.get(name);
+
+  let verdict;
+  try {
+    ctx.calls++;
+    const headers = { accept: "application/vnd.github+json", "user-agent": "source-leak-gate" };
+    if (ctx.token) headers.authorization = `Bearer ${ctx.token}`;
+    const res = await probeFetch(`${ctx.apiBase}/repos/${PROBE_ORG}/${encodeURIComponent(name)}`, {
+      headers,
+      signal: AbortSignal.timeout(ctx.timeoutMs || PROBE_TIMEOUT_MS),
+    });
+    const status = res && typeof res.status === "number" ? res.status : null;
+    if (status === 200) {
+      let body = null;
+      try { body = await res.json(); } catch { body = null; }
+      if (!body || typeof body.private !== "boolean") {
+        verdict = { state: "error", reason: "malformed API response (200 without a boolean `private`)" };
+      } else {
+        verdict = body.private
+          ? { state: "private", reason: "the API reports the repository private" }
+          : { state: "public", reason: "the API reports the repository public" };
+      }
+    } else if (status === 404) {
+      // What a private repository returns to a token without access — and what
+      // a name that does not exist returns. Both block: a gate that cannot see
+      // a repository must not vouch for it.
+      verdict = { state: "private", reason: "404 — private or nonexistent for this token" };
+    } else if (status === 401 || status === 403 || status === 429) {
+      verdict = { state: "error", reason: `not resolvable (HTTP ${status} — credentials or rate limit)` };
+    } else {
+      verdict = { state: "error", reason: `unexpected API status ${status === null ? "(no response)" : status}` };
+    }
+  } catch (e) {
+    verdict = { state: "error", reason: `network error: ${e.message}` };
+  }
+  ctx.cache.set(name, verdict);
+  return verdict;
+}
+
+function probeRepoName(match) {
+  const name = String(match || "").split("/")[1];
+  return name ? name.toLowerCase() : "";
+}
+
+// Turns nominated candidates into findings. A candidate the offline rules
+// already own, or one of the deliberately-named functional targets, is dropped
+// here (one readable place, with PROBE_EXEMPT_NAMES explaining each). A public
+// verdict is dropped. Everything else becomes a finding — an unresolved one
+// under its own rule id, carrying the cause, so a rate-limited run reads as
+// "could not verify", never as a leak and never as a pass.
+async function resolveProbeFindings(candidates, ctx) {
+  const out = [];
+  for (const f of candidates) {
+    const name = probeRepoName(f.match);
+    if (!name || PROBE_EXEMPT_NAMES.has(name)) continue;
+    const verdict = await resolveRepoVisibility(name, ctx);
+    if (verdict.state === "public") continue;
+    if (verdict.state === "private") {
+      out.push({ ...f, reason: verdict.reason });
+    } else {
+      out.push({ ...f, rule: PROBE_ERROR_RULE_ID, reason: verdict.reason, snippet: `unresolved (${verdict.reason}): ${f.snippet}` });
+    }
+  }
+  return out;
 }
 
 function listTrackedFiles() {
@@ -614,7 +867,7 @@ function buildSummary(findings, gateFindings, profile, scannedFileCount) {
   };
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const profile = args.profile || "default";
   if (!VALID_PROFILES.includes(profile)) fail(`unknown --profile '${profile}' (valid: ${VALID_PROFILES.join(", ")})`);
@@ -626,7 +879,17 @@ function main() {
   const includeTests = args["include-tests"] !== "false";
   const diffBaseEnv = args["diff-base-env"] || DEFAULT_DIFF_BASE_ENV;
   const config = loadConfig(args.config);
-  const rules = buildRules(config, profile, args.rules || null);
+
+  // Mode selection (see the header). `--offline` always wins; otherwise a token
+  // enables the probe, and `--probe` forces it on unauthenticated.
+  const probeToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+  const probeEnabled = !args.offline && (Boolean(probeToken) || Boolean(args.probe));
+  const knownPublic = probeEnabled ? loadKnownPublicRepos(args["public-repos"]) : null;
+  const probeCtx = probeEnabled
+    ? makeProbeContext({ token: probeToken, knownPublic: knownPublic.names, apiBase: args["api-base"] || DEFAULT_API_BASE })
+    : null;
+
+  const rules = buildRules(config, profile, args.rules || null, { probe: probeEnabled });
 
   const scanExtensions = new Set([...DEFAULT_SCAN_EXTENSIONS, ...((config.scanExtensions) || [])]);
   const skipDirs = new Set([...DEFAULT_SKIP_DIRS, ...((config.skipDirs) || [])]);
@@ -682,6 +945,13 @@ function main() {
     }
   }
 
+  // The probe lane is kept OUT of `findings` until it has verdicts: a nominated
+  // candidate is not a finding (most are ordinary public references), so it must
+  // never reach the summary total, the baseline writer or the file allowlist as
+  // one. Resolved verdicts are merged back below.
+  const probeCandidates = findings.filter((f) => f.rule === PROBE_RULE_ID);
+  findings = findings.filter((f) => f.rule !== PROBE_RULE_ID);
+
   let gateFindings = findings;
   let ratchetNote = "";
   if (ratchetMode === "line") {
@@ -700,6 +970,26 @@ function main() {
     if (r.error) fail(r.error);
     gateFindings = r.blockers; ratchetNote = r.note;
   }
+  // Resolve the probe lane AFTER the ratchet: only references on lines this
+  // change actually gates are worth an API call, which is what bounds the call
+  // count to the size of the diff. In every non-line mode each candidate
+  // resolves, matching how those modes treat the static rules.
+  let probeNote = "";
+  if (probeEnabled) {
+    const gatedCandidates = ratchetMode === "line"
+      ? applyLineRatchet(probeCandidates.filter((f) => f.line > 0), diffBaseEnv)
+      : probeCandidates;
+    const resolved = await resolveProbeFindings(gatedCandidates, probeCtx);
+    // Both lists are rebuilt, never mutated in place: in `off` mode gateFindings
+    // IS findings (same reference), so a push into one would land in both and
+    // report every resolved reference twice.
+    findings = [...findings, ...resolved];
+    gateFindings = [...gateFindings, ...resolved];
+    probeNote = `visibility probe: ${gatedCandidates.length} reference(s), ${probeCtx.cache.size} name(s) resolved, ${probeCtx.calls} API call(s); ${knownPublic.note}`;
+  } else {
+    probeNote = `visibility probe: offline (${args.offline ? "--offline" : "no token in GITHUB_TOKEN/GH_TOKEN"}) — the built-in private-repository list is the only authority`;
+  }
+
   if (args["write-gate-baseline"]) writeGateBaseline(findings, args["write-gate-baseline"]);
 
   if (format === "json") {
@@ -707,6 +997,7 @@ function main() {
   } else if (!quiet) {
     for (const f of gateFindings) process.stdout.write(`${f.rule}\t${f.file}:${f.line}:${f.column}\t${f.match}\t${f.snippet}\n`);
     process.stderr.write(`Scanned ${candidates.length} files, ${gateFindings.length} gated finding(s)` + (ratchetNote ? ` (${ratchetNote})` : "") + "\n");
+    process.stderr.write(`  ${probeNote}\n`);
     for (const [r, c] of Object.entries(countBy(gateFindings, (f) => f.rule)).sort((a, b) => b[1] - a[1])) {
       process.stderr.write(`  ${r}: ${c}\n`);
     }
@@ -726,8 +1017,12 @@ function isMainModule() {
   }
 }
 if (isMainModule()) {
-  try { main(); }
-  catch (e) { console.error("[source-leak-gate] scanner failed:", e.message); process.exit(2); }
+  main().catch((e) => { console.error("[source-leak-gate] scanner failed:", e.message); process.exit(2); });
 }
 
-export { buildRules, scanFile, RULES, readRuleDefRange };
+export {
+  buildRules, scanFile, RULES, readRuleDefRange,
+  setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
+  loadKnownPublicRepos, PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES,
+  PROBE_RULE_ID, PROBE_ERROR_RULE_ID,
+};

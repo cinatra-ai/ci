@@ -1,0 +1,13 @@
+{
+  "$comment": "Latency cache for the source-leak gate's repository-visibility probe: names the probe may clear WITHOUT an API call. It is not an authority for 'private' — a name absent from this list is resolved live against the API, so the list may be short and still be correct. It is deliberately NOT a mirror of every public repository in the organization: an entry that goes private later would keep clearing while it stands, so only repositories that are public by construction (the OSS product surfaces every caller cites constantly) belong here, and an entry is REMOVED rather than a new one accumulated when that stops being true. Each name below was confirmed public against the API when it was added.",
+  "public": [
+    "ci",
+    "cinatra",
+    "cinatra-cli",
+    "claude-plugin",
+    "docs",
+    "assistant-skills",
+    "engineering-proofs",
+    "mcp-server-connector"
+  ]
+}

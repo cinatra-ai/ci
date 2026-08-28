@@ -95,9 +95,18 @@ jobs:
         run: |
           printf 'ref=%s\n' "$(bash .source-leak-gate/scripts/resolve-diff-base.sh)" >> "$GITHUB_OUTPUT"
 
+      # GH_TOKEN turns the repository-visibility probe on: the gate resolves each
+      # `<org>/<name>` reference on a gated line against the API instead of
+      # trusting only its built-in private-repository list. The caller's own
+      # job token is exactly the right credential — it cannot enumerate the
+      # organization's private repositories, and it does not need to: a
+      # repository it cannot see as public is a finding. Without this env the
+      # gate runs OFFLINE (the built-in list only), which is also the fallback
+      # for the bare-name forms no API can resolve.
       - name: Run gate
         env:
           SOURCE_LEAK_DIFF_BASE: ${{ steps.base.outputs.ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           node .source-leak-gate/scripts/source-leak-gate.mjs \
             --profile "${{ inputs.profile }}" \

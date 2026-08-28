@@ -153,6 +153,37 @@ name a public spec/protocol (e.g. "the Truthful Attribution protocol"). For a
 genuinely-public reference, allowlist the single line via `config.lineExcludes`
 (full-line-anchored) or the whole file via `config.exemptFileBasenames`.
 
+### Private-repository references
+
+Two lanes decide whether an `<org>/<name>` reference names a repository the
+public may see:
+
+- **the built-in list** — a hard-coded set of private repository names, always
+  active. It is the only lane that can judge the *bare-name* forms (a name with
+  no org path, which no API can resolve), and the only lane a run without a
+  token has.
+- **the visibility probe** — active when the gate is given a token in
+  `GH_TOKEN` / `GITHUB_TOKEN` (the reusable workflow passes the caller's own
+  `github.token`). Every *other* `<org>/<name>` reference on a **gated** line is
+  resolved once against the GitHub API, so a repository created after the last
+  edit to the list is still caught. The caller's job token cannot enumerate an
+  organization's private repositories, and does not need to: the question asked
+  is only "can this token see that repository as public?".
+
+The probe never guesses. A repository the API reports public produces no
+finding; private, `404` (what a private *or* absent repository returns to a
+token without access), a rate limit, a network error and a malformed response
+all produce one — the unresolved cases under their own rule id
+(`SLG_PRIVATE_REPO_PROBE_ERROR`), naming the cause, so a run that could not
+verify never reads as a pass. Verdicts are memoised per run, and
+[`config/public-repos.json`](config/public-repos.json) is a small committed
+latency cache of names that may be cleared without a call.
+
+Pass `--offline` to force the list-only lane (also what happens with no token),
+and `--probe` to force the probe on unauthenticated. Deliberately-public
+references are allowlisted the same way every other rule allows them, via
+`config.lineExcludes` or `config.exemptFileBasenames`.
+
 ### Per-repo config
 
 See [`config/example-config.json`](config/example-config.json). A config may add
