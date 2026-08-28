@@ -10,7 +10,7 @@ import {
   normalizeRepoName, orgPathRepoName, functionalRefCovers,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
-  PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,
+  PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
 } from "../source-leak-gate.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
@@ -111,14 +111,14 @@ test("SLG_PRIVATE_ENG_REF ships in the default profile", () => {
 test("SLG_PRIVATE_ENG_REF flags every private-tracker reference form", () => {
   const rule = byId.get("SLG_PRIVATE_ENG_REF");
   const hits = [
-    "rationale in eng#231 here",
-    "// (eng#119 §7 step 6 rollout)",
-    "per ratified spec cinatra-engineering#119 (re-scopes #116)",
-    "see cinatra-ai/cinatra-engineering#56 form",
+    "rationale in eng#0 here",
+    "// (eng#0 §7 step 6 rollout)",
+    "per ratified spec cinatra-engineering#0 (re-scopes #0)",
+    "see cinatra-ai/cinatra-engineering#0 form",
     "filed under cinatra-ai/engineering tracker",
-    "fixed in cinatra-ai/engineering#309",
-    "https://github.com/cinatra-ai/engineering/issues/343",
-    "see engineering/issues/343 directly", // the bare URL-tail form, tested independently
+    "fixed in cinatra-ai/engineering#0",
+    "https://github.com/cinatra-ai/engineering/issues/0",
+    "see engineering/issues/0 directly", // the bare URL-tail form, tested independently
   ];
   for (const line of hits) {
     assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
@@ -139,8 +139,8 @@ test("SLG_PRIVATE_ENG_REF does NOT flag public-repo references", () => {
     "the cinatra-ai/engineering_tools dir",          // underscore after `engineering`
     "cinatra-ai/engineeringx is unrelated",          // letter after `engineering`
     "reverse-engineering/issues/ is a folder",       // hyphen-prefixed `engineering`
-    "the myeng#5 token is unrelated",                // alnum before `eng#`
-    "a reeng#5 marker",                              // alnum before `eng#`
+    "the myeng#0 token is unrelated",                // alnum before `eng#`
+    "a reeng#0 marker",                              // alnum before `eng#`
   ];
   for (const line of misses) {
     assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
@@ -198,7 +198,7 @@ test("removing the default short-circuit does NOT drop any built-in rule under d
 test("under a non-strict profile the sanctioned bare `engineering#<n>` form passes ALL rules", () => {
   // The point of the scoping: a PRIVATE repo cites the tracker as `engineering#<n>`
   // and NO active rule may flag it under the profiles those repos run.
-  const sanctioned = "see engineering#231 for the rationale";
+  const sanctioned = "see engineering#0 for the rationale";
   for (const p of ["default", "ops-docs"]) {
     const rules = buildRules({}, p, null);
     const total = rules.reduce((n, r) => n + matchRule(r, sanctioned), 0);
@@ -212,9 +212,9 @@ test("under a non-strict profile the sanctioned bare `engineering#<n>` form pass
 test("SLG_PRIVATE_ENG_REF_STRICT flags the bare full-form private-tracker references", () => {
   const rule = strictById.get("SLG_PRIVATE_ENG_REF_STRICT");
   const hits = [
-    "see engineering#231 for the rationale",
-    "filed engineering#5 upstream",
-    "regressed by engineering#1099 last week",
+    "see engineering#0 for the rationale",
+    "filed engineering#0 upstream",
+    "regressed by engineering#0 last week",
     "tracked in the cinatra-engineering repo",
   ];
   for (const line of hits) {
@@ -227,11 +227,11 @@ test("SLG_PRIVATE_ENG_REF_STRICT does NOT flag public refs, look-alikes, or the 
   const misses = [
     "the engineering team shipped it",                 // common word, no #<n>
     "software engineering is a discipline",            // common word
-    "reverse-engineering#5 is unrelated",              // hyphen before
-    "re-engineering#5 marker",                          // hyphen before
-    "bioengineering#5 domain token",                    // letter before
-    "cinatra-ai/engineering#309 (universal rule owns)", // slash before -> universal's job, not double-flagged
-    "legacy note per cinatra-engineering#119",          // trailing #<n> -> universal's job, NOT double-flagged
+    "reverse-engineering#0 is unrelated",              // hyphen before
+    "re-engineering#0 marker",                          // hyphen before
+    "bioengineering#0 domain token",                    // letter before
+    "cinatra-ai/engineering#0 (universal rule owns)", // slash before -> universal's job, not double-flagged
+    "legacy note per cinatra-engineering#0",          // trailing #<n> -> universal's job, NOT double-flagged
     "cinatra-engineering-tools is a directory",         // trailing hyphen after the name
     'import x from "@cinatra-ai/engineering";',         // @-scope before
     "public ref cinatra#231 stays",                     // public repo
@@ -244,13 +244,13 @@ test("SLG_PRIVATE_ENG_REF_STRICT does NOT flag public refs, look-alikes, or the 
 
 test("SLG_PRIVATE_ENG_REF_STRICT can be allowlisted on a single line via config.lineExcludes", () => {
   const withAllow = buildRules(
-    { lineExcludes: ["^// PUBLIC-OK: historical note re engineering#5$"] },
+    { lineExcludes: ["^// PUBLIC-OK: historical note re engineering#0$"] },
     "public-strict",
     null,
   );
   const rule = withAllow.find((r) => r.id === "SLG_PRIVATE_ENG_REF_STRICT");
-  assert.equal(matchRule(rule, "// PUBLIC-OK: historical note re engineering#5"), 0, "allowlisted line is excused");
-  assert.ok(matchRule(rule, "a different engineering#5 reference") >= 1, "a different line still flags");
+  assert.equal(matchRule(rule, "// PUBLIC-OK: historical note re engineering#0"), 0, "allowlisted line is excused");
+  assert.ok(matchRule(rule, "a different engineering#0 reference") >= 1, "a different line still flags");
 });
 
 test("the gate is clean on its own source under public-strict (sentinel self-exemption)", () => {
@@ -266,8 +266,8 @@ test("SLG_PRIVATE_REPO_REF flags bare private-repo path forms", () => {
   const rule = byId.get("SLG_PRIVATE_REPO_REF");
   const hits = [
     "tokens live in cinatra-ai/design here",
-    "see cinatra-ai/marketplace#12 for the submission",
-    "https://github.com/cinatra-ai/website/issues/4",
+    "see cinatra-ai/marketplace#0 for the submission",
+    "https://github.com/cinatra-ai/website/issues/0",
     "filed in cinatra-ai/cinatra-business tracker",
     "scaffold from cinatra-ai/create-cinatra-extension",
     "see cinatra-ai/renovate-config for the preset",
@@ -285,7 +285,7 @@ test("SLG_PRIVATE_REPO_REF does NOT flag the @cinatra-ai npm scope, cinatra-ai/o
     'import { x } from "@cinatra-ai/design";',
     'const m = require("@cinatra-ai/marketplace-sdk");',
     // cinatra-ai/ops is a REQUIRED functional dispatch target, deliberately excluded:
-    "uses: cinatra-ai/ops/.github/workflows/deploy.yml",
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",
     "repository: cinatra-ai/ops",
     // engineering is owned by SLG_PRIVATE_ENG_REF, not this rule:
     "filed under cinatra-ai/engineering tracker",
@@ -308,7 +308,7 @@ test("SLG_PRIVATE_REPO_REF flags the private proof-image twin and the other priv
     "shots filed in cinatra-ai/engineering-proofs-private",
     "https://github.com/cinatra-ai/engineering-proofs-private/blob/main/shot.png",
     "https://raw.githubusercontent.com/cinatra-ai/engineering-proofs-private/main/shot.png",
-    "see cinatra-ai/engineering-proofs-private#4 for the shots",
+    "see cinatra-ai/engineering-proofs-private#0 for the shots",
     "the pack in cinatra-ai/engineering-claude-plugin",
     "assets under cinatra-ai/marketing-explainer-video",
     "retired in cinatra-ai/major-release-workflow",
@@ -355,8 +355,8 @@ test("SLG_PRIVATE_PROOFS_REF flags the bare private proof-image repository name"
   const rule = byId.get("SLG_PRIVATE_PROOFS_REF");
   const hits = [
     "pictures pushed to engineering-proofs-private",
-    "opened engineering-proofs-private#4 for the shots",
-    "see engineering-proofs-private/issues/4 directly",
+    "opened engineering-proofs-private#0 for the shots",
+    "see engineering-proofs-private/issues/0 directly",
     "engineering-proofs-private holds the originals",
     "(engineering-proofs-private) is where they land",
     // The one deliberate exception to the npm-scope carve-out: no package will
@@ -609,6 +609,24 @@ test("probe: resolveRepoVisibility never returns public without an explicit publ
   assert.equal((await resolveRepoVisibility("some-new-repo", probeCtx())).state, "public");
 });
 
+test("this repo's own gate configs never exempt the ENGINE or its FIXTURE whole-file", () => {
+  // A whole-file exemption on the engine defeats the sentinel-scoped
+  // self-protection it already has: the rule-definition region is skipped by
+  // design, and everything OUTSIDE it must still be scanned, or a future leak
+  // anywhere else in the file would be silently discarded. The fixture needs no
+  // exemption either — the engine skips it by real path on every walk.
+  for (const cfgName of ["source-leak.json", "self-check.json"]) {
+    const cfg = JSON.parse(fs.readFileSync(
+      path.join(import.meta.dirname, "..", "..", "config", cfgName), "utf8",
+    ));
+    const exempt = new Set(cfg.exemptFileBasenames || []);
+    assert.equal(exempt.has("source-leak-gate.mjs"), false,
+      `${cfgName} must not exempt the engine whole-file (the sentinel region is the exemption)`);
+    assert.equal(exempt.has("source-leak.fixture.txt"), false,
+      `${cfgName} must not exempt the fixture whole-file (the engine path-skips it)`);
+  }
+});
+
 test("the committed public-repos cache parses and holds only confirmed-public names", () => {
   const loaded = loadKnownPublicRepos(path.join(import.meta.dirname, "..", "..", "config", "public-repos.json"));
   assert.ok(loaded.names.size >= 1, "the cache must load");
@@ -650,14 +668,45 @@ test("SLG_PRIVATE_DESIGN_PHRASE does NOT flag the public-safe phrasing", () => {
 test("a dispatch target's required machine forms are excused", () => {
   const rule = byId.get("SLG_PRIVATE_REPO_REF");
   for (const line of [
-    "uses: cinatra-ai/ops/.github/workflows/deploy.yml",
+    // The reusable-workflow / action grammar GitHub actually accepts:
+    // `<org>/<repo>[/<path>]@<ref>`, path either a workflow file under
+    // .github/workflows/ or an action directory, ref one tag/sha/branch token.
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",
     'uses: "cinatra-ai/ops/.github/workflows/deploy.yml@abc123"',
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yaml@v1.2.3",
+    "uses: cinatra-ai/ops/actions/notify@v1",
+    "uses: cinatra-ai/ops@0123456789abcdef0123456789abcdef01234567",
     "repository: cinatra-ai/ops",
     "  repositories: [cinatra-ai/wp-theme]",
+    'repository: "cinatra-ai/wp-theme"',
+    "repository: cinatra-ai/ops  # the operations repository",
     'REMOTE="https://github.com/cinatra-ai/wp-theme.git"',
     "git clone https://github.com/cinatra-ai/wp-theme.git",
   ]) {
     assert.equal(matchRule(rule, line), 0, `required functional form should be excused: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the functional carve-out is EXACT: nothing may follow the repository name", () => {
+  // The defect this locks: a carve-out that stopped at the repository name and
+  // tolerated any suffix excused the very citations it exists to catch — an
+  // issue URL or an `#<n>` ref wearing a machine key as a hat. The `uses:` form
+  // is anchored by its MANDATORY `@<ref>` (GitHub rejects a ref-less cross-repo
+  // `uses:`), the `repository:` form by an explicit terminator.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "repository: cinatra-ai/ops/issues/0",
+    "repository: cinatra-ai/ops#0",
+    "uses: cinatra-ai/ops/issues/0",
+    "repository: cinatra-ai/ops/pull/0",
+    'repository: "cinatra-ai/wp-theme/issues/0"',
+    "  repositories: [cinatra-ai/wp-theme#0]",
+    // A ref-less cross-repository `uses:` is not a machine form GitHub accepts,
+    // so it is not excused either.
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yml",
+    "uses: cinatra-ai/ops",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `a suffixed key is a citation, not a machine form: ${JSON.stringify(line)}`);
   }
 });
 
@@ -669,8 +718,8 @@ test("EVERY other form of a dispatch target still flags (a name-wide exemption w
     "download the cinatra-ai/wp-theme tree at a pinned ref",
     "operators run cinatra-ai/ops by hand",
     // issue citations and browse URLs — exactly what a leak looks like:
-    "see cinatra-ai/ops#378 for the rationale",
-    "https://github.com/cinatra-ai/ops/issues/378",
+    "see cinatra-ai/ops#0 for the rationale",
+    "https://github.com/cinatra-ai/ops/issues/0",
     "https://github.com/cinatra-ai/wp-theme/blob/main/style.css",
   ]) {
     assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
@@ -681,14 +730,14 @@ test("the functional carve-out is per MATCH, not per line", () => {
   // The whole reason for replacing the name-wide exemption: one line may carry
   // a required reference AND a leaked one, and only the required one is excused.
   const rule = byId.get("SLG_PRIVATE_REPO_REF");
-  const line = "uses: cinatra-ai/ops/x.yml  # rationale in cinatra-ai/ops#378";
+  const line = "uses: cinatra-ai/ops/.github/workflows/x.yml@main  # rationale in cinatra-ai/ops#0";
   assert.equal(matchRule(rule, line), 1, "the issue citation must still flag on a line with a legitimate `uses:`");
   assert.equal(functionalRefCovers("ops", line, line.indexOf("cinatra-ai/ops")), true, "the `uses:` occurrence is covered");
   assert.equal(functionalRefCovers("ops", line, line.lastIndexOf("cinatra-ai/ops")), false, "the citation is NOT covered");
 });
 
 test("the functional carve-out is keyed to its own repository, never shared", () => {
-  const line = "uses: cinatra-ai/ops/x.yml";
+  const line = "uses: cinatra-ai/ops/.github/workflows/x.yml@main";
   assert.equal(functionalRefCovers("ops", line, line.indexOf("cinatra-ai/ops")), true);
   assert.equal(functionalRefCovers("wp-theme", line, line.indexOf("cinatra-ai/ops")), false);
   for (const f of FUNCTIONAL_REPO_REFS) {
@@ -731,7 +780,7 @@ test("both lanes tokenize identically, and never both claim the same token", () 
     "see cinatra-ai/design.git here",          // clone   -> static only
     "see cinatra-ai/.github-private here",     // dotted leading name -> probe only
     "see cinatra-ai/some-new-repo here",       // unlisted -> probe only
-    "see cinatra-ai/ops#378 here",             // listed  -> static only
+    "see cinatra-ai/ops#0 here",             // listed  -> static only
   ]) {
     const staticHits = statics.reduce((n, r) => n + matchRule(r, line), 0);
     const probeHits = matchRule(probe, line);
@@ -739,10 +788,108 @@ test("both lanes tokenize identically, and never both claim the same token", () 
   }
 });
 
+test("the name grammar admits every legal GitHub repository name", () => {
+  // The old grammar demanded an alnum or a dot FIRST, so `<org>/_shared` — a
+  // perfectly legal repository — was invisible to both lanes.
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  const nameOf = (line) => {
+    const re = new RegExp(probe.re.source, probe.re.flags);
+    const m = re.exec(line);
+    return m ? m[0].split("/")[1] : null;
+  };
+  assert.equal(nameOf("see cinatra-ai/_s for it"), "_s", "an underscore-leading name is nominated");
+  assert.equal(nameOf("see cinatra-ai/_shared-tools for it"), "_shared-tools");
+  assert.equal(nameOf("see cinatra-ai/.github-private for it"), ".github-private");
+});
+
+test("the name grammar stops at GitHub's 100-character ceiling", () => {
+  // A longer run of name characters is not a repository: probing it can only
+  // 404, and a 404 is reported as a fail-closed finding. The trailing boundary
+  // refuses to stop mid-token, so an over-long run is not nominated AT ALL
+  // rather than truncated to its first 100 characters.
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  const nameOf = (line) => {
+    const re = new RegExp(probe.re.source, probe.re.flags);
+    const m = re.exec(line);
+    return m ? m[0].split("/")[1] : null;
+  };
+  const at100 = "a".repeat(REPO_NAME_MAX);
+  const at101 = "a".repeat(REPO_NAME_MAX + 1);
+  assert.equal(REPO_NAME_MAX, 100);
+  assert.equal(nameOf(`see cinatra-ai/${at100} here`), at100, "a 100-character name is nominated");
+  assert.equal(nameOf(`see cinatra-ai/${at101} here`), null, "a 101-character run is not a repository name");
+});
+
+test("ONE name grammar: the tokenizer and the cache validator agree", () => {
+  // Two hand-kept copies drift, and a name one lane accepts while the other
+  // rejects is exactly the disagreement that yields two different findings for
+  // one reference.
+  for (const good of ["ci", "_s", ".github-private", "some.repo.js", "a-b_c.d", "a".repeat(REPO_NAME_MAX)]) {
+    assert.equal(isValidRepoName(good), true, `should be a legal name: ${good}`);
+  }
+  for (const bad of ["", ".", "..", "-lead", "bad name", "ci.", "a".repeat(REPO_NAME_MAX + 1)]) {
+    assert.equal(isValidRepoName(bad), false, `should NOT be a legal name: ${JSON.stringify(bad)}`);
+  }
+  // And what the validator accepts is exactly what the tokenizer reads whole.
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  for (const good of ["ci", "_s", ".github-private", "some.repo.js"]) {
+    const re = new RegExp(probe.re.source, probe.re.flags);
+    assert.equal(re.exec(`see cinatra-ai/${good} here`)[0].split("/")[1], good);
+  }
+});
+
 test("a leading dot is a legal repository name", () => {
   const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
   const re = new RegExp(probe.re.source, probe.re.flags);
   assert.equal(re.exec("see cinatra-ai/.github-private notes")[0], "cinatra-ai/.github-private");
+});
+
+// --------------------------------------------------------------------------
+// Canonical token boundaries on the literal-name rules. A dot IS a repository-
+// name character, so a rule that treats it as a boundary claims the wrong
+// repository — and lets the probe claim the same token as well.
+// --------------------------------------------------------------------------
+
+test("a dotted sibling of the private tracker is a DIFFERENT repository", () => {
+  const rule = byId.get("SLG_PRIVATE_ENG_REF");
+  for (const line of [
+    "see cinatra-ai/engineering.tools for the sibling",   // dotted suffix
+    "the cinatra-ai/engineering.v2 mirror",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a dotted sibling is not the tracker: ${JSON.stringify(line)}`);
+  }
+  // …while a sentence-final period is still punctuation, not a name character.
+  assert.ok(matchRule(rule, "filed under cinatra-ai/engineering. Then closed.") >= 1);
+  assert.ok(matchRule(rule, "https://github.com/cinatra-ai/engineering/issues/0") >= 1);
+});
+
+test("a dotted neighbour of the private proof host is a DIFFERENT repository", () => {
+  const rule = byId.get("SLG_PRIVATE_PROOFS_REF");
+  for (const line of [
+    "the engineering-proofs-private.bak mirror",          // dotted suffix
+    "see sibling.engineering-proofs-private notes",       // dotted prefix
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a dotted neighbour is not the host: ${JSON.stringify(line)}`);
+  }
+  assert.ok(matchRule(rule, "filed under engineering-proofs-private. Then closed.") >= 1);
+});
+
+test("a tracker-form reference yields EXACTLY one finding, never a double", () => {
+  // The double this locks: the static rule read `<org>/engineering.tools` as the
+  // tracker (wrong repository) while the probe, which tokenizes the name whole,
+  // nominated `engineering.tools` — one reference, two findings.
+  const statics = buildRules({}, "default", null);
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  for (const line of [
+    "filed under cinatra-ai/engineering tracker",     // the tracker -> static only
+    "see cinatra-ai/engineering.tools here",          // a dotted sibling -> probe only
+    "https://github.com/cinatra-ai/engineering/issues/0",
+    "pushed to engineering-proofs-private",           // bare private host -> static only
+    "see cinatra-ai/engineering-proofs-private.bak",  // dotted sibling -> probe only
+  ]) {
+    const total = statics.reduce((n, r) => n + matchRule(r, line), 0) + matchRule(probe, line);
+    assert.equal(total, 1, `exactly one rule may claim ${JSON.stringify(line)}`);
+  }
 });
 
 // --------------------------------------------------------------------------
@@ -812,6 +959,49 @@ test("probe budget: a cached name costs no budget", async () => {
   assert.equal(out[0].rule, PROBE_RULE_ID);
 });
 
+test("probe deadline: an IN-FLIGHT request is cut at the deadline, not at its own timeout", async () => {
+  // The defect this locks: the deadline only stopped NEW requests, so a request
+  // already in flight kept its full 10s timeout and a 60s lane could run ~70s.
+  // The fetch here never resolves on its own — it settles only when the signal
+  // the gate handed it aborts — so the elapsed time IS the timeout the gate
+  // chose. With a 60ms deadline that must be ~60ms, not the 10s request timeout.
+  const seen = [];
+  setProbeFetch((url, init) => new Promise((_, reject) => {
+    seen.push(url);
+    // A long real timer stands in for the open socket of a server that never
+    // answers: `AbortSignal.timeout` uses an UNREF'd timer, so without it the
+    // loop would simply drain instead of proving anything.
+    const stuck = setTimeout(() => reject(new Error("the stub was never aborted")), 30_000);
+    init.signal.addEventListener("abort", () => {
+      clearTimeout(stuck);
+      reject(init.signal.reason ?? new Error("aborted"));
+    });
+  }));
+  const ctx = probeCtx({ deadlineMs: 60, concurrency: 2, maxNames: 50 });
+  const started = Date.now();
+  const out = await resolveProbeFindings(["a", "b", "c", "d"].map((n) => candidate(n)), ctx);
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 3000, `the lane must end at its deadline, not at the request timeout (took ${elapsed}ms)`);
+  assert.ok(seen.length >= 1, "at least one request was actually opened");
+  assert.equal(out.length, 4, "every reference is still reported — nothing unasked reads as clean");
+  for (const f of out) {
+    assert.equal(f.rule, PROBE_BUDGET_RULE_ID, "a request the deadline cut is the fail-closed BUDGET finding");
+    assert.match(f.reason, /deadline/);
+    assert.match(f.snippet, /probe budget/);
+  }
+});
+
+test("probe deadline: a request opened past the deadline is never sent", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: false }));
+  const ctx = probeCtx({ deadlineMs: 60 });
+  ctx.deadlineAt = Date.now() - 1; // the lane's time is already gone
+  const v = await resolveRepoVisibility("some-new-repo", ctx);
+  assert.equal(v.state, "deadline");
+  assert.match(v.reason, /deadline/);
+  assert.equal(calls.length, 0, "no request may be opened that cannot finish inside the deadline");
+});
+
 test("the shipped budget defaults are finite", () => {
   assert.ok(Number.isFinite(PROBE_MAX_NAMES) && PROBE_MAX_NAMES > 0);
   const ctx = probeCtx({});
@@ -875,6 +1065,89 @@ test("cache: malformed entries are hard errors, never silently ignored", () => {
       assert.throws(() => loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" }),
         `should reject ${JSON.stringify(obj)}`);
     }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: an out-of-range ttlDays makes the WHOLE cache ignored, with one warning", () => {
+  // A TTL the loader silently accepted was the freshness rule switched off: a
+  // 3650-day TTL keeps vouching for a repository that went private years ago.
+  const dir = tmpdir();
+  try {
+    for (const bad of [3650, 8, 0, -1, 3.5, "7", null, true]) {
+      const f = writeCache(dir, { ttlDays: bad, public: [{ name: "fresh-repo", verifiedAt: "2026-03-10" }] });
+      const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+      assert.equal(loaded.names.size, 0, `ttlDays ${JSON.stringify(bad)} must void the whole cache`);
+      assert.equal(loaded.ttlValid, false);
+      assert.equal(loaded.warnings.length, 1, "exactly one warning line");
+      assert.match(loaded.warnings[0], /ttlDays/);
+      assert.match(loaded.note, /IGNORED/);
+      // The entries are still listed, so `--verify-cache` can repair the file.
+      assert.equal(loaded.entries.length, 1);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: an in-range ttlDays is honoured, and an absent one takes the shipped default", () => {
+  const dir = tmpdir();
+  try {
+    for (const good of [1, 3, PUBLIC_CACHE_TTL_DAYS]) {
+      const f = writeCache(dir, { ttlDays: good, public: [{ name: "fresh-repo", verifiedAt: "2026-03-12" }] });
+      const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+      assert.equal(loaded.names.has("fresh-repo"), true, `ttlDays ${good} must be honoured`);
+      assert.equal(loaded.warnings.length, 0);
+    }
+    const f = writeCache(dir, { public: [{ name: "fresh-repo", verifiedAt: "2026-03-12" }] });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    assert.equal(loaded.ttlDays, PUBLIC_CACHE_TTL_DAYS, "an absent ttlDays is the shipped default, not an error");
+    assert.equal(loaded.names.has("fresh-repo"), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: a calendar-invalid verifiedAt is STALE, never verified", () => {
+  // `new Date("2026-02-30T00:00:00Z")` does not throw — it normalises to March
+  // 2nd — so a shape check plus "did it parse?" accepted a day that never
+  // existed and then called it fresh. The round-trip catches it.
+  const dir = tmpdir();
+  try {
+    for (const bad of ["2026-02-30", "2026-13-01", "2026-00-10", "2026-04-31"]) {
+      const f = writeCache(dir, { ttlDays: 7, public: [{ name: "impossible-day", verifiedAt: bad }] });
+      const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+      assert.equal(loaded.names.has("impossible-day"), false, `${bad} must never vouch for a name`);
+      assert.equal(loaded.warnings.length, 1);
+      assert.match(loaded.warnings[0], /verifiedAt/);
+      assert.match(loaded.note, /untrustworthy/);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: a FUTURE verifiedAt is STALE, never verified", () => {
+  // A stamp dated ahead of now can never age out; it would vouch forever.
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, {
+      ttlDays: 7,
+      public: [
+        { name: "time-traveller", verifiedAt: "2027-01-01" },
+        { name: "today-repo", verifiedAt: "2026-03-12" },
+      ],
+    });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    assert.equal(loaded.names.has("time-traveller"), false, "a future stamp must not be trusted");
+    assert.equal(loaded.names.has("today-repo"), true, "today is not the future");
+    assert.equal(loaded.warnings.length, 1);
+    assert.match(loaded.warnings[0], /future/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: an untrustworthy stamp is RESOLVED LIVE, and the live answer wins", async () => {
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, { ttlDays: 7, public: [{ name: "time-traveller", verifiedAt: "2027-01-01" }] });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    const calls = stubFetch(() => apiResponse(200, { private: true }));
+    const out = await resolveProbeFindings([candidate("time-traveller")], probeCtx({ knownPublic: loaded.names }));
+    assert.equal(calls.length, 1, "an invalid entry must not clear the name for free");
+    assert.equal(out.length, 1, "and the live answer wins");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

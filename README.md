@@ -170,11 +170,22 @@ public may see:
   organization's private repositories, and does not need to: the question asked
   is only "can this token see that repository as public?".
 
-Both lanes share ONE tokenizer, so they always agree on where a repository name
-starts and ends: a trailing `.git` resolves to the repository it clones, a
-leading dot is legal (`<org>/.github-private`), and a listed name with a dotted
-continuation (`<org>/<listed>.something`) is a *different* repository — claimed
-by the probe, never mistaken for the listed one.
+Both lanes share ONE repository-name grammar, so they always agree on where a
+name starts and ends — and so does the committed cache's entry validation, which
+is the same function rather than a second copy. The grammar is GitHub's: 1..100
+characters from `[A-Za-z0-9_.-]`, a leading `_` or `.` allowed
+(`<org>/_shared`, `<org>/.github-private`), never `.` or `..`, never a trailing
+dot (so a sentence-final period stays punctuation), and a trailing `.git`
+resolved to the repository it clones. A run longer than 100 characters is not a
+repository name at all and is not nominated — probing it could only 404, and the
+gate would then have to report that 404 as a fail-closed finding.
+
+A dot is a *name character*, so a listed name with a dotted continuation
+(`<org>/<listed>.something`) is a **different** repository — claimed by the
+probe, never mistaken for the listed one, and never claimed by both at once. The
+rules that match a fixed private name (the tracker, the private proof host) use
+the same boundary, so `<name>.sibling` and `sibling.<name>` are other names while
+`<name>.` at the end of a sentence still resolves.
 
 The probe never guesses. A repository the API reports public produces no
 finding; private, `404` (what a private *or* absent repository returns to a
@@ -184,15 +195,36 @@ all produce one — the unresolved cases under their own rule id
 verify never reads as a pass.
 
 The lane runs inside a per-run **budget**: a cap on distinct names, a wall-clock
-deadline and bounded concurrency. A candidate the budget leaves unasked is
-reported as `SLG_PRIVATE_REPO_PROBE_BUDGET`, so "we ran out of budget" can never
-read as "we checked it and it was fine". Verdicts are memoised per run, and
+deadline and bounded concurrency. The deadline bounds the whole lane, not just
+its next request: each request's timeout is `min(10s, time left on the
+deadline)`, so a request already in flight is aborted the moment the deadline
+passes instead of running its full timeout past it. A candidate the budget
+leaves unasked — including one whose request the deadline cut — is reported as
+`SLG_PRIVATE_REPO_PROBE_BUDGET`, so "we ran out of budget" can never read as "we
+checked it and it was fine".
+
+Verdicts are memoised per run, and
 [`config/public-repos.json`](config/public-repos.json) is a small committed
 latency cache: each entry records the day it was last confirmed public and is
 ignored once past the TTL, because an entry that cannot go stale would be a
-permanent fail-open. `--verify-cache` re-confirms every entry and rewrites those
-stamps, dropping any repository that is no longer public; a weekly workflow runs
-it and opens a pull request on drift.
+permanent fail-open. The cache's own metadata is validated fail-closed, since a
+cache that keeps vouching is the failure that matters:
+
+- `ttlDays` must be an **integer in 1..7**. Anything else — a huge TTL, `0`, a
+  fraction, a string — is the freshness rule switched off, so the **whole cache
+  is ignored** (one warning line, every name resolved live) rather than honoured.
+  Omitting it takes the shipped 7-day default.
+- `verifiedAt` must be a canonical `YYYY-MM-DD` day that **round-trips as a real
+  calendar date** (`2026-02-30` does not — `Date` silently normalises it to March
+  2nd) and is **not in the future** (UTC). An entry that fails either check is
+  treated as stale and resolved live; it is never counted as verified.
+- A structurally malformed file (no `public` array, an entry that is not an
+  object, a name that is not a repository name, a `verifiedAt` that is not a
+  `YYYY-MM-DD` day) fails the run outright.
+
+`--verify-cache` re-confirms every entry and rewrites those stamps, dropping any
+repository that is no longer public; a weekly workflow runs it and opens a pull
+request on drift.
 
 Pass `--offline` to force the list-only lane (also what happens with no token),
 and `--probe` to force the probe on unauthenticated. Deliberately-public
@@ -202,12 +234,26 @@ references are allowlisted the same way every other rule allows them, via
 ### Dispatch targets that are also private
 
 A few private repositories are named by the organization's own automation and
-cannot be rephrased away — a reusable-workflow path, a checkout or token-scope
-key, a clone URL. Those exact machine forms are excused **per match**, not per
-name and not per line: ordinary prose, an `#<n>` citation and an `/issues/` or
-`/blob/` URL naming the same repository all still flag, including on a line that
-also carries a legitimate functional reference. A name-wide exemption would have
-hidden precisely the forms worth catching.
+cannot be rephrased away — a reusable-workflow or action reference, a checkout or
+token-scope key, a clone URL. Those exact machine forms are excused **per
+match**, not per name and not per line: ordinary prose, an `#<n>` citation and an
+`/issues/` or `/blob/` URL naming the same repository all still flag, including
+on a line that also carries a legitimate functional reference. A name-wide
+exemption would have hidden precisely the forms worth catching.
+
+The excused forms are transcribed **exactly**, and nothing may follow the
+repository name:
+
+- `uses:` matches only the grammar GitHub accepts for a cross-repository step,
+  `<org>/<repo>[/<path>]@<ref>` — `<path>` a reusable-workflow file under
+  `.github/workflows/` or an action directory path, `<ref>` one tag / sha /
+  branch token. The `@<ref>` is mandatory (GitHub rejects a ref-less cross-repo
+  `uses:`), and requiring it is what keeps `uses: <org>/<repo>/issues/1` out.
+- `repository:` / `repositories:` matches a scalar `<org>/<repo>` terminated by
+  end of line, whitespace (which is also what precedes a YAML `#` comment), a
+  closing quote, or the `,`/`]` of a flow sequence — so
+  `repository: <org>/<repo>/issues/1` and `repository: <org>/<repo>#1` are
+  findings, not machine forms.
 
 ### Per-repo config
 
@@ -227,7 +273,12 @@ Add `--exit-on-match` to make it a gate, `--format json` for machine output.
 
 The scanner's rule definitions necessarily contain the markers they detect, so
 that region is bracketed by sentinel comments and skipped when the gate scans
-its own source. Dedicated test fixtures and baselines are path-exempt. For the
+its own source — **only** that region: the rest of the engine is scanned
+normally, and a marker-bearing line outside it is exempted at the line with a
+`source-leak-allow` marker, never by exempting the whole file. (A whole-file
+exemption on the engine would discard exactly the findings the sentinel scoping
+exists to preserve.) Dedicated test fixtures and baselines are path-exempt, so
+the gate's own fixture needs no config entry either. For the
 same reason, the `actions-pinned-gate` source and tests contain the version
 comments they enforce, so this repo's own self-check passes
 [`config/self-check.json`](config/self-check.json) to exempt those two files

@@ -128,18 +128,79 @@ const PRIVATE_REPO_NAME_SET = new Set(PRIVATE_REPO_NAMES);
 // exemption would have hidden exactly those.
 //
 // Each pattern is transcribed from the real automation:
-//   - `uses:` — a reusable-workflow path; the job cannot run without it.
+//   - `uses:` — a reusable-workflow / action reference; the job cannot run
+//     without it.
 //   - `repository:` / `repositories:` — a checkout target, and the key that
 //     scopes a short-lived installation token to one repository.
 //   - the `.git` clone URL — the remote a pinned tree is fetched from.
 // Everything else about those repositories (prose, operator error text, input
 // descriptions) is REPHRASEABLE and must be rephrased, not exempted.
+//
+// EXACTNESS is the whole point. A carve-out that stops at the repository name
+// and tolerates ANY suffix excuses the leak it was meant to let through around:
+// `uses: <org>/ops/issues/0`, `repository: <org>/ops/issues/0` and
+// `repository: <org>/ops#0` are issue citations wearing a machine key as a hat,
+// and each of them is a finding. So each form below is transcribed to its real
+// grammar and terminated explicitly.
+//
+// `uses:` — GitHub accepts exactly `<org>/<repo>[/<path>]@<ref>` for a
+// cross-repository step: `<path>` is a reusable-workflow file under
+// `.github/workflows/` or an action directory path, and `<ref>` is ONE tag /
+// sha / branch token (a ref carries no `/` here). The `@<ref>` is MANDATORY —
+// GitHub rejects a ref-less cross-repo `uses:` — and requiring it is what keeps
+// a URL tail such as `/issues/1` outside the exemption.
+const USES_REF_TOKEN = "[A-Za-z0-9._-]+";
+const USES_WORKFLOW_PATH = "\\/\\.github\\/workflows\\/[A-Za-z0-9._-]+\\.ya?ml";
+const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
+// `repository:` / `repositories:` — a SCALAR `<org>/<repo>`, and nothing after
+// the repository name: the value ends at end of line, whitespace (which is also
+// what precedes a YAML `#` comment), a closing quote, or the `,`/`]` of a flow
+// sequence. `/` and a comment-less `#` are deliberately NOT terminators, so a
+// `/issues/<n>` tail and an `#<n>` citation both fall out of the carve-out.
+const REPO_KEY_TERMINATOR = "(?=$|[\\s,\\]\"'])";
+function escapeForRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function usesRefRe(name) {
+  const n = escapeForRegex(name);
+  return new RegExp(
+    `\\buses:\\s*["']?cinatra-ai\\/${n}(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?@${USES_REF_TOKEN}`,
+    "g",
+  );
+}
+function repositoryKeyRe(name) {
+  const n = escapeForRegex(name);
+  return new RegExp(`\\brepositor(?:y|ies):\\s*\\[?\\s*["']?cinatra-ai\\/${n}${REPO_KEY_TERMINATOR}`, "g");
+}
 const FUNCTIONAL_REPO_REFS = [
-  { name: "ops", label: "reusable-workflow path (`uses:`)", re: /\buses:\s*["']?cinatra-ai\/ops\//g },
-  { name: "ops", label: "checkout / token-scope key", re: /\brepositor(?:y|ies):\s*\[?\s*["']?cinatra-ai\/ops(?![A-Za-z0-9_-])/g },
+  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops") },
+  { name: "ops", label: "checkout / token-scope key", re: repositoryKeyRe("ops") },
   { name: "wp-theme", label: "git clone URL", re: /cinatra-ai\/wp-theme\.git(?![A-Za-z0-9_-])/g },
-  { name: "wp-theme", label: "checkout / token-scope key", re: /\brepositor(?:y|ies):\s*\[?\s*["']?cinatra-ai\/wp-theme(?![A-Za-z0-9_-])/g },
+  { name: "wp-theme", label: "checkout / token-scope key", re: repositoryKeyRe("wp-theme") },
 ];
+
+// GitHub's repository-name grammar, written ONCE and shared by everything that
+// has to decide "is this a repository name?": the tokenizer both scanning lanes
+// use, and the committed public-repos cache's entry validation. Two hand-kept
+// copies would drift, and a name the tokenizer nominates but the cache calls
+// invalid (or the reverse) is exactly the disagreement that produces a finding
+// in one lane and a different finding in the other.
+//
+// GitHub accepts 1..100 characters from `[A-Za-z0-9_.-]`. A LEADING `_` or `.`
+// is legal (`<org>/_shared`, `<org>/.github-private`) — the old grammar demanded
+// an alnum or a dot first and silently dropped every underscore-leading name.
+// A leading `-` is not accepted here. `.` and `..` are not names (they are path
+// segments), and the name may not END in a dot, so a sentence-final period
+// ("… see <org>/<repo>.") stays punctuation instead of being read into the name
+// and 404-ing as a repository that does not exist. `.git` is a clone-URL suffix,
+// not part of the name; normalizeRepoName() strips it.
+//
+// The 100-character ceiling is load-bearing rather than cosmetic: a longer run
+// of name characters is not a repository, and accepting it would spend a probe
+// request on a string that can only 404 — a 404 the gate then has to report as
+// a fail-closed finding. The trailing boundary refuses to stop mid-token, so an
+// over-long run produces no match at all rather than a truncated one.
+const REPO_NAME_MAX = 100;
+const REPO_NAME_SOURCE =
+  "(?!\\.{1,2}(?![A-Za-z0-9_.-]))[A-Za-z0-9_.](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_-])?";
 
 // ONE tokenizer for BOTH lanes. The static rule and the probe must agree on
 // where a repository name starts and ends, or the same text is a finding in one
@@ -147,14 +208,21 @@ const FUNCTIONAL_REPO_REFS = [
 // that agreement structural instead of a thing two regexes have to remember.
 //
 // The `@` in the lookbehind is LOAD-BEARING: the vendored npm workspace packages
-// are named `@cinatra-ai/<x>` — package scopes, not repository references.
-// A leading `.` is allowed because GitHub allows it (`<org>/.github-private`).
-// The name may CONTAIN dots but may not END in one, so a sentence-final period
-// ("… see <org>/<repo>.") stays punctuation instead of being read into the name
-// and 404-ing as a repository that does not exist. The trailing
-// `(?![A-Za-z0-9_-])` still admits the `#<n>` and `/issues/<n>` tails.
+// are named `@cinatra-ai/<x>` — package scopes, not repository references. The
+// trailing `(?![A-Za-z0-9_-])` still admits the `#<n>` and `/issues/<n>` tails.
 const ORG_PATH_TOKEN_SOURCE =
-  "(?<![@A-Za-z0-9_-])cinatra-ai\\/(\\.?[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?)(?![A-Za-z0-9_-])";
+  `(?<![@A-Za-z0-9_-])cinatra-ai\\/(${REPO_NAME_SOURCE})(?![A-Za-z0-9_-])`;
+
+// The canonical TOKEN BOUNDARY, for the rules that match a FIXED repository name
+// instead of tokenizing one. The tokenizer gets its boundary for free: it
+// consumes the whole name greedily, so `<listed>.sibling` reads as one different
+// name. A literal-name rule has to say so, and a bare `(?![A-Za-z0-9_-])` does
+// NOT: it treats `.` as a boundary, so `<listed>.sibling` matches the listed name
+// — flagging the wrong repository, and (for a name the probe does not exempt)
+// letting the probe nominate the same token as well, for two findings on one
+// reference. `\.*[A-Za-z0-9_-]` rejects a dotted continuation while still
+// admitting a sentence-final period, matching the tokenizer exactly.
+const REPO_TOKEN_TAIL = "(?!\\.*[A-Za-z0-9_-])";
 
 // Names the visibility PROBE must never resolve: every PRIVATE_REPO_NAMES member
 // (SLG_PRIVATE_REPO_REF already owns it offline, so probing would double-flag the
@@ -306,16 +374,28 @@ const RULES = [
     // `cinatra-ai/cinatra#231`): those are deliberately public and stay. The
     // boundaries are repo-token-aware (a `-`/`_`/alnum on either side is NOT a
     // boundary) so look-alikes like `cinatra-ai/engineering-foo`,
-    // `reverse-engineering/issues/`, and `myeng#5` do NOT trip — JS `\b` treats
+    // `reverse-engineering/issues/`, and `myeng#0` do NOT trip — JS `\b` treats
     // `-` as a boundary and would false-positive on those. `#` and `/` after
     // `engineering` ARE allowed (they are the `#<n>` / `/issues/` URL forms).
     // Deliberately-public references go in a per-repo allowlist via
     // config.lineExcludes / config.exemptFileBasenames (the same mechanism the
     // other rules use); the org-wide attribution-protocol citation is rephrased
     // to a public-safe name rather than allowlisted.
+    //
+    // The boundaries are the CANONICAL token boundaries (REPO_TOKEN_TAIL, and a
+    // `.` in the lookbehind), not a bare `(?![A-Za-z0-9_-])`. A dot IS a name
+    // character, so treating it as a boundary made `<org>/engineering.tools`
+    // match as the tracker — the wrong repository — while the probe, which
+    // tokenizes the name whole, nominated `engineering.tools` as well: one
+    // reference, two findings, neither of them right. With the canonical tail the
+    // dotted sibling belongs to the probe alone, and a sentence-final period
+    // ("filed under <org>/engineering.") still resolves to the tracker.
     id: "SLG_PRIVATE_ENG_REF",
     description: "Reference to the private cinatra-ai/engineering tracker",
-    re: /(?<![A-Za-z0-9_-])(?:eng#\d+|cinatra-engineering#\d+|cinatra-ai\/engineering(?![A-Za-z0-9_-])|engineering\/issues\/)/gi,
+    re: new RegExp(
+      `(?<![A-Za-z0-9_.-])(?:eng#\\d+|cinatra-engineering#\\d+|cinatra-ai\\/engineering${REPO_TOKEN_TAIL}|engineering\\/issues\\/)`,
+      "gi",
+    ),
   },
   {
     // PUBLIC-STRICT-ONLY sibling of SLG_PRIVATE_ENG_REF (profiles: ["public-strict"]).
@@ -334,7 +414,7 @@ const RULES = [
     // rejects a `-`/`_`/`/`/`@`/alnum immediately before the token, so the prefixed
     // forms the universal rule already owns (`cinatra-ai/engineering#<n>`,
     // `cinatra-engineering#<n>`) are NOT double-flagged, and look-alikes
-    // (`reverse-engineering#5`, `re-engineering#5`, `bioengineering#5`,
+    // (`reverse-engineering#0`, `re-engineering#0`, `bioengineering#0`,
     // `@cinatra-ai/engineering`) do NOT trip. The `engineering#<n>` branch requires
     // `#<digit>`, so the ordinary English word "engineering" never matches; the
     // `cinatra-engineering` branch's trailing `(?![A-Za-z0-9_#-])` keeps
@@ -347,7 +427,10 @@ const RULES = [
     // other rule honors.
     id: "SLG_PRIVATE_ENG_REF_STRICT",
     description: "Full-form private engineering-tracker reference (public-repo strict)",
-    re: /(?<![@A-Za-z0-9_/-])(?:engineering#\d+|cinatra-engineering(?![A-Za-z0-9_#-]))/gi,
+    // Same canonical boundaries as its universal sibling, plus the `#` the
+    // universal rule owns: `cinatra-engineering.tools` is a different repository,
+    // and `cinatra-engineering#<n>` is the other rule's form.
+    re: /(?<![@A-Za-z0-9_./-])(?:engineering#\d+|cinatra-engineering(?!#|\.*[A-Za-z0-9_-]))/gi,
     profiles: ["public-strict"],
   },
   {
@@ -448,7 +531,13 @@ const RULES = [
     // match inside it: one form, one finding.
     id: "SLG_PRIVATE_PROOFS_REF",
     description: "Bare name of the private proof-image repository",
-    re: /(?:@cinatra-ai\/engineering-proofs-private|(?<![@A-Za-z0-9_/-])engineering-proofs-private)(?![A-Za-z0-9_-])/gi,
+    // The boundaries are the CANONICAL token boundaries: a `.` is a repository-
+    // name character, so `<name>.bak` and `sibling.<name>` are OTHER names and
+    // must not resolve to this one, while a sentence-final period still does.
+    re: new RegExp(
+      `(?:@cinatra-ai\\/engineering-proofs-private|(?<![@A-Za-z0-9_./-])engineering-proofs-private)${REPO_TOKEN_TAIL}`,
+      "gi",
+    ),
   },
   {
     // Descriptive prose naming the private design repository (the human-readable
@@ -476,6 +565,16 @@ const PROBE_ORG = "cinatra-ai";
 function normalizeRepoName(name) {
   const n = String(name || "").toLowerCase();
   return n.endsWith(".git") ? n.slice(0, -4) : n;
+}
+
+// THE repository-name predicate, anchored on the ONE grammar the tokenizer uses
+// (REPO_NAME_SOURCE). The committed public-repos cache validates its entries
+// with this, so "what the scan calls a repository name" and "what the cache will
+// accept as one" cannot drift apart into two grammars.
+const REPO_NAME_RE = new RegExp(`^(?:${REPO_NAME_SOURCE})$`);
+function isValidRepoName(name) {
+  const s = String(name ?? "");
+  return s.length >= 1 && s.length <= REPO_NAME_MAX && REPO_NAME_RE.test(s);
 }
 
 // The repository half of an `<org>/<name>` token the shared tokenizer matched.
@@ -623,7 +722,6 @@ const PROBE_CONCURRENCY = 4;
 // A cached public verdict older than this is not trusted: a repository can be
 // flipped to private at any time, and a stale entry would keep clearing it.
 const PUBLIC_CACHE_TTL_DAYS = 7;
-const REPO_NAME_RE = /^\.?[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Module-level injection point for the probe's one HTTP call. Production leaves
@@ -639,55 +737,109 @@ function probeFetch(url, init) {
 
 function isoDay(d) { return new Date(d).toISOString().slice(0, 10); }
 
+// A `verifiedAt` stamp is trustworthy only if it is a REAL calendar day that is
+// not in the future. `new Date("2026-02-30T00:00:00Z")` does not throw — it
+// normalises to March 2nd — so a shape check plus "did it parse?" accepts a day
+// that never existed and then treats it as fresh. The round-trip (format it back
+// and compare) is what catches that; the future check is what stops a stamp
+// dated next year from vouching for a repository forever.
+function verifiedAtVerdict(stamp, now) {
+  const raw = String(stamp || "");
+  if (!ISO_DAY_RE.test(raw)) return { ok: false, why: "not a YYYY-MM-DD day" };
+  const at = new Date(`${raw}T00:00:00Z`);
+  if (Number.isNaN(at.getTime())) return { ok: false, why: "unparseable" };
+  if (at.toISOString().slice(0, 10) !== raw) return { ok: false, why: "not a real calendar day" };
+  if (at.getTime() > now.getTime()) return { ok: false, why: "dated in the future (UTC)" };
+  return { ok: true, at };
+}
+
 // The committed known-PUBLIC cache, consulted BEFORE any call. It is a LATENCY
 // cache, never an authority for "private": a name absent from it — or present
-// but past its TTL — is resolved live. Each entry carries the day it was last
-// confirmed public, because a cache entry that cannot go stale is a permanent
-// fail-open: a repository turned private later would keep clearing forever.
-// Names are validated strictly, so a malformed or `.git`-suffixed entry is a
-// hard error rather than an entry that silently never matches anything. It
-// THROWS rather than exiting: the caller decides what a bad cache means (main()
-// turns it into the usual gate failure), and the loader stays testable.
+// but past its TTL, or carrying metadata that cannot be trusted — is resolved
+// live. Each entry carries the day it was last confirmed public, because a cache
+// entry that cannot go stale is a permanent fail-open: a repository turned
+// private later would keep clearing forever.
+//
+// VALIDATION IS FAIL-CLOSED. The failure mode this guards is not a crash, it is
+// a cache that quietly keeps vouching:
+//   - STRUCTURE (not an object, no `public` array, a name that is not a
+//     repository name, a `verifiedAt` that is not a YYYY-MM-DD day) THROWS. The
+//     file is malformed, and the caller decides what that means — main() turns
+//     it into the usual gate failure. Throwing rather than exiting keeps the
+//     loader testable.
+//   - `ttlDays` must be an INTEGER in 1..PUBLIC_CACHE_TTL_DAYS when present. An
+//     arbitrarily large TTL (or 0, or a fraction, or a string) is not a slightly
+//     wrong policy, it is the freshness rule switched off — so the WHOLE cache is
+//     ignored, with one warning line, and every name resolves live. Absent means
+//     the shipped default.
+//   - An ENTRY whose stamp is not a real, non-future calendar day is STALE: it
+//     never enters the fresh set, so it is resolved live. Never verified.
+// The warnings are returned rather than printed, so a caller (and a test) sees
+// exactly how many were raised; main() writes them to stderr.
 function loadKnownPublicRepos(explicitPath, options = {}) {
   const now = options.now ? new Date(options.now) : new Date();
   const p = explicitPath
     || (SCANNER_REAL ? path.join(path.dirname(SCANNER_REAL), "..", "config", "public-repos.json") : "");
-  if (!p) return { names: new Set(), entries: [], path: "", note: "no cache path resolved" };
+  const warnings = [];
+  if (!p) return { names: new Set(), entries: [], path: "", warnings, note: "no cache path resolved" };
   let raw;
   try { raw = fs.readFileSync(p, "utf8"); }
-  catch { return { names: new Set(), entries: [], path: p, note: "cache absent (every reference resolves live)" }; }
+  catch { return { names: new Set(), entries: [], path: p, warnings, note: "cache absent (every reference resolves live)" }; }
   let parsed;
   try { parsed = JSON.parse(raw); }
   catch (e) { throw new Error(`public-repos cache is not valid JSON (${p}): ${e.message}`); }
   if (!parsed || !Array.isArray(parsed.public)) {
     throw new Error(`public-repos cache must be an object with a "public" array (${p})`);
   }
-  const ttlDays = Number.isFinite(parsed.ttlDays) ? parsed.ttlDays : PUBLIC_CACHE_TTL_DAYS;
+
+  const declaredTtl = parsed.ttlDays;
+  const ttlDays = declaredTtl === undefined ? PUBLIC_CACHE_TTL_DAYS : declaredTtl;
+  const ttlOk = Number.isInteger(ttlDays) && ttlDays >= 1 && ttlDays <= PUBLIC_CACHE_TTL_DAYS;
+
   const entries = [];
   const fresh = new Set();
-  let stale = 0;
-  for (const raw of parsed.public) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  let stale = 0, invalid = 0;
+  for (const rawEntry of parsed.public) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
       throw new Error(`public-repos cache entries must be objects with "name" and "verifiedAt" (${p})`);
     }
-    const name = normalizeRepoName(raw.name);
-    if (!REPO_NAME_RE.test(String(raw.name || "")) || name !== String(raw.name || "").toLowerCase()) {
-      throw new Error(`public-repos cache has an invalid repository name: ${JSON.stringify(raw.name)} (${p})`);
+    const name = normalizeRepoName(rawEntry.name);
+    if (!isValidRepoName(rawEntry.name) || name !== String(rawEntry.name || "").toLowerCase()) {
+      throw new Error(`public-repos cache has an invalid repository name: ${JSON.stringify(rawEntry.name)} (${p})`);
     }
-    if (!ISO_DAY_RE.test(String(raw.verifiedAt || ""))) {
-      throw new Error(`public-repos cache entry ${JSON.stringify(raw.name)} needs a YYYY-MM-DD "verifiedAt" (${p})`);
+    if (!ISO_DAY_RE.test(String(rawEntry.verifiedAt || ""))) {
+      throw new Error(`public-repos cache entry ${JSON.stringify(rawEntry.name)} needs a YYYY-MM-DD "verifiedAt" (${p})`);
     }
-    const verifiedAt = new Date(`${raw.verifiedAt}T00:00:00Z`);
-    if (Number.isNaN(verifiedAt.getTime())) {
-      throw new Error(`public-repos cache entry ${JSON.stringify(raw.name)} has an unparseable "verifiedAt" (${p})`);
+    entries.push({ name, verifiedAt: rawEntry.verifiedAt });
+
+    const verdict = verifiedAtVerdict(rawEntry.verifiedAt, now);
+    if (!verdict.ok) {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${JSON.stringify(name)} has an untrustworthy "verifiedAt" `
+        + `(${verdict.why}) — treated as stale and resolved live (${p})`,
+      );
+      continue;
     }
-    entries.push({ name, verifiedAt: raw.verifiedAt });
-    const ageDays = (now.getTime() - verifiedAt.getTime()) / 86_400_000;
+    if (!ttlOk) continue; // the whole cache is ignored; entries are still listed for --verify-cache
+    const ageDays = (now.getTime() - verdict.at.getTime()) / 86_400_000;
     if (ageDays <= ttlDays) fresh.add(name); else stale++;
   }
+
+  if (!ttlOk) {
+    warnings.unshift(
+      `public-repos cache "ttlDays" must be an integer in 1..${PUBLIC_CACHE_TTL_DAYS} `
+      + `(got ${JSON.stringify(declaredTtl)}) — the WHOLE cache is ignored and every name resolves live (${p})`,
+    );
+    return {
+      names: new Set(), entries, path: p, ttlDays, ttlValid: false, warnings,
+      note: `cache IGNORED: invalid ttlDays ${JSON.stringify(declaredTtl)} (every reference resolves live)`,
+    };
+  }
   const note = `${fresh.size} fresh cached public name(s)`
-    + (stale ? `, ${stale} past the ${ttlDays}-day TTL (resolved live)` : "");
-  return { names: fresh, entries, path: p, ttlDays, note };
+    + (stale ? `, ${stale} past the ${ttlDays}-day TTL (resolved live)` : "")
+    + (invalid ? `, ${invalid} with an untrustworthy stamp (resolved live)` : "");
+  return { names: fresh, entries, path: p, ttlDays, ttlValid: true, warnings, note };
 }
 
 function makeProbeContext({ token, knownPublic, apiBase, timeoutMs, maxNames, deadlineMs, concurrency }) {
@@ -709,6 +861,19 @@ async function resolveRepoVisibility(name, ctx) {
   if (ctx.knownPublic.has(name)) return { state: "public", reason: "a fresh entry in the committed public-repos cache" };
   if (ctx.cache.has(name)) return ctx.cache.get(name);
 
+  // The per-request timeout is capped to what is LEFT of the lane deadline. A
+  // deadline that only stops NEW requests is not a deadline: an in-flight
+  // request keeping its full timeout lets a lane with a 60s budget run for 70s.
+  // Capping here both bounds the wall clock and aborts everything still in
+  // flight the moment the deadline passes — the signal fires at exactly the
+  // deadline for every outstanding request.
+  const requestTimeoutMs = ctx.timeoutMs || PROBE_TIMEOUT_MS;
+  const remainingMs = ctx.deadlineAt === undefined ? Infinity : ctx.deadlineAt - Date.now();
+  const budgetMs = Math.min(requestTimeoutMs, remainingMs);
+  const deadlineReason = `past the ${ctx.deadlineMs}ms per-run deadline`;
+  // Already out of time: never open a request that cannot finish.
+  if (budgetMs <= 0) return { state: "deadline", reason: deadlineReason };
+
   let verdict;
   try {
     ctx.calls++;
@@ -716,7 +881,7 @@ async function resolveRepoVisibility(name, ctx) {
     if (ctx.token) headers.authorization = `Bearer ${ctx.token}`;
     const res = await probeFetch(`${ctx.apiBase}/repos/${PROBE_ORG}/${encodeURIComponent(name)}`, {
       headers,
-      signal: AbortSignal.timeout(ctx.timeoutMs || PROBE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(budgetMs),
     });
     const status = res && typeof res.status === "number" ? res.status : null;
     if (status === 200) {
@@ -740,6 +905,13 @@ async function resolveRepoVisibility(name, ctx) {
       verdict = { state: "error", reason: `unexpected API status ${status === null ? "(no response)" : status}` };
     }
   } catch (e) {
+    // A request the DEADLINE cut is a budget outcome, not a network fault: it
+    // reports as the existing fail-closed `probe budget` finding (unverified),
+    // never as an unresolved-error one, and it is not memoised — the name was
+    // never actually asked about.
+    if (budgetMs < requestTimeoutMs && ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt) {
+      return { state: "deadline", reason: deadlineReason };
+    }
     verdict = { state: "error", reason: `network error: ${e.message}` };
   }
   ctx.cache.set(name, verdict);
@@ -756,7 +928,10 @@ async function resolveNamesWithinBudget(names, ctx) {
     if (queue.length >= ctx.maxNames) { unasked.set(n, `over the ${ctx.maxNames}-name per-run cap`); continue; }
     queue.push(n);
   }
+  // Published on the context so every request this lane opens can cap its own
+  // timeout to what is left of it (see resolveRepoVisibility).
   const deadline = Date.now() + ctx.deadlineMs;
+  ctx.deadlineAt = deadline;
   let next = 0;
   const worker = async () => {
     for (;;) {
@@ -764,7 +939,10 @@ async function resolveNamesWithinBudget(names, ctx) {
       if (i >= queue.length) return;
       const name = queue[i];
       if (Date.now() >= deadline) { unasked.set(name, `past the ${ctx.deadlineMs}ms per-run deadline`); continue; }
-      await resolveRepoVisibility(name, ctx);
+      const verdict = await resolveRepoVisibility(name, ctx);
+      // Cut mid-flight by the deadline: the same unasked/fail-closed bucket as a
+      // name we never got to, so it reads as "could not verify", never as clean.
+      if (verdict.state === "deadline") { unasked.set(name, verdict.reason); ctx.cache.delete(name); }
     }
   };
   const lanes = Math.max(1, Math.min(ctx.concurrency, queue.length));
@@ -800,6 +978,10 @@ async function resolveProbeFindings(candidates, ctx) {
     }
     const verdict = await resolveRepoVisibility(name, ctx);
     if (verdict.state === "public") continue;
+    if (verdict.state === "deadline") {
+      out.push({ ...f, rule: PROBE_BUDGET_RULE_ID, reason: verdict.reason, snippet: `unverified (probe budget: ${verdict.reason}): ${f.snippet}` });
+      continue;
+    }
     if (verdict.state === "private") {
       out.push({ ...f, reason: verdict.reason });
     } else {
@@ -1104,6 +1286,9 @@ async function main() {
   if (probeEnabled) {
     try { knownPublic = loadKnownPublicRepos(args["public-repos"]); }
     catch (e) { return fail(e.message); }
+    // Untrustworthy cache metadata never fails the run — it makes the cache stop
+    // vouching — so it has to be VISIBLE, one line per reason.
+    for (const w of knownPublic.warnings) process.stderr.write(`[source-leak-gate] ${w}\n`);
   }
   const num = (k, d) => (args[k] === undefined ? d : Number(args[k]));
   const probeCtx = probeEnabled
@@ -1267,7 +1452,7 @@ export {
   buildRules, scanFile, RULES, readRuleDefRange,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
-  normalizeRepoName, orgPathRepoName, functionalRefCovers,
+  normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,
