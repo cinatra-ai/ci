@@ -143,37 +143,73 @@ const PRIVATE_REPO_NAME_SET = new Set(PRIVATE_REPO_NAMES);
 // and each of them is a finding. So each form below is transcribed to its real
 // grammar and terminated explicitly.
 //
+// A YAML key carve-out is a MACHINE GRAMMAR, not a substring. Three things make
+// it exact:
+//
+//   1. THE KEY OWNS THE LINE. The key must be the line's first non-blank token
+//      (after an optional `- ` sequence marker). A `#` anywhere before it makes
+//      the line a COMMENT, and a comment is prose ABOUT a machine form, never
+//      the machine form itself: a commented-out step excuses nothing.
+//   2. THE SCALAR IS COMPLETE. After the value only end of line or a real YAML
+//      comment (whitespace, then `#`) may follow — so a trailing `/issues/0`, an
+//      `#0` citation glued to the value, or any other junk leaves the carve-out.
+//      The whitespace before `#` is load-bearing: a comment-less `#` is an issue
+//      citation, not a comment. The terminator is a LOOKAHEAD, so the excused
+//      span stops at the value and a citation living in the trailing comment
+//      still flags.
+//   3. QUOTES MATCH. An opening quote is captured and the same quote is required
+//      to close the scalar, so an unbalanced quote is not a machine form.
+//
 // `uses:` — GitHub accepts exactly `<org>/<repo>[/<path>]@<ref>` for a
 // cross-repository step: `<path>` is a reusable-workflow file under
-// `.github/workflows/` or an action directory path, and `<ref>` is ONE tag /
-// sha / branch token (a ref carries no `/` here). The `@<ref>` is MANDATORY —
-// GitHub rejects a ref-less cross-repo `uses:` — and requiring it is what keeps
-// a URL tail such as `/issues/1` outside the exemption.
-const USES_REF_TOKEN = "[A-Za-z0-9._-]+";
+// `.github/workflows/` or an action directory path, and `<ref>` is a tag / sha /
+// branch name, which MAY contain `/` (branch names do) but never whitespace, `@`
+// or `#`. The `@<ref>` is MANDATORY — GitHub rejects a ref-less cross-repo
+// `uses:` — and requiring it is what keeps a URL tail such as `/issues/1`
+// outside the exemption.
+const YAML_KEY_PREFIX = "^[ \\t]*(?:-[ \\t]+)?";
+const SCALAR_TERMINATOR = "(?=[ \\t]+#|[ \\t]*$)";
+const USES_REF_TOKEN = "[A-Za-z0-9._/-]+";
 const USES_WORKFLOW_PATH = "\\/\\.github\\/workflows\\/[A-Za-z0-9._-]+\\.ya?ml";
 const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
-// `repository:` / `repositories:` — a SCALAR `<org>/<repo>`, and nothing after
-// the repository name: the value ends at end of line, whitespace (which is also
-// what precedes a YAML `#` comment), a closing quote, or the `,`/`]` of a flow
+// Where the caller can tell the hook WHICH FILE the line came from, a `uses:`
+// step only exists in a workflow file or an action definition; anywhere else the
+// key is prose wearing YAML clothes and is not excused. When no path is
+// available (a rule exercised on a bare string) the restriction is simply not
+// applied — it can only ever narrow the carve-out, never widen it.
+const USES_FILE_RE = /(?:^|\/)\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\.ya?ml$/;
+// `repository:` / `repositories:` — a SCALAR `<org>/<repo>` and nothing else:
+// the value ends at end of line, a `#` comment, or the `,`/`]` of a flow
 // sequence. `/` and a comment-less `#` are deliberately NOT terminators, so a
 // `/issues/<n>` tail and an `#<n>` citation both fall out of the carve-out.
-const REPO_KEY_TERMINATOR = "(?=$|[\\s,\\]\"'])";
+const REPO_KEY_TERMINATOR = "(?=[ \\t]*[,\\]]|[ \\t]+#|[ \\t]*$)";
+// The clone URL terminates at `.git` PLUS a terminator. `<org>/<repo>.git` is a
+// remote; `<org>/<repo>.git/issues/0` is an issue citation with a remote's
+// spelling, and it is a finding.
+const CLONE_TERMINATOR = "(?=$|[\\s,;)\\]\"'`])";
 function escapeForRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function usesRefRe(name) {
   const n = escapeForRegex(name);
   return new RegExp(
-    `\\buses:\\s*["']?cinatra-ai\\/${n}(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?@${USES_REF_TOKEN}`,
+    `${YAML_KEY_PREFIX}uses:[ \\t]*(["']?)cinatra-ai\\/${n}(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?@${USES_REF_TOKEN}\\1${SCALAR_TERMINATOR}`,
     "g",
   );
 }
 function repositoryKeyRe(name) {
   const n = escapeForRegex(name);
-  return new RegExp(`\\brepositor(?:y|ies):\\s*\\[?\\s*["']?cinatra-ai\\/${n}${REPO_KEY_TERMINATOR}`, "g");
+  return new RegExp(
+    `${YAML_KEY_PREFIX}repositor(?:y|ies):[ \\t]*\\[?[ \\t]*(["']?)cinatra-ai\\/${n}\\1${REPO_KEY_TERMINATOR}`,
+    "g",
+  );
+}
+function cloneUrlRe(name) {
+  const n = escapeForRegex(name);
+  return new RegExp(`cinatra-ai\\/${n}\\.git${CLONE_TERMINATOR}`, "g");
 }
 const FUNCTIONAL_REPO_REFS = [
-  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops") },
+  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE },
   { name: "ops", label: "checkout / token-scope key", re: repositoryKeyRe("ops") },
-  { name: "wp-theme", label: "git clone URL", re: /cinatra-ai\/wp-theme\.git(?![A-Za-z0-9_-])/g },
+  { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
   { name: "wp-theme", label: "checkout / token-scope key", re: repositoryKeyRe("wp-theme") },
 ];
 
@@ -184,45 +220,77 @@ const FUNCTIONAL_REPO_REFS = [
 // invalid (or the reverse) is exactly the disagreement that produces a finding
 // in one lane and a different finding in the other.
 //
-// GitHub accepts 1..100 characters from `[A-Za-z0-9_.-]`. A LEADING `_` or `.`
-// is legal (`<org>/_shared`, `<org>/.github-private`) — the old grammar demanded
-// an alnum or a dot first and silently dropped every underscore-leading name.
-// A leading `-` is not accepted here. `.` and `..` are not names (they are path
-// segments), and the name may not END in a dot, so a sentence-final period
-// ("… see <org>/<repo>.") stays punctuation instead of being read into the name
-// and 404-ing as a repository that does not exist. `.git` is a clone-URL suffix,
-// not part of the name; normalizeRepoName() strips it.
+// GitHub accepts 1..100 characters from `[A-Za-z0-9_.-]`, in ANY position: a
+// leading `_`, `.` or `-` is legal (`<org>/_shared`, `<org>/.github-private`,
+// `<org>/-secret`), and a grammar that demanded an alnum first silently dropped
+// every one of them. `.` and `..` are not names (they are path segments), and
+// the name may not END in a dot, so a sentence-final period ("… see
+// <org>/<repo>.") stays punctuation instead of being read into the name and
+// 404-ing as a repository that does not exist. `.git` is a clone-URL suffix, not
+// part of the name; normalizeRepoName() strips it once the tail below has
+// confirmed it really is a suffix and not the head of a longer name.
 //
 // The 100-character ceiling is load-bearing rather than cosmetic: a longer run
 // of name characters is not a repository, and accepting it would spend a probe
-// request on a string that can only 404 — a 404 the gate then has to report as
-// a fail-closed finding. The trailing boundary refuses to stop mid-token, so an
-// over-long run produces no match at all rather than a truncated one.
+// request on a string that can only 404 — a 404 the gate then has to report as a
+// fail-closed finding. That is why the name must END AT A BOUNDARY (see
+// REPO_TOKEN_TAIL): an over-long run produces no match at all, instead of a
+// 100-character prefix nominated as a repository that cannot exist.
 const REPO_NAME_MAX = 100;
 const REPO_NAME_SOURCE =
-  "(?!\\.{1,2}(?![A-Za-z0-9_.-]))[A-Za-z0-9_.](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_-])?";
+  "(?!\\.{1,2}(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_-])?";
+
+// THE canonical token boundary — used by the tokenizer AND by every rule that
+// matches a FIXED repository name, so "where does this name end?" has one answer.
+//
+// It says two things at once:
+//   - `.git` is a CLONE SUFFIX, and it is recognised BEFORE the dotted-sibling
+//     test. `<name>.git` (followed by a boundary) is the same repository as
+//     `<name>`; without this the clone form fell through the dotted-sibling
+//     branch below, was rejected as "a different repository", and then
+//     normalised back to a name both lanes already owned — one reference, zero
+//     findings.
+//   - a `.` followed by more name characters is NOT a boundary. A dot is a name
+//     character, so `<listed>.sibling` is a DIFFERENT repository, and a rule that
+//     stopped at the bare `(?![A-Za-z0-9_-])` claimed the wrong one (and let the
+//     probe claim the same token as well, for two findings on one reference).
+//     `\.*[A-Za-z0-9_-]` rejects that continuation while still admitting a
+//     sentence-final period — and it is what stops the tokenizer from truncating
+//     an over-long run to its first 100 characters, since the 101st character is
+//     exactly such a continuation.
+// `.gitlab` and `.gitfoo` are dotted siblings, not clone URLs: the optional
+// `.git` is followed by the same boundary test, so it only ever consumes a
+// suffix that really ends the token.
+const REPO_TOKEN_TAIL = "(?:\\.git)?(?!\\.*[A-Za-z0-9_-])";
+
+// A numeric ISSUE reference must TERMINATE. A `#<digits>` that runs straight
+// into another alphanumeric — a hex digest, an anchor slug, an identifier that
+// merely starts with a shorthand — is not an issue citation, and reading one out
+// of it invents a leak that is not there.
+const ISSUE_REF_TAIL = "(?![A-Za-z0-9])";
 
 // ONE tokenizer for BOTH lanes. The static rule and the probe must agree on
 // where a repository name starts and ends, or the same text is a finding in one
 // lane and a different finding in the other. Sharing the source string makes
 // that agreement structural instead of a thing two regexes have to remember.
 //
-// The `@` in the lookbehind is LOAD-BEARING: the vendored npm workspace packages
-// are named `@cinatra-ai/<x>` — package scopes, not repository references. The
-// trailing `(?![A-Za-z0-9_-])` still admits the `#<n>` and `/issues/<n>` tails.
+// The `@` in the lookbehind is the NPM-SCOPE CARVE-OUT: the vendored npm
+// workspace packages are named `@cinatra-ai/<x>` — package scopes, not
+// repository references. It applies to the PROBE lane, which nominates names
+// nobody has classified yet, and it is the reason `@cinatra-ai/<public-name>`
+// costs nothing.
 const ORG_PATH_TOKEN_SOURCE =
-  `(?<![@A-Za-z0-9_-])cinatra-ai\\/(${REPO_NAME_SOURCE})(?![A-Za-z0-9_-])`;
+  `(?<![@A-Za-z0-9_-])cinatra-ai\\/(${REPO_NAME_SOURCE})${REPO_TOKEN_TAIL}`;
 
-// The canonical TOKEN BOUNDARY, for the rules that match a FIXED repository name
-// instead of tokenizing one. The tokenizer gets its boundary for free: it
-// consumes the whole name greedily, so `<listed>.sibling` reads as one different
-// name. A literal-name rule has to say so, and a bare `(?![A-Za-z0-9_-])` does
-// NOT: it treats `.` as a boundary, so `<listed>.sibling` matches the listed name
-// — flagging the wrong repository, and (for a name the probe does not exempt)
-// letting the probe nominate the same token as well, for two findings on one
-// reference. `\.*[A-Za-z0-9_-]` rejects a dotted continuation while still
-// admitting a sentence-final period, matching the tokenizer exactly.
-const REPO_TOKEN_TAIL = "(?!\\.*[A-Za-z0-9_-])";
+// The SAME tokenizer for the private-list lane, with `@` admitted before the
+// org: the npm-scope carve-out NEVER excuses a name on the private list. A
+// package scope is a plausible reason to write `@<org>/<x>` for a name nobody
+// has classified; it is not a reason to write a PRIVATE repository's name into
+// public source, and no package carries one of those names. Membership is still
+// decided in matchExclude, so an unlisted (public, or probe-owned) name under a
+// scope stays excused exactly as before.
+const PRIVATE_ORG_PATH_TOKEN_SOURCE =
+  `(?<![A-Za-z0-9_-])cinatra-ai\\/(${REPO_NAME_SOURCE})${REPO_TOKEN_TAIL}`;
 
 // Names the visibility PROBE must never resolve: every PRIVATE_REPO_NAMES member
 // (SLG_PRIVATE_REPO_REF already owns it offline, so probing would double-flag the
@@ -393,7 +461,7 @@ const RULES = [
     id: "SLG_PRIVATE_ENG_REF",
     description: "Reference to the private cinatra-ai/engineering tracker",
     re: new RegExp(
-      `(?<![A-Za-z0-9_.-])(?:eng#\\d+|cinatra-engineering#\\d+|cinatra-ai\\/engineering${REPO_TOKEN_TAIL}|engineering\\/issues\\/)`,
+      `(?<![A-Za-z0-9_.-])(?:eng#\\d+${ISSUE_REF_TAIL}|cinatra-engineering#\\d+${ISSUE_REF_TAIL}|cinatra-ai\\/engineering${REPO_TOKEN_TAIL}|engineering\\/issues\\/)`,
       "gi",
     ),
   },
@@ -430,7 +498,10 @@ const RULES = [
     // Same canonical boundaries as its universal sibling, plus the `#` the
     // universal rule owns: `cinatra-engineering.tools` is a different repository,
     // and `cinatra-engineering#<n>` is the other rule's form.
-    re: /(?<![@A-Za-z0-9_./-])(?:engineering#\d+|cinatra-engineering(?!#|\.*[A-Za-z0-9_-]))/gi,
+    re: new RegExp(
+      `(?<![@A-Za-z0-9_./-])(?:engineering#\\d+${ISSUE_REF_TAIL}|cinatra-engineering(?!#)${REPO_TOKEN_TAIL})`,
+      "gi",
+    ),
     profiles: ["public-strict"],
   },
   {
@@ -446,6 +517,11 @@ const RULES = [
     // about where a name ends, so nothing is double-flagged and nothing is
     // flagged as the wrong repository. A trailing `.git` is normalized away, so
     // a clone URL resolves to the repository it clones.
+    //
+    // It tokenizes with PRIVATE_ORG_PATH_TOKEN_SOURCE, which admits a leading
+    // `@`: the npm-scope carve-out spares a name nobody has classified, never a
+    // name on the private list. `@<org>/<listed>` is one finding here, and the
+    // probe (which keeps the carve-out) never nominates the same token.
     //
     // DELIBERATELY EXCLUDED:
     //   - `engineering` — already owned by SLG_PRIVATE_ENG_REF (avoid double-flag).
@@ -464,11 +540,11 @@ const RULES = [
     // mechanism the other rules honor.
     id: "SLG_PRIVATE_REPO_REF",
     description: "Reference to a private cinatra-ai repository (bare GitHub path-form)",
-    re: new RegExp(ORG_PATH_TOKEN_SOURCE, "gi"),
-    matchExclude(match, line, index) {
+    re: new RegExp(PRIVATE_ORG_PATH_TOKEN_SOURCE, "gi"),
+    matchExclude(match, line, index, filePath) {
       const name = orgPathRepoName(match);
       if (!name || !PRIVATE_REPO_NAME_SET.has(name)) return true;
-      return functionalRefCovers(name, line, index);
+      return functionalRefCovers(name, line, index, filePath);
     },
   },
   {
@@ -507,35 +583,27 @@ const RULES = [
     // rule is UNIVERSAL — every profile runs it — and needs no strict-only twin.
     //
     // Boundaries are LOAD-BEARING and follow SLG_PRIVATE_ENG_REF_STRICT exactly.
-    // The negative lookbehind `(?<![@A-Za-z0-9_/-])` rejects an alnum / `_` / `-`
-    // immediately before the token, so a longer identifier that merely ENDS in
-    // the name does not trip; it also rejects `/` and `@`, which is what leaves
-    // the org-path form SOLELY to SLG_PRIVATE_REPO_REF (no double-flag) and keeps
-    // the vendored `@cinatra-ai/<x>` npm scope out, the same carve-out that rule
-    // documents. The trailing `(?![A-Za-z0-9_-])` keeps a longer name that merely
+    // The negative lookbehind `(?<![@A-Za-z0-9_./-])` rejects an alnum / `_` /
+    // `-` / `.` immediately before the token, so a longer identifier that merely
+    // ENDS in the name does not trip; it also rejects `/` and `@`, which leaves
+    // BOTH org-path forms — plain, and under an npm scope — solely to
+    // SLG_PRIVATE_REPO_REF, whose tokenizer now sees through the scope for a name
+    // on the private list. One form, one finding, and this rule owns exactly the
+    // BARE name. The trailing REPO_TOKEN_TAIL keeps a longer name that merely
     // STARTS with it from tripping, while still admitting the `#<n>` and
-    // `/issues/<n>` tails. Because the regex demands the whole `-private` suffix,
-    // the PUBLIC twin never matches — citing it stays free, which is the point of
+    // `/issues/<n>` tails and reading a `.git` clone suffix as this same
+    // repository. Because the regex demands the whole `-private` suffix, the
+    // PUBLIC twin never matches — citing it stays free, which is the point of
     // splitting the pair. A deliberately-public reference (if one ever arises)
     // uses the same config.lineExcludes / config.exemptFileBasenames allowlist
     // mechanism every other rule honors.
-    //
-    // The FIRST alternative is the one deliberate exception to the npm-scope
-    // carve-out, and it is written as a LITERAL rather than as a hole in the
-    // lookbehind: the carve-out exists because `@<org>/<x>` names a real vendored
-    // workspace package, and no package will ever carry THIS name. Spelling the
-    // one exception out leaves the general rule — every other `@<org>/<x>` is a
-    // package scope, never a repo reference — exactly as strict as it was. It
-    // shares the trailing lookahead, so `@<org>/<name>-foo` still does not trip,
-    // and because it consumes the whole token the bare alternative cannot also
-    // match inside it: one form, one finding.
     id: "SLG_PRIVATE_PROOFS_REF",
     description: "Bare name of the private proof-image repository",
     // The boundaries are the CANONICAL token boundaries: a `.` is a repository-
     // name character, so `<name>.bak` and `sibling.<name>` are OTHER names and
     // must not resolve to this one, while a sentence-final period still does.
     re: new RegExp(
-      `(?:@cinatra-ai\\/engineering-proofs-private|(?<![@A-Za-z0-9_./-])engineering-proofs-private)${REPO_TOKEN_TAIL}`,
+      `(?<![@A-Za-z0-9_./-])engineering-proofs-private${REPO_TOKEN_TAIL}`,
       "gi",
     ),
   },
@@ -586,9 +654,16 @@ function orgPathRepoName(match) {
 // True when the match at `index` sits INSIDE one of the required machine forms
 // for `name`. Span-based on purpose: a line may carry a functional reference and
 // a leaked one at once, and only the functional one is excused.
-function functionalRefCovers(name, line, index) {
+//
+// `filePath` is optional and can only NARROW the carve-out: a form that declares
+// a `fileRe` (the `uses:` step, which exists in a workflow file or an action
+// definition and nowhere else) is excused only in such a file. A caller that has
+// no path — a rule exercised on a bare string — passes nothing and the form is
+// judged on its grammar alone.
+function functionalRefCovers(name, line, index, filePath) {
   for (const f of FUNCTIONAL_REPO_REFS) {
     if (f.name !== name) continue;
+    if (f.fileRe && filePath && !f.fileRe.test(String(filePath))) continue;
     const re = new RegExp(f.re.source, f.re.flags.includes("g") ? f.re.flags : `${f.re.flags}g`);
     let m;
     while ((m = re.exec(line)) !== null) {
@@ -1215,7 +1290,7 @@ function scanFile(relPath, rules) {
         // matchExclude is per MATCH (contextExclude is per LINE): a rule that
         // excuses one specific form must not excuse every other token that
         // happens to share the line with it.
-        if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index))) {
+        if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, relPath))) {
           findings.push({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) });
         }
         if (!localRe.global) break;
@@ -1243,7 +1318,7 @@ function scanPath(relPath, pathRules) {
       let m;
       while ((m = localRe.exec(seg)) !== null) {
         if (rule.contextExclude && rule.contextExclude(seg)) break;
-        if (!(rule.matchExclude && rule.matchExclude(m[0], seg, m.index))) {
+        if (!(rule.matchExclude && rule.matchExclude(m[0], seg, m.index, relPath))) {
           findings.push({ rule: rule.id, file: relPath, line: 0, column: 0, match: m[0], snippet: `path: ${relPath}` });
         }
         if (!localRe.global) break;

@@ -139,7 +139,10 @@ A default rule (`SLG_PRIVATE_ENG_REF`) flags references to the **private**
 `cinatra-ai/engineering` issue tracker leaking into a public repo:
 
 - `eng#<n>` and `cinatra-engineering#<n>` shorthands (the latter also catches
-  the `cinatra-ai/cinatra-engineering#<n>` legacy form);
+  the `cinatra-ai/cinatra-engineering#<n>` legacy form). A numeric issue
+  reference must **terminate**: `#<digits>` running straight into another
+  alphanumeric (`eng#0abc`, a digest, an anchor slug) is not a citation and is
+  not flagged;
 - the full `cinatra-ai/engineering` repo path (including `#<n>` and
   `/issues/<n>` URL forms);
 - the bare `engineering/issues/` URL tail.
@@ -173,19 +176,32 @@ public may see:
 Both lanes share ONE repository-name grammar, so they always agree on where a
 name starts and ends — and so does the committed cache's entry validation, which
 is the same function rather than a second copy. The grammar is GitHub's: 1..100
-characters from `[A-Za-z0-9_.-]`, a leading `_` or `.` allowed
-(`<org>/_shared`, `<org>/.github-private`), never `.` or `..`, never a trailing
-dot (so a sentence-final period stays punctuation), and a trailing `.git`
-resolved to the repository it clones. A run longer than 100 characters is not a
-repository name at all and is not nominated — probing it could only 404, and the
-gate would then have to report that 404 as a fail-closed finding.
+characters from `[A-Za-z0-9_.-]` in any position, so a leading `_`, `.` or `-`
+is allowed (`<org>/_shared`, `<org>/.github-private`, `<org>/-secret`), never `.`
+or `..`, and never a trailing dot (so a sentence-final period stays punctuation).
 
-A dot is a *name character*, so a listed name with a dotted continuation
-(`<org>/<listed>.something`) is a **different** repository — claimed by the
-probe, never mistaken for the listed one, and never claimed by both at once. The
-rules that match a fixed private name (the tracker, the private proof host) use
-the same boundary, so `<name>.sibling` and `sibling.<name>` are other names while
-`<name>.` at the end of a sentence still resolves.
+A name token must **end at a boundary** — a character outside `[A-Za-z0-9_.-]`,
+or end of text. A run longer than 100 characters therefore yields **no name at
+all** rather than a 100-character prefix: probing a truncated prefix could only
+404, and the gate would have to report that 404 as a fail-closed finding.
+
+A trailing **`.git` followed by a boundary** is a clone suffix and resolves to
+the repository it clones, and it is recognised **before** the dotted-sibling
+test — so `<org>/<private>.git`, `git@github.com:<org>/<private>.git` and
+`<org>/<private>.git/issues/1` are all the private repository. `.gitlab`,
+`.gitfoo` and `.tools` are not: a dot is a *name character*, so a listed name
+with a dotted continuation (`<org>/<listed>.something`) is a **different**
+repository — claimed by the probe, never mistaken for the listed one, and never
+claimed by both at once. The rules that match a fixed private name (the tracker,
+the private proof host) use the same boundary, so `<name>.sibling` and
+`sibling.<name>` are other names while `<name>.` at the end of a sentence still
+resolves.
+
+The **npm-scope carve-out** — `@<org>/<name>` names a vendored workspace
+package, not a repository, so it is not a reference — **never excuses a name on
+the private list**: no package carries one of those names, and the form leaks the
+name just the same. `@<org>/<public-or-unclassified>` costs nothing, in both
+lanes, exactly as before.
 
 The probe never guesses. A repository the API reports public produces no
 finding; private, `404` (what a private *or* absent repository returns to a
@@ -241,19 +257,37 @@ match**, not per name and not per line: ordinary prose, an `#<n>` citation and a
 on a line that also carries a legitimate functional reference. A name-wide
 exemption would have hidden precisely the forms worth catching.
 
-The excused forms are transcribed **exactly**, and nothing may follow the
-repository name:
+The excused forms are transcribed as **machine grammars**, not substrings. A
+carve-out applies only where:
+
+- **the key owns the line** — the key is the line's first non-blank token, after
+  an optional `- ` sequence marker. A `#` anywhere before it makes the line a
+  comment, and a comment is prose *about* a machine form: `# uses: <org>/<repo>@main`
+  and `see uses: <org>/<repo>@main in the old job` are findings;
+- **the scalar is complete** — after the value only end of line or a real YAML
+  comment (whitespace, then `#`) may follow. Trailing junk, a `/issues/1` tail
+  and a comment-less `#1` all leave the carve-out. Quotes must match: an opening
+  `"` or `'` has to close the scalar. The terminator is a lookahead, so the
+  excused span stops at the value — a citation inside the trailing comment still
+  flags.
 
 - `uses:` matches only the grammar GitHub accepts for a cross-repository step,
   `<org>/<repo>[/<path>]@<ref>` — `<path>` a reusable-workflow file under
-  `.github/workflows/` or an action directory path, `<ref>` one tag / sha /
-  branch token. The `@<ref>` is mandatory (GitHub rejects a ref-less cross-repo
-  `uses:`), and requiring it is what keeps `uses: <org>/<repo>/issues/1` out.
-- `repository:` / `repositories:` matches a scalar `<org>/<repo>` terminated by
-  end of line, whitespace (which is also what precedes a YAML `#` comment), a
-  closing quote, or the `,`/`]` of a flow sequence — so
+  `.github/workflows/` or an action directory path, `<ref>` one or more of
+  `[A-Za-z0-9._/-]` (branch names contain `/`) and never whitespace, `@` or `#`.
+  The `@<ref>` is mandatory (GitHub rejects a ref-less cross-repo `uses:`), and
+  requiring it is what keeps `uses: <org>/<repo>/issues/1` out. Where the scan
+  knows the file path — a repository walk always does — a `uses:` step is
+  excused only in `.github/workflows/*.yml|.yaml` or an `action.yml|.yaml`,
+  because that is the only place one can run.
+- `repository:` / `repositories:` matches exactly `<org>/<repo>` as the complete
+  scalar under the same terminator rule, plus the `,`/`]` of a flow sequence — so
   `repository: <org>/<repo>/issues/1` and `repository: <org>/<repo>#1` are
   findings, not machine forms.
+- the **clone URL** terminates at `.git` plus a terminator (end of line,
+  whitespace, a quote, `,`, `;`, `)`), so `<org>/<repo>.git` is a remote while
+  `<org>/<repo>.git/issues/1` is a citation wearing a remote's spelling — and a
+  finding.
 
 ### Per-repo config
 

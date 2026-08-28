@@ -280,12 +280,35 @@ test("SLG_PRIVATE_REPO_REF flags bare private-repo path forms", () => {
   }
 });
 
-test("SLG_PRIVATE_REPO_REF does NOT flag the @cinatra-ai npm scope, cinatra-ai/ops, public repos, or look-alikes", () => {
+test("the npm-scope carve-out never excuses a name on the PRIVATE list", () => {
+  // The carve-out exists because `@<org>/<x>` names a vendored workspace
+  // package. That is a reason to spare a name nobody has classified — it is not
+  // a reason to write a PRIVATE repository's name into public source, and no
+  // package carries one of those names. So the scope is transparent to the
+  // private list and opaque to everything else.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    'import { x } from "@cinatra-ai/design";',
+    "@cinatra-ai/engineering-proofs-private in a dependency list",
+    'import x from "@cinatra-ai/engineering-claude-plugin";',
+  ]) {
+    assert.equal(matchRule(rule, line), 1, `a private name under an npm scope is a leak: ${JSON.stringify(line)}`);
+  }
+  // …while every OTHER @-scoped name keeps costing nothing, in both lanes.
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  for (const line of [
+    'const m = require("@cinatra-ai/marketplace-sdk");',
+    'import x from "@cinatra-ai/cinatra-cli";',
+    'import { s } from "@cinatra-ai/sdk-extensions";',
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `an unlisted package scope stays excused: ${JSON.stringify(line)}`);
+    assert.equal(matchRule(probe, line), 0, `the probe never nominates a package scope: ${JSON.stringify(line)}`);
+  }
+});
+
+test("SLG_PRIVATE_REPO_REF does NOT flag cinatra-ai/ops, public repos, or look-alikes", () => {
   const rule = byId.get("SLG_PRIVATE_REPO_REF");
   const misses = [
-    // The vendored npm workspace package scope — load-bearing negative lookbehind:
-    'import { x } from "@cinatra-ai/design";',
-    'const m = require("@cinatra-ai/marketplace-sdk");',
     // cinatra-ai/ops is a REQUIRED functional dispatch target, deliberately excluded:
     "uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",
     "repository: cinatra-ai/ops",
@@ -332,8 +355,6 @@ test("SLG_PRIVATE_REPO_REF does NOT flag the PUBLIC proof-image twin or the func
     // Trailing-boundary look-alikes on the private twin's own name:
     "see cinatra-ai/engineering-proofs-private-foo instead",
     "the cinatra-ai/engineering-proofs-private_bak dir",
-    // The npm-scope carve-out holds for the added members too:
-    'import x from "@cinatra-ai/engineering-claude-plugin";',
     // Only the REQUIRED machine forms of a dispatch target are excused:
     "REMOTE=https://github.com/cinatra-ai/wp-theme.git",
     "repository: cinatra-ai/wp-theme",
@@ -361,10 +382,6 @@ test("SLG_PRIVATE_PROOFS_REF flags the bare private proof-image repository name"
     "see engineering-proofs-private/issues/0 directly",
     "engineering-proofs-private holds the originals",
     "(engineering-proofs-private) is where they land",
-    // The one deliberate exception to the npm-scope carve-out: no package will
-    // ever carry this name, so the @-scoped literal is a leak like any other.
-    'import x from "@cinatra-ai/engineering-proofs-private";',
-    "@cinatra-ai/engineering-proofs-private in a dependency list",
   ];
   for (const line of hits) {
     assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
@@ -385,8 +402,11 @@ test("SLG_PRIVATE_PROOFS_REF does NOT flag the public twin, look-alikes, or the 
     // The org-path form belongs SOLELY to SLG_PRIVATE_REPO_REF -> no double-flag:
     "cinatra-ai/engineering-proofs-private is the path form",
     "https://github.com/cinatra-ai/engineering-proofs-private/blob/main/shot.png",
-    // The carve-out is narrowed by ONE literal, not opened: every other
-    // @-scoped package name is still untouched, including the public twin's.
+    // The @-scoped form is the org-path form with a scope in front, so it too
+    // belongs to SLG_PRIVATE_REPO_REF alone — this rule owns the BARE name.
+    'import x from "@cinatra-ai/engineering-proofs-private";',
+    "@cinatra-ai/engineering-proofs-private in a dependency list",
+    // The public twin is untouched under a scope as well.
     'import x from "@cinatra-ai/engineering-proofs";',
     'import x from "@cinatra-ai/engineering-proofs-private-foo";',
     // The ordinary word, and the private tracker the eng rules own:
@@ -853,7 +873,10 @@ test("ONE name grammar: the tokenizer and the cache validator agree", () => {
   for (const good of ["ci", "_s", ".github-private", "some.repo.js", "a-b_c.d", "a".repeat(REPO_NAME_MAX)]) {
     assert.equal(isValidRepoName(good), true, `should be a legal name: ${good}`);
   }
-  for (const bad of ["", ".", "..", "-lead", "bad name", "ci.", "a".repeat(REPO_NAME_MAX + 1)]) {
+  for (const good of ["-secret", "-lead"]) {
+    assert.equal(isValidRepoName(good), true, `GitHub accepts a leading hyphen: ${good}`);
+  }
+  for (const bad of ["", ".", "..", "bad name", "ci.", "a".repeat(REPO_NAME_MAX + 1)]) {
     assert.equal(isValidRepoName(bad), false, `should NOT be a legal name: ${JSON.stringify(bad)}`);
   }
   // And what the validator accepts is exactly what the tokenizer reads whole.
@@ -1082,7 +1105,7 @@ test("cache: malformed entries are hard errors, never silently ignored", () => {
     { public: [{ name: "ci", verifiedAt: "10-03-2026" }] },        // wrong date shape
     { public: [{ name: "bad name", verifiedAt: "2026-03-10" }] },  // invalid repo name
     { public: [{ name: "ci.git", verifiedAt: "2026-03-10" }] },    // a clone suffix is not a name
-    { public: [{ name: "-lead", verifiedAt: "2026-03-10" }] },     // must start with a dot or alnum
+    { public: [{ name: "has/slash", verifiedAt: "2026-03-10" }] }, // a slash is not a name character
     { ttlDays: 7 },                                                // no public array
   ];
   try {
@@ -1402,4 +1425,237 @@ test("readUsesPins: deduplicates identical pins and reports refs that are not co
   );
   assert.deepEqual(shas, [PIN_A]);
   assert.deepEqual(unpinned, ["o/b@v4"]);
+});
+
+// --------------------------------------------------------------------------
+// The functional carve-outs are MACHINE GRAMMARS, not substrings.
+// --------------------------------------------------------------------------
+
+test("a carve-out key must OWN its line: a comment excuses nothing", () => {
+  // The defect this locks: the carve-out matched anywhere on the line, so a
+  // commented-out step — prose ABOUT a machine form — excused the name in it.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "# uses: cinatra-ai/ops@main",
+    "  # uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",
+    "# repository: cinatra-ai/ops",
+    "  # - uses: cinatra-ai/ops@main",
+    "see uses: cinatra-ai/ops@main in the old job",  // the key is not the first token
+    "step uses: cinatra-ai/ops@main to deploy",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `a commented / embedded key is prose: ${JSON.stringify(line)}`);
+  }
+  // …while the real key, with or without a sequence marker, still is one.
+  for (const line of [
+    "uses: cinatra-ai/ops@main",
+    "  - uses: cinatra-ai/ops@main",
+    "\t- uses: cinatra-ai/ops/actions/notify@v1",
+    "      repository: cinatra-ai/ops",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a real machine form is excused: ${JSON.stringify(line)}`);
+  }
+});
+
+test("a carve-out scalar must be COMPLETE: trailing junk leaves the exemption", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "uses: cinatra-ai/ops@main and then some",
+    "uses: cinatra-ai/ops@main#0",                 // a comment-less `#` is a citation
+    'uses: "cinatra-ai/ops@main',                  // unbalanced quote
+    "uses: 'cinatra-ai/ops@main\"",                // mismatched quotes
+    "repository: cinatra-ai/ops junk",
+    "repository: cinatra-ai/ops#0",
+    'repository: "cinatra-ai/ops',
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `an incomplete scalar is not a machine form: ${JSON.stringify(line)}`);
+  }
+  // A real YAML comment (whitespace, then `#`) IS a terminator, and the excused
+  // span stops at the value — so a citation inside the comment still flags.
+  assert.equal(matchRule(rule, "uses: cinatra-ai/ops@main  # pinned by the release job"), 0);
+  assert.equal(matchRule(rule, "repository: cinatra-ai/ops  # the operations repository"), 0);
+  assert.equal(matchRule(rule, "uses: cinatra-ai/ops@main  # see cinatra-ai/ops#0"), 1);
+});
+
+test("a `uses:` ref may contain slashes (branch names do), but never whitespace, `@` or `#`", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "uses: cinatra-ai/ops@release/1.0",
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yml@feature/x-y",
+    'uses: "cinatra-ai/ops/actions/notify@release/1.0"',
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a slash-containing ref is legal: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    "uses: cinatra-ai/ops@ main",
+    "uses: cinatra-ai/ops@main@extra",
+    "uses: cinatra-ai/ops@",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `not a ref GitHub accepts: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the clone-URL carve-out terminates at `.git`", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "REMOTE=https://github.com/cinatra-ai/wp-theme.git",
+    "git clone https://github.com/cinatra-ai/wp-theme.git",
+    'REMOTE="https://github.com/cinatra-ai/wp-theme.git"',
+    "git clone git@github.com:cinatra-ai/wp-theme.git, then build",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a clone remote is excused: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    "https://github.com/cinatra-ai/wp-theme.git/issues/0",
+    "https://github.com/cinatra-ai/wp-theme.git/anything",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `a citation wearing a remote's spelling: ${JSON.stringify(line)}`);
+  }
+  // The carve-out is per repository: no other listed name has a clone form.
+  assert.ok(matchRule(rule, "git@github.com:cinatra-ai/ops.git") >= 1);
+});
+
+test("where the file path is known, `uses:` is excused only in a workflow or action file", () => {
+  // The hook CAN see the path: scanFile passes it, so the restriction is real
+  // rather than a documented impossibility. A caller with no path (matchRule
+  // above, and any direct rule use) judges the grammar alone.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slg-uses-"));
+  const line = "uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n";
+  const write = (rel) => {
+    const f = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, line);
+    return f;
+  };
+  const idsFor = (rel) => scanFile(write(rel), active).map((f) => f.rule);
+  try {
+    assert.deepEqual(idsFor(".github/workflows/deploy.yml"), []);
+    assert.deepEqual(idsFor(".github/workflows/deploy.yaml"), []);
+    assert.deepEqual(idsFor("action.yml"), []);
+    assert.deepEqual(idsFor(".github/actions/notify/action.yaml"), []);
+    assert.deepEqual(idsFor("docs/runbook.md"), ["SLG_PRIVATE_REPO_REF"]);
+    assert.deepEqual(idsFor("templates/deploy.yml"), ["SLG_PRIVATE_REPO_REF"]);
+    // The path narrows the `uses:` form only: the checkout key is a legal
+    // machine form in any YAML, and stays excused.
+    fs.writeFileSync(path.join(dir, "compose.yml"), "repository: cinatra-ai/ops\n");
+    assert.deepEqual(scanFile(path.join(dir, "compose.yml"), active).map((f) => f.rule), []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// --------------------------------------------------------------------------
+// The name grammar: a leading `-`, and a token that must END at a boundary.
+// --------------------------------------------------------------------------
+
+test("a leading hyphen is a legal repository name, and it is nominated", () => {
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  const re = new RegExp(probe.re.source, probe.re.flags);
+  assert.equal(re.exec("see cinatra-ai/-secret here")[0], "cinatra-ai/-secret");
+  assert.equal(isValidRepoName("-secret"), true);
+});
+
+test("an over-long run is NOT truncated to a name that must 404", () => {
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  const nameOf = (line) => {
+    const re = new RegExp(probe.re.source, probe.re.flags);
+    const m = re.exec(line);
+    return m ? m[0].split("/")[1] : null;
+  };
+  const at100 = "a".repeat(REPO_NAME_MAX);
+  assert.equal(nameOf(`see cinatra-ai/${at100} here`), at100, "a 100-character name is nominated");
+  assert.equal(nameOf(`see cinatra-ai/${at100}.x here`), null, "the run continues past the ceiling: not a name");
+  assert.equal(nameOf(`see cinatra-ai/${"a".repeat(REPO_NAME_MAX + 1)} here`), null, "101 characters is not a name");
+});
+
+// --------------------------------------------------------------------------
+// `.git` is a clone suffix, recognised BEFORE the dotted-sibling boundary.
+// --------------------------------------------------------------------------
+
+test("a `.git` clone suffix names the SAME repository, in every lane", () => {
+  // The defect this locks: `.git` was normalised away only AFTER the
+  // dotted-sibling boundary had already rejected the token, so the clone form of
+  // a private repository produced no finding in either lane.
+  const rules = buildRules({}, "public-strict", null);
+  const total = (line) => rules.reduce((n, r) => n + matchRule(r, line), 0);
+  for (const line of [
+    "clone cinatra-ai/engineering.git now",
+    "git@github.com:cinatra-ai/ops.git",
+    "clone engineering-proofs-private.git now",
+    "https://github.com/cinatra-ai/engineering.git/issues/0",
+    "clone cinatra-ai/design.git today",
+  ]) {
+    assert.equal(total(line), 1, `the clone form is the same repository: ${JSON.stringify(line)}`);
+  }
+  // …while a DOTTED SIBLING is still a different repository, claimed by nobody
+  // offline (the probe owns it).
+  for (const line of [
+    "the cinatra-ai/engineering.gitlab mirror",
+    "see cinatra-ai/engineering.tools for the sibling",
+  ]) {
+    assert.equal(total(line), 0, `a dotted sibling is not the tracker: ${JSON.stringify(line)}`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// A numeric issue reference must TERMINATE.
+// --------------------------------------------------------------------------
+
+test("`#<n>` that runs into another alphanumeric is not an issue reference", () => {
+  const rules = buildRules({}, "public-strict", null);
+  const total = (line) => rules.reduce((n, r) => n + matchRule(r, line), 0);
+  for (const line of [
+    "the eng#0abc digest is not an issue",
+    "the cinatra-engineering#0abc digest is not an issue",
+    "the engineering#0abc digest is not an issue",
+  ]) {
+    assert.equal(total(line), 0, `not an issue citation: ${JSON.stringify(line)}`);
+  }
+  // The real citations are unchanged.
+  for (const line of [
+    "rationale in eng#0 here",
+    "per ratified spec cinatra-engineering#0",
+    "see engineering#0 for the rationale",
+    "closed as eng#0.",
+    "closed as eng#0, then reopened",
+  ]) {
+    assert.equal(total(line), 1, `a terminated citation still flags: ${JSON.stringify(line)}`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// AGGREGATE: every active rule over one corpus. Exactly one finding per leaked
+// form (no double-flag), zero for everything that is allowed to stay.
+// --------------------------------------------------------------------------
+
+test("aggregate: every active rule over one corpus agrees on the count", () => {
+  const rules = buildRules({}, "public-strict", null);
+  const total = (line) => rules.reduce((n, r) => n + matchRule(r, line), 0);
+  const corpus = [
+    // The npm scope: transparent to a private name, opaque to everything else.
+    ['import x from "@cinatra-ai/engineering";', 1],
+    ['import x from "@cinatra-ai/cinatra-cli";', 0],
+    ['import { x } from "@cinatra-ai/design";', 1],
+    ['import x from "@cinatra-ai/engineering-proofs-private";', 1],
+    // The machine grammars (and the forms that only look like them).
+    ["uses: cinatra-ai/ops/.github/workflows/deploy.yml@main", 0],
+    ["  - uses: cinatra-ai/ops@release/1.0  # pinned", 0],
+    ["repository: cinatra-ai/wp-theme", 0],
+    ["  repositories: [cinatra-ai/wp-theme]", 0],
+    ["REMOTE=https://github.com/cinatra-ai/wp-theme.git", 0],
+    ["# uses: cinatra-ai/ops@main", 1],
+    ["uses: cinatra-ai/ops@main and then some", 1],
+    ["repository: cinatra-ai/ops#0", 1],
+    ["https://github.com/cinatra-ai/wp-theme.git/issues/0", 1],
+    // The clone suffix.
+    ["clone cinatra-ai/engineering.git now", 1],
+    ["git@github.com:cinatra-ai/ops.git", 1],
+    ["clone engineering-proofs-private.git now", 1],
+    ["https://github.com/cinatra-ai/engineering.git/issues/0", 1],
+    ["the cinatra-ai/engineering.gitlab mirror", 0],
+    ["see cinatra-ai/engineering.tools for the sibling", 0],
+    // Terminated issue references.
+    ["the eng#0abc digest is not an issue", 0],
+    ["rationale in eng#0 here", 1],
+  ];
+  for (const [line, expected] of corpus) {
+    assert.equal(total(line), expected, `${expected} finding(s) expected for ${JSON.stringify(line)}`);
+  }
 });
