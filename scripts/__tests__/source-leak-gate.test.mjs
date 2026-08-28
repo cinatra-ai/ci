@@ -374,7 +374,7 @@ test("SLG_PRIVATE_PROOFS_REF does NOT flag the public twin, look-alikes, or the 
     'import x from "@cinatra-ai/engineering-proofs-private-foo";',
     // The ordinary word, and the private tracker the eng rules own:
     "the engineering team shipped it",
-    "filed under cinatra-ai/engineering tracker",
+    "filed under cinatra-ai/engineering tracker", // source-leak-allow: deliberate test input
   ];
   for (const line of misses) {
     assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
