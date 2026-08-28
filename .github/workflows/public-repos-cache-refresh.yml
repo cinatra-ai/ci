@@ -1,0 +1,80 @@
+name: public-repos-cache-refresh
+
+# Weekly refresh of the source-leak gate's known-PUBLIC latency cache
+# (config/public-repos.json).
+#
+# WHY IT EXISTS: the cache lets the visibility probe clear a name without an API
+# call. That is only safe while the entry is recent, so every entry carries the
+# day it was last confirmed and the gate ignores it once past the TTL. Ignoring a
+# stale entry is already fail-safe (the name is resolved live instead), so this
+# job is about keeping the cache USEFUL — and about noticing the one case that
+# matters: a repository that is no longer public. `--verify-cache` re-confirms
+# every entry, restamps the ones still public and DROPS the ones that are not.
+#
+# An entry that cannot be resolved at all is left exactly as it was and the run
+# exits 2 — a refresh must never launder an unanswered request into a fresh
+# timestamp.
+#
+# The pull request is opened with the job token, so the checks on it do not
+# re-trigger from this event; a maintainer re-runs them (or pushes an empty
+# commit) before merging. The alternative — a bot App credential — is deliberately
+# not invented here.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+
+      - name: Re-confirm every cached name against the API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/source-leak-gate.mjs --verify-cache
+
+      - name: Open a pull request when the cache drifted
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- config/public-repos.json; then
+            echo "::notice::public-repos cache is unchanged — no pull request needed"
+            exit 0
+          fi
+          branch="chore/public-repos-cache-$(date -u +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add config/public-repos.json
+          printf '%s\n' \
+            'chore(source-leak-gate): refresh the known-public cache timestamps' \
+            '' \
+            'Re-confirmed every entry against the API. Entries still public are' \
+            'restamped; entries that are no longer public are dropped, so the probe' \
+            'resolves them live from now on.' \
+            '' \
+            'Assisted-by: none' > "$RUNNER_TEMP/cache-refresh-msg"
+          git commit -F "$RUNNER_TEMP/cache-refresh-msg"
+          git push origin "$branch"
+          gh pr create \
+            --base "${{ github.ref_name }}" \
+            --head "$branch" \
+            --title "chore(source-leak-gate): refresh the known-public cache" \
+            --body "Automated weekly refresh of \`config/public-repos.json\`. Every entry was re-confirmed against the API; entries no longer public were dropped. Review the diff: a DROPPED entry means that repository stopped being public, which is worth knowing."

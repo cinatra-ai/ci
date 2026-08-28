@@ -6,17 +6,32 @@ import path from "node:path";
 import {
   buildRules, scanFile, RULES,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
-  loadKnownPublicRepos, PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES,
-  PROBE_RULE_ID, PROBE_ERROR_RULE_ID,
+  loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
+  normalizeRepoName, orgPathRepoName, functionalRefCovers,
+  PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
+  PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
+  PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,
 } from "../source-leak-gate.mjs";
 
-// Replicates the scanner's per-line matching for a single rule on a string.
+// NAMING CONVENTION. Real private repository names appear ONLY where a test
+// actually exercises the real list — list membership, the per-match carve-outs
+// for the dispatch targets, the public/private twin split, and the places where
+// tokenization has to agree with the list. Everything else — the probe, the
+// budget, the cache — uses SYNTHETIC names, because those behaviours are
+// name-independent and a real name there would be decoration. (The names
+// themselves are publishable either way; see the declassification statement in
+// the engine. This convention keeps the tests legible about WHY a real name is
+// present, not about whether it may be.)
+
+// Replicates the scanner's per-line matching for a single rule on a string —
+// including matchExclude, which is per MATCH (contextExclude is per LINE), so a
+// line carrying a required functional form AND a leaked one scores 1, not 0.
 function matchRule(rule, line) {
   const re = new RegExp(rule.re.source, rule.re.flags);
   let m, found = 0;
   while ((m = re.exec(line)) !== null) {
     if (rule.contextExclude && rule.contextExclude(line)) return 0;
-    found++;
+    if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index))) found++;
     if (!re.global) break;
     if (m.index === re.lastIndex) re.lastIndex++;
   }
@@ -317,9 +332,9 @@ test("SLG_PRIVATE_REPO_REF does NOT flag the PUBLIC proof-image twin or the func
     "the cinatra-ai/engineering-proofs-private_bak dir",
     // The npm-scope carve-out holds for the added members too:
     'import x from "@cinatra-ai/engineering-claude-plugin";',
-    // Deliberately excluded, same functional class as the ops dispatch target:
-    "the cinatra-ai/wp-theme staging remote",
+    // Only the REQUIRED machine forms of a dispatch target are excused:
     "REMOTE=https://github.com/cinatra-ai/wp-theme.git",
+    "repository: cinatra-ai/wp-theme",
   ];
   for (const line of misses) {
     assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
@@ -626,4 +641,306 @@ test("SLG_PRIVATE_DESIGN_PHRASE does NOT flag the public-safe phrasing", () => {
   for (const line of misses) {
     assert.equal(matchRule(rule, line), 0, `should NOT flag: ${JSON.stringify(line)}`);
   }
+});
+
+// --------------------------------------------------------------------------
+// Functional dispatch targets: only the REQUIRED machine forms are excused.
+// --------------------------------------------------------------------------
+
+test("a dispatch target's required machine forms are excused", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "uses: cinatra-ai/ops/.github/workflows/deploy.yml",
+    'uses: "cinatra-ai/ops/.github/workflows/deploy.yml@abc123"',
+    "repository: cinatra-ai/ops",
+    "  repositories: [cinatra-ai/wp-theme]",
+    'REMOTE="https://github.com/cinatra-ai/wp-theme.git"',
+    "git clone https://github.com/cinatra-ai/wp-theme.git",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `required functional form should be excused: ${JSON.stringify(line)}`);
+  }
+});
+
+test("EVERY other form of a dispatch target still flags (a name-wide exemption would have hidden these)", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    // ordinary prose — rephraseable, so it is not excused:
+    "the cinatra-ai/wp-theme staging remote",
+    "download the cinatra-ai/wp-theme tree at a pinned ref",
+    "operators run cinatra-ai/ops by hand",
+    // issue citations and browse URLs — exactly what a leak looks like:
+    "see cinatra-ai/ops#378 for the rationale",
+    "https://github.com/cinatra-ai/ops/issues/378",
+    "https://github.com/cinatra-ai/wp-theme/blob/main/style.css",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `should flag: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the functional carve-out is per MATCH, not per line", () => {
+  // The whole reason for replacing the name-wide exemption: one line may carry
+  // a required reference AND a leaked one, and only the required one is excused.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  const line = "uses: cinatra-ai/ops/x.yml  # rationale in cinatra-ai/ops#378";
+  assert.equal(matchRule(rule, line), 1, "the issue citation must still flag on a line with a legitimate `uses:`");
+  assert.equal(functionalRefCovers("ops", line, line.indexOf("cinatra-ai/ops")), true, "the `uses:` occurrence is covered");
+  assert.equal(functionalRefCovers("ops", line, line.lastIndexOf("cinatra-ai/ops")), false, "the citation is NOT covered");
+});
+
+test("the functional carve-out is keyed to its own repository, never shared", () => {
+  const line = "uses: cinatra-ai/ops/x.yml";
+  assert.equal(functionalRefCovers("ops", line, line.indexOf("cinatra-ai/ops")), true);
+  assert.equal(functionalRefCovers("wp-theme", line, line.indexOf("cinatra-ai/ops")), false);
+  for (const f of FUNCTIONAL_REPO_REFS) {
+    assert.ok(PRIVATE_REPO_NAMES.includes(f.name), `${f.name} carries a carve-out but is not on the private list`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// Shared tokenization: the static lane and the probe must agree.
+// --------------------------------------------------------------------------
+
+test("normalizeRepoName folds case and strips a clone URL's `.git`", () => {
+  assert.equal(normalizeRepoName("Design"), "design");
+  assert.equal(normalizeRepoName("design.git"), "design");
+  assert.equal(normalizeRepoName("design.github"), "design.github");
+  assert.equal(orgPathRepoName("cinatra-ai/design.git"), "design");
+  assert.equal(orgPathRepoName("cinatra-ai/some.repo.js"), "some.repo.js");
+});
+
+test("a clone URL resolves to the repository it clones", () => {
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  assert.ok(matchRule(rule, "clone cinatra-ai/design.git today") >= 1, "`.git` must not hide a listed name");
+});
+
+test("a listed name with a dotted continuation is a DIFFERENT repository", () => {
+  // The bug this locks: truncating `<listed>.something` back to `<listed>` would
+  // flag the wrong repository in the static lane while the probe read it whole.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  assert.equal(matchRule(rule, "see cinatra-ai/design.foo for the helper"), 0);
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  assert.equal(matchRule(probe, "see cinatra-ai/design.foo for the helper"), 1, "the probe claims it instead");
+});
+
+test("both lanes tokenize identically, and never both claim the same token", () => {
+  const statics = buildRules({}, "default", null);
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  for (const line of [
+    "see cinatra-ai/design here",              // listed  -> static only
+    "see cinatra-ai/design.foo here",          // dotted  -> probe only
+    "see cinatra-ai/design.git here",          // clone   -> static only
+    "see cinatra-ai/.github-private here",     // dotted leading name -> probe only
+    "see cinatra-ai/some-new-repo here",       // unlisted -> probe only
+    "see cinatra-ai/ops#378 here",             // listed  -> static only
+  ]) {
+    const staticHits = statics.reduce((n, r) => n + matchRule(r, line), 0);
+    const probeHits = matchRule(probe, line);
+    assert.equal(staticHits + probeHits, 1, `exactly one lane must claim ${JSON.stringify(line)}`);
+  }
+});
+
+test("a leading dot is a legal repository name", () => {
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  const re = new RegExp(probe.re.source, probe.re.flags);
+  assert.equal(re.exec("see cinatra-ai/.github-private notes")[0], "cinatra-ai/.github-private");
+});
+
+// --------------------------------------------------------------------------
+// Probe budget: a cap, a deadline, bounded concurrency, and nothing unasked
+// ever reads as clean.
+// --------------------------------------------------------------------------
+
+test("probe budget: names over the per-run cap become budget findings, unqueried", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: false }));
+  const ctx = probeCtx({ maxNames: 3 });
+  const cands = ["r1", "r2", "r3", "r4", "r5"].map((n) => candidate(n));
+  const out = await resolveProbeFindings(cands, ctx);
+  assert.equal(calls.length, 3, "only the capped number of names is fetched");
+  assert.equal(out.length, 2, "every unasked candidate is still reported");
+  for (const f of out) {
+    assert.equal(f.rule, PROBE_BUDGET_RULE_ID);
+    assert.match(f.reason, /cap/);
+    assert.match(f.snippet, /probe budget/);
+  }
+  assert.deepEqual(out.map((f) => f.match).sort(), ["cinatra-ai/r4", "cinatra-ai/r5"]);
+});
+
+test("probe budget: EVERY reference to an unasked name is named, not just the first", async () => {
+  stubFetch(() => apiResponse(200, { private: false }));
+  const ctx = probeCtx({ maxNames: 1 });
+  const out = await resolveProbeFindings(
+    [candidate("r1"), candidate("r2"), candidate("r2", { line: 9 }), candidate("r2", { file: "other.ts" })],
+    ctx,
+  );
+  assert.equal(out.length, 3, "all three references to the unasked name are reported");
+  assert.ok(out.every((f) => f.rule === PROBE_BUDGET_RULE_ID));
+});
+
+test("probe budget: a passed deadline stops further calls and reports the rest", async () => {
+  const calls = stubFetch(async () => { await new Promise((r) => setTimeout(r, 12)); return apiResponse(200, { private: false }); });
+  const ctx = probeCtx({ deadlineMs: 1, concurrency: 1, maxNames: 50 });
+  const out = await resolveProbeFindings(["a", "b", "c", "d"].map((n) => candidate(n)), ctx);
+  assert.ok(calls.length < 4, `the deadline must cut the run short (made ${calls.length} calls)`);
+  assert.ok(out.length >= 1, "the names it never asked about are reported");
+  assert.ok(out.every((f) => f.rule === PROBE_BUDGET_RULE_ID));
+  assert.match(out[0].reason, /deadline/);
+});
+
+test("probe budget: concurrency is bounded", async () => {
+  let inFlight = 0, peak = 0;
+  stubFetch(async () => {
+    inFlight++; peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return apiResponse(200, { private: true });
+  });
+  const ctx = probeCtx({ concurrency: 2, maxNames: 50 });
+  const out = await resolveProbeFindings(["a", "b", "c", "d", "e", "f"].map((n) => candidate(n)), ctx);
+  assert.ok(peak <= 2, `at most 2 requests in flight, saw ${peak}`);
+  assert.equal(out.length, 6, "and every name still gets its verdict");
+});
+
+test("probe budget: a cached name costs no budget", async () => {
+  const calls = stubFetch(() => apiResponse(200, { private: true }));
+  const ctx = probeCtx({ maxNames: 1, knownPublic: new Set(["cached-a", "cached-b"]) });
+  const out = await resolveProbeFindings(
+    [candidate("cached-a"), candidate("cached-b"), candidate("fresh-one")].map((c) => c),
+    ctx,
+  );
+  assert.equal(calls.length, 1, "the cache hits do not consume the cap");
+  assert.equal(out.length, 1);
+  assert.equal(out[0].rule, PROBE_RULE_ID);
+});
+
+test("the shipped budget defaults are finite", () => {
+  assert.ok(Number.isFinite(PROBE_MAX_NAMES) && PROBE_MAX_NAMES > 0);
+  const ctx = probeCtx({});
+  assert.ok(Number.isFinite(ctx.maxNames) && Number.isFinite(ctx.deadlineMs) && Number.isFinite(ctx.concurrency));
+});
+
+// --------------------------------------------------------------------------
+// Cache freshness: stamped entries, strict validation, a TTL, and a refresh mode.
+// --------------------------------------------------------------------------
+
+function writeCache(dir, obj) {
+  const f = path.join(dir, "public-repos.json");
+  fs.writeFileSync(f, `${JSON.stringify(obj, null, 2)}\n`);
+  return f;
+}
+function tmpdir() { return fs.mkdtempSync(path.join(os.tmpdir(), "slg-cache-")); }
+
+test("cache: a fresh entry is trusted and a stale one is ignored", () => {
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, {
+      ttlDays: 7,
+      public: [
+        { name: "fresh-repo", verifiedAt: "2026-03-10" },
+        { name: "stale-repo", verifiedAt: "2026-03-01" },
+      ],
+    });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    assert.equal(loaded.names.has("fresh-repo"), true);
+    assert.equal(loaded.names.has("stale-repo"), false, "past the TTL the name must be resolved live");
+    assert.match(loaded.note, /TTL/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: a stale entry is PROBED rather than trusted", async () => {
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, { ttlDays: 7, public: [{ name: "stale-repo", verifiedAt: "2026-03-01" }] });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-04-01T00:00:00Z" });
+    const calls = stubFetch(() => apiResponse(200, { private: true }));
+    const out = await resolveProbeFindings([candidate("stale-repo")], probeCtx({ knownPublic: loaded.names }));
+    assert.equal(calls.length, 1, "a stale entry must not clear the name for free");
+    assert.equal(out.length, 1, "and the live answer wins");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: malformed entries are hard errors, never silently ignored", () => {
+  const dir = tmpdir();
+  const bad = [
+    { public: ["ci"] },                                            // legacy bare string
+    { public: [{ name: "ci" }] },                                  // no verifiedAt
+    { public: [{ name: "ci", verifiedAt: "10-03-2026" }] },        // wrong date shape
+    { public: [{ name: "bad name", verifiedAt: "2026-03-10" }] },  // invalid repo name
+    { public: [{ name: "ci.git", verifiedAt: "2026-03-10" }] },    // a clone suffix is not a name
+    { public: [{ name: "-lead", verifiedAt: "2026-03-10" }] },     // must start with a dot or alnum
+    { ttlDays: 7 },                                                // no public array
+  ];
+  try {
+    for (const obj of bad) {
+      const f = writeCache(dir, obj);
+      assert.throws(() => loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" }),
+        `should reject ${JSON.stringify(obj)}`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: --verify-cache restamps what is still public and DROPS what is not", async () => {
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, {
+      $comment: "kept",
+      ttlDays: 7,
+      public: [
+        { name: "still-public", verifiedAt: "2026-01-01" },
+        { name: "went-private", verifiedAt: "2026-01-01" },
+      ],
+    });
+    stubFetch((url) => (url.endsWith("/still-public") ? apiResponse(200, { private: false }) : apiResponse(404, {})));
+    const r = await verifyPublicRepoCache(f, probeCtx(), { now: "2026-03-12T00:00:00Z" });
+    assert.equal(r.changed, true);
+    assert.deepEqual(r.dropped.map((d) => d.name), ["went-private"]);
+    const after = JSON.parse(fs.readFileSync(f, "utf8"));
+    assert.equal(after.$comment, "kept", "the file's own documentation survives a rewrite");
+    assert.deepEqual(after.public, [{ name: "still-public", verifiedAt: "2026-03-12" }]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: --verify-cache never launders an unresolved entry into a fresh stamp", async () => {
+  const dir = tmpdir();
+  try {
+    // Canonical on disk, so the only thing that could change the file is a
+    // laundered timestamp — which is exactly what this test forbids.
+    const f = path.join(dir, "public-repos.json");
+    fs.writeFileSync(f, serializePublicRepoCache({ ttlDays: 7, public: [{ name: "unreachable", verifiedAt: "2026-01-01" }] }));
+    stubFetch(() => { throw new Error("ECONNRESET"); });
+    const r = await verifyPublicRepoCache(f, probeCtx(), { now: "2026-03-12T00:00:00Z" });
+    assert.equal(r.unresolved.length, 1);
+    assert.equal(r.changed, false, "an unresolved entry is left EXACTLY as it was");
+    assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")).public, [{ name: "unreachable", verifiedAt: "2026-01-01" }]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the committed cache is valid, fresh-shaped, and holds nothing privately owned", () => {
+  const f = path.join(import.meta.dirname, "..", "..", "config", "public-repos.json");
+  const loaded = loadKnownPublicRepos(f, { now: new Date(`${JSON.parse(fs.readFileSync(f, "utf8")).public[0].verifiedAt}T00:00:00Z`) });
+  assert.ok(loaded.entries.length >= 1, "the cache must load");
+  assert.equal(loaded.ttlDays, PUBLIC_CACHE_TTL_DAYS);
+  for (const e of loaded.entries) {
+    assert.equal(PROBE_EXEMPT_NAMES.has(e.name), false, `${e.name} cannot be both cached-public and privately owned`);
+  }
+});
+
+test("the committed cache is already in the generator's canonical form", () => {
+  // Otherwise the weekly refresh would "drift" on formatting alone and open a
+  // pull request that changes nothing — noise that trains people to ignore it.
+  const f = path.join(import.meta.dirname, "..", "..", "config", "public-repos.json");
+  const onDisk = fs.readFileSync(f, "utf8");
+  assert.equal(serializePublicRepoCache(JSON.parse(onDisk)), onDisk);
+});
+
+test("a refresh that changes nothing rewrites nothing", async () => {
+  const dir = tmpdir();
+  try {
+    const f = path.join(dir, "public-repos.json");
+    fs.writeFileSync(f, serializePublicRepoCache({ $comment: "x", ttlDays: 7, public: [{ name: "still-public", verifiedAt: "2026-03-12" }] }));
+    const before = fs.readFileSync(f, "utf8");
+    stubFetch(() => apiResponse(200, { private: false }));
+    const r = await verifyPublicRepoCache(f, probeCtx(), { now: "2026-03-12T00:00:00Z" });
+    assert.equal(r.changed, false, "same day, same entries => no drift");
+    assert.equal(fs.readFileSync(f, "utf8"), before);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

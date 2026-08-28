@@ -1,13 +1,14 @@
 {
-  "$comment": "Latency cache for the source-leak gate's repository-visibility probe: names the probe may clear WITHOUT an API call. It is not an authority for 'private' — a name absent from this list is resolved live against the API, so the list may be short and still be correct. It is deliberately NOT a mirror of every public repository in the organization: an entry that goes private later would keep clearing while it stands, so only repositories that are public by construction (the OSS product surfaces every caller cites constantly) belong here, and an entry is REMOVED rather than a new one accumulated when that stops being true. Each name below was confirmed public against the API when it was added.",
+  "$comment": "Latency cache for the source-leak gate's repository-visibility probe: names the probe may clear WITHOUT an API call. It is not an authority for 'private' — a name absent from this list, or present but older than ttlDays, is resolved live against the API, so the list may be short and still be correct. Each entry records the day the name was last confirmed public against the API; a cache entry that cannot go stale would be a permanent fail-open, because a repository turned private later would keep clearing forever. It is deliberately NOT a mirror of every public repository in the organization: only repositories that are public by construction (the OSS product surfaces every caller cites constantly) belong here, and an entry is REMOVED rather than a new one accumulated when that stops being true. Regenerate with `--verify-cache`; the weekly refresh workflow does it and opens a pull request on drift.",
+  "ttlDays": 7,
   "public": [
-    "ci",
-    "cinatra",
-    "cinatra-cli",
-    "claude-plugin",
-    "docs",
-    "assistant-skills",
-    "engineering-proofs",
-    "mcp-server-connector"
+    { "name": "ci", "verifiedAt": "2026-08-28" },
+    { "name": "cinatra", "verifiedAt": "2026-08-28" },
+    { "name": "cinatra-cli", "verifiedAt": "2026-08-28" },
+    { "name": "claude-plugin", "verifiedAt": "2026-08-28" },
+    { "name": "docs", "verifiedAt": "2026-08-28" },
+    { "name": "assistant-skills", "verifiedAt": "2026-08-28" },
+    { "name": "engineering-proofs", "verifiedAt": "2026-08-28" },
+    { "name": "mcp-server-connector", "verifiedAt": "2026-08-28" }
   ]
 }

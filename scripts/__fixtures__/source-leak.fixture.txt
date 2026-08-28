@@ -62,7 +62,12 @@ HIT:SLG_PRIVATE_REPO_REF:assets under cinatra-ai/marketing-explainer-video
 MISS:SLG_PRIVATE_REPO_REF:public host cinatra-ai/engineering-proofs is cited freely
 MISS:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/engineering-proofs/blob/main/shot.png
 MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/engineering-proofs-private-foo instead
-MISS:SLG_PRIVATE_REPO_REF:the cinatra-ai/wp-theme staging remote
+HIT:SLG_PRIVATE_REPO_REF:the cinatra-ai/wp-theme staging remote
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/ops/issues/378
+MISS:SLG_PRIVATE_REPO_REF:REMOTE=https://github.com/cinatra-ai/wp-theme.git
+MISS:SLG_PRIVATE_REPO_REF:repository: cinatra-ai/wp-theme
+MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/design.foo for the helper
+HIT:SLG_PRIVATE_REPO_REF:clone cinatra-ai/design.git today
 HIT:SLG_PRIVATE_PROOFS_REF:pictures pushed to engineering-proofs-private
 HIT:SLG_PRIVATE_PROOFS_REF:opened engineering-proofs-private#4 for the shots
 HIT:SLG_PRIVATE_PROOFS_REF:see engineering-proofs-private/issues/4 directly

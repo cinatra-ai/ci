@@ -51,6 +51,18 @@ function runGate(dir, base, extraArgs) {
 // server running in THIS process, so a synchronous spawn would block the event
 // loop and deadlock against the child waiting for a reply.
 const execFileAsync = promisify(execFile);
+async function runGateStatus(dir, base, extraArgs, env = {}) {
+  try {
+    await execFileAsync(
+      "node",
+      [SCANNER, "--exit-on-match", "--quiet", "--diff-base-env", "TESTBASE", ...extraArgs],
+      { cwd: dir, encoding: "utf8", env: gateEnv(base, env), maxBuffer: 64 * 1024 * 1024 },
+    );
+    return 0;
+  } catch (e) {
+    return e.code;
+  }
+}
 async function runGateJson(dir, base, extraArgs, env = {}) {
   const { stdout } = await execFileAsync(
     "node",
@@ -229,7 +241,7 @@ test("probe (end to end): public clears, private blocks, and each reference is r
         'const b = "cinatra-ai/a-private-repo";',
         'const c = "cinatra-ai/never-heard-of-it";',
         'import x from "@cinatra-ai/a-private-repo";',
-        'const d = "cinatra-ai/ops";',
+        'uses: cinatra-ai/ops/.github/workflows/deploy.yml',
       ].join("\n") + "\n",
     }, "init");
 
@@ -311,5 +323,108 @@ test("probe (end to end): the line ratchet bounds the probe to gated lines", asy
       assert.equal(out.samples[0].match, "cinatra-ai/newly-added-repo");
       assert.deepEqual(seen, ["newly-added-repo"], "the untouched line costs no API call");
     });
+  } finally { rm(dir); }
+});
+
+// --------------------------------------------------------------------------
+// The probe lane resolves BEFORE the file/baseline ratchets, so a resolved
+// probe finding is an ordinary finding by the time they run. Resolving after
+// them would mean an allowlisted file still blocks, a probe-only allowlist entry
+// reads as stale, and a baseline can never tolerate a probe finding.
+// --------------------------------------------------------------------------
+
+test("file ratchet: an allowlisted, untouched file with only a PROBE finding is tolerated", async () => {
+  const dir = setupRepo();
+  try {
+    const base = commit(dir, {
+      "probe.ts": 'const p = "cinatra-ai/probe-only-repo";\n',
+      "other.txt": "x\n",
+    }, "init");
+    commit(dir, { "other.txt": "x\ny\n" }, "touch other only");
+    fs.writeFileSync(path.join(dir, "allow.json"), JSON.stringify({ files: ["probe.ts"] }));
+
+    await withApiStub({}, async (apiBase) => {
+      // Sanity: without the allowlist the probe finding really does block.
+      assert.equal(
+        await runGateStatus(dir, base, ["--ratchet-mode", "file", "--probe", "--api-base", apiBase]),
+        1, "the probe finding must block when nothing excuses it",
+      );
+      // With it: tolerated — and the entry must NOT read as stale either, which
+      // would block just as hard.
+      assert.equal(
+        await runGateStatus(dir, base, ["--ratchet-mode", "file", "--legacy-allowlist", "allow.json", "--probe", "--api-base", apiBase]),
+        0, "an allowlisted, untouched probe-only file is tolerated and its entry is not stale",
+      );
+    });
+  } finally { rm(dir); }
+});
+
+test("file ratchet: a TOUCHED allowlisted file with a probe finding still blocks", async () => {
+  const dir = setupRepo();
+  try {
+    const base = commit(dir, { "probe.ts": "const clean = 1;\n" }, "init");
+    commit(dir, { "probe.ts": 'const clean = 1;\nconst p = "cinatra-ai/probe-only-repo";\n' }, "add a reference");
+    fs.writeFileSync(path.join(dir, "allow.json"), JSON.stringify({ files: ["probe.ts"] }));
+    await withApiStub({}, async (apiBase) => {
+      assert.equal(
+        await runGateStatus(dir, base, ["--ratchet-mode", "file", "--legacy-allowlist", "allow.json", "--probe", "--api-base", apiBase]),
+        1, "the allowlist never excuses a file the change touched",
+      );
+    });
+  } finally { rm(dir); }
+});
+
+test("baseline ratchet: an accepted probe count is tolerated, an increase blocks", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "probe.ts": 'const p = "cinatra-ai/probe-only-repo";\n' }, "init");
+    fs.writeFileSync(path.join(dir, "baseline.json"),
+      JSON.stringify({ perRuleFile: { ["SLG_PRIVATE_REPO_PROBE\tprobe.ts"]: 1 } }));
+    await withApiStub({}, async (apiBase) => {
+      assert.equal(
+        await runGateStatus(dir, "", ["--ratchet-mode", "baseline", "--gate-baseline", "baseline.json", "--probe", "--api-base", apiBase]),
+        0, "a baseline that records the probe finding tolerates it",
+      );
+      fs.writeFileSync(path.join(dir, "probe.ts"),
+        'const p = "cinatra-ai/probe-only-repo";\nconst q = "cinatra-ai/probe-only-repo";\n');
+      assert.equal(
+        await runGateStatus(dir, "", ["--ratchet-mode", "baseline", "--gate-baseline", "baseline.json", "--probe", "--api-base", apiBase]),
+        1, "one more than the baseline blocks",
+      );
+    });
+  } finally { rm(dir); }
+});
+
+test("baseline writer records resolved probe findings", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "probe.ts": 'const p = "cinatra-ai/probe-only-repo";\n' }, "init");
+    await withApiStub({}, async (apiBase) => {
+      await runGateJson(dir, "", [
+        "--ratchet-mode", "off", "--probe", "--api-base", apiBase,
+        "--write-gate-baseline", "out.json",
+      ], {});
+      const written = JSON.parse(fs.readFileSync(path.join(dir, "out.json"), "utf8"));
+      assert.equal(written.perRuleFile["SLG_PRIVATE_REPO_PROBE\tprobe.ts"], 1,
+        "a baseline generated before the probe resolved would be unusable");
+    });
+  } finally { rm(dir); }
+});
+
+test("probe budget (end to end): unasked candidates are reported, never passed", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, {
+      "note.ts": ["one", "two", "three"].map((n) => `const ${n} = "cinatra-ai/repo-${n}";`).join("\n") + "\n",
+    }, "init");
+    await withApiStub({ "repo-one": { private: false }, "repo-two": { private: false }, "repo-three": { private: false } },
+      async (apiBase, seen) => {
+        const out = await runGateJson(dir, "", [
+          "--ratchet-mode", "off", "--probe", "--api-base", apiBase, "--probe-max-names", "1",
+        ], {});
+        assert.equal(seen.length, 1, "the cap is enforced end to end");
+        assert.equal(out.perRule.SLG_PRIVATE_REPO_PROBE_BUDGET, 2, "the two unasked names are reported");
+        assert.equal(out.gatedFindings, 2);
+      });
   } finally { rm(dir); }
 });

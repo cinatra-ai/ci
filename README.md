@@ -170,19 +170,44 @@ public may see:
   organization's private repositories, and does not need to: the question asked
   is only "can this token see that repository as public?".
 
+Both lanes share ONE tokenizer, so they always agree on where a repository name
+starts and ends: a trailing `.git` resolves to the repository it clones, a
+leading dot is legal (`<org>/.github-private`), and a listed name with a dotted
+continuation (`<org>/<listed>.something`) is a *different* repository — claimed
+by the probe, never mistaken for the listed one.
+
 The probe never guesses. A repository the API reports public produces no
 finding; private, `404` (what a private *or* absent repository returns to a
 token without access), a rate limit, a network error and a malformed response
 all produce one — the unresolved cases under their own rule id
 (`SLG_PRIVATE_REPO_PROBE_ERROR`), naming the cause, so a run that could not
-verify never reads as a pass. Verdicts are memoised per run, and
+verify never reads as a pass.
+
+The lane runs inside a per-run **budget**: a cap on distinct names, a wall-clock
+deadline and bounded concurrency. A candidate the budget leaves unasked is
+reported as `SLG_PRIVATE_REPO_PROBE_BUDGET`, so "we ran out of budget" can never
+read as "we checked it and it was fine". Verdicts are memoised per run, and
 [`config/public-repos.json`](config/public-repos.json) is a small committed
-latency cache of names that may be cleared without a call.
+latency cache: each entry records the day it was last confirmed public and is
+ignored once past the TTL, because an entry that cannot go stale would be a
+permanent fail-open. `--verify-cache` re-confirms every entry and rewrites those
+stamps, dropping any repository that is no longer public; a weekly workflow runs
+it and opens a pull request on drift.
 
 Pass `--offline` to force the list-only lane (also what happens with no token),
 and `--probe` to force the probe on unauthenticated. Deliberately-public
 references are allowlisted the same way every other rule allows them, via
 `config.lineExcludes` or `config.exemptFileBasenames`.
+
+### Dispatch targets that are also private
+
+A few private repositories are named by the organization's own automation and
+cannot be rephrased away — a reusable-workflow path, a checkout or token-scope
+key, a clone URL. Those exact machine forms are excused **per match**, not per
+name and not per line: ordinary prose, an `#<n>` citation and an `/issues/` or
+`/blob/` URL naming the same repository all still flag, including on a line that
+also carries a legitimate functional reference. A name-wide exemption would have
+hidden precisely the forms worth catching.
 
 ### Per-repo config
 
@@ -409,8 +434,8 @@ scripts/docs-contract-gate.mjs`, Node builtins only) that validates one
 integration's `docs/` directory against the **integration docs contract** — the
 fixed page-set + frontmatter shape authored in
 [`cinatra-ai/docs`](https://github.com/cinatra-ai/docs) (docs#51) and compiled
-into the Integrations chapter of docs.cinatra.ai by the docs publish path
-(cinatra-ai/ops#378). Integration repos call it **pre-tag** so their per-repo
+into the Integrations chapter of docs.cinatra.ai by the docs publish path.
+Integration repos call it **pre-tag** so their per-repo
 docs stay consistent without central control; the publish path runs the SAME
 gate at compile time against the tagged docs tree.
 

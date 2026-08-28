@@ -4,7 +4,7 @@ name: docs-contract-gate
 # Integration repos (wordpress-plugin, drupal-module, twenty-connector,
 # plane-connector) call it from a thin caller PRE-TAG to validate their per-repo
 # `docs/` against the docs contract authored in cinatra-ai/docs (docs#51); the
-# docs publish path (cinatra-ai/ops#378) runs the same gate at compile time.
+# docs publish path runs the same gate at compile time.
 #
 #   jobs:
 #     docs-contract-gate:
