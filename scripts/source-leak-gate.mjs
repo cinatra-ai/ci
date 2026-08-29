@@ -14,13 +14,47 @@
  *     very markers it detects) is bracketed by sentinel comments and skipped on
  *     the gate's own file; dedicated fixtures + baselines are path-exempt.
  *
- * Zero runtime dependencies (node builtins only).
+ * Repository-visibility detection runs in ONE of two modes:
+ *   - OFFLINE (the default, and what `--offline` forces): the hard-coded
+ *     PRIVATE_REPO_NAMES list is the whole authority. Chosen automatically when
+ *     no token is present, because unauthenticated API calls are rate-limited
+ *     hard enough that a fail-closed probe would red every caller. This is also
+ *     the only mode that can judge the BARE-name forms, which carry no org path
+ *     for an API to resolve.
+ *   - PROBE (a token in GITHUB_TOKEN / GH_TOKEN, or `--probe` to force it
+ *     unauthenticated): the list still runs, and every OTHER `<org>/<name>`
+ *     token on a gated line is additionally resolved against the GitHub API —
+ *     so a repository created after the last list edit is caught. Public => no
+ *     finding. Private, 404 (what a private-or-absent repo returns to a token
+ *     without access), or ANY unresolved answer => a finding. The probe never
+ *     guesses "public": a network error, a rate limit and a malformed response
+ *     are all fail-closed, reported with their cause. The lane runs inside a
+ *     per-run BUDGET (a cap on distinct names, a wall-clock deadline, bounded
+ *     concurrency); a candidate the budget leaves unasked is reported too, so
+ *     "we ran out of budget" can never read as "we checked it and it was fine".
+ *     `config/public-repos.json` is a latency cache of names confirmed public,
+ *     each stamped with the day it was confirmed and ignored once past its TTL.
+ *     `--verify-cache` re-confirms every entry and rewrites those stamps.
+ *
+ * No registry dependencies: node builtins, plus the VENDORED js-yaml copy
+ * committed at scripts/lib/vendor/js-yaml/ (MIT; provenance and digest beside
+ * it). The gate runs in callers' CI with no `npm install`, so everything it
+ * imports is committed under scripts/.
  */
 import { execFileSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveBaseRef, buildRenameMap, getAddedLineNumbers, getIntroducedPaths } from "./lib/touch-ratchet.mjs";
+// The YAML parser is VENDORED (scripts/lib/vendor/js-yaml/, MIT, provenance and
+// digest recorded beside it) and imported by relative path: this engine runs in
+// consuming repositories' CI with no `npm install`, so it may only import files
+// committed under `scripts/`. It is used for ONE thing — deciding whether a
+// value stands at a structurally valid GitHub Actions location — because nine
+// rounds of hand-tracked YAML context (block scalars, `- |` items, quoted
+// scalars, quoted keys, `--- |` documents, node properties) each missed one more
+// syntax form. A parser knows the syntax; a line scanner never will.
+import { loadAll as loadAllYaml } from "./lib/vendor/js-yaml/js-yaml.mjs";
 
 const SCANNER_VERSION = "0.1.0";
 const DEFAULT_DIFF_BASE_ENV = "SOURCE_LEAK_DIFF_BASE";
@@ -72,6 +106,379 @@ const PRIVATE_EXACT = new Set([".github/CODEOWNERS"]);
 // Doc files are scanned but findings dropped (they legitimately reference history).
 const EXEMPT_FILE_BASENAMES = new Set(["CLAUDE.md", "AGENTS.md", "MEMORY.md", "README.md", "CHANGELOG.md"]);
 const EXEMPT_DIR_PREFIXES = ["docs/"];
+
+// DECLASSIFICATION STATEMENT — read this before adding or removing a name.
+//
+// This file is PUBLIC and has always carried private repository NAMES: a
+// detector cannot match what it may not spell. That is a deliberate position,
+// not an oversight. A repository NAME is not a secret — it leaks nothing about
+// what the repository holds — while its CONTENTS, its issue text and its issue
+// NUMBERS are, and none of those appear here or may be added. The list below is
+// therefore published on purpose so every consuming repository can run the same
+// check offline. Keep it to bare names; if a name ever does encode something
+// confidential, that is a reason to rename the repository, not to weaken the
+// gate by dropping it from this list.
+//
+// The OFFLINE authority for repository visibility. It is ONE list: the probe
+// lane subtracts it mechanically (PROBE_EXEMPT_NAMES) rather than trusting a
+// second hand-maintained copy to stay in step.
+const PRIVATE_REPO_NAMES = [
+  "design", "marketplace", "website", "cinatra-business", "create-cinatra-extension",
+  "dev-skills-store", "extension-release-tooling", "legal-archive-skills", "renovate-config",
+  "dev-internal-archive", "cinatra-poc", "cinatra-oss-transit", "cinatra-claude-memory",
+  "engineering-claude-plugin", "engineering-proofs-private", "marketing-explainer-video",
+  "major-release-workflow", "blog-content-workflow", "ops", "wp-theme",
+];
+const PRIVATE_REPO_NAME_SET = new Set(PRIVATE_REPO_NAMES);
+
+// GitHub's repository-name grammar, written ONCE and shared by everything that
+// has to decide "is this a repository name?": the tokenizer both scanning lanes
+// use, the functional carve-out grammars below, and the committed public-repos
+// cache's entry validation. Two hand-kept copies would drift, and a name the
+// tokenizer nominates but the cache calls invalid (or the reverse) is exactly
+// the disagreement that produces a finding in one lane and a different finding
+// in the other.
+//
+// GitHub accepts 1..100 characters from `[A-Za-z0-9_.-]`, in ANY position: a
+// leading `_`, `.` or `-` is legal (`<org>/_shared`, `<org>/.github-private`,
+// `<org>/-secret`), and a grammar that demanded an alnum first silently dropped
+// every one of them. A token made of NOTHING BUT dots is not a name at all —
+// GitHub rejects `.`, `..` and every longer run — so the leading guard rejects a
+// dot run of ANY length that ends at the token boundary. The length is the
+// point: a guard that stopped at two dots read `<org>/...` (an ellipsis) as the
+// repository `.`, and then spent a probe request on a name that can only 404
+// into a fail-closed finding. The name may not END in a dot either, so a
+// sentence-final period ("… see <org>/<repo>.") stays punctuation instead of
+// being read into the name. `.git` is a clone-URL suffix, not part of the name;
+// normalizeRepoName() strips it once the tail below has confirmed it really is
+// a suffix — and only when what remains is itself a name.
+//
+// The 100-character ceiling is load-bearing rather than cosmetic: a longer run
+// of name characters is not a repository, and accepting it would spend a probe
+// request on a string that can only 404 — a 404 the gate then has to report as a
+// fail-closed finding. That is why the name must END AT A BOUNDARY (see
+// REPO_TOKEN_TAIL): an over-long run produces no match at all, instead of a
+// 100-character prefix nominated as a repository that cannot exist.
+const REPO_NAME_MAX = 100;
+const REPO_NAME_SOURCE =
+  "(?!\\.+(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_-])?";
+
+// An `<owner>/<repo>` scalar for ANY owner, in the same one grammar: the
+// flow-sequence carve-out below validates EVERY entry with it, so a sequence
+// that carries junk in a later entry is not a machine form and excuses nothing.
+//
+// The owner is GitHub's LOGIN grammar, exactly: 1..39 characters of
+// `[A-Za-z0-9-]` that may neither begin nor end with a hyphen nor carry two
+// hyphens in a row. The looser `[A-Za-z0-9][A-Za-z0-9-]{0,38}` accepted logins
+// GitHub rejects, and that laxness ran the wrong way: `bad-/public` parsed as a
+// valid entry, so `repositories: [bad-/public, <org>/ops]` read as a functional
+// sequence and the private entry rode out on it. An entry whose owner cannot
+// exist makes the sequence NOT a machine form, and every private entry in it is
+// a finding.
+//
+// The leading lookahead is what actually holds the 39-character CEILING: the
+// hyphen rule alone is written as 38 repetitions of `-?[A-Za-z0-9]`, and each
+// repetition may carry a hyphen, so on its own it would accept a 77-character
+// login. The lookahead measures the whole run of login characters first — the
+// same shape REPO_NAME_MAX uses for repository names, and for the same reason:
+// a login GitHub cannot issue must produce NO match, never a truncated prefix.
+const OWNER_NAME_MAX = 39;
+const OWNER_NAME_SOURCE =
+  `(?=[A-Za-z0-9-]{1,${OWNER_NAME_MAX}}(?![A-Za-z0-9-]))[A-Za-z0-9](?:-?[A-Za-z0-9]){0,${OWNER_NAME_MAX - 1}}`;
+const ANY_ORG_PATH_SOURCE = `${OWNER_NAME_SOURCE}\\/${REPO_NAME_SOURCE}`;
+
+// FUNCTIONAL references: the exact machine forms the organization's own
+// automation REQUIRES, for private repositories that are also dispatch targets.
+// These are the ONLY forms excused, and they are excused per MATCH, not per name
+// and not per line — so ordinary prose, an `#<n>` issue citation and a
+// `/issues/` or `/blob/` URL naming the same repository all still flag, even on
+// a line that also carries a legitimate functional reference. A name-wide
+// exemption would have hidden exactly those.
+//
+// Each pattern is transcribed from the real automation:
+//   - `uses:` — a reusable-workflow / action reference; the job cannot run
+//     without it.
+//   - `repository:` / `repositories:` — a checkout target, and the key that
+//     scopes a short-lived installation token to one repository.
+//   - the `.git` clone URL — the remote a pinned tree is fetched from.
+// Everything else about those repositories (prose, operator error text, input
+// descriptions) is REPHRASEABLE and must be rephrased, not exempted.
+//
+// EXACTNESS is the whole point. A carve-out that stops at the repository name
+// and tolerates ANY suffix excuses the leak it was meant to let through around:
+// `uses: <org>/ops/issues/0`, `repository: <org>/ops/issues/0` and
+// `repository: <org>/ops#0` are issue citations wearing a machine key as a hat,
+// and each of them is a finding. So each form below is transcribed to its real
+// grammar and terminated explicitly.
+//
+// A YAML key carve-out is a MACHINE GRAMMAR, not a substring. Four things make
+// it exact:
+//
+//   1. THE KEY OWNS THE LINE. The key must be the line's first non-blank token
+//      (after an optional `- ` sequence marker). A `#` anywhere before it makes
+//      the line a COMMENT, and a comment is prose ABOUT a machine form, never
+//      the machine form itself: a commented-out step excuses nothing.
+//   2. A KEY IS SEPARATED FROM ITS VALUE BY REAL WHITESPACE. YAML requires a
+//      space after a mapping key, so `uses:<org>/ops@main` and
+//      `repository:<org>/ops` are not scalars at all — they are text that
+//      happens to contain a colon, and no runner accepts them. The gap is
+//      `[ \t]+`; the earlier `[ \t]*` excused a form that cannot run.
+//   3. THE SCALAR IS COMPLETE. After the value only end of line or a real YAML
+//      comment (whitespace, then `#`) may follow — so a trailing `/issues/0`, an
+//      `#0` citation glued to the value, or any other junk leaves the carve-out.
+//      The whitespace before `#` is load-bearing: a comment-less `#` is an issue
+//      citation, not a comment. The terminator is a LOOKAHEAD, so the excused
+//      span stops at the value and a citation living in the trailing comment
+//      still flags.
+//   4. QUOTES MATCH. An opening quote is captured and the same quote is required
+//      to close the scalar, so an unbalanced quote is not a machine form.
+//
+// CASE. GitHub resolves owner and repository names case-insensitively, so
+// `uses: Cinatra-AI/Ops@main` is the same dispatch as the lower-case spelling
+// and refusing it would refuse CORRECT input. Every carve-out therefore folds
+// case on the ORG and the NAME only (ciLiteral below). The KEY does not fold:
+// `uses:` is the one spelling a runner accepts, and `Uses:` is prose.
+//
+// `uses:` — GitHub accepts exactly `<org>/<repo>[/<path>]@<ref>` for a
+// cross-repository step: `<path>` is a reusable-workflow file under
+// `.github/workflows/` or an action directory path, and `<ref>` is a tag / sha /
+// branch name, which MAY contain `/` (branch names do) but never whitespace, `@`
+// or `#`. The `@<ref>` is MANDATORY — GitHub rejects a ref-less cross-repo
+// `uses:` — and requiring it is what keeps a URL tail such as `/issues/1`
+// outside the exemption.
+const YAML_KEY_PREFIX = "^[ \\t]*(?:-[ \\t]+)?";
+// A mapping key and its value are separated by REAL whitespace (rule 2 above).
+const KEY_VALUE_GAP = "[ \\t]+";
+const SCALAR_TERMINATOR = "(?=[ \\t]+#|[ \\t]*$)";
+const USES_REF_TOKEN = "[A-Za-z0-9._/-]+";
+const USES_WORKFLOW_PATH = "\\/\\.github\\/workflows\\/[A-Za-z0-9._-]+\\.ya?ml";
+const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
+// A `uses:` step only exists in a workflow file or an action definition;
+// anywhere else the key is prose wearing YAML clothes and is not excused. The
+// carve-out therefore needs the FILE: a caller that cannot say which file the
+// line came from has no document to judge it against either, and gets no
+// carve-out at all (see functionalRefCovers).
+//
+// The workflow path is ANCHORED AT THE REPOSITORY ROOT. GitHub runs workflows
+// out of the root `.github/workflows/` directory and nowhere else, so a
+// `.github/workflows/` folder at any other depth is an ordinary directory whose
+// files never execute: `nested/.github/workflows/fake.yml` is a document that
+// looks like a workflow, and the reference in it is prose. Paths arrive
+// repository-relative (`git ls-files`), with an optional `./` prefix tolerated.
+// `action.ya?ml` stays matched by BASENAME at any depth — a composite action
+// legitimately lives in a subdirectory (`.github/actions/<name>/action.yml`).
+//
+// The two arms are named SEPARATELY because they are not interchangeable: a
+// workflow declares `jobs:` and an action declares `runs:`, and
+// legitimateActionValues reads each key only out of the file type that can
+// really carry it. USES_FILE_RE — the union — is only the coarse "could this
+// file run a `uses:` step at all" test the carve-out's file gate needs.
+const ROOT_WORKFLOW_FILE_RE = /^(?:\.\/)?\.github\/workflows\/[^/]+\.ya?ml$/;
+const ACTION_FILE_RE = /(?:^|\/)action\.ya?ml$/;
+const USES_FILE_RE = new RegExp(`${ROOT_WORKFLOW_FILE_RE.source}|${ACTION_FILE_RE.source}`);
+// The `repository:` / `repositories:` keys are ordinary YAML mapping keys, so
+// unlike `uses:` they are legal in ANY workflow, action or compose file — but
+// only in a YAML one. Outside YAML the key is prose wearing a machine key as a
+// hat: a shell script or a Markdown runbook that writes `repository: <org>/<repo>`
+// is spelling the name, not configuring a checkout, and it is a finding. Being
+// YAML is necessary and not sufficient: the value must also stand at a real
+// Actions location in the parsed document (see legitimateActionValues).
+const YAML_FILE_RE = /\.ya?ml$/i;
+// `repository:` / `repositories:` has TWO forms, and they are SEPARATE grammars
+// on purpose:
+//   - a SCALAR `key: <org>/<repo>`, ending only at end of line, at a real
+//     comment, or at its own closing quote. A `,` and a `]` are NOT terminators
+//     here: with no `[` ever opened there is no sequence to close, so
+//     `repository: <org>/ops,#0` is trailing junk — an issue citation wearing a
+//     machine key as a hat — and a finding. One terminator set serving both
+//     forms excused exactly that.
+//   - a FLOW SEQUENCE `key: [<org>/<repo>, <org>/<repo>]` with PAIRED
+//     delimiters, in which EVERY entry must itself be a valid `<org>/<repo>`
+//     scalar (ANY_ORG_PATH_SOURCE, optionally quoted). The excused span is the
+//     WHOLE sequence, so every entry is excused rather than only the first —
+//     while an unclosed `[`, or junk in any entry, matches nothing and excuses
+//     nothing.
+const FLOW_OPEN = "\\[[ \\t]*";
+const FLOW_CLOSE = "[ \\t]*\\]";
+const FLOW_SEP = "[ \\t]*,[ \\t]*";
+// YAML accepts ONE optional trailing comma before the closing bracket, so
+// `repositories: [<org>/<repo>,]` is a real flow sequence a runner reads exactly
+// like the comma-less spelling. Refusing it was a refusal cost: valid input the
+// gate called a leak. It is a single optional comma, not a separator that may
+// repeat — `[<org>/<repo>,,]` is still not YAML and still excuses nothing.
+const FLOW_TRAILING_COMMA = "(?:[ \\t]*,)?";
+// The clone URL terminates at `.git` PLUS a terminator — end of line,
+// whitespace, a quote, `,`, `;` or `)`, and nothing else. `<org>/<repo>.git` is
+// a remote; `<org>/<repo>.git/issues/0` is an issue citation with a remote's
+// spelling, and it is a finding.
+//
+// A `]` is NOT a terminator here. The left delimiter admits an opening bracket
+// because a remote can be quoted or bracketed by the prose around it, but a
+// remote that ENDS at a `]` is a bracketed citation — a Markdown link label, a
+// list entry — rather than a command anybody runs, and the documented set never
+// contained one. It excused `[<org>/<repo>.git]`.
+//
+// It is also ANCHORED ON THE LEFT, which is what makes it a clone reference
+// rather than a substring of one. A clone reference is either a FULL REMOTE
+// (`https://github.com/<org>/<repo>.git`, `git@github.com:<org>/<repo>.git`,
+// `ssh://git@github.com/<org>/<repo>.git`) or the BARE `<org>/<repo>.git`
+// standing on its own — and BOTH forms take the SAME left delimiter: start of
+// text, whitespace, an opening quote or bracket, or the `=` of a shell/env
+// assignment (`REMOTE=https://github.com/<org>/<repo>.git` is the machine form,
+// spelled the way scripts actually spell it). Never after an `@`:
+// `@<org>/<repo>.git` is an npm scope, not a remote, and an unanchored pattern
+// excused it by matching from the org onward.
+//
+// The delimiter binds the REMOTE FORMS too, not just the bare one. While it
+// guarded only the bare alternative, any junk could carry a remote:
+// `xhttps://github.com/<org>/<repo>.git`, `xgit@github.com:…` and `xssh://…`
+// are not remotes anybody clones, but they spell the private name in full and
+// the carve-out excused every one of them. One delimiter, applied once in front
+// of an OPTIONAL remote prefix, is what makes that impossible to reintroduce.
+const CLONE_TERMINATOR = "(?=$|[\\s,;)\"'`])";
+const CLONE_REMOTE_PREFIX =
+  "(?:https:\\/\\/github\\.com\\/|git@github\\.com:|ssh:\\/\\/git@github\\.com\\/)";
+const CLONE_LEFT = "(?<![^\\s=\"'`([{])";
+function escapeForRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+// Case-folded literal: `ops` becomes `[oO][pP][sS]`. Folding a LITERAL rather
+// than setting the `i` flag keeps the fold where it belongs — the org and the
+// repository name — and leaves the YAML key case-sensitive.
+function ciLiteral(s) { return String(s).replace(/[A-Za-z]/g, (c) => `[${c.toLowerCase()}${c.toUpperCase()}]`); }
+const ORG_CI = ciLiteral("cinatra-ai");
+function repoNameCi(name) { return ciLiteral(escapeForRegex(name)); }
+const FLOW_ENTRY = `(?:"${ANY_ORG_PATH_SOURCE}"|'${ANY_ORG_PATH_SOURCE}'|${ANY_ORG_PATH_SOURCE})`;
+// The optional tail of a `uses:` target: a reusable-workflow file under
+// `.github/workflows/` or an action directory path.
+const USES_TARGET_TAIL = `(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?`;
+// THE `uses:` scalar grammar, written ONCE and parameterised by the TARGET it
+// has to match. The carve-out below asks for one specific private repository;
+// the expiry reader (readUsesPins) asks for any `<owner>/<repo>` target. They
+// are the SAME line grammar — key owns the line, real whitespace after the key,
+// matching quotes or none, a mandatory `@<ref>`, then only a real comment or end
+// of line — and sharing the source is what keeps them from drifting apart. A
+// second, looser reader is how `uses:<target>@<sha>` (no whitespace: not a
+// scalar, no runner accepts it) came to answer for a pin that no longer exists.
+//
+// Groups: 1 = the opening quote (backreferenced to close), 2 = the target,
+// 3 = the ref.
+function usesScalarSource(targetSource) {
+  return `${YAML_KEY_PREFIX}uses:${KEY_VALUE_GAP}(["']?)(${targetSource})@(${USES_REF_TOKEN})\\1${SCALAR_TERMINATOR}`;
+}
+function usesRefRe(name) {
+  const n = repoNameCi(name);
+  return new RegExp(usesScalarSource(`${ORG_CI}\\/${n}${USES_TARGET_TAIL}`), "g");
+}
+function repositoryKeyScalarRe(name) {
+  const n = repoNameCi(name);
+  return new RegExp(
+    `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}(["']?)(${ORG_CI}\\/${n})\\1${SCALAR_TERMINATOR}`,
+    "g",
+  );
+}
+function repositoryKeyFlowRe(name) {
+  const n = repoNameCi(name);
+  return new RegExp(
+    `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}${FLOW_OPEN}`
+    + `(?:${FLOW_ENTRY}${FLOW_SEP})*(["']?)(${ORG_CI}\\/${n})\\1`
+    + `(?:${FLOW_SEP}${FLOW_ENTRY})*${FLOW_TRAILING_COMMA}${FLOW_CLOSE}${SCALAR_TERMINATOR}`,
+    "g",
+  );
+}
+function cloneUrlRe(name) {
+  const n = repoNameCi(name);
+  return new RegExp(
+    `${CLONE_LEFT}(?:${CLONE_REMOTE_PREFIX})?${ORG_CI}\\/${n}\\.git${CLONE_TERMINATOR}`,
+    "g",
+  );
+}
+// The KIND of YAML node a form's value stands at, named as the collection that
+// answers for that kind. The two kinds are SEPARATE COLLECTIONS, and that is the
+// whole mechanism: a scalar value can never answer for a sequence because it is
+// never in the sequence collection, whatever either one spells. Sharing one
+// collection and telling the kinds apart by a marker inside the key cannot hold
+// — the parser decodes `"\0"` in a double-quoted scalar into a real NUL, so a
+// value can spell any marker a key uses.
+//
+// The engine builds the SCALAR collection and no other: every Actions location
+// that takes a repository takes one scalar (a `uses:` target, a step's
+// `with: repository:`), so legitimateActionValues records scalars and nothing
+// else, and no parsed document declares a LIST at `repository:`.
+const SCALAR_NODE = "legitValues";
+const SEQUENCE_NODE = "legitSequences";
+
+// `value(m)` is the STRUCTURAL half of a form: the value the line carries, at the
+// node kind it stands at, which must be one the file really declares at a GitHub
+// Actions location (see legitimateActionValues). A form that declares one is
+// excused only where the document agrees; a form without one — the clone URL,
+// which is a shell remote and belongs to no YAML location — is judged on its
+// grammar alone, unchanged.
+const FUNCTIONAL_REPO_REFS = [
+  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE, node: SCALAR_NODE, value: (m) => `${m[2]}@${m[3]}` },
+  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE, node: SCALAR_NODE, value: (m) => m[2] },
+  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE, node: SEQUENCE_NODE, value: (m) => m[2] },
+  { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
+  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE, node: SCALAR_NODE, value: (m) => m[2] },
+  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE, node: SEQUENCE_NODE, value: (m) => m[2] },
+];
+
+// THE canonical token boundary — used by the tokenizer AND by every rule that
+// matches a FIXED repository name, so "where does this name end?" has one answer.
+//
+// It says two things at once:
+//   - `.git` is a CLONE SUFFIX, and it is recognised BEFORE the dotted-sibling
+//     test. `<name>.git` (followed by a boundary) is the same repository as
+//     `<name>`; without this the clone form fell through the dotted-sibling
+//     branch below, was rejected as "a different repository", and then
+//     normalised back to a name both lanes already owned — one reference, zero
+//     findings.
+//   - a `.` followed by more name characters is NOT a boundary. A dot is a name
+//     character, so `<listed>.sibling` is a DIFFERENT repository, and a rule that
+//     stopped at the bare `(?![A-Za-z0-9_-])` claimed the wrong one (and let the
+//     probe claim the same token as well, for two findings on one reference).
+//     `\.*[A-Za-z0-9_-]` rejects that continuation while still admitting a
+//     sentence-final period — and it is what stops the tokenizer from truncating
+//     an over-long run to its first 100 characters, since the 101st character is
+//     exactly such a continuation.
+// `.gitlab` and `.gitfoo` are dotted siblings, not clone URLs: the optional
+// `.git` is followed by the same boundary test, so it only ever consumes a
+// suffix that really ends the token.
+const REPO_TOKEN_TAIL = "(?:\\.git)?(?!\\.*[A-Za-z0-9_-])";
+
+// A numeric ISSUE reference must TERMINATE. A `#<digits>` that runs straight
+// into another alphanumeric — a hex digest, an anchor slug, an identifier that
+// merely starts with a shorthand — is not an issue citation, and reading one out
+// of it invents a leak that is not there.
+const ISSUE_REF_TAIL = "(?![A-Za-z0-9])";
+
+// ONE tokenizer for BOTH lanes. The static rule and the probe must agree on
+// where a repository name starts and ends, or the same text is a finding in one
+// lane and a different finding in the other. Sharing the source string makes
+// that agreement structural instead of a thing two regexes have to remember.
+//
+// The `@` in the lookbehind is the NPM-SCOPE CARVE-OUT: the vendored npm
+// workspace packages are named `@cinatra-ai/<x>` — package scopes, not
+// repository references. It applies to the PROBE lane, which nominates names
+// nobody has classified yet, and it is the reason `@cinatra-ai/<public-name>`
+// costs nothing.
+const ORG_PATH_TOKEN_SOURCE =
+  `(?<![@A-Za-z0-9_-])cinatra-ai\\/(${REPO_NAME_SOURCE})${REPO_TOKEN_TAIL}`;
+
+// The SAME tokenizer for the private-list lane, with `@` admitted before the
+// org: the npm-scope carve-out NEVER excuses a name on the private list. A
+// package scope is a plausible reason to write `@<org>/<x>` for a name nobody
+// has classified; it is not a reason to write a PRIVATE repository's name into
+// public source, and no package carries one of those names. Membership is still
+// decided in matchExclude, so an unlisted (public, or probe-owned) name under a
+// scope stays excused exactly as before.
+const PRIVATE_ORG_PATH_TOKEN_SOURCE =
+  `(?<![A-Za-z0-9_-])cinatra-ai\\/(${REPO_NAME_SOURCE})${REPO_TOKEN_TAIL}`;
+
+// Names the visibility PROBE must never resolve: every PRIVATE_REPO_NAMES member
+// (SLG_PRIVATE_REPO_REF already owns it offline, so probing would double-flag the
+// same token) plus `engineering`, owned by SLG_PRIVATE_ENG_REF for the same
+// reason. The functional dispatch targets are NOT here — they are on the private
+// list now, and their carve-out is the per-match one above.
+const PROBE_EXEMPT_NAMES = new Set([...PRIVATE_REPO_NAMES, "engineering"]);
 
 const RULES = [
   {
@@ -216,16 +623,28 @@ const RULES = [
     // `cinatra-ai/cinatra#231`): those are deliberately public and stay. The
     // boundaries are repo-token-aware (a `-`/`_`/alnum on either side is NOT a
     // boundary) so look-alikes like `cinatra-ai/engineering-foo`,
-    // `reverse-engineering/issues/`, and `myeng#5` do NOT trip — JS `\b` treats
+    // `reverse-engineering/issues/`, and `myeng#0` do NOT trip — JS `\b` treats
     // `-` as a boundary and would false-positive on those. `#` and `/` after
     // `engineering` ARE allowed (they are the `#<n>` / `/issues/` URL forms).
     // Deliberately-public references go in a per-repo allowlist via
     // config.lineExcludes / config.exemptFileBasenames (the same mechanism the
     // other rules use); the org-wide attribution-protocol citation is rephrased
     // to a public-safe name rather than allowlisted.
+    //
+    // The boundaries are the CANONICAL token boundaries (REPO_TOKEN_TAIL, and a
+    // `.` in the lookbehind), not a bare `(?![A-Za-z0-9_-])`. A dot IS a name
+    // character, so treating it as a boundary made `<org>/engineering.tools`
+    // match as the tracker — the wrong repository — while the probe, which
+    // tokenizes the name whole, nominated `engineering.tools` as well: one
+    // reference, two findings, neither of them right. With the canonical tail the
+    // dotted sibling belongs to the probe alone, and a sentence-final period
+    // ("filed under <org>/engineering.") still resolves to the tracker.
     id: "SLG_PRIVATE_ENG_REF",
     description: "Reference to the private cinatra-ai/engineering tracker",
-    re: /(?<![A-Za-z0-9_-])(?:eng#\d+|cinatra-engineering#\d+|cinatra-ai\/engineering(?![A-Za-z0-9_-])|engineering\/issues\/)/gi,
+    re: new RegExp(
+      `(?<![A-Za-z0-9_.-])(?:eng#\\d+${ISSUE_REF_TAIL}|cinatra-engineering#\\d+${ISSUE_REF_TAIL}|cinatra-ai\\/engineering${REPO_TOKEN_TAIL}|engineering\\/issues\\/)`,
+      "gi",
+    ),
   },
   {
     // PUBLIC-STRICT-ONLY sibling of SLG_PRIVATE_ENG_REF (profiles: ["public-strict"]).
@@ -244,7 +663,7 @@ const RULES = [
     // rejects a `-`/`_`/`/`/`@`/alnum immediately before the token, so the prefixed
     // forms the universal rule already owns (`cinatra-ai/engineering#<n>`,
     // `cinatra-engineering#<n>`) are NOT double-flagged, and look-alikes
-    // (`reverse-engineering#5`, `re-engineering#5`, `bioengineering#5`,
+    // (`reverse-engineering#0`, `re-engineering#0`, `bioengineering#0`,
     // `@cinatra-ai/engineering`) do NOT trip. The `engineering#<n>` branch requires
     // `#<digit>`, so the ordinary English word "engineering" never matches; the
     // `cinatra-engineering` branch's trailing `(?![A-Za-z0-9_#-])` keeps
@@ -257,33 +676,117 @@ const RULES = [
     // other rule honors.
     id: "SLG_PRIVATE_ENG_REF_STRICT",
     description: "Full-form private engineering-tracker reference (public-repo strict)",
-    re: /(?<![@A-Za-z0-9_/-])(?:engineering#\d+|cinatra-engineering(?![A-Za-z0-9_#-]))/gi,
+    // Same canonical boundaries as its universal sibling, plus the `#` the
+    // universal rule owns: `cinatra-engineering.tools` is a different repository,
+    // and `cinatra-engineering#<n>` is the other rule's form.
+    re: new RegExp(
+      `(?<![@A-Za-z0-9_./-])(?:engineering#\\d+${ISSUE_REF_TAIL}|cinatra-engineering(?!#)${REPO_TOKEN_TAIL})`,
+      "gi",
+    ),
     profiles: ["public-strict"],
   },
   {
-    // Sibling of SLG_PRIVATE_ENG_REF: catches the bare GitHub path-form of OTHER
-    // private cinatra-ai repos leaking into a public repo (the `cinatra-ai/design`
-    // / `cinatra-ai/marketplace` / … forms, incl. `#<n>` and `/issues/<n>` URL
-    // tails, since the token-boundary lookahead permits `#`/`/` after the name).
+    // Sibling of SLG_PRIVATE_ENG_REF: catches the GitHub path-form of OTHER
+    // private cinatra-ai repositories leaking into a public repo, incl. the
+    // `#<n>` and `/issues/<n>` URL tails the shared tokenizer admits.
     //
-    // The NEGATIVE LOOKBEHIND for `@` is LOAD-BEARING: the in-repo vendored npm
-    // workspace packages are named `@cinatra-ai/<x>` — those are package scopes,
-    // NOT repo references, and must NEVER be flagged. JS `\b` would not protect
-    // them; the `(?<![@A-Za-z0-9_-])` prefix does.
+    // Membership is decided in matchExclude against PRIVATE_REPO_NAME_SET, not
+    // by an alternation baked into the regex. That is what lets this rule and
+    // the probe share ONE tokenizer: a name the tokenizer reads as
+    // `<listed-name>.something` is never silently truncated back to the listed
+    // prefix here while the probe reads it whole — the two lanes cannot disagree
+    // about where a name ends, so nothing is double-flagged and nothing is
+    // flagged as the wrong repository. A trailing `.git` is normalized away, so
+    // a clone URL resolves to the repository it clones.
     //
-    // DELIBERATELY EXCLUDED from the alternation:
+    // It tokenizes with PRIVATE_ORG_PATH_TOKEN_SOURCE, which admits a leading
+    // `@`: the npm-scope carve-out spares a name nobody has classified, never a
+    // name on the private list. `@<org>/<listed>` is one finding here, and the
+    // probe (which keeps the carve-out) never nominates the same token.
+    //
+    // DELIBERATELY EXCLUDED:
     //   - `engineering` — already owned by SLG_PRIVATE_ENG_REF (avoid double-flag).
-    //   - `ops` — `cinatra-ai/ops` is a REQUIRED functional dispatch target named
-    //     in many public workflows (`uses: cinatra-ai/ops/...`, `repository:
-    //     cinatra-ai/ops`). Flagging it would be all-false-positive, so it is
-    //     omitted from the regex entirely.
-    // The trailing `(?![A-Za-z0-9_-])` keeps look-alikes like
-    // `cinatra-ai/design-system-foo` from tripping. Deliberately-public refs (if
-    // any ever arise) use the same config.lineExcludes / config.exemptFileBasenames
-    // allowlist mechanism the other rules honor.
+    //   - the PUBLIC proof-image host — public repos cite it constantly, so only
+    //     its private twin (the same name plus a `-private` suffix) is listed.
+    //     Membership is exact-match, so the public name can never resolve to the
+    //     private entry.
+    // A name that merely BEGINS with the tracker's name is not the tracker:
+    // SLG_PRIVATE_ENG_REF closes that name with `(?![A-Za-z0-9_-])`, so it never
+    // claims a hyphen-extended sibling. Those repositories belong here.
+    //
+    // The dispatch targets ARE listed, and their required machine forms are
+    // excused per match by FUNCTIONAL_REPO_REFS — see there for why a name-wide
+    // exemption was the wrong shape. Deliberately-public refs (if any ever arise)
+    // use the same config.lineExcludes / config.exemptFileBasenames allowlist
+    // mechanism the other rules honor.
     id: "SLG_PRIVATE_REPO_REF",
     description: "Reference to a private cinatra-ai repository (bare GitHub path-form)",
-    re: /(?<![@A-Za-z0-9_-])cinatra-ai\/(design|marketplace|website|cinatra-business|create-cinatra-extension|dev-skills-store|extension-release-tooling|legal-archive-skills|renovate-config|dev-internal-archive|cinatra-poc|cinatra-oss-transit|cinatra-claude-memory)(?![A-Za-z0-9_-])/gi,
+    re: new RegExp(PRIVATE_ORG_PATH_TOKEN_SOURCE, "gi"),
+    matchExclude(match, line, index, filePath, context) {
+      const name = orgPathRepoName(match);
+      if (!name || !PRIVATE_REPO_NAME_SET.has(name)) return true;
+      return functionalRefCovers(name, line, index, filePath, context);
+    },
+  },
+  {
+    // The DYNAMIC lane. The list above can only know the repositories someone
+    // remembered to add; this rule nominates EVERY other org path token and asks
+    // GitHub whether that repository is actually public, so a repository created
+    // after the last list edit is still caught.
+    //
+    // The regex only NOMINATES — it deliberately matches public repositories
+    // too. Nothing here is a finding until resolveProbeFindings() has a verdict,
+    // and a candidate that resolves PUBLIC is dropped. See that function for the
+    // fail-closed contract and the per-run budget.
+    //
+    // It shares ORG_PATH_TOKEN_SOURCE with the static rule (see there), so the
+    // two lanes tokenize identically; matchExclude subtracts the names the
+    // offline rules already own, which is also what keeps the functional
+    // dispatch targets out of this lane without a second carve-out.
+    id: "SLG_PRIVATE_REPO_PROBE",
+    description: "Reference to a repository this token cannot see as public",
+    re: new RegExp(ORG_PATH_TOKEN_SOURCE, "gi"),
+    matchExclude(match) {
+      const name = orgPathRepoName(match);
+      return !name || PROBE_EXEMPT_NAMES.has(name);
+    },
+    probe: true,
+  },
+  {
+    // Bare-NAME form of the private proof-image repository, with no org prefix —
+    // the sibling of SLG_PRIVATE_REPO_REF's path form, and the reason that form
+    // alone is not enough. The org runs a TWIN pair: a PUBLIC image host that
+    // public repos cite constantly, and a PRIVATE repository whose name is the
+    // public one plus a `-private` suffix. Only the private name is a leak, and
+    // unlike the bare `engineering#<n>` tracker citation that
+    // SLG_PRIVATE_ENG_REF_STRICT has to confine to `public-strict`, this name has
+    // NO sanctioned use that writes it into committed source anywhere. So the
+    // rule is UNIVERSAL — every profile runs it — and needs no strict-only twin.
+    //
+    // Boundaries are LOAD-BEARING and follow SLG_PRIVATE_ENG_REF_STRICT exactly.
+    // The negative lookbehind `(?<![@A-Za-z0-9_./-])` rejects an alnum / `_` /
+    // `-` / `.` immediately before the token, so a longer identifier that merely
+    // ENDS in the name does not trip; it also rejects `/` and `@`, which leaves
+    // BOTH org-path forms — plain, and under an npm scope — solely to
+    // SLG_PRIVATE_REPO_REF, whose tokenizer now sees through the scope for a name
+    // on the private list. One form, one finding, and this rule owns exactly the
+    // BARE name. The trailing REPO_TOKEN_TAIL keeps a longer name that merely
+    // STARTS with it from tripping, while still admitting the `#<n>` and
+    // `/issues/<n>` tails and reading a `.git` clone suffix as this same
+    // repository. Because the regex demands the whole `-private` suffix, the
+    // PUBLIC twin never matches — citing it stays free, which is the point of
+    // splitting the pair. A deliberately-public reference (if one ever arises)
+    // uses the same config.lineExcludes / config.exemptFileBasenames allowlist
+    // mechanism every other rule honors.
+    id: "SLG_PRIVATE_PROOFS_REF",
+    description: "Bare name of the private proof-image repository",
+    // The boundaries are the CANONICAL token boundaries: a `.` is a repository-
+    // name character, so `<name>.bak` and `sibling.<name>` are OTHER names and
+    // must not resolve to this one, while a sentence-final period still does.
+    re: new RegExp(
+      `(?<![@A-Za-z0-9_./-])engineering-proofs-private${REPO_TOKEN_TAIL}`,
+      "gi",
+    ),
   },
   {
     // Descriptive prose naming the private design repository (the human-readable
@@ -295,7 +798,472 @@ const RULES = [
 ];
 // Single-prefix requirement IDs are project-specific; supply via config.reqIdSinglePrefixes.
 const REQ_ID_SINGLE_RULE_ID = "SLG_REQ_ID_SINGLE";
+// The organization the probe resolves names against. Held as a constant so no
+// literal org path form appears OUTSIDE this self-exempt region.
+const PROBE_ORG = "cinatra-ai";
 // ===================== SOURCE_LEAK_RULES_END =====================
+
+// ---------------------------------------------------------------------------
+// Shared repository-name tokenization. Both lanes call these, so "which
+// repository does this text name?" has exactly ONE answer in the whole gate.
+// ---------------------------------------------------------------------------
+
+// Canonical form of a repository name: case-folded (GitHub names are
+// case-insensitive) with a trailing `.git` removed, so the remote in a clone URL
+// resolves to the repository it clones rather than to a name that does not exist.
+//
+// The suffix comes off ONLY when what remains is itself a repository name. A
+// token whose whole name IS `.git` is not a clone URL of anything — stripping it
+// left an empty string, and an empty name is what both lanes drop as "not a
+// repository", so the reference was excluded without ever being probed. When the
+// remainder is not a name, the token is the name AS WRITTEN and is judged like
+// any other.
+function normalizeRepoName(name) {
+  const n = String(name || "").toLowerCase();
+  if (!n.endsWith(".git")) return n;
+  const base = n.slice(0, -4);
+  return isValidRepoName(base) ? base : n;
+}
+
+// THE repository-name predicate, anchored on the ONE grammar the tokenizer uses
+// (REPO_NAME_SOURCE). The committed public-repos cache validates its entries
+// with this, so "what the scan calls a repository name" and "what the cache will
+// accept as one" cannot drift apart into two grammars.
+const REPO_NAME_RE = new RegExp(`^(?:${REPO_NAME_SOURCE})$`);
+function isValidRepoName(name) {
+  const s = String(name ?? "");
+  return s.length >= 1 && s.length <= REPO_NAME_MAX && REPO_NAME_RE.test(s);
+}
+
+// A WRITTEN reference to a repository: a name, or that name with the `.git`
+// clone suffix the tokenizer reads off it. The two halves are judged
+// separately, exactly as normalizeRepoName() strips the suffix — a name is at
+// most REPO_NAME_MAX characters, and the four the clone suffix adds are not part
+// of it. Measuring the ceiling against `<base>.git` called a 97-character
+// repository spelled as a clone "not a repository name", which is a name the
+// tokenizer resolves and the cache would then have to send to a live probe.
+function isValidRepoReference(name) {
+  const s = String(name ?? "");
+  if (isValidRepoName(s)) return true;
+  return s.toLowerCase().endsWith(".git") && isValidRepoName(s.slice(0, -4));
+}
+
+// The repository half of an `<org>/<name>` token the shared tokenizer matched.
+function orgPathRepoName(match) {
+  const parts = String(match || "").split("/");
+  return parts.length > 1 ? normalizeRepoName(parts[1]) : "";
+}
+
+// THE TWO FIELDS a finding carries about the reference it caught, and they are
+// not the same string. `match` is SOURCE-EXACT — the text as the file spells it,
+// byte for byte, so it can be found on the line it came from — while
+// `repository` is the canonical `<org>/<name>` that text names: the `.git` clone
+// suffix off and both halves case-folded, which is the spelling GitHub resolves
+// and the one the probe lane keys its request, its memo and its cache on. A
+// reader that had only `match` had to re-derive that fold, and `match` still
+// carries the suffix, so `<org>/<name>.git` and `<org>/<name>` read as two
+// repositories where the lane had already decided they are one.
+//
+// A match that names no `<org>/<name>` token — an issue id, a milestone number,
+// a bare repository name written without its owner — carries NO `repository`:
+// the canonical field states what the text says, and never a name inferred for
+// it.
+const CANONICAL_REPO_REF_RE = new RegExp(`(${ORG_CI})\\/(${REPO_NAME_SOURCE})${REPO_TOKEN_TAIL}`);
+function canonicalRepoRef(match) {
+  const m = CANONICAL_REPO_REF_RE.exec(String(match || ""));
+  return m ? `${m[1].toLowerCase()}/${normalizeRepoName(m[2])}` : "";
+}
+
+// Every finding both lanes emit is built through here, so the two spellings can
+// never drift apart: the probe lane spreads the candidate it was given into its
+// result, and whatever the static scan wrote is what the probe finding carries.
+function repoFinding(f) {
+  const repository = canonicalRepoRef(f.match);
+  return repository ? { ...f, repository } : f;
+}
+
+// ---------------------------------------------------------------------------
+// STRUCTURAL carve-outs: a machine form is excused only where the DOCUMENT says
+// it is one.
+//
+// Every carve-out used to judge ONE LINE, and a line cannot know what it is part
+// of. Nine review rounds each found one more YAML syntax form that hid a private
+// reference inside text a runner never dispatches — a `run: |` heredoc, a `- |`
+// sequence item, a key that carries its own colon, a quoted scalar running over
+// several lines, a `--- |` whole-document scalar, an anchor between the key and
+// the indicator, an `env:` mapping whose KEY happens to be `uses` — and each was
+// answered with one more hand-written tracker. Tracking YAML by hand ends here:
+// the file is PARSED, and the grammar carve-outs are granted only to values the
+// parsed document really carries at a GitHub Actions location.
+//
+// LEGITIMATE VALUES, per file, are every string at:
+//   - `jobs.<id>.uses`                    — a reusable-workflow call
+//   - `jobs.<id>.steps[].uses`            — an action / reusable step
+//   - `jobs.<id>.steps[].with.repository` — a checkout / dispatch input
+//   - `runs.steps[].uses`, `runs.steps[].with.repository` — a composite action
+//
+// A `uses:` / `repository:` carve-out then applies to a line ONLY when the value
+// its grammar reads is a member of that set. Everything else is text: the
+// heredoc, the folded block, the quoted continuation, the `env:` mapping, the
+// document scalar. And where there is no set at all — the file is not YAML, the
+// path is unknown, or the document does not parse — there is no carve-out and
+// every private reference is a finding.
+//
+// Membership is by VALUE, not by line, and that is deliberate: a value the file
+// legitimately dispatches somewhere is not made secret by also appearing inside
+// a heredoc in the same file. The leak this gate exists to stop is a private
+// name a public file would not otherwise carry, and by the time the file
+// dispatches it, the file carries it.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// PARSING A DOCUMENT IS NOT TRUSTING IT.
+//
+// Everything below this line reads parsed YAML, and a parsed document is
+// ATTACKER-SHAPED INPUT: the text comes from the repository being scanned, and
+// the whole point of the scan is that some of that text may be hostile. A YAML
+// parser that lets a document reach the JavaScript prototype chain turns this
+// engine's two structural readers into forgery tools — an INHERITED `jobs` is a
+// dispatch the file never declares, and it buys both halves of the gate at once:
+// a carve-out that excuses a private name (legitimateActionValues) and a live
+// `uses:` pin that keeps an expired exemption alive (readUsesPins).
+//
+// That was not hypothetical. js-yaml 4.1.0 guarded a directly written
+// `__proto__` mapping key but not the MERGE path, so
+//
+//     payload: &payload
+//       __proto__:
+//         jobs: { gate: { uses: <org>/<repo>/.github/workflows/w.yml@<sha> } }
+//     <<: *payload
+//
+// produced a document with two innocent own keys whose PROTOTYPE carried a
+// fabricated `jobs`. The vendored parser is now 4.1.1, which fixes it.
+//
+// The version is not the defence. THREE independent guards are, and each one
+// alone is sufficient — a parser is a dependency, and a dependency's next
+// version is a bug nobody has found yet:
+//
+//   (a) OWN PROPERTIES ONLY. Every read of a parsed document goes through
+//       `own()`, and a value whose prototype is neither `Object.prototype` nor
+//       `null` is not a mapping this engine will read at all. An inherited key
+//       is not "a key we found"; it is a key that is not there.
+//   (b) A POLLUTING KEY MAKES THE DOCUMENT UNREADABLE. A mapping key named
+//       `__proto__`, `constructor` or `prototype` at ANY depth means the file
+//       is not a document whose structure anyone can state, so it gets the same
+//       answer as a syntax error: NULL. No carve-out for anything in it, and a
+//       config error if it is a pin file. No legitimate workflow, action or
+//       compose file needs those keys, so the refusal costs nothing real.
+//   (c) IF THE PROCESS IS POLLUTED, THE RUN IS OVER. The own-property names of
+//       `Object.prototype`, `Array.prototype` and `Function.prototype` are
+//       snapshotted before every parse and compared after it. A difference means
+//       the interpreter this gate is reasoning with has been edited underneath
+//       it, and NOTHING it says afterwards can be trusted — not this file's
+//       verdict, not the clean ones already printed. So it aborts the whole run
+//       with a named error and a non-zero exit rather than reporting a result.
+// ---------------------------------------------------------------------------
+
+// Mapping keys that reach the prototype chain in one parser or another. Refused
+// wholesale rather than sanitised: sanitising means keeping the document and
+// arguing about which parts of it are safe.
+const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+const PROTOTYPE_POLLUTION_ERROR = "PrototypePollutionError";
+
+// A mapping this engine will read: a real object whose prototype is the
+// ordinary one (or none at all). An object with any other prototype has had its
+// chain replaced, and its inherited keys are exactly the forgery — so it is not
+// a mapping, and `own()` on it answers undefined for everything.
+function isPlainObject(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+// The sequence twin of isPlainObject. `Array.isArray` alone is not enough: an
+// array whose own prototype has been REPLACED inherits from the forgery, so it
+// is not a sequence this engine walks as one (it falls through to the ordinary
+// own-property walk, which reads nothing it does not own).
+function isPlainArray(v) {
+  if (!Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Array.prototype || proto === null;
+}
+
+// THE only way this engine walks a parsed sequence. `for (const x of arr)` reads
+// indices 0..length-1 THROUGH THE PROTOTYPE CHAIN, so a polluted
+// `Array.prototype[1]` supplies a value for a HOLE the document does not
+// contain — an inherited step, an inherited document, an inherited job — which
+// is exactly the payload the own-property rule exists to refuse. Own numeric
+// indices only: a hole is ABSENT, a named own property (`arr.jobs = …`) is not
+// an element, and an accessor is not a value a YAML document can declare.
+function ownItems(v) {
+  if (!isPlainArray(v)) return [];
+  const out = [];
+  for (const key of Object.keys(v)) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(key)) continue;
+    const desc = Object.getOwnPropertyDescriptor(v, key);
+    if (!desc || !("value" in desc)) continue;
+    out.push(desc.value);
+  }
+  return out;
+}
+
+// THE only way this engine reads a key off a parsed document. `doc.jobs` walks
+// the prototype chain; `own(doc, "jobs")` does not.
+function own(obj, key) {
+  if (obj === null || typeof obj !== "object") return undefined;
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+// The prototypes whose shape a parse must never change, snapshotted as their
+// own-property NAMES. Names, not descriptors: a parse that adds `jobs` to
+// `Object.prototype` shows up here, and that is the whole class.
+const GUARDED_PROTOTYPES = [
+  ["Object.prototype", Object.prototype],
+  ["Array.prototype", Array.prototype],
+  ["Function.prototype", Function.prototype],
+];
+
+function snapshotPrototypes() {
+  return GUARDED_PROTOTYPES.map(([label, target]) => [label, target, Object.getOwnPropertyNames(target)]);
+}
+
+// Throws — never returns a verdict — when a builtin prototype changed shape.
+// Exported so the guard itself is testable without having to actually corrupt a
+// scan.
+function assertPrototypesUnpolluted(snapshot) {
+  for (const [label, target, before] of snapshot) {
+    const after = Object.getOwnPropertyNames(target);
+    const beforeSet = new Set(before);
+    const afterSet = new Set(after);
+    const added = after.filter((k) => !beforeSet.has(k));
+    const removed = before.filter((k) => !afterSet.has(k));
+    if (added.length === 0 && removed.length === 0) continue;
+    const changes = [
+      added.length ? `added ${added.join(", ")}` : "",
+      removed.length ? `removed ${removed.join(", ")}` : "",
+    ].filter(Boolean).join("; ");
+    const err = new Error(
+      `${label} changed shape during a YAML parse (${changes}). The interpreter this gate reasons with has `
+      + "been edited by the input it was reading, so every verdict in this run — including the clean ones already "
+      + "printed — is untrustworthy. The run is aborted rather than completed.",
+    );
+    err.name = PROTOTYPE_POLLUTION_ERROR;
+    throw err;
+  }
+}
+
+// True when any mapping in the parsed value carries a prototype-reaching key.
+// Walks OWN property names (an inherited key is not the document's), follows
+// only data properties (a getter is not a mapping value a YAML document can
+// declare), and remembers what it has seen because YAML anchors make cycles.
+function hasPrototypeKey(value, seen) {
+  if (value === null || typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (isPlainArray(value)) {
+    for (const item of ownItems(value)) if (hasPrototypeKey(item, seen)) return true;
+    return false;
+  }
+  // An `Array.isArray` value whose prototype has been replaced is NOT handled
+  // here: it falls through to the own-property walk at the bottom, which visits
+  // its own indices and nothing it inherits.
+  if (value instanceof Map) {
+    for (const [k, v] of value) {
+      if (typeof k === "string" && PROTOTYPE_KEYS.has(k)) return true;
+      if (hasPrototypeKey(k, seen) || hasPrototypeKey(v, seen)) return true;
+    }
+    return false;
+  }
+  if (value instanceof Set) {
+    for (const item of value) if (hasPrototypeKey(item, seen)) return true;
+    return false;
+  }
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (PROTOTYPE_KEYS.has(key)) return true;
+    const desc = Object.getOwnPropertyDescriptor(value, key);
+    if (!desc || !("value" in desc)) continue;
+    if (hasPrototypeKey(desc.value, seen)) return true;
+  }
+  return false;
+}
+
+// THE test seam for the parser, and the only indirection in front of it.
+// Production leaves it null and parses with the VENDORED js-yaml; a test installs
+// a loader that behaves the way a hostile parser would — polluting a builtin
+// prototype mid-parse, or handing back a shape js-yaml never produces — so the
+// guards below can be exercised through the real scan path instead of only
+// through their own comparator. `setYamlLoader(null)` puts the vendored loader
+// back, and nothing but a test ever calls it.
+let yamlLoaderImpl = null;
+function setYamlLoader(fn) { yamlLoaderImpl = fn || null; }
+function yamlLoad(text) { return (yamlLoaderImpl || loadAllYaml)(text); }
+
+// THE single parse entry point for this engine. Every reader below goes through
+// it, so the three guards cannot be bypassed by adding a fourth reader later.
+//
+// NULL means "no document anyone can state the structure of" — a syntax error,
+// a duplicate key, an unresolvable tag, or a prototype-reaching key. Callers
+// already treat NULL as "excuses nothing / config error at the call site", which
+// is exactly the right answer for a hostile document too.
+//
+// The pollution guard runs even when the parse THREW: a parser that throws
+// halfway can have written a prototype before it failed, and "it errored" is not
+// evidence that it did nothing.
+function parseYamlDocuments(text) {
+  const snapshot = snapshotPrototypes();
+  let docs;
+  let threw = false;
+  try { docs = yamlLoad(text); }
+  catch { threw = true; }
+  assertPrototypesUnpolluted(snapshot);
+  if (threw || !isPlainArray(docs)) return null;
+  if (hasPrototypeKey(docs, new Set())) return null;
+  return docs;
+}
+
+// THE canonical form of a carve-out value, applied on INSERTION and on LOOKUP so
+// the two sides of the membership test are spelled the same way. Only the
+// OWNER/REPOSITORY halves fold — GitHub resolves those case-insensitively —
+// while the path inside the checkout and the `@<ref>` stay exact and
+// case-sensitive (a file name and a git ref both are). Compared raw, the fold
+// the grammar performs stopped at the line: a real `<Org>/<Repo>@main` dispatch
+// did not cover the lower-case spelling of that same dispatch elsewhere in the
+// file, which is the one thing membership-by-value exists to do. The ref is
+// split off FIRST because it is the last segment of no path — `<org>/<repo>@Main`
+// would otherwise fold its ref along with the repository.
+function canonicalLegitValue(v) {
+  const s = String(v ?? "");
+  const at = s.indexOf("@");
+  if (at === -1) return canonicalUsesTarget(s);
+  return `${canonicalUsesTarget(s.slice(0, at))}@${s.slice(at + 1)}`;
+}
+
+// SCALARS ONLY, in every reader below: a value is recorded when the parsed node
+// is a string and never otherwise, because a scalar is the only node kind a
+// GitHub Actions location dispatches. So the set can answer for a scalar form
+// and for no other node kind.
+function addLegitimateValue(values, v) {
+  if (typeof v === "string" && v !== "") values.add(canonicalLegitValue(v));
+}
+
+// `steps:` is the same shape in a workflow job and in a composite action.
+function collectStepValues(steps, values) {
+  for (const step of ownItems(steps)) {
+    if (!isPlainObject(step)) continue;
+    addLegitimateValue(values, own(step, "uses"));
+    const withInputs = own(step, "with");
+    if (isPlainObject(withInputs)) addLegitimateValue(values, own(withInputs, "repository"));
+  }
+}
+
+// The set of values this YAML file declares at a GitHub Actions location, or
+// NULL when the text is not parseable YAML — which is not a lesser answer: a
+// file the parser cannot read is a file whose structure nobody knows, and an
+// unknown structure excuses nothing.
+//
+// PROVENANCE IS STRUCTURAL, and the FILE is half of it. A key only dispatches
+// where GitHub reads it:
+//
+//   - `jobs.*` is read ONLY from a repository-root workflow
+//     (`.github/workflows/<file>.yml|.yaml`). Nothing runs the `jobs:` tree of
+//     an `action.yml` or of `docs/example.yml`.
+//   - `runs.steps[]` is read ONLY from an `action.yml|.yaml` whose own
+//     `runs.using` is the string `composite`. A `node20` or `docker` action has
+//     no steps GitHub runs, and a workflow has no `runs:` tree at all.
+//
+// Without that, ANY document shape forged a carve-out: a stray `runs: steps:`
+// tree in a workflow — or in an action that does not even declare
+// `using: composite` — handed the value set a dispatch the runner would never
+// make. Any other file type, or a document that does not carry the matching
+// shape, contributes NOTHING; the result is then an EMPTY set (the file parsed,
+// it just dispatches nothing), which is distinct from the NULL above.
+//
+// It parses through `parseYamlDocuments` (every document in the stream, on
+// js-yaml's default schema, which resolves only standard YAML tags — no code, no
+// custom types), so every failure mode lands on the same NULL: a syntax error, a
+// duplicate key, an unresolvable tag, and a document carrying a
+// prototype-reaching key. Every key below is read with `own()`, so an INHERITED
+// `jobs` — the whole point of a pollution payload — is not a carve-out; it is
+// not there.
+function legitimateActionValues(text, filePath) {
+  const docs = parseYamlDocuments(text);
+  if (docs === null) return null;
+  const values = new Set();
+  const p = filePath === undefined || filePath === null ? "" : String(filePath);
+  const isWorkflowFile = ROOT_WORKFLOW_FILE_RE.test(p);
+  const isActionFile = ACTION_FILE_RE.test(p);
+  if (!isWorkflowFile && !isActionFile) return values;  // no file type, no location
+  for (const doc of ownItems(docs)) {
+    if (!isPlainObject(doc)) continue;
+    if (isWorkflowFile) {
+      const jobs = own(doc, "jobs");
+      if (isPlainObject(jobs)) {
+        for (const jobId of Object.getOwnPropertyNames(jobs)) {
+          const job = own(jobs, jobId);
+          if (!isPlainObject(job)) continue;
+          addLegitimateValue(values, own(job, "uses"));   // a reusable-workflow call
+          collectStepValues(own(job, "steps"), values);
+        }
+      }
+    }
+    if (isActionFile) {
+      const runs = own(doc, "runs");
+      // `using: composite` is the ONE declaration that makes `runs.steps[]` a
+      // list of things GitHub runs; the string is compared exactly, because
+      // that is the one spelling the runner accepts.
+      if (isPlainObject(runs) && own(runs, "using") === "composite") {
+        collectStepValues(own(runs, "steps"), values);
+      }
+    }
+  }
+  return values;
+}
+
+// True when the match at `index` sits INSIDE one of the required machine forms
+// for `name`. Span-based on purpose: a line may carry a functional reference and
+// a leaked one at once, and only the functional one is excused.
+//
+// Two things must hold at once, and both can only ever NARROW the carve-out:
+//
+//   - THE FILE. A form that declares a `fileRe` (the `uses:` step, which exists
+//     in a root workflow or an action definition and nowhere else; the
+//     `repository:` keys, which exist in YAML) is excused only in such a file,
+//     and only where the caller actually knows the path. A caller with no path
+//     has no document either, so it gets no carve-out.
+//   - THE DOCUMENT. A form that declares a `value` is excused only when that
+//     value is one the collection for its own NODE KIND holds — for a scalar,
+//     `context.legitValues`, the set the parsed file declares at an Actions
+//     location. No collection for that kind, no carve-out, which is the whole
+//     answer for a flow sequence: nothing builds a sequence collection.
+//
+// The clone URL declares neither: it is a shell remote, not a YAML location, and
+// it is judged on its grammar exactly as before.
+function functionalRefCovers(name, line, index, filePath, context) {
+  for (const f of FUNCTIONAL_REPO_REFS) {
+    if (f.name !== name) continue;
+    if (f.fileRe && !(filePath && f.fileRe.test(String(filePath)))) continue;
+    const re = new RegExp(f.re.source, f.re.flags.includes("g") ? f.re.flags : `${f.re.flags}g`);
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (index >= m.index && index < m.index + m[0].length) {
+        if (!f.value) return true;
+        // The value is asked of the collection for its OWN NODE KIND, and the
+        // scan builds the scalar one only. A FLOW SEQUENCE is therefore excused
+        // by nothing in any real file — no Actions input takes a LIST at
+        // `repository:` (a checkout takes one string), so a parsed document
+        // never declares one and a sequence is a finding wherever it stands.
+        // The kinds cannot collide, because a scalar's text is never in the
+        // sequence collection: asked out of ONE collection by value, a single
+        // honest `with: repository: <org>/<repo>` step anywhere in a document
+        // excused every `repositories: [<org>/<repo>]` line in it.
+        const declared = context ? context[f.node] : null;
+        if (declared && declared.has(canonicalLegitValue(f.value(m)))) return true;
+      }
+      if (m.index === re.lastIndex) re.lastIndex++;
+    }
+  }
+  return false;
+}
 
 const RULE_DEFS_MARKER_BEGIN = "SOURCE_LEAK_RULES" + "_BEGIN";
 const RULE_DEFS_MARKER_END = "SOURCE_LEAK_RULES" + "_END";
@@ -332,8 +1300,248 @@ function loadConfig(configPath) {
   catch (e) { return fail(`config is not valid JSON (${configPath}): ${e.message}`); }
 }
 
-function buildRules(config, profile, onlyRules) {
-  const rules = RULES.map((r) => ({ ...r, profiles: r.profiles || VALID_PROFILES }));
+// ---------------------------------------------------------------------------
+// Pin-keyed expiry for file-basename exemptions.
+//
+// A basename exemption that exists only because some OTHER, pinned copy of this
+// engine lacks a fix is a debt, not a rule: the pinned engine that judges this
+// repository's own pull requests is checked out at a fixed sha, so a carve-out
+// the current engine no longer needs can still be required by that one. Such an
+// exemption is keyed to the pin that justifies it through
+// `exemptFileBasenamesExpiry`: the entry names a file in the SCANNED tree, the
+// exact `uses:` TARGET inside it, and the sha that target is pinned to today.
+// While that target still carries that sha the exemption is live and the gate
+// says nothing; the moment the pin moves the gate fails and names the pair to
+// delete. The exemption cannot outlive its reason, and nobody has to remember it.
+//
+// The TARGET is what makes the check honest. Keyed to "some sha in the file",
+// the exemption survived the very edit it exists to catch: move the gate
+// reference to `@main` and leave an unrelated `actions/checkout@<sha>` in place,
+// and the file still carried the keyed sha, so the expiry stayed silent while
+// the pin it names was gone. The comparison is now against the ref of THAT
+// target and nothing else — any other `uses:` line in the file is irrelevant,
+// and a target that is missing, that appears twice with different refs, or that
+// is not pinned to a commit sha at all is a config error rather than a verdict.
+//
+// An expiry entry only ever time-boxes a LIVE exemption, so a basename listed
+// here but absent from exemptFileBasenames is a config error, as is an entry
+// whose shape is wrong or whose pin file cannot be read: an exemption whose
+// expiry cannot be evaluated must never quietly stay in force.
+// ---------------------------------------------------------------------------
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function expiryFail(msg) {
+  console.error(`[source-leak-gate] ${msg}`);
+  process.exit(1);
+}
+
+// The `uses:` PINS a caller workflow really dispatches, as `{ target, ref }`
+// pairs in document order — every `jobs.<id>.uses`, the job-level
+// reusable-workflow call, and nothing else. Pairs, not a bag of shas: an expiry
+// is keyed to ONE target, and only that target's ref may answer for it.
+//
+// It is STRUCTURAL, for the same reason the carve-out is. A pin is a dispatch,
+// and only the parser knows which text is one: a `uses:` line inside a `run: |`
+// heredoc, inside a folded block, inside a multi-line quoted scalar or under an
+// `env:` mapping is text no runner dispatches, and every one of those spellings
+// once answered for a keyed pin — a real gate call could be deleted and replaced
+// by prose while the sha it named kept an exemption alive. Reading the parsed
+// document instead of the lines ends the whole class, and it also drops the
+// step-level `uses:` values: a pinned ACTION inside a job is not the caller's
+// dispatch of the gate, and an expiry keyed to one was never keyed to a caller.
+//
+// The value is split with the SAME `<target>@<ref>` grammar the carve-out uses
+// (the `@<ref>` is mandatory; GitHub rejects a ref-less cross-repository
+// `uses:`, and a local `uses: ./…` is not a cross-repository dispatch at all),
+// and the target comes back CASE-CANONICAL, so one dispatch has one spelling.
+//
+// NULL means the text is not a document whose structure anyone can state — a
+// syntax error, or a prototype-reaching mapping key. An unreadable caller is a
+// config error at the call site, never a silent "no pins".
+const USES_VALUE_RE = new RegExp(`^(${ANY_ORG_PATH_SOURCE}${USES_TARGET_TAIL})@(${USES_REF_TOKEN})$`);
+function readUsesPins(text) {
+  const docs = parseYamlDocuments(text);
+  if (docs === null) return null;
+  const pins = [];
+  for (const doc of ownItems(docs)) {
+    if (!isPlainObject(doc)) continue;
+    const jobs = own(doc, "jobs");
+    if (!isPlainObject(jobs)) continue;
+    for (const jobId of Object.getOwnPropertyNames(jobs)) {
+      const job = own(jobs, jobId);
+      if (!isPlainObject(job)) continue;
+      const uses = own(job, "uses");
+      if (typeof uses !== "string") continue;
+      const m = uses.match(USES_VALUE_RE);
+      if (!m) continue;
+      pins.push({ target: canonicalUsesTarget(m[1]), ref: m[2] });
+    }
+  }
+  return pins;
+}
+
+// GitHub resolves the OWNER and REPOSITORY halves of a `uses:` target
+// case-insensitively — `Some-Org/CI/...` dispatches exactly what
+// `some-org/ci/...` dispatches — while everything after them is a PATH inside
+// the checkout, and file names are case-sensitive. So the comparison folds
+// precisely those two segments and nothing else. Compared literally, one
+// case-variant spelling of the configured target answered "no such line" (a
+// refusal on valid input) while a SECOND, case-variant spelling at another sha
+// slipped past the duplicate-target check and left the exemption live on an
+// ambiguous pin.
+function canonicalUsesTarget(target) {
+  const parts = String(target || "").split("/");
+  if (parts.length < 2) return String(target || "");
+  return [parts[0].toLowerCase(), parts[1].toLowerCase(), ...parts.slice(2)].join("/");
+}
+
+// `untilPin.file` names the CALLER WORKFLOW whose pin justifies the exemption,
+// and these three constraints are what make it one instead of "any file that
+// happens to contain the target at the old sha". A README, or a path climbing
+// out of the tree with `..`, could carry that line forever while the real caller
+// moved on; a symlink can point at one. So the path must be a repository-root
+// workflow file (the only place a caller can run), must be TRACKED in the
+// scanned tree, and must be a regular file. Anything else is a config error, not
+// a verdict — an exemption whose expiry cannot be honestly evaluated never stays
+// in force.
+const PIN_FILE_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+// Characters git would read as PATHSPEC MAGIC rather than as a file name, plus a
+// leading `-`, which git would read as an option. `untilPin.file` names ONE
+// tracked file, so a value carrying any of them is a config error before git is
+// ever asked (see the call site): the question "is this file tracked?" has no
+// answer for a pattern.
+const PIN_FILE_PATHSPEC_CHARS = ["*", "?", "[", "\\"];
+function pinFileIsPathspecPattern(relFile) {
+  return relFile.startsWith("-") || PIN_FILE_PATHSPEC_CHARS.some((c) => relFile.includes(c));
+}
+// Tracked means "git lists exactly THIS path", not "git found something for this
+// argument". `git ls-files --error-unmatch -- <file>` treats its argument as a
+// pathspec, so an UNTRACKED literal file named `.github/workflows/*.yml` exited 0
+// on the strength of some other workflow matching the glob — and keyed a live
+// exemption to a file nothing runs. `--literal-pathspecs` turns the argument back
+// into a file name, and the output is compared byte-for-byte with the path that
+// was asked about, so a match on any other path is untracked.
+function isTrackedInScannedTree(relFile) {
+  let out;
+  try {
+    out = execFileSync("git", ["--literal-pathspecs", "ls-files", "-z", "--error-unmatch", "--", relFile],
+      { stdio: ["ignore", "pipe", "ignore"] });
+  } catch { return false; }
+  // `-z` and a BYTE comparison: line-terminated output is C-quoted
+  // (`core.quotePath`) for any name outside ASCII, so a tracked workflow whose
+  // name carries a diaeresis came back as `"w\303\266rk.yml"` and read as
+  // untracked — a config error reported for a file git lists.
+  const listed = [];
+  let start = 0;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] !== 0) continue;
+    listed.push(out.subarray(start, i));
+    start = i + 1;
+  }
+  if (start < out.length) listed.push(out.subarray(start));
+  return listed.length === 1 && listed[0].equals(Buffer.from(relFile, "utf8"));
+}
+
+function enforceBasenameExpiries(config, exemptFiles, configPath) {
+  const map = config.exemptFileBasenamesExpiry;
+  if (map === undefined || map === null) return;
+  const where = `exemptFileBasenamesExpiry${configPath ? ` in ${configPath}` : ""}`;
+  if (typeof map !== "object" || Array.isArray(map)) {
+    expiryFail(`config error: ${where} must be an object mapping a file basename to its expiry entry`);
+  }
+  for (const [basename, entry] of Object.entries(map)) {
+    if (!exemptFiles.has(basename)) {
+      expiryFail(`config error: ${where} keys '${basename}', which is not listed in exemptFileBasenames — `
+        + "an expiry entry only ever time-boxes a live exemption; list the basename or delete the expiry entry");
+    }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      expiryFail(`config error: ${where}['${basename}'] must be an object carrying untilPin { file, uses, sha }`);
+    }
+    const pin = entry.untilPin;
+    if (!pin || typeof pin !== "object" || Array.isArray(pin)
+      || typeof pin.file !== "string" || !pin.file.trim()
+      || typeof pin.uses !== "string" || !pin.uses.trim()
+      || typeof pin.sha !== "string" || !FULL_SHA_RE.test(pin.sha)) {
+      expiryFail(`config error: ${where}['${basename}'].untilPin must be `
+        + "{ file: <path in the scanned repository>, uses: <the `uses:` target that file pins>, "
+        + "sha: <40-character commit sha> }");
+    }
+    if (!PIN_FILE_RE.test(pin.file)) {
+      expiryFail(`config error: ${where}['${basename}'].untilPin.file must be a repository-relative `
+        + `.github/workflows/<file>.yml|.yaml path — '${pin.file}' is not one. A pin lives in the caller `
+        + "workflow that actually runs; any other readable file could carry the keyed target at the keyed "
+        + "sha long after the real caller moved");
+    }
+    if (pinFileIsPathspecPattern(pin.file)) {
+      expiryFail(`config error: ${where}['${basename}'].untilPin.file must name ONE file — `
+        + `'${pin.file}' carries a pathspec pattern character (*, ?, [, \\) or a leading '-'. `
+        + "A pattern is not the caller workflow that runs, and git would answer for whatever it matches");
+    }
+    let pinStat;
+    try { pinStat = fs.lstatSync(pin.file); }
+    catch {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not readable in the scanned repository — an exemption whose expiry cannot be checked does not stay in force");
+    }
+    if (pinStat.isSymbolicLink()) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, which is a SYMLINK — `
+        + "the pin must be the tracked workflow itself, because a link can point at any file that still carries the keyed sha");
+    }
+    if (!isTrackedInScannedTree(pin.file)) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not tracked in the scanned repository — an untracked file is not the caller that runs");
+    }
+    let text;
+    try { text = fs.readFileSync(pin.file, "utf8"); }
+    catch {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not readable in the scanned repository — an exemption whose expiry cannot be checked does not stay in force");
+    }
+    // ONLY the keyed target answers. Every other `uses:` line in the file — an
+    // action the job happens to pin, a second reusable workflow — is irrelevant
+    // to this exemption, and letting one of them supply the sha is exactly how
+    // an expiry outlives the pin it names.
+    const wantedTarget = canonicalUsesTarget(pin.uses);
+    const pins = readUsesPins(text);
+    if (pins === null) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not parseable YAML (a syntax error, or a `__proto__` / `constructor` / `prototype` mapping "
+        + "key, which makes the document unreadable on purpose) — a caller workflow nobody can read has no "
+        + "dispatch to be keyed to, "
+        + "and an exemption whose expiry cannot be evaluated does not stay in force");
+    }
+    const forTarget = pins.filter((u) => canonicalUsesTarget(u.target) === wantedTarget);
+    if (forTarget.length === 0) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
+        + "which carries no such `uses:` line — an exemption whose pin cannot be found does not stay in force "
+        + "(the pin must be a job-level `uses:` the caller really dispatches, not a step, a comment or a heredoc)");
+    }
+    const refs = [...new Set(forTarget.map((u) => u.ref.toLowerCase()))];
+    if (refs.length > 1) {
+      expiryFail(`config error: ${pin.file} pins \`${pin.uses}\` at ${refs.length} different refs `
+        + `(${refs.join(", ")}) — the '${basename}' exemption cannot be keyed to an ambiguous target`);
+    }
+    const pinned = refs[0];
+    if (!FULL_SHA_RE.test(pinned)) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
+        + `which is not pinned to a commit sha (it references \`${pinned}\`)`);
+    }
+    if (pinned === pin.sha.toLowerCase()) continue; // live: the reason still holds
+    expiryFail(`the '${basename}' file-basename exemption has EXPIRED: ${pin.file} now pins `
+      + `\`${pin.uses}\` at ${pinned}, not ${pin.sha.toLowerCase()}, the sha the exemption was keyed to. `
+      + `Delete "${basename}" from exemptFileBasenames AND its exemptFileBasenamesExpiry entry `
+      + "in the same change that moved the pin.");
+  }
+}
+
+// `options.probe` opts the DYNAMIC lane in. Probe rules are gated by MODE, not
+// by profile: they are useless without a resolver, and their regex nominates
+// public repositories too, so leaving them in the static rule set would turn
+// every ordinary public reference into a finding.
+function buildRules(config, profile, onlyRules, options = {}) {
+  const rules = RULES
+    .filter((r) => (options.probe ? true : !r.probe))
+    .map((r) => ({ ...r, profiles: r.profiles || VALID_PROFILES }));
 
   const singlePrefixes = Array.isArray(config.reqIdSinglePrefixes) ? config.reqIdSinglePrefixes : [];
   if (singlePrefixes.length) {
@@ -387,6 +1595,486 @@ function buildRules(config, profile, onlyRules) {
   }
   return active;
 }
+
+// ---------------------------------------------------------------------------
+// The visibility probe (the DYNAMIC lane).
+//
+// A caller runs this gate with its OWN repository's GITHUB_TOKEN, which cannot
+// enumerate the organization's private repositories — so there is no list to
+// fetch. The probe asks a different, answerable question, once per distinct
+// name: "can this token see that repository as public?". Only an explicit
+// public answer clears a reference.
+// ---------------------------------------------------------------------------
+const PROBE_RULE_ID = "SLG_PRIVATE_REPO_PROBE";
+const PROBE_ERROR_RULE_ID = "SLG_PRIVATE_REPO_PROBE_ERROR";
+const PROBE_BUDGET_RULE_ID = "SLG_PRIVATE_REPO_PROBE_BUDGET";
+const DEFAULT_API_BASE = "https://api.github.com";
+// A gate that hangs is worse than a gate that blocks: an unanswered request
+// times out into the same fail-closed branch as a refused one.
+const PROBE_TIMEOUT_MS = 10_000;
+// Per-run BUDGET. A gate must have a predictable worst case, so the probe has a
+// hard ceiling on distinct names, a wall-clock deadline for the whole lane, and
+// bounded concurrency. Every candidate the budget prevents us from asking about
+// becomes a `probe budget` finding: unasked is never treated as clean.
+const PROBE_MAX_NAMES = 40;
+const PROBE_DEADLINE_MS = 60_000;
+const PROBE_CONCURRENCY = 4;
+// A cached public verdict older than this is not trusted: a repository can be
+// flipped to private at any time, and a stale entry would keep clearing it.
+const PUBLIC_CACHE_TTL_DAYS = 7;
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Module-level injection point for the probe's one HTTP call. Production leaves
+// it null and uses the global fetch; the tests install a stub so the suite stays
+// hermetic and dependency-free.
+let probeFetchImpl = null;
+function setProbeFetch(fn) { probeFetchImpl = fn || null; }
+function probeFetch(url, init) {
+  const impl = probeFetchImpl || globalThis.fetch;
+  if (typeof impl !== "function") throw new Error("no fetch implementation available");
+  return impl(url, init);
+}
+
+function isoDay(d) { return new Date(d).toISOString().slice(0, 10); }
+
+// Whole UTC calendar days since the epoch. Freshness is measured in DAYS, so it
+// is computed on days: a stamp is a day, not an instant, and a fraction of a day
+// must not decide whether a name is still vouched for.
+function utcDayIndex(d) { return Math.floor(new Date(d).getTime() / 86_400_000); }
+
+// One short, quotable label for a cache entry, so a warning can NAME the entry
+// it is about even when that entry has no usable `name` to quote.
+function cacheEntryLabel(entry) {
+  let s;
+  try { s = JSON.stringify(entry); } catch { s = undefined; }
+  if (typeof s !== "string") s = String(entry);
+  return s.length > 120 ? `${s.slice(0, 117)}...` : s;
+}
+
+// A `verifiedAt` stamp is trustworthy only if it is a REAL calendar day that is
+// not in the future. `new Date("2026-02-30T00:00:00Z")` does not throw — it
+// normalises to March 2nd — so a shape check plus "did it parse?" accepts a day
+// that never existed and then treats it as fresh. The round-trip (format it back
+// and compare) is what catches that; the future check is what stops a stamp
+// dated next year from vouching for a repository forever.
+function verifiedAtVerdict(stamp, now) {
+  const raw = String(stamp || "");
+  if (!ISO_DAY_RE.test(raw)) return { ok: false, why: "not a YYYY-MM-DD day" };
+  const at = new Date(`${raw}T00:00:00Z`);
+  if (Number.isNaN(at.getTime())) return { ok: false, why: "unparseable" };
+  if (at.toISOString().slice(0, 10) !== raw) return { ok: false, why: "not a real calendar day" };
+  if (at.getTime() > now.getTime()) return { ok: false, why: "dated in the future (UTC)" };
+  return { ok: true, at };
+}
+
+// The committed known-PUBLIC cache, consulted BEFORE any call. It is a LATENCY
+// cache, never an authority for "private": a name absent from it — or present
+// but past its TTL, or carrying metadata that cannot be trusted — is resolved
+// live. Each entry carries the day it was last confirmed public, because a cache
+// entry that cannot go stale is a permanent fail-open: a repository turned
+// private later would keep clearing forever.
+//
+// VALIDATION IS FAIL-CLOSED. The failure mode this guards is not a crash, it is
+// a cache that quietly keeps vouching:
+//   - The FILE's structure (not JSON, not an object, no `public` array) THROWS.
+//     There is nothing to read, the caller decides what that means — main()
+//     turns it into the usual gate failure. Throwing rather than exiting keeps
+//     the loader testable.
+//   - An ENTRY that is not an object, or whose `name`/`verifiedAt` is not a JSON
+//     STRING (and, for the name, a real repository name), is INVALID: it never
+//     enters the fresh set, so the name it was going to clear is resolved live,
+//     and one warning names the entry. The types are checked, not coerced —
+//     `{"name": 123}` used to stringify into the perfectly good name `123` and
+//     clear `<org>/123` with no probe at all, and `"verifiedAt": ["2026-08-28"]`
+//     stringified into a day that then read as fresh. A malformed entry must
+//     never clear a name; it also must not take the whole cache down with it,
+//     which is why it warns and is skipped rather than throwing.
+//   - `ttlDays` must be an INTEGER in 1..PUBLIC_CACHE_TTL_DAYS when present. An
+//     arbitrarily large TTL (or 0, or a fraction, or a string) is not a slightly
+//     wrong policy, it is the freshness rule switched off — so the WHOLE cache is
+//     ignored, with one warning line, and every name resolves live. Absent means
+//     the shipped default.
+//   - An ENTRY whose stamp is not a real, non-future calendar day is STALE: it
+//     never enters the fresh set, so it is resolved live. Never verified.
+// The warnings are returned rather than printed, so a caller (and a test) sees
+// exactly how many were raised; main() writes them to stderr.
+function loadKnownPublicRepos(explicitPath, options = {}) {
+  const now = options.now ? new Date(options.now) : new Date();
+  const p = explicitPath
+    || (SCANNER_REAL ? path.join(path.dirname(SCANNER_REAL), "..", "config", "public-repos.json") : "");
+  const warnings = [];
+  if (!p) return { names: new Set(), entries: [], path: "", warnings, note: "no cache path resolved" };
+  let raw;
+  try { raw = fs.readFileSync(p, "utf8"); }
+  catch { return { names: new Set(), entries: [], path: p, warnings, note: "cache absent (every reference resolves live)" }; }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (e) { throw new Error(`public-repos cache is not valid JSON (${p}): ${e.message}`); }
+  if (!parsed || !Array.isArray(parsed.public)) {
+    throw new Error(`public-repos cache must be an object with a "public" array (${p})`);
+  }
+
+  const declaredTtl = parsed.ttlDays;
+  const ttlDays = declaredTtl === undefined ? PUBLIC_CACHE_TTL_DAYS : declaredTtl;
+  const ttlOk = Number.isInteger(ttlDays) && ttlDays >= 1 && ttlDays <= PUBLIC_CACHE_TTL_DAYS;
+
+  const entries = [];
+  const fresh = new Set();
+  const seenNames = new Set();
+  let stale = 0, invalid = 0;
+  for (const rawEntry of parsed.public) {
+    const label = cacheEntryLabel(rawEntry);
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${label} is not an object with a "name" and a "verifiedAt" `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
+    }
+    // TYPE FIRST, then grammar. A non-string name coerced to a string is a name
+    // nobody wrote and nobody verified, and it would clear a repository for free.
+    //
+    // Every spelling the SHARED grammar allows is accepted, and the entry is
+    // folded to the canonical form the scan itself uses (normalizeRepoName:
+    // case-folded, with a `.git` clone suffix resolved to the repository it
+    // clones). An extra lower-case-only requirement called `CI` "not a
+    // repository name" — a name GitHub resolves, and one the tokenizer folds to
+    // `ci` — and sent it to a live probe whose verdict the network can change.
+    // One grammar means one canonical form on both sides of the comparison.
+    //
+    // The entry is validated as BASE plus an optional `.git` (isValidRepoReference),
+    // never as one string against the name ceiling: a rejection here happens
+    // BEFORE folding, so a rejected alias also escapes the folded-duplicate
+    // check below and leaves its twin trusted — one spelling of a name deciding
+    // that another spelling of the same name needs no probe.
+    const rawName = rawEntry.name;
+    const nameIsString = typeof rawName === "string";
+    if (!nameIsString || !isValidRepoReference(rawName)) {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${label} has an invalid "name" `
+        + `(${nameIsString ? "not a repository name" : "not a JSON string"}) `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
+    }
+    const name = normalizeRepoName(rawName);
+    // Two spellings that fold to ONE name are one name, and one name may not
+    // carry two verdicts. The pair is INVALID: no spelling of it enters the
+    // fresh set, so it resolves live, and only the FIRST entry can stay listed
+    // — `--verify-cache` then rewrites the file with the canonical spelling and
+    // the duplicate is gone.
+    if (seenNames.has(name)) {
+      invalid++;
+      fresh.delete(name);
+      warnings.push(
+        `public-repos cache entry ${label} names ${JSON.stringify(name)} more than once `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
+    }
+    seenNames.add(name);
+    if (typeof rawEntry.verifiedAt !== "string") {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${label} has an invalid "verifiedAt" (not a JSON string) `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
+    }
+    // The NAME is usable, so the entry stays listed for `--verify-cache` even
+    // when its stamp cannot be trusted: a refresh re-probes it and repairs the
+    // stamp. An entry with no usable name is not listed — there is nothing to
+    // probe — so the same refresh drops it from the file.
+    entries.push({ name, verifiedAt: rawEntry.verifiedAt });
+
+    const verdict = verifiedAtVerdict(rawEntry.verifiedAt, now);
+    if (!verdict.ok) {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${JSON.stringify(name)} has an untrustworthy "verifiedAt" `
+        + `(${verdict.why}) — treated as stale and resolved live (${p})`,
+      );
+      continue;
+    }
+    if (!ttlOk) continue; // the whole cache is ignored; entries are still listed for --verify-cache
+    // Age in whole UTC CALENDAR DAYS, and the comparison is STRICT. The contract
+    // is that an entry expires BY `verifiedAt + ttlDays`, so the entry stamped
+    // exactly that many days ago is already out of date: `<=` trusted it for one
+    // more day than the TTL it is named for.
+    const ageDays = utcDayIndex(now) - utcDayIndex(verdict.at);
+    if (ageDays < ttlDays) fresh.add(name); else stale++;
+  }
+
+  if (!ttlOk) {
+    warnings.unshift(
+      `public-repos cache "ttlDays" must be an integer in 1..${PUBLIC_CACHE_TTL_DAYS} `
+      + `(got ${JSON.stringify(declaredTtl)}) — the WHOLE cache is ignored and every name resolves live (${p})`,
+    );
+    return {
+      names: new Set(), entries, path: p, ttlDays, ttlValid: false, warnings,
+      note: `cache IGNORED: invalid ttlDays ${JSON.stringify(declaredTtl)} (every reference resolves live)`,
+    };
+  }
+  const note = `${fresh.size} fresh cached public name(s)`
+    + (stale ? `, ${stale} past the ${ttlDays}-day TTL (resolved live)` : "")
+    + (invalid ? `, ${invalid} with untrustworthy metadata (resolved live)` : "");
+  return { names: fresh, entries, path: p, ttlDays, ttlValid: true, warnings, note };
+}
+
+function makeProbeContext({ token, knownPublic, apiBase, timeoutMs, maxNames, deadlineMs, concurrency }) {
+  return {
+    token: token || "", knownPublic: knownPublic || new Set(),
+    apiBase: apiBase || DEFAULT_API_BASE, timeoutMs: timeoutMs || PROBE_TIMEOUT_MS,
+    maxNames: Number.isFinite(maxNames) ? maxNames : PROBE_MAX_NAMES,
+    deadlineMs: Number.isFinite(deadlineMs) ? deadlineMs : PROBE_DEADLINE_MS,
+    concurrency: Number.isFinite(concurrency) ? concurrency : PROBE_CONCURRENCY,
+    cache: new Map(), calls: 0, skipped: 0,
+  };
+}
+
+// True when a rejection is the request being CUT rather than a fault of its
+// own. The signal is asked first — it is the authority on whether this request
+// was aborted — and the error's own name covers a stub or a runtime that
+// rejects with an abort error before the signal's own state is observable.
+function isAbortCut(e, signal) {
+  if (signal && signal.aborted) return true;
+  const n = e && e.name;
+  return n === "AbortError" || n === "TimeoutError";
+}
+
+// One verdict per distinct name: { state: "public" | "private" | "error", reason }.
+// Every non-public branch — including every branch that failed to produce an
+// answer — is a blocking state. There is no path that returns "public" without
+// the API having said so (or a FRESH cache entry vouching for it).
+async function resolveRepoVisibility(name, ctx) {
+  if (ctx.knownPublic.has(name)) return { state: "public", reason: "a fresh entry in the committed public-repos cache" };
+  if (ctx.cache.has(name)) return ctx.cache.get(name);
+
+  // The per-request timeout is capped to what is LEFT of the lane deadline. A
+  // deadline that only stops NEW requests is not a deadline: an in-flight
+  // request keeping its full timeout lets a lane with a 60s budget run for 70s.
+  // Capping here both bounds the wall clock and aborts everything still in
+  // flight the moment the deadline passes — the signal fires at exactly the
+  // deadline for every outstanding request.
+  const requestTimeoutMs = ctx.timeoutMs || PROBE_TIMEOUT_MS;
+  const remainingMs = ctx.deadlineAt === undefined ? Infinity : ctx.deadlineAt - Date.now();
+  const budgetMs = Math.min(requestTimeoutMs, remainingMs);
+  const deadlineReason = `past the ${ctx.deadlineMs}ms per-run deadline`;
+  // Already out of time: never open a request that cannot finish.
+  if (budgetMs <= 0) return { state: "deadline", reason: deadlineReason };
+
+  // THE LANE OWNS THE CLOCK. An abort signal is a REQUEST to stop, and a
+  // transport is free to ignore it: a fetch that never looks at its signal and
+  // resolves after the deadline used to be accepted and MEMOISED — including a
+  // `private: false`, which cleared the name for the rest of the run on an
+  // answer the lane had no time for. So both halves of the request — the
+  // response and the body read — are raced against a timer this lane owns, and
+  // the clock is re-read before ANY verdict is accepted or memoised: an answer
+  // that lands past the deadline is the same unmemoised budget outcome as an
+  // abort. The timer is cleared on every path out, including the throwing ones.
+  const signal = AbortSignal.timeout(budgetMs);
+  const CUT = Symbol("probe budget cut");
+  let timer = null;
+  const cut = new Promise((resolve) => { timer = setTimeout(() => resolve(CUT), budgetMs); });
+  const overdue = () => signal.aborted || (ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt);
+  // What an overrun MEANS depends on whose clock ran out: past the lane
+  // deadline it is the budget outcome (unmemoised — the name was never
+  // answered), and with lane time still left it is the request's own timeout,
+  // which is an ordinary unresolved probe.
+  const cutVerdict = () => (ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt
+    ? { state: "deadline", reason: deadlineReason }
+    : { state: "error", reason: `network error: no answer inside the ${budgetMs}ms request timeout` });
+  // The LOSER of a race still settles, and a rejection nobody reads is an
+  // unhandled rejection, so every raced promise carries a handler of its own.
+  const withinBudget = (p) => {
+    const settling = Promise.resolve(p);
+    settling.catch(() => {});
+    return Promise.race([settling, cut]);
+  };
+
+  let verdict;
+  try {
+    ctx.calls++;
+    const headers = { accept: "application/vnd.github+json", "user-agent": "source-leak-gate" };
+    if (ctx.token) headers.authorization = `Bearer ${ctx.token}`;
+    const res = await withinBudget(probeFetch(`${ctx.apiBase}/repos/${PROBE_ORG}/${encodeURIComponent(name)}`, {
+      headers,
+      signal,
+    }));
+    if (res === CUT || overdue()) {
+      verdict = cutVerdict();
+    } else {
+      const status = res && typeof res.status === "number" ? res.status : null;
+      if (status === 200) {
+        let body = null;
+        // A body read the ABORT cut is not a malformed response, and the two must
+        // be told apart HERE — before the conversion — because they get opposite
+        // treatment. Reading the body is the second half of the request, and the
+        // deadline fires during it as readily as during the headers; swallowing
+        // that rejection turned "we ran out of time" into "the API answered 200
+        // with no `private`", MEMOISED it as a PROBE_ERROR, and left the deadline
+        // guard below with nothing to classify. Rethrowing hands the abort to
+        // that guard, which reports the unmemoised budget finding.
+        try { body = await withinBudget(res.json()); }
+        catch (e) { if (isAbortCut(e, signal)) throw e; body = null; }
+        if (body === CUT || overdue()) {
+          verdict = cutVerdict();
+        } else if (!body || typeof body.private !== "boolean") {
+          verdict = { state: "error", reason: "malformed API response (200 without a boolean `private`)" };
+        } else {
+          verdict = body.private
+            ? { state: "private", reason: "the API reports the repository private" }
+            : { state: "public", reason: "the API reports the repository public" };
+        }
+      } else if (status === 404) {
+        // What a private repository returns to a token without access — and what
+        // a name that does not exist returns. Both block: a gate that cannot see
+        // a repository must not vouch for it.
+        verdict = { state: "private", reason: "404 — private or nonexistent for this token" };
+      } else if (status === 401 || status === 403 || status === 429) {
+        verdict = { state: "error", reason: `not resolvable (HTTP ${status} — credentials or rate limit)` };
+      } else {
+        verdict = { state: "error", reason: `unexpected API status ${status === null ? "(no response)" : status}` };
+      }
+    }
+  } catch (e) {
+    // A request the DEADLINE cut is a budget outcome, not a network fault: it
+    // reports as the existing fail-closed `probe budget` finding (unverified),
+    // never as an unresolved-error one, and it is not memoised — the name was
+    // never actually asked about.
+    verdict = overdue() ? cutVerdict() : { state: "error", reason: `network error: ${e.message}` };
+  } finally {
+    clearTimeout(timer);
+  }
+  // The last read of the clock, and the one that covers a transport which
+  // honoured nothing: a verdict computed from an answer the lane no longer had
+  // time for is not a verdict this run may keep.
+  if (verdict.state !== "deadline" && overdue()) verdict = cutVerdict();
+  if (verdict.state === "deadline") return verdict; // never memoised: the name was never answered
+  ctx.cache.set(name, verdict);
+  return verdict;
+}
+
+// Resolves distinct names with bounded concurrency inside a wall-clock deadline,
+// up to a hard ceiling. Returns the set of names the budget left UNASKED.
+async function resolveNamesWithinBudget(names, ctx) {
+  const unasked = new Map();
+  const queue = [];
+  for (const n of names) {
+    if (ctx.knownPublic.has(n) || ctx.cache.has(n)) continue; // free: already answered
+    if (queue.length >= ctx.maxNames) { unasked.set(n, `over the ${ctx.maxNames}-name per-run cap`); continue; }
+    queue.push(n);
+  }
+  // Published on the context so every request this lane opens can cap its own
+  // timeout to what is left of it (see resolveRepoVisibility).
+  const deadline = Date.now() + ctx.deadlineMs;
+  ctx.deadlineAt = deadline;
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= queue.length) return;
+      const name = queue[i];
+      if (Date.now() >= deadline) { unasked.set(name, `past the ${ctx.deadlineMs}ms per-run deadline`); continue; }
+      const verdict = await resolveRepoVisibility(name, ctx);
+      // Cut mid-flight by the deadline: the same unasked/fail-closed bucket as a
+      // name we never got to, so it reads as "could not verify", never as clean.
+      if (verdict.state === "deadline") { unasked.set(name, verdict.reason); ctx.cache.delete(name); }
+    }
+  };
+  const lanes = Math.max(1, Math.min(ctx.concurrency, queue.length));
+  await Promise.all(Array.from({ length: lanes }, worker));
+  ctx.skipped = unasked.size;
+  return unasked;
+}
+
+// Turns nominated candidates into findings. A candidate the offline rules
+// already own is dropped by the rule's own matchExclude before it ever gets
+// here. A public verdict is dropped. Everything else becomes a finding — an
+// unresolved one, or a budget-skipped one, under its own rule id and carrying
+// the cause, so a rate-limited or over-budget run reads as "could not verify",
+// never as a leak and never as a pass.
+async function resolveProbeFindings(candidates, ctx) {
+  const order = [];
+  const seen = new Set();
+  for (const f of candidates) {
+    const name = orgPathRepoName(f.match);
+    if (!name || PROBE_EXEMPT_NAMES.has(name)) continue;
+    if (!seen.has(name)) { seen.add(name); order.push(name); }
+  }
+  const unasked = await resolveNamesWithinBudget(order, ctx);
+
+  const out = [];
+  for (const f of candidates) {
+    const name = orgPathRepoName(f.match);
+    if (!name || PROBE_EXEMPT_NAMES.has(name)) continue;
+    if (unasked.has(name)) {
+      const why = unasked.get(name);
+      out.push({ ...f, rule: PROBE_BUDGET_RULE_ID, reason: why, snippet: `unverified (probe budget: ${why}): ${f.snippet}` });
+      continue;
+    }
+    const verdict = await resolveRepoVisibility(name, ctx);
+    if (verdict.state === "public") continue;
+    if (verdict.state === "deadline") {
+      out.push({ ...f, rule: PROBE_BUDGET_RULE_ID, reason: verdict.reason, snippet: `unverified (probe budget: ${verdict.reason}): ${f.snippet}` });
+      continue;
+    }
+    if (verdict.state === "private") {
+      out.push({ ...f, reason: verdict.reason });
+    } else {
+      out.push({ ...f, rule: PROBE_ERROR_RULE_ID, reason: verdict.reason, snippet: `unresolved (${verdict.reason}): ${f.snippet}` });
+    }
+  }
+  return out;
+}
+
+// The ONE canonical serialization of the cache file. Exported so a test can
+// assert the committed file is already in it (the gate-suite index uses the same
+// trick): a hand-edit that reflows the file is then caught here, not by a
+// scheduled job opening a pull request for whitespace.
+function serializePublicRepoCache(obj) {
+  const entries = (obj.public || []).map((e) => `    { "name": ${JSON.stringify(e.name)}, "verifiedAt": ${JSON.stringify(e.verifiedAt)} }`);
+  const head = { ...obj };
+  delete head.public;
+  const headJson = JSON.stringify(head, null, 2).slice(1, -1).replace(/\n$/, "").replace(/\s+$/, "");
+  // The separating comma belongs to the head, not to `"public"`: a cache with no
+  // other top-level field (no `$comment`, no `ttlDays` — the documented default)
+  // serialised as `{,` and was not JSON at all, so the very next read of the file
+  // the writer had just produced threw.
+  const headPart = headJson ? `${headJson},` : "";
+  return `{${headPart}\n  "public": [\n${entries.join(",\n")}\n  ]\n}\n`;
+}
+
+// `--verify-cache`: re-confirm every committed cache entry against the API and
+// rewrite its timestamp, dropping any entry that is no longer explicitly public.
+// An entry that cannot be resolved is left EXACTLY as it was and reported as an
+// error — a refresh run must never launder an unanswered request into a fresh
+// timestamp. Returns a summary; the caller decides the exit code.
+async function verifyPublicRepoCache(cachePath, ctx, options = {}) {
+  const loaded = loadKnownPublicRepos(cachePath, { now: options.now });
+  if (!loaded.path) return { error: "no public-repos cache path resolved" };
+  const today = isoDay(options.now || Date.now());
+  const bare = makeProbeContext({ token: ctx.token, apiBase: ctx.apiBase, timeoutMs: ctx.timeoutMs, knownPublic: new Set() });
+  const refreshed = [], dropped = [], unresolved = [];
+  for (const entry of loaded.entries) {
+    const verdict = await resolveRepoVisibility(entry.name, bare);
+    if (verdict.state === "public") refreshed.push({ name: entry.name, verifiedAt: today, changed: entry.verifiedAt !== today });
+    else if (verdict.state === "private") dropped.push({ name: entry.name, reason: verdict.reason });
+    else { refreshed.push({ name: entry.name, verifiedAt: entry.verifiedAt, changed: false }); unresolved.push({ name: entry.name, reason: verdict.reason }); }
+  }
+  // Serialize in the generator's CANONICAL form. The committed file must already
+  // be in it, or every scheduled refresh would "drift" on formatting alone and
+  // open a pull request that changes nothing.
+  const raw = JSON.parse(fs.readFileSync(loaded.path, "utf8"));
+  raw.public = refreshed.map((r) => ({ name: r.name, verifiedAt: r.verifiedAt }));
+  const next = serializePublicRepoCache(raw);
+  const changed = next !== fs.readFileSync(loaded.path, "utf8");
+  if (changed && !options.dryRun) fs.writeFileSync(loaded.path, next);
+  return { path: loaded.path, changed, dropped, unresolved, calls: bare.calls, checked: loaded.entries.length };
+}
+
 
 function listTrackedFiles() {
   try {
@@ -458,16 +2146,80 @@ function readRuleDefRange(text) {
   return { start, end };
 }
 
-function scanFile(relPath, rules) {
+// A file the scan SELECTED is read and scanned whatever its size. Returning no
+// findings for a big file made "too big" a way through the gate: an unread file
+// is not a clean file, and a leak had only to be padded. The one limit left is a
+// RESOURCE cap — beyond it the file cannot be held in a single JS string, so
+// this engine cannot scan it at all — and exceeding it FAILS the run by name
+// (see main()'s handler) instead of passing quietly.
+const SCAN_MAX_BYTES = 64_000_000;
+const SCAN_TOO_LARGE_ERROR = "ScanFileTooLargeError";
+// The same rule for the other way a read can end without content: a selected
+// file the engine cannot stat or read FAILS the run by name. A swallowed errno
+// reported "no findings" for a file nobody opened, which is the one verdict an
+// unread file may never receive.
+const SCAN_UNREADABLE_ERROR = "ScanFileUnreadableError";
+
+function scanUnreadable(relPath, cause) {
+  const err = new Error(
+    `${relPath} could not be read (${(cause && cause.message) || String(cause)}) — a file this engine cannot `
+    + "read is never reported clean. Repair the file, or exclude it deliberately (skipDirs / "
+    + "exemptFileBasenames) so the exclusion is on the record.",
+  );
+  err.name = SCAN_UNREADABLE_ERROR;
+  return err;
+}
+
+// `tally` is the caller's scan record: this function is the only place that
+// knows whether a selected file was actually READ, so the run diagnostic counts
+// what it did rather than what it was handed. Optional — every other caller
+// scans one file and already knows the answer.
+function scanFile(relPath, rules, tally = null) {
+  // lstat, never stat: what git stores for a symbolic link is its LINK TEXT, so
+  // the link is the file to scan, not a window onto whatever it points at.
   let stat;
-  try { stat = fs.statSync(relPath); } catch { return []; }
-  if (!stat.isFile() || stat.size > 2_000_000) return [];
+  try { stat = fs.lstatSync(relPath); } catch (e) { throw scanUnreadable(relPath, e); }
+  if (stat.size > SCAN_MAX_BYTES) {
+    const err = new Error(
+      `${relPath} is ${stat.size} bytes, past the ${SCAN_MAX_BYTES}-byte scan limit — a file this engine `
+      + "cannot read in one piece is never reported clean. Split the file, or exclude it deliberately "
+      + "(skipDirs / exemptFileBasenames) so the exclusion is on the record.",
+    );
+    err.name = SCAN_TOO_LARGE_ERROR;
+    throw err;
+  }
   let text;
-  try { text = fs.readFileSync(relPath, "utf8"); } catch { return []; }
-  if (text.includes("\0")) return [];
+  if (stat.isSymbolicLink()) {
+    try { text = fs.readlinkSync(relPath, "utf8"); } catch (e) { throw scanUnreadable(relPath, e); }
+  } else if (!stat.isFile()) {
+    // git stores no content for a submodule gitlink (a directory in the working
+    // tree), so there is no content this engine can scan. The exclusion is
+    // PRINTED by path — on the record, never a silent clean — and the entry's
+    // NAME is still scanned by scanPath.
+    process.stderr.write(`[source-leak-gate] not a regular file, no content to scan: ${relPath}\n`);
+    if (tally) tally.notRegular++;
+    return [];
+  } else {
+    try { text = fs.readFileSync(relPath, "utf8"); } catch (e) { throw scanUnreadable(relPath, e); }
+  }
+  if (tally) tally.scanned++;
+  // Content carrying a NUL byte is scanned like any other selected file. "Looks
+  // binary" was a heuristic that returned clean for a file nobody had examined,
+  // so a leak had only to carry one NUL to be waved through; a NUL stops nothing.
   const isSelf = SCANNER_REAL !== "" && realPathOf(relPath) === SCANNER_REAL;
   const defRange = isSelf ? readRuleDefRange(text) : { start: -1, end: -1 };
   const lines = text.split(/\r?\n/);
+  // The legitimate-value set is a property of the FILE, so it is parsed once,
+  // and only where the file is YAML — nothing else has Actions locations. NULL
+  // (not YAML, or not parseable) means no structural carve-out at all.
+  // ONE COLLECTION PER NODE KIND (see SCALAR_NODE / SEQUENCE_NODE), so a scalar
+  // value can never answer for a sequence. There is no sequence collection to
+  // build: no Actions location takes a LIST at `repository:`, so a parsed
+  // document declares no sequence value at all.
+  const context = {
+    [SCALAR_NODE]: YAML_FILE_RE.test(relPath) ? legitimateActionValues(text, relPath) : null,
+    [SEQUENCE_NODE]: null,
+  };
   const findings = [];
   for (const rule of rules) {
     if (rule.pathExclude && rule.pathExclude(relPath)) continue;
@@ -479,7 +2231,12 @@ function scanFile(relPath, rules) {
       let m;
       while ((m = localRe.exec(line)) !== null) {
         if (rule.contextExclude && rule.contextExclude(line)) break;
-        findings.push({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) });
+        // matchExclude is per MATCH (contextExclude is per LINE): a rule that
+        // excuses one specific form must not excuse every other token that
+        // happens to share the line with it.
+        if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, relPath, context))) {
+          findings.push(repoFinding({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) }));
+        }
         if (!localRe.global) break;
         if (m.index === localRe.lastIndex) localRe.lastIndex++;
       }
@@ -505,7 +2262,9 @@ function scanPath(relPath, pathRules) {
       let m;
       while ((m = localRe.exec(seg)) !== null) {
         if (rule.contextExclude && rule.contextExclude(seg)) break;
-        findings.push({ rule: rule.id, file: relPath, line: 0, column: 0, match: m[0], snippet: `path: ${relPath}` });
+        if (!(rule.matchExclude && rule.matchExclude(m[0], seg, m.index, relPath))) {
+          findings.push(repoFinding({ rule: rule.id, file: relPath, line: 0, column: 0, match: m[0], snippet: `path: ${relPath}` }));
+        }
         if (!localRe.global) break;
         if (m.index === localRe.lastIndex) localRe.lastIndex++;
       }
@@ -614,7 +2373,7 @@ function buildSummary(findings, gateFindings, profile, scannedFileCount) {
   };
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const profile = args.profile || "default";
   if (!VALID_PROFILES.includes(profile)) fail(`unknown --profile '${profile}' (valid: ${VALID_PROFILES.join(", ")})`);
@@ -626,7 +2385,47 @@ function main() {
   const includeTests = args["include-tests"] !== "false";
   const diffBaseEnv = args["diff-base-env"] || DEFAULT_DIFF_BASE_ENV;
   const config = loadConfig(args.config);
-  const rules = buildRules(config, profile, args.rules || null);
+
+  // Mode selection (see the header). `--offline` always wins; otherwise a token
+  // enables the probe, and `--probe` forces it on unauthenticated.
+  const probeToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+  const probeEnabled = !args.offline && (Boolean(probeToken) || Boolean(args.probe));
+  let knownPublic = null;
+  if (probeEnabled) {
+    try { knownPublic = loadKnownPublicRepos(args["public-repos"]); }
+    catch (e) { return fail(e.message); }
+    // Untrustworthy cache metadata never fails the run — it makes the cache stop
+    // vouching — so it has to be VISIBLE, one line per reason.
+    for (const w of knownPublic.warnings) process.stderr.write(`[source-leak-gate] ${w}\n`);
+  }
+  const num = (k, d) => (args[k] === undefined ? d : Number(args[k]));
+  const probeCtx = probeEnabled
+    ? makeProbeContext({
+      token: probeToken, knownPublic: knownPublic.names,
+      apiBase: args["api-base"] || DEFAULT_API_BASE,
+      maxNames: num("probe-max-names", undefined),
+      deadlineMs: num("probe-deadline-ms", undefined),
+      concurrency: num("probe-concurrency", undefined),
+    })
+    : null;
+
+  // `--verify-cache` is a MAINTENANCE mode, not a scan: it re-confirms every
+  // committed cache entry and rewrites the timestamps. It needs a resolver, so
+  // it refuses to run offline rather than quietly rubber-stamping the file.
+  if (args["verify-cache"]) {
+    if (!probeEnabled) fail("--verify-cache needs the probe (a token in GITHUB_TOKEN/GH_TOKEN, or --probe)");
+    let r;
+    try { r = await verifyPublicRepoCache(args["public-repos"], probeCtx, { dryRun: Boolean(args["dry-run"]) }); }
+    catch (e) { return fail(e.message); }
+    if (r.error) fail(r.error);
+    const verb = r.changed ? (args["dry-run"] ? "WOULD BE REWRITTEN (dry run)" : "REWRITTEN") : "unchanged";
+    process.stderr.write(`public-repos cache: ${r.checked} entry(ies) checked, ${r.calls} API call(s), ${verb}\n`);
+    for (const d of r.dropped) process.stderr.write(`  dropped ${d.name}: ${d.reason}\n`);
+    for (const u of r.unresolved) process.stderr.write(`  UNRESOLVED ${u.name}: ${u.reason} (entry left untouched)\n`);
+    process.exit(r.unresolved.length ? 2 : 0);
+  }
+
+  const rules = buildRules(config, profile, args.rules || null, { probe: probeEnabled });
 
   const scanExtensions = new Set([...DEFAULT_SCAN_EXTENSIONS, ...((config.scanExtensions) || [])]);
   const skipDirs = new Set([...DEFAULT_SKIP_DIRS, ...((config.skipDirs) || [])]);
@@ -634,6 +2433,7 @@ function main() {
   const skipFilePatterns = [...DEFAULT_SKIP_FILE_PATTERNS, ...((config.skipFilePatterns) || []).map((s) => new RegExp(s))];
   const exemptDirs = [...EXEMPT_DIR_PREFIXES, ...((config.exemptDirPrefixes) || [])];
   const exemptFiles = new Set([...EXEMPT_FILE_BASENAMES, ...((config.exemptFileBasenames) || [])]);
+  enforceBasenameExpiries(config, exemptFiles, args.config);
 
   // The gate's own config / legacy-allowlist / baseline artifacts necessarily
   // contain the very tokens (and leaky path strings) they describe — never scan
@@ -654,14 +2454,28 @@ function main() {
     return shouldScan(p, scanExtensions, skipDirs, skipDirPrefixes, skipFilePatterns);
   });
 
+  // "Scanned N files" must be the files this run actually READ. Counting the
+  // candidate set instead reported the exempt files and the non-regular entries
+  // — the ones printed as excluded a few lines above — as scanned, so the
+  // number an operator reads beside "clean" claimed coverage the run never had.
+  // The skipped categories are stated beside it, not folded into it.
+  const scanTally = { scanned: 0, notRegular: 0, exempt: 0 };
   let findings = [];
   for (const f of candidates) {
-    const fileFindings = scanFile(f, rules);
-    if (!fileFindings.length) continue;
+    // The exemption decides BEFORE the file is opened. It read the same either
+    // way while scanning was infallible; now that a file past the resource cap
+    // FAILS the run, an exempt file must not be able to fail it — the operator
+    // has already said this one is not scanned.
     const base = f.split("/").pop();
-    if (exemptFiles.has(base) || exemptDirs.some((pre) => f.startsWith(pre))) continue;
+    if (exemptFiles.has(base) || exemptDirs.some((pre) => f.startsWith(pre))) { scanTally.exempt++; continue; }
+    const fileFindings = scanFile(f, rules, scanTally);
+    if (!fileFindings.length) continue;
     findings.push(...fileFindings);
   }
+  const skippedNote = [
+    scanTally.exempt ? `${scanTally.exempt} exempt` : "",
+    scanTally.notRegular ? `${scanTally.notRegular} not regular` : "",
+  ].filter(Boolean).join(", ");
 
   // File-name (path) scan: extension-INDEPENDENT candidate set (a leaky-named
   // binary counts), re-applying every exclusion (private/skip/exempt/gate-own)
@@ -680,6 +2494,33 @@ function main() {
       if (exemptFiles.has(base) || exemptDirs.some((pre) => p.startsWith(pre))) continue;
       findings.push(...scanPath(p, pathRules));
     }
+  }
+
+  // The probe lane is kept OUT of `findings` until it has verdicts: a nominated
+  // candidate is not a finding (most are ordinary public references), so it must
+  // never reach the summary total, the baseline writer or the file allowlist as
+  // one.
+  const probeCandidates = findings.filter((f) => f.rule === PROBE_RULE_ID);
+  findings = findings.filter((f) => f.rule !== PROBE_RULE_ID);
+
+  // Resolve BEFORE the ratchets, so a resolved probe finding is an ordinary
+  // finding by the time they run: the file allowlist can cover it, a
+  // probe-only allowlist entry does not read as stale, and a baseline can
+  // record it. Only LINE mode filters first — there the ratchet verdict is
+  // already known per line, so dropping tolerated candidates up front saves the
+  // API calls without changing any outcome. The other modes cannot know what
+  // they will tolerate until they have counted, so they resolve everything.
+  let probeNote = "";
+  if (probeEnabled) {
+    const toResolve = ratchetMode === "line"
+      ? applyLineRatchet(probeCandidates.filter((f) => f.line > 0), diffBaseEnv)
+      : probeCandidates;
+    const resolved = await resolveProbeFindings(toResolve, probeCtx);
+    findings = [...findings, ...resolved];
+    probeNote = `visibility probe: ${toResolve.length} reference(s), ${probeCtx.cache.size} name(s) resolved, `
+      + `${probeCtx.calls} API call(s), ${probeCtx.skipped} over budget; ${knownPublic.note}`;
+  } else {
+    probeNote = `visibility probe: offline (${args.offline ? "--offline" : "no token in GITHUB_TOKEN/GH_TOKEN"}) — the built-in private-repository list is the only authority`;
   }
 
   let gateFindings = findings;
@@ -703,10 +2544,12 @@ function main() {
   if (args["write-gate-baseline"]) writeGateBaseline(findings, args["write-gate-baseline"]);
 
   if (format === "json") {
-    process.stdout.write(JSON.stringify(buildSummary(findings, gateFindings, profile, candidates.length), null, 2) + "\n");
+    process.stdout.write(JSON.stringify(buildSummary(findings, gateFindings, profile, scanTally.scanned), null, 2) + "\n");
   } else if (!quiet) {
     for (const f of gateFindings) process.stdout.write(`${f.rule}\t${f.file}:${f.line}:${f.column}\t${f.match}\t${f.snippet}\n`);
-    process.stderr.write(`Scanned ${candidates.length} files, ${gateFindings.length} gated finding(s)` + (ratchetNote ? ` (${ratchetNote})` : "") + "\n");
+    process.stderr.write(`Scanned ${scanTally.scanned} files` + (skippedNote ? ` (${skippedNote})` : "")
+      + `, ${gateFindings.length} gated finding(s)` + (ratchetNote ? ` (${ratchetNote})` : "") + "\n");
+    process.stderr.write(`  ${probeNote}\n`);
     for (const [r, c] of Object.entries(countBy(gateFindings, (f) => f.rule)).sort((a, b) => b[1] - a[1])) {
       process.stderr.write(`  ${r}: ${c}\n`);
     }
@@ -726,8 +2569,34 @@ function isMainModule() {
   }
 }
 if (isMainModule()) {
-  try { main(); }
-  catch (e) { console.error("[source-leak-gate] scanner failed:", e.message); process.exit(2); }
+  main().catch((e) => {
+    // A polluted interpreter is reported as ITSELF, not as a generic failure.
+    // Everything this run printed before the abort was computed by a runtime the
+    // scanned input had already edited, so the operator has to be told that the
+    // OUTPUT is void — not merely that the scan stopped.
+    if (e && e.name === PROTOTYPE_POLLUTION_ERROR) {
+      console.error(`[source-leak-gate] ${PROTOTYPE_POLLUTION_ERROR}: ${e.message}`);
+      console.error("[source-leak-gate] ABORTED — discard this run's output entirely and re-run on a clean checkout.");
+      process.exit(2);
+    }
+    if (e && (e.name === SCAN_TOO_LARGE_ERROR || e.name === SCAN_UNREADABLE_ERROR)) {
+      console.error(`[source-leak-gate] ${e.name}: ${e.message}`);
+      process.exit(2);
+    }
+    console.error("[source-leak-gate] scanner failed:", e.message);
+    process.exit(2);
+  });
 }
 
-export { buildRules, scanFile, RULES, readRuleDefRange };
+export {
+  buildRules, scanFile, RULES, readRuleDefRange, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR, SCAN_UNREADABLE_ERROR,
+  setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
+  loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
+  normalizeRepoName, orgPathRepoName, canonicalRepoRef, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
+  readUsesPins, canonicalUsesTarget, canonicalLegitValue, legitimateActionValues, isTrackedInScannedTree,
+  parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
+  setYamlLoader, isPlainObject, isPlainArray, ownItems, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
+  PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
+  PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
+  PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,
+};

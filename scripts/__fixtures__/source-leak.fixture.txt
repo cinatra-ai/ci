@@ -26,34 +26,85 @@ HIT:SLG_HISTORICAL:renamed from the older name
 HIT:SLG_DECISION_RECORD:see ADR 0045 for rationale
 HIT:SLG_AGENT_MEMORY:pointer [[feedback_some-note]] saved
 HIT:SLG_MILESTONE_VERSION:ship the v6.13 milestone work
-HIT:SLG_PRIVATE_ENG_REF:rationale in eng#231 here
-HIT:SLG_PRIVATE_ENG_REF:per ratified spec cinatra-engineering#119
-HIT:SLG_PRIVATE_ENG_REF:see cinatra-ai/cinatra-engineering#56 form
+HIT:SLG_PRIVATE_ENG_REF:rationale in eng#0 here
+HIT:SLG_PRIVATE_ENG_REF:per ratified spec cinatra-engineering#0
+HIT:SLG_PRIVATE_ENG_REF:see cinatra-ai/cinatra-engineering#0 form
 HIT:SLG_PRIVATE_ENG_REF:filed under cinatra-ai/engineering tracker
-HIT:SLG_PRIVATE_ENG_REF:https://github.com/cinatra-ai/engineering/issues/343
-HIT:SLG_PRIVATE_ENG_REF:see engineering/issues/343 directly
+HIT:SLG_PRIVATE_ENG_REF:https://github.com/cinatra-ai/engineering/issues/0
+HIT:SLG_PRIVATE_ENG_REF:see engineering/issues/0 directly
 
 MISS:SLG_PRIVATE_ENG_REF:public ref cinatra#231 stays
 MISS:SLG_PRIVATE_ENG_REF:public ref cinatra-cli#61 stays
 MISS:SLG_PRIVATE_ENG_REF:full public path cinatra-ai/cinatra#231
 MISS:SLG_PRIVATE_ENG_REF:the engineering team shipped it
 MISS:SLG_PRIVATE_ENG_REF:see cinatra-ai/engineering-foo helper
+MISS:SLG_PRIVATE_ENG_REF:see cinatra-ai/engineering.tools for the sibling
+HIT:SLG_PRIVATE_ENG_REF:filed under cinatra-ai/engineering. Then closed.
+HIT:SLG_PRIVATE_ENG_REF:clone cinatra-ai/engineering.git now
+HIT:SLG_PRIVATE_ENG_REF:https://github.com/cinatra-ai/engineering.git/issues/0
+MISS:SLG_PRIVATE_ENG_REF:the cinatra-ai/engineering.gitlab mirror
+MISS:SLG_PRIVATE_ENG_REF:the eng#0abc digest is not an issue
+MISS:SLG_PRIVATE_ENG_REF:the cinatra-engineering#0abc digest is not an issue
 MISS:SLG_PRIVATE_ENG_REF:reverse-engineering/issues/ is a folder
-MISS:SLG_PRIVATE_ENG_REF:the myeng#5 token is unrelated
-HIT:SLG_PRIVATE_ENG_REF_STRICT:see engineering#231 for the rationale
+MISS:SLG_PRIVATE_ENG_REF:the myeng#0 token is unrelated
+HIT:SLG_PRIVATE_ENG_REF_STRICT:see engineering#0 for the rationale
 HIT:SLG_PRIVATE_ENG_REF_STRICT:tracked in the cinatra-engineering repo
 MISS:SLG_PRIVATE_ENG_REF_STRICT:the engineering team shipped it
-MISS:SLG_PRIVATE_ENG_REF_STRICT:reverse-engineering#5 is unrelated
-MISS:SLG_PRIVATE_ENG_REF_STRICT:cinatra-ai/engineering#309 stays the universal rule's
+MISS:SLG_PRIVATE_ENG_REF_STRICT:reverse-engineering#0 is unrelated
+MISS:SLG_PRIVATE_ENG_REF_STRICT:the engineering#0abc digest is not an issue
+HIT:SLG_PRIVATE_ENG_REF_STRICT:clone cinatra-engineering.git now
+MISS:SLG_PRIVATE_ENG_REF_STRICT:cinatra-ai/engineering#0 stays the universal rule's
 HIT:SLG_PRIVATE_REPO_REF:tokens live in cinatra-ai/design here
-HIT:SLG_PRIVATE_REPO_REF:see cinatra-ai/marketplace#12 for the submission
-HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/website/issues/4
+HIT:SLG_PRIVATE_REPO_REF:see cinatra-ai/marketplace#0 for the submission
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/website/issues/0
 HIT:SLG_PRIVATE_DESIGN_PHRASE:pull tokens from the design repository
 HIT:SLG_PRIVATE_DESIGN_PHRASE:edit the design repo to add a token
-MISS:SLG_PRIVATE_REPO_REF:import { x } from "@cinatra-ai/design";
-MISS:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/.github/workflows/deploy.yml
+HIT:SLG_PRIVATE_REPO_REF:import { x } from "@cinatra-ai/design";
+MISS:SLG_PRIVATE_REPO_REF:import { x } from "@cinatra-ai/marketplace-sdk";
+MISS:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/.github/workflows/deploy.yml@main
 MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/design-system-foo for the helper
 MISS:SLG_PRIVATE_REPO_REF:public ref cinatra-ai/cinatra#231 stays
+HIT:SLG_PRIVATE_REPO_REF:shots filed in cinatra-ai/engineering-proofs-private
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/engineering-proofs-private/blob/main/shot.png
+HIT:SLG_PRIVATE_REPO_REF:https://raw.githubusercontent.com/cinatra-ai/engineering-proofs-private/main/shot.png
+HIT:SLG_PRIVATE_REPO_REF:the pack in cinatra-ai/engineering-claude-plugin
+HIT:SLG_PRIVATE_REPO_REF:assets under cinatra-ai/marketing-explainer-video
+MISS:SLG_PRIVATE_REPO_REF:public host cinatra-ai/engineering-proofs is cited freely
+MISS:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/engineering-proofs/blob/main/shot.png
+MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/engineering-proofs-private-foo instead
+HIT:SLG_PRIVATE_REPO_REF:the cinatra-ai/wp-theme staging remote
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/ops/issues/0
+MISS:SLG_PRIVATE_REPO_REF:REMOTE=https://github.com/cinatra-ai/wp-theme.git
+MISS:SLG_PRIVATE_REPO_REF:repository: cinatra-ai/wp-theme
+MISS:SLG_PRIVATE_REPO_REF:  repositories: [cinatra-ai/wp-theme]
+MISS:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/actions/notify@v1
+HIT:SLG_PRIVATE_REPO_REF:repository: cinatra-ai/ops/issues/0
+HIT:SLG_PRIVATE_REPO_REF:repository: cinatra-ai/ops#0
+HIT:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/issues/0
+HIT:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops/.github/workflows/deploy.yml
+HIT:SLG_PRIVATE_REPO_REF:# uses: cinatra-ai/ops@main
+HIT:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops@main and then some
+MISS:SLG_PRIVATE_REPO_REF:uses: cinatra-ai/ops@release/1.0
+MISS:SLG_PRIVATE_REPO_REF:  - uses: cinatra-ai/ops@main  # pinned by the release job
+HIT:SLG_PRIVATE_REPO_REF:https://github.com/cinatra-ai/wp-theme.git/issues/0
+HIT:SLG_PRIVATE_REPO_REF:git@github.com:cinatra-ai/ops.git
+MISS:SLG_PRIVATE_REPO_REF:see cinatra-ai/design.foo for the helper
+HIT:SLG_PRIVATE_REPO_REF:clone cinatra-ai/design.git today
+HIT:SLG_PRIVATE_PROOFS_REF:pictures pushed to engineering-proofs-private
+HIT:SLG_PRIVATE_PROOFS_REF:opened engineering-proofs-private#0 for the shots
+HIT:SLG_PRIVATE_PROOFS_REF:see engineering-proofs-private/issues/0 directly
+MISS:SLG_PRIVATE_PROOFS_REF:public host engineering-proofs is cited freely
+MISS:SLG_PRIVATE_PROOFS_REF:the myengineering-proofs-private token is unrelated
+MISS:SLG_PRIVATE_PROOFS_REF:see engineering-proofs-private-foo instead
+MISS:SLG_PRIVATE_PROOFS_REF:the engineering-proofs-private.bak mirror
+MISS:SLG_PRIVATE_PROOFS_REF:see sibling.engineering-proofs-private notes
+HIT:SLG_PRIVATE_PROOFS_REF:filed under engineering-proofs-private. Then closed.
+HIT:SLG_PRIVATE_PROOFS_REF:clone engineering-proofs-private.git now
+HIT:SLG_PRIVATE_REPO_REF:retired in cinatra-ai/major-release-workflow
+HIT:SLG_PRIVATE_REPO_REF:retired in cinatra-ai/blog-content-workflow
+HIT:SLG_PRIVATE_REPO_REF:import x from "@cinatra-ai/engineering-proofs-private";
+MISS:SLG_PRIVATE_PROOFS_REF:import x from "@cinatra-ai/engineering-proofs";
+MISS:SLG_PRIVATE_PROOFS_REF:cinatra-ai/engineering-proofs-private is the path form
 MISS:SLG_MILESTONE_NUMBER:Phase 1 of the project
 MISS:SLG_MILESTONE_NUMBER:phased rollout is enabled
 MISS:SLG_MILESTONE_NUMBER:if (NEXT_PHASE=phase-production-build) return;

@@ -1,0 +1,14 @@
+{
+  "$comment": "Latency cache for the source-leak gate's repository-visibility probe: names the probe may clear WITHOUT an API call. It is not an authority for 'private' — a name absent from this list, or present but older than ttlDays, is resolved live against the API, so the list may be short and still be correct. Each entry records the day the name was last confirmed public against the API; a cache entry that cannot go stale would be a permanent fail-open, because a repository turned private later would keep clearing forever. It is deliberately NOT a mirror of every public repository in the organization: only repositories that are public by construction (the OSS product surfaces every caller cites constantly) belong here, and an entry is REMOVED rather than a new one accumulated when that stops being true. Metadata is validated fail-closed, because a cache that keeps vouching is the failure that matters: `ttlDays` must be an INTEGER in 1..7 (anything else — a huge TTL, 0, a fraction, a string — is the freshness rule switched off, so the WHOLE cache is ignored with one warning line and every name resolves live; omitting it takes the shipped 7-day default), each `verifiedAt` must be a canonical YYYY-MM-DD day that round-trips as a real calendar date (2026-02-30 does not — Date silently normalises it to March 2nd) and is not in the future (UTC); freshness is counted in whole UTC calendar days and an entry expires BY verifiedAt + ttlDays, so the entry stamped exactly that many days ago is already out of date; and `name` and `verifiedAt` must be JSON STRINGS, with `name` a real repository name — types are checked, never coerced, because a numeric name would otherwise stringify into a perfectly good name and clear that repository with no probe at all. An entry failing any of these is treated as stale and resolved live, never as verified, with one warning naming it; one bad entry never voids the file, and a malformed FILE (not JSON, not an object, no `public` array) still fails the run outright. Regenerate with `--verify-cache`; the weekly refresh workflow does it and opens a pull request on drift.",
+  "ttlDays": 7,
+  "public": [
+    { "name": "ci", "verifiedAt": "2026-08-28" },
+    { "name": "cinatra", "verifiedAt": "2026-08-28" },
+    { "name": "cinatra-cli", "verifiedAt": "2026-08-28" },
+    { "name": "claude-plugin", "verifiedAt": "2026-08-28" },
+    { "name": "docs", "verifiedAt": "2026-08-28" },
+    { "name": "assistant-skills", "verifiedAt": "2026-08-28" },
+    { "name": "engineering-proofs", "verifiedAt": "2026-08-28" },
+    { "name": "mcp-server-connector", "verifiedAt": "2026-08-28" }
+  ]
+}

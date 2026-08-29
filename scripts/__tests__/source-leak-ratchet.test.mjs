@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync, execFile } from "node:child_process";
+import http from "node:http";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -31,13 +33,43 @@ function commit(dir, files, msg) {
   git(dir, "commit", "-m", msg);
   return git(dir, "rev-parse", "HEAD");
 }
+// The ratchet suite tests the RATCHET, so it always runs the gate offline: an
+// ambient GH_TOKEN in the environment would otherwise switch the visibility
+// probe on and make these outcomes depend on the network.
+function gateEnv(base, extra = {}) {
+  return { ...process.env, GITHUB_TOKEN: "", GH_TOKEN: "", TESTBASE: base || "", ...extra };
+}
 function runGate(dir, base, extraArgs) {
   const res = spawnSync(
     "node",
     [SCANNER, "--exit-on-match", "--quiet", "--diff-base-env", "TESTBASE", ...extraArgs],
-    { cwd: dir, encoding: "utf8", env: { ...process.env, TESTBASE: base || "" } },
+    { cwd: dir, encoding: "utf8", env: gateEnv(base) },
   );
   return res.status;
+}
+// ASYNC on purpose: the probe tests answer the gate's API calls from a stub
+// server running in THIS process, so a synchronous spawn would block the event
+// loop and deadlock against the child waiting for a reply.
+const execFileAsync = promisify(execFile);
+async function runGateStatus(dir, base, extraArgs, env = {}) {
+  try {
+    await execFileAsync(
+      "node",
+      [SCANNER, "--exit-on-match", "--quiet", "--diff-base-env", "TESTBASE", ...extraArgs],
+      { cwd: dir, encoding: "utf8", env: gateEnv(base, env), maxBuffer: 64 * 1024 * 1024 },
+    );
+    return 0;
+  } catch (e) {
+    return e.code;
+  }
+}
+async function runGateJson(dir, base, extraArgs, env = {}) {
+  const { stdout } = await execFileAsync(
+    "node",
+    [SCANNER, "--format", "json", "--diff-base-env", "TESTBASE", ...extraArgs],
+    { cwd: dir, encoding: "utf8", env: gateEnv(base, env), maxBuffer: 64 * 1024 * 1024 },
+  );
+  return JSON.parse(stdout);
 }
 function rm(dir) { fs.rmSync(dir, { recursive: true, force: true }); }
 
@@ -174,5 +206,225 @@ test("manifest include/negation scopes the scan", () => {
     fs.writeFileSync(path.join(dir, "m-neg.txt"), "a.md\nb.md\n!b.md\n");
     assert.equal(runGate(dir, "", ["--ratchet-mode", "off", "--manifest", "m-all.txt"]), 1);
     assert.equal(runGate(dir, "", ["--ratchet-mode", "off", "--manifest", "m-neg.txt"]), 0);
+  } finally { rm(dir); }
+});
+
+// A localhost stand-in for the GitHub API, so the probe's end-to-end wiring is
+// exercised by a real subprocess without a network call. Names are answered from
+// a table; anything unlisted 404s, exactly as a private repository does to a
+// token without access.
+async function withApiStub(table, fn) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    const name = decodeURIComponent(req.url.split("/").pop());
+    seen.push(name);
+    const entry = table[name];
+    res.writeHead(entry ? 200 : 404, { "content-type": "application/json" });
+    res.end(JSON.stringify(entry ? { private: entry.private } : { message: "Not Found" }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    return await fn(`http://127.0.0.1:${server.address().port}`, seen);
+  } finally {
+    // The gate's fetch keeps its sockets alive; close() alone would wait for them.
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+  }
+}
+
+test("probe (end to end): public clears, private blocks, and each reference is reported ONCE", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, {
+      "note.ts": [
+        'const a = "cinatra-ai/a-public-repo";',
+        'const b = "cinatra-ai/a-private-repo";',
+        'const c = "cinatra-ai/never-heard-of-it";',
+        'import x from "@cinatra-ai/a-private-repo";',
+        'uses: cinatra-ai/ops/.github/workflows/deploy.yml',
+      ].join("\n") + "\n",
+    }, "init");
+
+    await withApiStub(
+      { "a-public-repo": { private: false }, "a-private-repo": { private: true } },
+      async (apiBase, seen) => {
+        const out = await runGateJson(dir, "", ["--ratchet-mode", "off", "--probe", "--api-base", apiBase], {});
+        const probe = out.samples.filter((f) => f.rule.startsWith("SLG_PRIVATE_REPO_PROBE"));
+        const matches = probe.map((f) => f.match).sort();
+        // In `off` mode the gated list and the total list are the same array —
+        // a merge that mutated one would report every reference twice.
+        assert.deepEqual(matches, ["cinatra-ai/a-private-repo", "cinatra-ai/never-heard-of-it"]);
+        assert.equal(out.perRule.SLG_PRIVATE_REPO_PROBE, 2);
+        // The npm scope was never nominated; the functional target was never probed.
+        assert.deepEqual(seen.sort(), ["a-private-repo", "a-public-repo", "never-heard-of-it"]);
+      },
+    );
+  } finally { rm(dir); }
+});
+
+test("probe (end to end): an unreachable API is fail-closed, never a pass", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "note.ts": 'const a = "cinatra-ai/a-public-repo";\n' }, "init");
+    // Port 1 on loopback refuses instantly.
+    const out = await runGateJson(dir, "", ["--ratchet-mode", "off", "--probe", "--api-base", "http://127.0.0.1:1"], {});
+    assert.equal(out.perRule.SLG_PRIVATE_REPO_PROBE_ERROR, 1);
+    assert.equal(out.perRule.SLG_PRIVATE_REPO_PROBE, undefined);
+  } finally { rm(dir); }
+});
+
+test("probe (end to end): no token means OFFLINE — the built-in list only, and no calls", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, {
+      "note.ts": [
+        'const a = "cinatra-ai/never-heard-of-it";',
+        'const b = "cinatra-ai/engineering-proofs-private";',
+        'const c = "cinatra-ai/engineering-proofs";',
+      ].join("\n") + "\n",
+    }, "init");
+    await withApiStub({}, async (apiBase, seen) => {
+      const out = await runGateJson(dir, "", ["--ratchet-mode", "off", "--api-base", apiBase], {});
+      const ids = out.samples.map((f) => f.rule);
+      // The offline list still catches the private twin, and leaves the public one.
+      assert.deepEqual(ids, ["SLG_PRIVATE_REPO_REF"]);
+      assert.equal(out.samples[0].match, "cinatra-ai/engineering-proofs-private");
+      assert.deepEqual(seen, [], "an offline run must not call the API at all");
+    });
+  } finally { rm(dir); }
+});
+
+test("probe (end to end): --offline forces the built-in list even WITH a token", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "note.ts": 'const a = "cinatra-ai/never-heard-of-it";\n' }, "init");
+    await withApiStub({}, async (apiBase, seen) => {
+      const out = await runGateJson(
+        dir, "",
+        ["--ratchet-mode", "off", "--offline", "--api-base", apiBase],
+        { GH_TOKEN: "t0ken" },
+      );
+      assert.equal(out.gatedFindings, 0);
+      assert.deepEqual(seen, []);
+    });
+  } finally { rm(dir); }
+});
+
+test("probe (end to end): the line ratchet bounds the probe to gated lines", async () => {
+  const dir = setupRepo();
+  try {
+    const base = commit(dir, { "note.ts": 'const old = "cinatra-ai/pre-existing-repo";\n' }, "init");
+    commit(dir, {
+      "note.ts": 'const old = "cinatra-ai/pre-existing-repo";\nconst fresh = "cinatra-ai/newly-added-repo";\n',
+    }, "add a line");
+    await withApiStub({}, async (apiBase, seen) => {
+      const out = await runGateJson(dir, base, ["--ratchet-mode", "line", "--probe", "--api-base", apiBase], {});
+      assert.equal(out.gatedFindings, 1);
+      assert.equal(out.samples[0].match, "cinatra-ai/newly-added-repo");
+      assert.deepEqual(seen, ["newly-added-repo"], "the untouched line costs no API call");
+    });
+  } finally { rm(dir); }
+});
+
+// --------------------------------------------------------------------------
+// The probe lane resolves BEFORE the file/baseline ratchets, so a resolved
+// probe finding is an ordinary finding by the time they run. Resolving after
+// them would mean an allowlisted file still blocks, a probe-only allowlist entry
+// reads as stale, and a baseline can never tolerate a probe finding.
+// --------------------------------------------------------------------------
+
+test("file ratchet: an allowlisted, untouched file with only a PROBE finding is tolerated", async () => {
+  const dir = setupRepo();
+  try {
+    const base = commit(dir, {
+      "probe.ts": 'const p = "cinatra-ai/probe-only-repo";\n',
+      "other.txt": "x\n",
+    }, "init");
+    commit(dir, { "other.txt": "x\ny\n" }, "touch other only");
+    fs.writeFileSync(path.join(dir, "allow.json"), JSON.stringify({ files: ["probe.ts"] }));
+
+    await withApiStub({}, async (apiBase) => {
+      // Sanity: without the allowlist the probe finding really does block.
+      assert.equal(
+        await runGateStatus(dir, base, ["--ratchet-mode", "file", "--probe", "--api-base", apiBase]),
+        1, "the probe finding must block when nothing excuses it",
+      );
+      // With it: tolerated — and the entry must NOT read as stale either, which
+      // would block just as hard.
+      assert.equal(
+        await runGateStatus(dir, base, ["--ratchet-mode", "file", "--legacy-allowlist", "allow.json", "--probe", "--api-base", apiBase]),
+        0, "an allowlisted, untouched probe-only file is tolerated and its entry is not stale",
+      );
+    });
+  } finally { rm(dir); }
+});
+
+test("file ratchet: a TOUCHED allowlisted file with a probe finding still blocks", async () => {
+  const dir = setupRepo();
+  try {
+    const base = commit(dir, { "probe.ts": "const clean = 1;\n" }, "init");
+    commit(dir, { "probe.ts": 'const clean = 1;\nconst p = "cinatra-ai/probe-only-repo";\n' }, "add a reference");
+    fs.writeFileSync(path.join(dir, "allow.json"), JSON.stringify({ files: ["probe.ts"] }));
+    await withApiStub({}, async (apiBase) => {
+      assert.equal(
+        await runGateStatus(dir, base, ["--ratchet-mode", "file", "--legacy-allowlist", "allow.json", "--probe", "--api-base", apiBase]),
+        1, "the allowlist never excuses a file the change touched",
+      );
+    });
+  } finally { rm(dir); }
+});
+
+test("baseline ratchet: an accepted probe count is tolerated, an increase blocks", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "probe.ts": 'const p = "cinatra-ai/probe-only-repo";\n' }, "init");
+    fs.writeFileSync(path.join(dir, "baseline.json"),
+      JSON.stringify({ perRuleFile: { ["SLG_PRIVATE_REPO_PROBE\tprobe.ts"]: 1 } }));
+    await withApiStub({}, async (apiBase) => {
+      assert.equal(
+        await runGateStatus(dir, "", ["--ratchet-mode", "baseline", "--gate-baseline", "baseline.json", "--probe", "--api-base", apiBase]),
+        0, "a baseline that records the probe finding tolerates it",
+      );
+      fs.writeFileSync(path.join(dir, "probe.ts"),
+        'const p = "cinatra-ai/probe-only-repo";\nconst q = "cinatra-ai/probe-only-repo";\n');
+      assert.equal(
+        await runGateStatus(dir, "", ["--ratchet-mode", "baseline", "--gate-baseline", "baseline.json", "--probe", "--api-base", apiBase]),
+        1, "one more than the baseline blocks",
+      );
+    });
+  } finally { rm(dir); }
+});
+
+test("baseline writer records resolved probe findings", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, { "probe.ts": 'const p = "cinatra-ai/probe-only-repo";\n' }, "init");
+    await withApiStub({}, async (apiBase) => {
+      await runGateJson(dir, "", [
+        "--ratchet-mode", "off", "--probe", "--api-base", apiBase,
+        "--write-gate-baseline", "out.json",
+      ], {});
+      const written = JSON.parse(fs.readFileSync(path.join(dir, "out.json"), "utf8"));
+      assert.equal(written.perRuleFile["SLG_PRIVATE_REPO_PROBE\tprobe.ts"], 1,
+        "a baseline generated before the probe resolved would be unusable");
+    });
+  } finally { rm(dir); }
+});
+
+test("probe budget (end to end): unasked candidates are reported, never passed", async () => {
+  const dir = setupRepo();
+  try {
+    commit(dir, {
+      "note.ts": ["one", "two", "three"].map((n) => `const ${n} = "cinatra-ai/repo-${n}";`).join("\n") + "\n",
+    }, "init");
+    await withApiStub({ "repo-one": { private: false }, "repo-two": { private: false }, "repo-three": { private: false } },
+      async (apiBase, seen) => {
+        const out = await runGateJson(dir, "", [
+          "--ratchet-mode", "off", "--probe", "--api-base", apiBase, "--probe-max-names", "1",
+        ], {});
+        assert.equal(seen.length, 1, "the cap is enforced end to end");
+        assert.equal(out.perRule.SLG_PRIVATE_REPO_PROBE_BUDGET, 2, "the two unasked names are reported");
+        assert.equal(out.gatedFindings, 2);
+      });
   } finally { rm(dir); }
 });

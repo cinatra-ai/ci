@@ -11,6 +11,12 @@ export default [
     ignores: [
       "scripts/__fixtures__/ui-design-system/**",
       "scripts/__fixtures__/extension-ioc/**",
+      // VENDORED third-party code, committed verbatim under its own licence
+      // (scripts/lib/vendor/js-yaml/PROVENANCE.md records the source and the
+      // digest the drift test enforces). It is never edited here, so linting it
+      // can only produce findings nobody may fix — the copy has to stay
+      // byte-identical to the published build.
+      "scripts/lib/vendor/**",
     ],
   },
   ...uiDesignSystem(),

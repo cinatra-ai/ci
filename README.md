@@ -27,10 +27,11 @@ consuming repo), operational runbooks, or secret material of any kind.
 ```
 .github/workflows/   Gate workflows (reusable workflow_call callers) and
                      org-level scheduled/self-check workflows
-scripts/             Gate engine scripts (Node, no runtime deps)
+scripts/             Gate engine scripts (Node built-ins; no registry deps)
   __tests__/         Unit test suite (node --test)
   __fixtures__/      Deterministic fixtures for the test suite
-  lib/vendor/        Vendored substrate (extension-ioc-gate)
+  lib/vendor/        Vendored third-party code and substrate (js-yaml,
+                     extension-ioc-gate) — see "Vendored code"
 config/              Shared profiles, baselines, and JSON config files
 templates/           Copy-paste caller workflow templates for consuming repos
 docs/                Org-wide conventions (release contract)
@@ -121,6 +122,29 @@ renamed-to / copied-to vs the base) in `line` mode, and by the legacy allowlist
 in `file` mode — so pre-existing leaky names are tolerated and only newly
 introduced ones block.
 
+### Every selected file is scanned
+
+Every file the scan selects is **read and scanned whatever its size** — an
+unread file is never reported clean, so a leak cannot be padded past the gate —
+and the one limit left is a resource cap (`64,000,000` bytes, what the engine can
+hold in a single string) whose breach **fails the run**, naming the file and its
+size, instead of passing it. A selected file the engine cannot stat or read
+**fails the run** the same way, naming the file and the error, rather than
+counting as clean. A selected **symbolic link** is scanned as the link text git
+stores for it, not as whatever it points at. A selected entry that is neither a
+regular file nor a link — a submodule gitlink, for which git stores no content —
+is **excluded from the content scan and printed by path**, so the exclusion is on
+the record and a repository with submodules stays scannable; its name is still
+path-scanned. Content is scanned **whatever bytes it carries**: a `NUL` byte is
+not a "binary" marker and stops nothing, so a leak cannot be hidden behind one.
+
+The run's `Scanned N files` diagnostic (and the JSON summary's
+`scannedFileCount`) counts the files this run actually **read**, never the
+candidate set: a file skipped before it was opened — an exempt basename, an
+exempt directory, a non-regular entry — is stated beside the count
+(`Scanned 12 files (2 exempt, 1 not regular)`) instead of being counted as
+coverage the run did not have.
+
 ### Ratchet modes
 
 - **line** (default): only findings on lines the PR added (and paths the PR
@@ -139,7 +163,10 @@ A default rule (`SLG_PRIVATE_ENG_REF`) flags references to the **private**
 `cinatra-ai/engineering` issue tracker leaking into a public repo:
 
 - `eng#<n>` and `cinatra-engineering#<n>` shorthands (the latter also catches
-  the `cinatra-ai/cinatra-engineering#<n>` legacy form);
+  the `cinatra-ai/cinatra-engineering#<n>` legacy form). A numeric issue
+  reference must **terminate**: `#<digits>` running straight into another
+  alphanumeric (`eng#0abc`, a digest, an anchor slug) is not a citation and is
+  not flagged;
 - the full `cinatra-ai/engineering` repo path (including `#<n>` and
   `/issues/<n>` URL forms);
 - the bare `engineering/issues/` URL tail.
@@ -153,11 +180,333 @@ name a public spec/protocol (e.g. "the Truthful Attribution protocol"). For a
 genuinely-public reference, allowlist the single line via `config.lineExcludes`
 (full-line-anchored) or the whole file via `config.exemptFileBasenames`.
 
+### Private-repository references
+
+Two lanes decide whether an `<org>/<name>` reference names a repository the
+public may see:
+
+- **the built-in list** — a hard-coded set of private repository names, always
+  active. It is the only lane that can judge the *bare-name* forms (a name with
+  no org path, which no API can resolve), and the only lane a run without a
+  token has.
+- **the visibility probe** — active when the gate is given a token in
+  `GH_TOKEN` / `GITHUB_TOKEN` (the reusable workflow passes the caller's own
+  `github.token`). Every *other* `<org>/<name>` reference on a **gated** line is
+  resolved once against the GitHub API, so a repository created after the last
+  edit to the list is still caught. The caller's job token cannot enumerate an
+  organization's private repositories, and does not need to: the question asked
+  is only "can this token see that repository as public?".
+
+Both lanes share ONE repository-name grammar, so they always agree on where a
+name starts and ends — and so does the committed cache's entry validation, which
+is the same function rather than a second copy. The grammar is GitHub's: 1..100
+characters from `[A-Za-z0-9_.-]` in any position, so a leading `_`, `.` or `-`
+is allowed (`<org>/_shared`, `<org>/.github-private`, `<org>/-secret`), never `.`
+or `..`, and never a trailing dot (so a sentence-final period stays punctuation).
+
+A name token must **end at a boundary** — a character outside `[A-Za-z0-9_.-]`,
+or end of text. A run longer than 100 characters therefore yields **no name at
+all** rather than a 100-character prefix: probing a truncated prefix could only
+404, and the gate would have to report that 404 as a fail-closed finding.
+
+A trailing **`.git` followed by a boundary** is a clone suffix and resolves to
+the repository it clones, and it is recognised **before** the dotted-sibling
+test — so `<org>/<private>.git`, `git@github.com:<org>/<private>.git` and
+`<org>/<private>.git/issues/1` are all the private repository. `.gitlab`,
+`.gitfoo` and `.tools` are not: a dot is a *name character*, so a listed name
+with a dotted continuation (`<org>/<listed>.something`) is a **different**
+repository — claimed by the probe, never mistaken for the listed one, and never
+claimed by both at once. The rules that match a fixed private name (the tracker,
+the private proof host) use the same boundary, so `<name>.sibling` and
+`sibling.<name>` are other names while `<name>.` at the end of a sentence still
+resolves. The 1..100 ceiling belongs to the **name**, not to the spelling: a
+written reference is a name plus that optional suffix, and the committed cache
+validates its entries that way too — so a 100-character repository written as
+`<name>.git` is that repository, folds to it, and collides with any other
+spelling of it exactly like a bare entry would.
+
+Every finding carries **both spellings** of the reference it caught: `match` is
+the source-exact text, byte for byte as the file writes it (clone suffix
+included), while `repository` is the canonical `<org>/<name>` that text names —
+suffix off, both halves case-folded — which is the spelling the probe's request,
+its memo and the committed cache all key on, and a match that names no
+`<org>/<name>` token (a bare name, an issue id) carries no `repository` at all.
+
+The **npm-scope carve-out** — `@<org>/<name>` names a vendored workspace
+package, not a repository, so it is not a reference — **never excuses a name on
+the private list**: no package carries one of those names, and the form leaks the
+name just the same. `@<org>/<public-or-unclassified>` costs nothing, in both
+lanes, exactly as before.
+
+The probe never guesses. A repository the API reports public produces no
+finding; private, `404` (what a private *or* absent repository returns to a
+token without access), a rate limit, a network error and a malformed response
+all produce one — the unresolved cases under their own rule id
+(`SLG_PRIVATE_REPO_PROBE_ERROR`), naming the cause, so a run that could not
+verify never reads as a pass.
+
+The lane runs inside a per-run **budget**: a cap on distinct names, a wall-clock
+deadline and bounded concurrency. The deadline bounds the whole lane, not just
+its next request: each request's timeout is `min(10s, time left on the
+deadline)`, so a request already in flight is aborted the moment the deadline
+passes instead of running its full timeout past it. The deadline bounds the
+**answer** as well as the request, because an abort signal is only a request to
+stop and a transport is free to ignore it: both halves of a probe — the response
+and the body read — are raced against the lane's own clock, and a resolution that
+lands past the deadline is refused and **not memoised**, so a late
+`private: false` can never clear a name for the rest of the run. A candidate the
+budget leaves unasked — including one whose request the deadline cut, and one
+whose answer arrived too late — is reported as
+`SLG_PRIVATE_REPO_PROBE_BUDGET`, so "we ran out of budget" can never read as "we
+checked it and it was fine".
+
+Verdicts are memoised per run, and
+[`config/public-repos.json`](config/public-repos.json) is a small committed
+latency cache: each entry records the day it was last confirmed public and is
+ignored once past the TTL, because an entry that cannot go stale would be a
+permanent fail-open. The cache's own metadata is validated fail-closed, since a
+cache that keeps vouching is the failure that matters:
+
+- `ttlDays` must be an **integer in 1..7**. Anything else — a huge TTL, `0`, a
+  fraction, a string — is the freshness rule switched off, so the **whole cache
+  is ignored** (one warning line, every name resolved live) rather than honoured.
+  Omitting it takes the shipped 7-day default.
+- `verifiedAt` must be a canonical `YYYY-MM-DD` day that **round-trips as a real
+  calendar date** (`2026-02-30` does not — `Date` silently normalises it to March
+  2nd) and is **not in the future** (UTC). An entry that fails either check is
+  treated as stale and resolved live; it is never counted as verified.
+- Freshness is measured in whole **UTC calendar days**, and an entry expires
+  **by** `verifiedAt + ttlDays`: the entry stamped exactly that many days ago is
+  already out of date, so a 7-day TTL vouches for seven days and not an eighth.
+- `name` is accepted in **every spelling the shared grammar allows** and is
+  stored, compared and rewritten in the one canonical form the scan itself uses —
+  case-folded, with a `.git` clone suffix resolved to the repository it clones —
+  so `CI`, `ci` and `ci.git` are one name and the cache cannot disagree with the
+  scan about which repository an entry clears. Two entries that fold to one name
+  are that name twice, which no cache may hold: the pair is **invalid** (one
+  warning, no spelling of it cleared, the name resolved live), and
+  `--verify-cache` collapses it to the canonical spelling.
+- `name` and `verifiedAt` must be JSON **strings** (and `name` a real repository
+  name). Types are checked, never coerced: `{"name": 123}` would otherwise
+  stringify into the perfectly good name `123` and clear that repository with no
+  probe at all. An entry that is not an object, or whose `name`/`verifiedAt`
+  fails this, is **invalid** — skipped with one warning naming it, and the name
+  it was going to clear is resolved live. One bad entry never decides the fate of
+  the file, and never clears a name.
+- A malformed **file** (not JSON, not an object, no `public` array) still fails
+  the run outright: there is nothing to read.
+
+`--verify-cache` re-confirms every entry and rewrites those stamps, dropping any
+repository that is no longer public; a weekly workflow runs it and opens a pull
+request on drift.
+
+Pass `--offline` to force the list-only lane (also what happens with no token),
+and `--probe` to force the probe on unauthenticated. Deliberately-public
+references are allowlisted the same way every other rule allows them, via
+`config.lineExcludes` or `config.exemptFileBasenames`.
+
+### Dispatch targets that are also private
+
+A few private repositories are named by the organization's own automation and
+cannot be rephrased away — a reusable-workflow or action reference, a checkout or
+token-scope key, a clone URL. Those exact machine forms are excused **per
+match**, not per name and not per line: ordinary prose, an `#<n>` citation and an
+`/issues/` or `/blob/` URL naming the same repository all still flag, including
+on a line that also carries a legitimate functional reference. A name-wide
+exemption would have hidden precisely the forms worth catching.
+
+The excused forms are transcribed as **machine grammars**, not substrings. A
+carve-out applies only where:
+
+- **the key owns the line** — the key is the line's first non-blank token, after
+  an optional `- ` sequence marker. A `#` anywhere before it makes the line a
+  comment, and a comment is prose *about* a machine form: `# uses: <org>/<repo>@main`
+  and `see uses: <org>/<repo>@main in the old job` are findings;
+- **the key is separated from its value by real whitespace** — YAML requires a
+  space (or tab) after a mapping key, so `uses:<org>/<repo>@main` and
+  `repository:<org>/<repo>` are not scalars at all, no runner accepts them, and
+  they are findings;
+- **the scalar is complete** — after the value only end of line or a real YAML
+  comment (whitespace, then `#`) may follow. Trailing junk, a `/issues/1` tail
+  and a comment-less `#1` all leave the carve-out. Quotes must match: an opening
+  `"` or `'` has to close the scalar. The terminator is a lookahead, so the
+  excused span stops at the value — a citation inside the trailing comment still
+  flags;
+- **the document says the value is a dispatch** — the grammar is necessary and
+  never sufficient. A `*.yml|*.yaml` file is **parsed** (with the vendored
+  js-yaml, below), and the parse yields the file's set of *legitimate values*:
+  every string at `jobs.<id>.uses` (a reusable-workflow call),
+  `jobs.<id>.steps[].uses` (an action), `jobs.<id>.steps[].with.repository` (a
+  checkout or dispatch input), and, for a composite action, `runs.steps[].uses`
+  and `runs.steps[].with.repository`. **Where those keys are read from is part
+  of the rule, not an aside**: `jobs.*` counts only in a repository-root
+  workflow (`.github/workflows/<file>.yml|.yaml`), and `runs.steps[]` only in an
+  `action.yml|.yaml` whose own `runs.using` is the string `composite` — the one
+  declaration that makes those steps a list GitHub runs. Any other file type, or
+  a document that does not carry the matching shape, yields **no legitimate
+  value at all**: a `runs:` tree in a workflow, a `jobs:` tree in an action file
+  or in a `compose.yml`, and a `node20` or `docker` action's `runs.steps` are
+  shapes nothing executes, so they dispatch nothing however well they are
+  spelled. A `uses:` / `repository:` carve-out then applies to a line **only
+  when the value its grammar reads is a member of that set**. If the file is not
+  YAML, the path is unknown, or the document does not parse, there is **no
+  carve-out at all** and every private reference in it is a finding. A document carrying a `__proto__`, `constructor` or `prototype`
+  mapping key at any depth counts as one that does not parse (see "Vendored
+  code"), and every key is read as an **own** property, so an inherited `jobs`
+  is not a dispatch.
+
+  This is what makes the multi-line text forms findings without a line scanner
+  having to recognise them: a heredoc under `run: |`, a folded `run: >-` body, a
+  `- |` sequence item, a key that carries its own colon (`run:x: |`), an anchored
+  block (`run: &payload |`), a `--- |` whole-document scalar, a quoted value
+  (bare or quoted-key) that runs over several lines, and an `env:` mapping whose
+  key happens to be `uses` are all *strings* to a parser, dispatched nowhere —
+  so nothing in them is excused. Membership is by **value**, not by line: a value
+  the same file really does dispatch stays excused wherever else it appears in
+  that file, because by then the file carries the name either way.
+
+Owner and repository **names fold case** — GitHub resolves them
+case-insensitively, so `uses: <Org>/<Repo>@main` is the same dispatch as the
+lower-case spelling and is excused with it. The fold reaches the **comparison**,
+not only the grammar: the value a line carries and the value the document
+declares are both canonicalised on their owner/repository halves before
+membership is tested — the `<path>` inside the checkout and the `@<ref>` stay
+exact and case-sensitive — so a `<Org>/<Repo>@main` the file really dispatches
+covers that same dispatch's other spellings wherever else they appear in it,
+while another path or another ref is another value and is covered by nothing.
+The **key** does not fold: `uses:` is the one spelling a runner accepts, so
+`Uses: <org>/<repo>@main` is prose.
+
+- `uses:` matches only the grammar GitHub accepts for a cross-repository step,
+  `<org>/<repo>[/<path>]@<ref>` — `<path>` a reusable-workflow file under
+  `.github/workflows/` or an action directory path, `<ref>` one or more of
+  `[A-Za-z0-9._/-]` (branch names contain `/`) and never whitespace, `@` or `#`.
+  The `@<ref>` is mandatory (GitHub rejects a ref-less cross-repo `uses:`), and
+  requiring it is what keeps `uses: <org>/<repo>/issues/1` out. Where the scan
+  knows the file path — a repository walk always does — a `uses:` step is
+  excused only in the **repository-root** `.github/workflows/*.yml|.yaml` or in
+  an `action.yml|.yaml` at any depth (composite actions live in subdirectories),
+  because that is the only place one can run: a `.github/workflows/` directory
+  at any other depth never executes, so `nested/.github/workflows/fake.yml` is
+  an ordinary document and the reference in it is prose.
+- `repository:` / `repositories:` is excused **only in a YAML file**
+  (`*.yml|*.yaml`) where the scan knows the path — its grammar is that of an
+  ordinary mapping key, legal in any workflow, action or compose file, but
+  outside YAML the same text is prose wearing a machine key as a hat and is a
+  finding. Being YAML only gets it as far as the structural rule above, which
+  finds an Actions location for it in a root workflow or a composite action and
+  nowhere else. It has **two
+  separate grammars**. The SCALAR form is exactly `<org>/<repo>` under the
+  terminator rule above — end of line, a real
+  comment, or its own closing quote. A `,` or `]` ends nothing there, because
+  nothing was opened: `repository: <org>/<repo>,#1`, `repository: <org>/<repo>/issues/1`
+  and `repository: <org>/<repo>#1` are findings, not machine forms. The FLOW
+  SEQUENCE form is `key: [<org>/<repo>, <org>/<repo>]` with **paired**
+  delimiters, in which every entry must itself be a valid `<org>/<repo>` scalar
+  (optionally quoted), with one optional trailing comma before `]` — YAML
+  accepts `key: [<org>/<repo>,]` and so does the carve-out. The excused span is
+  the whole sequence, so *every* entry is excused by the grammar, while an
+  unclosed `[` — or junk in any entry — excuses nothing. In a real file the
+  structural rule then decides, and no GitHub Actions input takes a **list** at
+  `repository:` (a checkout takes one string), so a parsed document never
+  declares such a value and a flow sequence is a finding wherever it stands. The owner of an entry is GitHub's login
+  grammar exactly (1–39 of `[A-Za-z0-9-]`, no leading, trailing or consecutive
+  hyphen), so an entry such as `bad-/public` names an owner GitHub cannot issue,
+  the sequence is not a machine form, and every private entry in it is a
+  finding.
+- the **clone URL** terminates at `.git` plus a terminator (end of line,
+  whitespace, a quote, `,`, `;`, `)`), so `<org>/<repo>.git` is a remote while
+  `<org>/<repo>.git/issues/1` is a citation wearing a remote's spelling — and a
+  finding. It is anchored on the left as well, and the anchor binds the full
+  remotes (`https://github.com/<org>/<repo>.git`,
+  `git@github.com:<org>/<repo>.git`, `ssh://git@github.com/<org>/<repo>.git`)
+  exactly as it binds the bare `<org>/<repo>.git`: the reference must start a
+  line or follow whitespace, an opening quote or bracket, or the `=` of a
+  shell/env assignment (`REMOTE=https://github.com/<org>/<repo>.git`). So
+  `xhttps://github.com/<org>/<repo>.git` is not a remote and is a finding, and
+  neither is anything after an `@`, because `@<org>/<repo>.git` is an npm scope.
+
 ### Per-repo config
 
 See [`config/example-config.json`](config/example-config.json). A config may add
 `reqIdSinglePrefixes`, `extraRules`, `lineExcludes`, `scanExtensions`,
-`skipDirs`, and `exemptDirPrefixes`. Keep your config in your own repo.
+`skipDirs`, `exemptDirPrefixes`, `exemptFileBasenames`, and
+`exemptFileBasenamesExpiry`. Keep your config in your own repo.
+
+### Time-boxed basename exemptions
+
+A whole-file exemption that exists only because some *other*, pinned copy of the
+engine lacks a fix is a debt, not a rule — and an undated debt is never paid.
+`exemptFileBasenamesExpiry` keys such an entry to the pin that justifies it:
+
+```json
+"exemptFileBasenames": ["some-fixture.txt"],
+"exemptFileBasenamesExpiry": {
+  "some-fixture.txt": {
+    "untilPin": {
+      "file": ".github/workflows/my-caller.yml",
+      "uses": "<org>/<repo>/.github/workflows/<workflow>.yml",
+      "sha": "<the 40-character commit sha that target is pinned to today>"
+    },
+    "why": "one sentence: what the pinned engine cannot do yet"
+  }
+}
+```
+
+`untilPin.file` names the **caller workflow that actually runs**, and only that:
+it must be a repository-relative `.github/workflows/<file>.yml|.yaml` path (no
+`..`, no absolute segments), must be **tracked** in the scanned tree, and must
+not be a symlink. It must also name **one literal file**: a value carrying a
+pathspec pattern character (`*`, `?`, `[`, `\`) or a leading `-` is a config
+error before git is asked anything, and "tracked" means git — asked with
+`--literal-pathspecs` and `-z`, its `NUL`-separated answer compared byte for
+byte — lists exactly that path and nothing else, so an untracked file literally
+named `.github/workflows/*.yml` can no longer pass on the strength of some other
+workflow the glob would have matched, and a tracked workflow whose name carries a
+non-ASCII character (which line-terminated `ls-files` output would C-quote) is
+read as the tracked file it is. Any other readable file — a `README.md`, a path climbing out of
+the tree, a link — could carry the keyed target at the keyed sha long after the
+real caller moved, so each of those is a config error rather than a verdict.
+
+Before every scan the gate reads `untilPin.file` out of the **scanned** tree and
+takes the ref of the one `uses:` line whose target is `untilPin.uses`. Same sha,
+and the exemption is live and the gate says nothing about it. A different sha,
+and the exemption has EXPIRED: the run exits 1 and names the basename, the file,
+the target, both shas, and the fix — **the pull request that moves the pin
+deletes the basename and its expiry entry in the same change.**
+
+The pin is read **structurally**, from the same parse: the caller workflow's
+pins are its `jobs.<id>.uses` values — the job-level reusable-workflow calls it
+actually dispatches — split with the carve-out's own `<target>@<ref>` grammar. A
+step's `uses:` is an action the job runs, not the caller's dispatch of the gate,
+and it cannot answer for a keyed target; neither can text that merely spells one
+(a heredoc, a folded block, a quoted continuation, an `env:` mapping). A value
+the `<target>@<ref>` grammar rejects — no whitespace after the key, a trailing
+tail, a ref-less or local `uses:` — is not a pin either, so replacing a real gate
+call with text no runner accepts makes the keyed target *missing* (a config
+error) instead of leaving the exemption it justifies quietly alive. A pin file
+that is **not parseable YAML** is likewise a config error: a caller nobody can
+read has no dispatch to be keyed to.
+
+The target is compared **case-canonically**: GitHub resolves the owner and
+repository halves case-insensitively, so `Some-Org/CI/.github/workflows/x.yml`
+is the same dispatch as `some-org/ci/.github/workflows/x.yml` and answers for it
+— while everything after them is a path inside the checkout, where file names
+stay case-sensitive. Two spellings of the same target at different refs are
+therefore the ambiguous-target config error, not an evasion of it.
+
+`untilPin.uses` is what binds the expiry to the reference it is actually about.
+Keyed to "some sha in the file", an exemption survived the very edit it exists to
+catch — move the gate reference to `@main`, leave an unrelated
+`actions/checkout@<sha>` in place, and the keyed sha was still "in the file".
+Only the named target answers now; every other `uses:` line is irrelevant, in
+either direction. A basename listed in the map but not in `exemptFileBasenames`,
+an entry of the wrong shape (a missing `file`, `uses` or 40-character `sha`), a
+`file` that is not a tracked, non-symlink repository-root workflow or that
+cannot be read, a named target that is absent, that appears twice with different
+refs, or that is not pinned to a commit sha are all config errors
+(exit 1): an exemption whose expiry cannot be evaluated must never stay quietly
+in force.
 
 ### Run locally
 
@@ -171,7 +520,12 @@ Add `--exit-on-match` to make it a gate, `--format json` for machine output.
 
 The scanner's rule definitions necessarily contain the markers they detect, so
 that region is bracketed by sentinel comments and skipped when the gate scans
-its own source. Dedicated test fixtures and baselines are path-exempt. For the
+its own source — **only** that region: the rest of the engine is scanned
+normally, and a marker-bearing line outside it is exempted at the line with a
+`source-leak-allow` marker, never by exempting the whole file. (A whole-file
+exemption on the engine would discard exactly the findings the sentinel scoping
+exists to preserve.) Dedicated test fixtures and baselines are path-exempt, so
+the gate's own fixture needs no config entry either. For the
 same reason, the `actions-pinned-gate` source and tests contain the version
 comments they enforce, so this repo's own self-check passes
 [`config/self-check.json`](config/self-check.json) to exempt those two files
@@ -378,8 +732,8 @@ scripts/docs-contract-gate.mjs`, Node builtins only) that validates one
 integration's `docs/` directory against the **integration docs contract** — the
 fixed page-set + frontmatter shape authored in
 [`cinatra-ai/docs`](https://github.com/cinatra-ai/docs) (docs#51) and compiled
-into the Integrations chapter of docs.cinatra.ai by the docs publish path
-(cinatra-ai/ops#378). Integration repos call it **pre-tag** so their per-repo
+into the Integrations chapter of docs.cinatra.ai by the docs publish path.
+Integration repos call it **pre-tag** so their per-repo
 docs stay consistent without central control; the publish path runs the SAME
 gate at compile time against the tagged docs tree.
 
@@ -1678,7 +2032,8 @@ suite on every PR and push to `main`.
 ### Add a new gate
 
 1. Write the engine script at `scripts/<gate-name>.mjs` (Node built-ins only,
-   zero registry dependencies).
+   zero registry dependencies — anything else is vendored under
+   `scripts/lib/vendor/`, see "Vendored code").
 2. Add unit tests at `scripts/__tests__/<gate-name>.test.mjs` using
    `node:test`.
 3. Add the reusable workflow at `.github/workflows/<gate-name>.yml`.
@@ -1686,6 +2041,45 @@ suite on every PR and push to `main`.
    on this repo.
 5. Document the gate in this README (purpose, thin-caller snippet, inputs
    table, local run command where applicable, develop command).
+
+### Vendored code
+
+Gate engines run inside consuming repositories' CI with **no `npm install`**, so
+they may only import files committed under `scripts/`. Where an engine needs a
+third-party library, the library is vendored under `scripts/lib/vendor/<name>/`,
+verbatim, with its licence beside it:
+
+| file | what it is |
+| --- | --- |
+| [`scripts/lib/vendor/js-yaml/js-yaml.mjs`](scripts/lib/vendor/js-yaml/js-yaml.mjs) | the single-file ESM build of the `js-yaml` package, **4.1.1** (MIT), used by `source-leak-gate` to parse YAML and decide which values stand at a real GitHub Actions location |
+| [`scripts/lib/vendor/js-yaml/LICENSE`](scripts/lib/vendor/js-yaml/LICENSE) | the package's MIT licence, as published |
+| [`scripts/lib/vendor/js-yaml/PROVENANCE.md`](scripts/lib/vendor/js-yaml/PROVENANCE.md) | package, version, registry tarball URL and its `dist.integrity`, the vendored file's sha256, the date, and the refresh procedure |
+
+The copy is never edited in place, and it is **not** an npm dependency — there is
+no `package.json` entry for it. A drift test in
+`scripts/__tests__/source-leak-gate.test.mjs` recomputes the sha256 of
+`js-yaml.mjs` and compares it with the digest recorded in `PROVENANCE.md`, so
+refreshing the copy without updating its provenance (or editing it at all) fails
+the suite. The directory is excluded from the repository lint in
+`eslint.config.mjs` for the same reason: nobody may fix a finding in it.
+
+A parsed document is **attacker-shaped input** — the text comes from the
+repository being scanned — so the engine never trusts the parser to be the whole
+defence. js-yaml 4.1.0 protected a directly written `__proto__` mapping key but
+not the **merge** path (`<<:`), so a document could set a parsed object's
+prototype and make the engine read an *inherited* `jobs` — a dispatch the file
+never declares, which forges both a carve-out and a live `uses:` pin at once.
+4.1.1 fixes the parser, and independently of the parser version the engine (a)
+reads **own properties only**, and treats a value whose prototype is neither
+`Object.prototype` nor `null` as absent; (b) treats a document carrying a
+`__proto__`, `constructor` or `prototype` mapping key **at any depth** as
+unparsable — no carve-out for anything in it, and a config error if it is a pin
+file; and (c) snapshots the own-property names of `Object.prototype`,
+`Array.prototype` and `Function.prototype` before every parse and compares them
+after, aborting the **whole run** with a named `PrototypePollutionError` and a
+non-zero exit if any of them changed — a run whose interpreter was edited by its
+own input has no trustworthy verdict to report, including the clean ones it
+already printed.
 
 ### Update the vendored substrate (extension-ioc-gate)
 
