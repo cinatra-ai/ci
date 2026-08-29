@@ -122,6 +122,14 @@ renamed-to / copied-to vs the base) in `line` mode, and by the legacy allowlist
 in `file` mode — so pre-existing leaky names are tolerated and only newly
 introduced ones block.
 
+### Every selected file is scanned
+
+Every file the scan selects is **read and scanned whatever its size** — an
+unread file is never reported clean, so a leak cannot be padded past the gate —
+and the one limit left is a resource cap (`64,000,000` bytes, what the engine can
+hold in a single string) whose breach **fails the run**, naming the file and its
+size, instead of passing it.
+
 ### Ratchet modes
 
 - **line** (default): only findings on lines the PR added (and paths the PR
@@ -215,8 +223,14 @@ The lane runs inside a per-run **budget**: a cap on distinct names, a wall-clock
 deadline and bounded concurrency. The deadline bounds the whole lane, not just
 its next request: each request's timeout is `min(10s, time left on the
 deadline)`, so a request already in flight is aborted the moment the deadline
-passes instead of running its full timeout past it. A candidate the budget
-leaves unasked — including one whose request the deadline cut — is reported as
+passes instead of running its full timeout past it. The deadline bounds the
+**answer** as well as the request, because an abort signal is only a request to
+stop and a transport is free to ignore it: both halves of a probe — the response
+and the body read — are raced against the lane's own clock, and a resolution that
+lands past the deadline is refused and **not memoised**, so a late
+`private: false` can never clear a name for the rest of the run. A candidate the
+budget leaves unasked — including one whose request the deadline cut, and one
+whose answer arrived too late — is reported as
 `SLG_PRIVATE_REPO_PROBE_BUDGET`, so "we ran out of budget" can never read as "we
 checked it and it was fine".
 
@@ -238,6 +252,14 @@ cache that keeps vouching is the failure that matters:
 - Freshness is measured in whole **UTC calendar days**, and an entry expires
   **by** `verifiedAt + ttlDays`: the entry stamped exactly that many days ago is
   already out of date, so a 7-day TTL vouches for seven days and not an eighth.
+- `name` is accepted in **every spelling the shared grammar allows** and is
+  stored, compared and rewritten in the one canonical form the scan itself uses —
+  case-folded, with a `.git` clone suffix resolved to the repository it clones —
+  so `CI`, `ci` and `ci.git` are one name and the cache cannot disagree with the
+  scan about which repository an entry clears. Two entries that fold to one name
+  are that name twice, which no cache may hold: the pair is **invalid** (one
+  warning, no spelling of it cleared, the name resolved live), and
+  `--verify-cache` collapses it to the canonical spelling.
 - `name` and `verifiedAt` must be JSON **strings** (and `name` a real repository
   name). Types are checked, never coerced: `{"name": 123}` would otherwise
   stringify into the perfectly good name `123` and clear that repository with no
@@ -319,8 +341,15 @@ carve-out applies only where:
 
 Owner and repository **names fold case** — GitHub resolves them
 case-insensitively, so `uses: <Org>/<Repo>@main` is the same dispatch as the
-lower-case spelling and is excused with it. The **key** does not fold: `uses:`
-is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
+lower-case spelling and is excused with it. The fold reaches the **comparison**,
+not only the grammar: the value a line carries and the value the document
+declares are both canonicalised on their owner/repository halves before
+membership is tested — the `<path>` inside the checkout and the `@<ref>` stay
+exact and case-sensitive — so a `<Org>/<Repo>@main` the file really dispatches
+covers that same dispatch's other spellings wherever else they appear in it,
+while another path or another ref is another value and is covered by nothing.
+The **key** does not fold: `uses:` is the one spelling a runner accepts, so
+`Uses: <org>/<repo>@main` is prose.
 
 - `uses:` matches only the grammar GitHub accepts for a cross-repository step,
   `<org>/<repo>[/<path>]@<ref>` — `<path>` a reusable-workflow file under

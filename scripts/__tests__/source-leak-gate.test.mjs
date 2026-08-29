@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  buildRules, scanFile, RULES,
+  buildRules, scanFile, RULES, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers,
@@ -114,6 +114,40 @@ test("self-exemption does not mask a normal file", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a big file is SCANNED, and the resource cap fails the run instead of passing it", () => {
+  // ADDED. CHANGED CONTRACT: a file over 2,000,000 bytes returned zero findings
+  // BEFORE it was read or parsed, so an unread file passed as a clean one and a
+  // leak had only to be padded past the limit. Every selected file is read and
+  // scanned whatever its size; the cap that remains is a RESOURCE limit, and
+  // exceeding it is an explicit failure of the run naming the file and its size.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-size-")));
+  const cwd0 = process.cwd();
+  try {
+    process.chdir(dir);
+    const rel = ".github/workflows/big.yml";
+    fs.mkdirSync(".github/workflows", { recursive: true });
+    // A real root workflow, padded past the old limit with comment lines, whose
+    // `uses:` value the document dispatches nowhere (it is heredoc text).
+    const pad = `# ${"x".repeat(1998)}\n`.repeat(1_100);
+    fs.writeFileSync(rel, `name: big\n${pad}jobs:\n  build:\n    steps:\n      - run: |\n          uses: cinatra-ai/ops@main\n`);
+    assert.ok(fs.statSync(rel).size > 2_000_000, "the fixture really is past the old limit");
+    assert.deepEqual(scanFile(rel, active).map((f) => f.rule), ["SLG_PRIVATE_REPO_REF"],
+      "a padded file is still read, parsed and scanned");
+
+    // Past the hard cap the run FAILS, by name — never clean. (A sparse file:
+    // the size is what the cap reads, and nothing is ever allocated.)
+    const huge = "huge.txt";
+    fs.writeFileSync(huge, "");
+    fs.truncateSync(huge, SCAN_MAX_BYTES + 1);
+    assert.throws(() => scanFile(huge, active), (e) => {
+      assert.equal(e.name, SCAN_TOO_LARGE_ERROR, "the failure is NAMED, not a generic scanner error");
+      assert.match(e.message, /huge\.txt/, "and it names the file");
+      assert.match(e.message, new RegExp(String(SCAN_MAX_BYTES + 1)), "and its size");
+      return true;
+    });
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("config-driven single-prefix IDs are detected only when configured", () => {
@@ -942,6 +976,51 @@ test("ONE name grammar: the tokenizer and the cache validator agree", () => {
   }
 });
 
+test("ONE name grammar, ONE canonical form: the cache loads what the tokenizer reads", async () => {
+  // ADDED (the test above never called the cache loader, so the loader's own
+  // second grammar went unmeasured). CHANGED CONTRACT: the loader demanded a
+  // lower-case spelling and rejected `CI` — a grammar-valid name GitHub
+  // resolves — as "not a repository name", forcing a live probe whose verdict
+  // the network or the budget can change. Every grammar-valid spelling is now
+  // accepted and folded to the canonical form the scan itself uses.
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, { ttlDays: 7, public: [{ name: "CI", verifiedAt: "2026-03-12" }] });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    assert.deepEqual([...loaded.names], ["ci"], "an upper-case entry loads FOLDED");
+    assert.deepEqual(loaded.warnings, [], "a grammar-valid spelling is not a warning");
+    // …and it really clears the reference, with no live call: the tokenizer
+    // folds `cinatra-ai/CI` to the same name.
+    const calls = stubFetch(() => apiResponse(200, { private: true }));
+    assert.deepEqual(await resolveProbeFindings([candidate("CI")], probeCtx({ knownPublic: loaded.names })), []);
+    assert.equal(calls.length, 0, "a cached name is never resolved live");
+    // The clone suffix is part of the same canonicalisation: `ci.git` is the
+    // repository it clones, not a second name (CHANGED EXPECTATION — it used to
+    // be rejected as "not a repository name").
+    const g = writeCache(dir, { ttlDays: 7, public: [{ name: "ci.git", verifiedAt: "2026-03-12" }] });
+    assert.deepEqual([...loadKnownPublicRepos(g, { now: "2026-03-12T00:00:00Z" }).names], ["ci"]);
+    // A grammar-INVALID name is still the invalid-entry warning, and clears
+    // nothing.
+    const b = writeCache(dir, { ttlDays: 7, public: [{ name: "bad name", verifiedAt: "2026-03-12" }] });
+    const bad = loadKnownPublicRepos(b, { now: "2026-03-12T00:00:00Z" });
+    assert.equal(bad.names.size, 0);
+    assert.equal(bad.warnings.length, 1);
+    assert.match(bad.warnings[0], /not a repository name/);
+    // Two spellings that fold to ONE name are one name: the pair is invalid, no
+    // spelling of it is cleared, and one entry stays listed so `--verify-cache`
+    // rewrites the file with the canonical spelling.
+    const d = writeCache(dir, {
+      ttlDays: 7,
+      public: [{ name: "CI", verifiedAt: "2026-03-12" }, { name: "ci", verifiedAt: "2026-03-12" }],
+    });
+    const dup = loadKnownPublicRepos(d, { now: "2026-03-12T00:00:00Z" });
+    assert.equal(dup.names.size, 0, "a folded duplicate clears nothing");
+    assert.equal(dup.warnings.length, 1);
+    assert.match(dup.warnings[0], /more than once/);
+    assert.deepEqual(dup.entries, [{ name: "ci", verifiedAt: "2026-03-12" }]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a leading dot is a legal repository name", () => {
   const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
   const re = new RegExp(probe.re.source, probe.re.flags);
@@ -1028,6 +1107,9 @@ test("probe budget: EVERY reference to an unasked name is named, not just the fi
 });
 
 test("probe budget: a passed deadline stops further calls and reports the rest", async () => {
+  // The stub IGNORES its abort signal and resolves ~12ms late with a
+  // `private: false` — a transport that honours nothing, which is the case the
+  // deadline has to survive on its own.
   const calls = stubFetch(async () => { await new Promise((r) => setTimeout(r, 12)); return apiResponse(200, { private: false }); });
   const ctx = probeCtx({ deadlineMs: 1, concurrency: 1, maxNames: 50 });
   const out = await resolveProbeFindings(["a", "b", "c", "d"].map((n) => candidate(n)), ctx);
@@ -1035,6 +1117,22 @@ test("probe budget: a passed deadline stops further calls and reports the rest",
   assert.ok(out.length >= 1, "the names it never asked about are reported");
   assert.ok(out.every((f) => f.rule === PROBE_BUDGET_RULE_ID));
   assert.match(out[0].reason, /deadline/);
+  // CHANGED EXPECTATION (this test passed while the ONE name the deadline
+  // actually cut — "a" — was missing from `out` entirely): the late answer was
+  // accepted and memoised, so a `private: false` that arrived after the lane
+  // was over CLEARED the name. Every name the deadline touched is the budget
+  // finding, "a" included.
+  assert.deepEqual(out.map((f) => f.match).sort(),
+    ["cinatra-ai/a", "cinatra-ai/b", "cinatra-ai/c", "cinatra-ai/d"],
+    "a late `private: false` clears nothing — the name it named is reported too");
+  // ADDED: and it is not memoised, because the name was never answered. A later
+  // resolution (a lane with time left) really does ask again.
+  assert.equal(ctx.cache.has("a"), false, "an overdue answer is never memoised");
+  const before = calls.length;
+  ctx.deadlineAt = undefined;
+  const v = await resolveRepoVisibility("a", ctx);
+  assert.equal(calls.length, before + 1, "the unmemoised name is asked again");
+  assert.equal(v.state, "public", "and THAT answer, inside the budget, is the one that counts");
 });
 
 test("probe budget: concurrency is bounded", async () => {
@@ -1217,7 +1315,10 @@ test("cache: a malformed ENTRY never clears a name — it is stale, with one war
     { entry: { name: "ci" }, why: /verifiedAt/ },                       // no verifiedAt
     { entry: { name: "ci", verifiedAt: "10-03-2026" }, why: /verifiedAt/ },
     { entry: { name: "bad name", verifiedAt: "2026-03-12" }, why: /not a repository name/ },
-    { entry: { name: "ci.git", verifiedAt: "2026-03-12" }, why: /not a repository name/ },
+    // CHANGED EXPECTATION: `{"name": "ci.git"}` was here as "not a repository
+    // name". It IS one — the shared grammar reads it whole and the shared
+    // canonicaliser resolves the clone suffix to `ci` — so it is now a valid
+    // entry that folds; see the folding test in the grammar section.
     { entry: { name: "has/slash", verifiedAt: "2026-03-12" }, why: /not a repository name/ },
   ];
   try {
@@ -2186,6 +2287,48 @@ test("owner and repository names fold CASE, the YAML key does not", () => {
   ]) {
     assert.ok(matchRule(rule, line) >= 1, `case never excuses a non-machine form: ${JSON.stringify(line)}`);
   }
+});
+
+test("the fold reaches the COMPARISON: a real dispatch covers its own other spelling", () => {
+  // ADDED. The grammar test above runs on a legitimate-value set that answers
+  // YES to everything, so it measured the fold in the REGEX and nothing else.
+  // Here the set is the real one, built by parsing a document that dispatches
+  // `Cinatra-AI/Ops@main`. CHANGED CONTRACT: the set and the matched value were
+  // compared as RAW strings, so that dispatch did not cover `cinatra-ai/ops@main`
+  // elsewhere in the same file — the fold stopped at the line, and
+  // membership-by-value (which is what makes a repeated name harmless) did not
+  // survive a change of case.
+  const wf = [
+    "name: deploy",                                                     // 1
+    "jobs:",                                                            // 2
+    "  build:",                                                         // 3
+    "    steps:",                                                       // 4
+    "      - uses: Cinatra-AI/Ops@main",                                // 5: the real dispatch
+    "      - run: |",                                                   // 6
+    "          uses: cinatra-ai/ops@main",                              // 7: the same dispatch, folded
+    "          uses: cinatra-ai/ops@MAIN",                              // 8: another REF
+    "          uses: cinatra-ai/ops/.github/workflows/x.yml@main",      // 9: another PATH
+    "",
+  ];
+  scanTree((t) => {
+    assert.deepEqual(t.lines(".github/workflows/deploy.yml", wf.join("\n")), [8, 9],
+      "the owner/repository halves fold; the path and the `@<ref>` stay exact");
+    // `repository:` values fold the same way, and only on those two halves.
+    const chk = [
+      "jobs:",                                                          // 1
+      "  build:",                                                       // 2
+      "    steps:",                                                     // 3
+      "      - uses: actions/checkout@v4",                              // 4
+      "        with:",                                                  // 5
+      "          repository: Cinatra-AI/Ops",                           // 6: the real checkout input
+      "      - run: |",                                                 // 7
+      "          repository: cinatra-ai/ops",                           // 8: the same value, folded
+      "          repository: Cinatra-AI/WP-Theme",                      // 9: a DIFFERENT repository
+      "",
+    ];
+    assert.deepEqual(t.lines(".github/workflows/checkout.yml", chk.join("\n")), [9],
+      "a value the document really checks out is excused in either case, and only that value");
+  });
 });
 
 test("the clone carve-out is ANCHORED on the left: an npm scope is not a remote", () => {

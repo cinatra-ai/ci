@@ -1086,8 +1086,25 @@ function parseYamlDocuments(text) {
   return docs;
 }
 
+// THE canonical form of a carve-out value, applied on INSERTION and on LOOKUP so
+// the two sides of the membership test are spelled the same way. Only the
+// OWNER/REPOSITORY halves fold — GitHub resolves those case-insensitively —
+// while the path inside the checkout and the `@<ref>` stay exact and
+// case-sensitive (a file name and a git ref both are). Compared raw, the fold
+// the grammar performs stopped at the line: a real `<Org>/<Repo>@main` dispatch
+// did not cover the lower-case spelling of that same dispatch elsewhere in the
+// file, which is the one thing membership-by-value exists to do. The ref is
+// split off FIRST because it is the last segment of no path — `<org>/<repo>@Main`
+// would otherwise fold its ref along with the repository.
+function canonicalLegitValue(v) {
+  const s = String(v ?? "");
+  const at = s.indexOf("@");
+  if (at === -1) return canonicalUsesTarget(s);
+  return `${canonicalUsesTarget(s.slice(0, at))}@${s.slice(at + 1)}`;
+}
+
 function addLegitimateValue(values, v) {
-  if (typeof v === "string" && v !== "") values.add(v);
+  if (typeof v === "string" && v !== "") values.add(canonicalLegitValue(v));
 }
 
 // `steps:` is the same shape in a workflow job and in a composite action.
@@ -1190,7 +1207,7 @@ function functionalRefCovers(name, line, index, filePath, context) {
     while ((m = re.exec(line)) !== null) {
       if (index >= m.index && index < m.index + m[0].length) {
         if (!f.value) return true;
-        if (legitValues && legitValues.has(f.value(m))) return true;
+        if (legitValues && legitValues.has(canonicalLegitValue(f.value(m)))) return true;
       }
       if (m.index === re.lastIndex) re.lastIndex++;
     }
@@ -1642,6 +1659,7 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
 
   const entries = [];
   const fresh = new Set();
+  const seenNames = new Set();
   let stale = 0, invalid = 0;
   for (const rawEntry of parsed.public) {
     const label = cacheEntryLabel(rawEntry);
@@ -1655,10 +1673,17 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
     }
     // TYPE FIRST, then grammar. A non-string name coerced to a string is a name
     // nobody wrote and nobody verified, and it would clear a repository for free.
+    //
+    // Every spelling the SHARED grammar allows is accepted, and the entry is
+    // folded to the canonical form the scan itself uses (normalizeRepoName:
+    // case-folded, with a `.git` clone suffix resolved to the repository it
+    // clones). An extra lower-case-only requirement called `CI` "not a
+    // repository name" — a name GitHub resolves, and one the tokenizer folds to
+    // `ci` — and sent it to a live probe whose verdict the network can change.
+    // One grammar means one canonical form on both sides of the comparison.
     const rawName = rawEntry.name;
     const nameIsString = typeof rawName === "string";
-    const name = nameIsString ? normalizeRepoName(rawName) : "";
-    if (!nameIsString || !isValidRepoName(rawName) || name !== rawName.toLowerCase()) {
+    if (!nameIsString || !isValidRepoName(rawName)) {
       invalid++;
       warnings.push(
         `public-repos cache entry ${label} has an invalid "name" `
@@ -1667,6 +1692,22 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
       );
       continue;
     }
+    const name = normalizeRepoName(rawName);
+    // Two spellings that fold to ONE name are one name, and one name may not
+    // carry two verdicts. The pair is INVALID: no spelling of it enters the
+    // fresh set, so it resolves live, and only the FIRST entry can stay listed
+    // — `--verify-cache` then rewrites the file with the canonical spelling and
+    // the duplicate is gone.
+    if (seenNames.has(name)) {
+      invalid++;
+      fresh.delete(name);
+      warnings.push(
+        `public-repos cache entry ${label} names ${JSON.stringify(name)} more than once `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
+    }
+    seenNames.add(name);
     if (typeof rawEntry.verifiedAt !== "string") {
       invalid++;
       warnings.push(
@@ -1757,56 +1798,94 @@ async function resolveRepoVisibility(name, ctx) {
   // Already out of time: never open a request that cannot finish.
   if (budgetMs <= 0) return { state: "deadline", reason: deadlineReason };
 
+  // THE LANE OWNS THE CLOCK. An abort signal is a REQUEST to stop, and a
+  // transport is free to ignore it: a fetch that never looks at its signal and
+  // resolves after the deadline used to be accepted and MEMOISED — including a
+  // `private: false`, which cleared the name for the rest of the run on an
+  // answer the lane had no time for. So both halves of the request — the
+  // response and the body read — are raced against a timer this lane owns, and
+  // the clock is re-read before ANY verdict is accepted or memoised: an answer
+  // that lands past the deadline is the same unmemoised budget outcome as an
+  // abort. The timer is cleared on every path out, including the throwing ones.
+  const signal = AbortSignal.timeout(budgetMs);
+  const CUT = Symbol("probe budget cut");
+  let timer = null;
+  const cut = new Promise((resolve) => { timer = setTimeout(() => resolve(CUT), budgetMs); });
+  const overdue = () => signal.aborted || (ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt);
+  // What an overrun MEANS depends on whose clock ran out: past the lane
+  // deadline it is the budget outcome (unmemoised — the name was never
+  // answered), and with lane time still left it is the request's own timeout,
+  // which is an ordinary unresolved probe.
+  const cutVerdict = () => (ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt
+    ? { state: "deadline", reason: deadlineReason }
+    : { state: "error", reason: `network error: no answer inside the ${budgetMs}ms request timeout` });
+  // The LOSER of a race still settles, and a rejection nobody reads is an
+  // unhandled rejection, so every raced promise carries a handler of its own.
+  const withinBudget = (p) => {
+    const settling = Promise.resolve(p);
+    settling.catch(() => {});
+    return Promise.race([settling, cut]);
+  };
+
   let verdict;
   try {
     ctx.calls++;
     const headers = { accept: "application/vnd.github+json", "user-agent": "source-leak-gate" };
     if (ctx.token) headers.authorization = `Bearer ${ctx.token}`;
-    const signal = AbortSignal.timeout(budgetMs);
-    const res = await probeFetch(`${ctx.apiBase}/repos/${PROBE_ORG}/${encodeURIComponent(name)}`, {
+    const res = await withinBudget(probeFetch(`${ctx.apiBase}/repos/${PROBE_ORG}/${encodeURIComponent(name)}`, {
       headers,
       signal,
-    });
-    const status = res && typeof res.status === "number" ? res.status : null;
-    if (status === 200) {
-      let body = null;
-      // A body read the ABORT cut is not a malformed response, and the two must
-      // be told apart HERE — before the conversion — because they get opposite
-      // treatment. Reading the body is the second half of the request, and the
-      // deadline fires during it as readily as during the headers; swallowing
-      // that rejection turned "we ran out of time" into "the API answered 200
-      // with no `private`", MEMOISED it as a PROBE_ERROR, and left the deadline
-      // guard below with nothing to classify. Rethrowing hands the abort to
-      // that guard, which reports the unmemoised budget finding.
-      try { body = await res.json(); }
-      catch (e) { if (isAbortCut(e, signal)) throw e; body = null; }
-      if (!body || typeof body.private !== "boolean") {
-        verdict = { state: "error", reason: "malformed API response (200 without a boolean `private`)" };
-      } else {
-        verdict = body.private
-          ? { state: "private", reason: "the API reports the repository private" }
-          : { state: "public", reason: "the API reports the repository public" };
-      }
-    } else if (status === 404) {
-      // What a private repository returns to a token without access — and what
-      // a name that does not exist returns. Both block: a gate that cannot see
-      // a repository must not vouch for it.
-      verdict = { state: "private", reason: "404 — private or nonexistent for this token" };
-    } else if (status === 401 || status === 403 || status === 429) {
-      verdict = { state: "error", reason: `not resolvable (HTTP ${status} — credentials or rate limit)` };
+    }));
+    if (res === CUT || overdue()) {
+      verdict = cutVerdict();
     } else {
-      verdict = { state: "error", reason: `unexpected API status ${status === null ? "(no response)" : status}` };
+      const status = res && typeof res.status === "number" ? res.status : null;
+      if (status === 200) {
+        let body = null;
+        // A body read the ABORT cut is not a malformed response, and the two must
+        // be told apart HERE — before the conversion — because they get opposite
+        // treatment. Reading the body is the second half of the request, and the
+        // deadline fires during it as readily as during the headers; swallowing
+        // that rejection turned "we ran out of time" into "the API answered 200
+        // with no `private`", MEMOISED it as a PROBE_ERROR, and left the deadline
+        // guard below with nothing to classify. Rethrowing hands the abort to
+        // that guard, which reports the unmemoised budget finding.
+        try { body = await withinBudget(res.json()); }
+        catch (e) { if (isAbortCut(e, signal)) throw e; body = null; }
+        if (body === CUT || overdue()) {
+          verdict = cutVerdict();
+        } else if (!body || typeof body.private !== "boolean") {
+          verdict = { state: "error", reason: "malformed API response (200 without a boolean `private`)" };
+        } else {
+          verdict = body.private
+            ? { state: "private", reason: "the API reports the repository private" }
+            : { state: "public", reason: "the API reports the repository public" };
+        }
+      } else if (status === 404) {
+        // What a private repository returns to a token without access — and what
+        // a name that does not exist returns. Both block: a gate that cannot see
+        // a repository must not vouch for it.
+        verdict = { state: "private", reason: "404 — private or nonexistent for this token" };
+      } else if (status === 401 || status === 403 || status === 429) {
+        verdict = { state: "error", reason: `not resolvable (HTTP ${status} — credentials or rate limit)` };
+      } else {
+        verdict = { state: "error", reason: `unexpected API status ${status === null ? "(no response)" : status}` };
+      }
     }
   } catch (e) {
     // A request the DEADLINE cut is a budget outcome, not a network fault: it
     // reports as the existing fail-closed `probe budget` finding (unverified),
     // never as an unresolved-error one, and it is not memoised — the name was
     // never actually asked about.
-    if (budgetMs < requestTimeoutMs && ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt) {
-      return { state: "deadline", reason: deadlineReason };
-    }
-    verdict = { state: "error", reason: `network error: ${e.message}` };
+    verdict = overdue() ? cutVerdict() : { state: "error", reason: `network error: ${e.message}` };
+  } finally {
+    clearTimeout(timer);
   }
+  // The last read of the clock, and the one that covers a transport which
+  // honoured nothing: a verdict computed from an answer the lane no longer had
+  // time for is not a verdict this run may keep.
+  if (verdict.state !== "deadline" && overdue()) verdict = cutVerdict();
+  if (verdict.state === "deadline") return verdict; // never memoised: the name was never answered
   ctx.cache.set(name, verdict);
   return verdict;
 }
@@ -2000,10 +2079,28 @@ function readRuleDefRange(text) {
   return { start, end };
 }
 
+// A file the scan SELECTED is read and scanned whatever its size. Returning no
+// findings for a big file made "too big" a way through the gate: an unread file
+// is not a clean file, and a leak had only to be padded. The one limit left is a
+// RESOURCE cap — beyond it the file cannot be held in a single JS string, so
+// this engine cannot scan it at all — and exceeding it FAILS the run by name
+// (see main()'s handler) instead of passing quietly.
+const SCAN_MAX_BYTES = 64_000_000;
+const SCAN_TOO_LARGE_ERROR = "ScanFileTooLargeError";
+
 function scanFile(relPath, rules) {
   let stat;
   try { stat = fs.statSync(relPath); } catch { return []; }
-  if (!stat.isFile() || stat.size > 2_000_000) return [];
+  if (!stat.isFile()) return [];
+  if (stat.size > SCAN_MAX_BYTES) {
+    const err = new Error(
+      `${relPath} is ${stat.size} bytes, past the ${SCAN_MAX_BYTES}-byte scan limit — a file this engine `
+      + "cannot read in one piece is never reported clean. Split the file, or exclude it deliberately "
+      + "(skipDirs / exemptFileBasenames) so the exclusion is on the record.",
+    );
+    err.name = SCAN_TOO_LARGE_ERROR;
+    throw err;
+  }
   let text;
   try { text = fs.readFileSync(relPath, "utf8"); } catch { return []; }
   if (text.includes("\0")) return [];
@@ -2250,10 +2347,14 @@ async function main() {
 
   let findings = [];
   for (const f of candidates) {
-    const fileFindings = scanFile(f, rules);
-    if (!fileFindings.length) continue;
+    // The exemption decides BEFORE the file is opened. It read the same either
+    // way while scanning was infallible; now that a file past the resource cap
+    // FAILS the run, an exempt file must not be able to fail it — the operator
+    // has already said this one is not scanned.
     const base = f.split("/").pop();
     if (exemptFiles.has(base) || exemptDirs.some((pre) => f.startsWith(pre))) continue;
+    const fileFindings = scanFile(f, rules);
+    if (!fileFindings.length) continue;
     findings.push(...fileFindings);
   }
 
@@ -2358,17 +2459,21 @@ if (isMainModule()) {
       console.error("[source-leak-gate] ABORTED — discard this run's output entirely and re-run on a clean checkout.");
       process.exit(2);
     }
+    if (e && e.name === SCAN_TOO_LARGE_ERROR) {
+      console.error(`[source-leak-gate] ${SCAN_TOO_LARGE_ERROR}: ${e.message}`);
+      process.exit(2);
+    }
     console.error("[source-leak-gate] scanner failed:", e.message);
     process.exit(2);
   });
 }
 
 export {
-  buildRules, scanFile, RULES, readRuleDefRange,
+  buildRules, scanFile, RULES, readRuleDefRange, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
+  readUsesPins, canonicalUsesTarget, canonicalLegitValue, legitimateActionValues, isTrackedInScannedTree,
   parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
   setYamlLoader, isPlainObject, isPlainArray, ownItems, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
