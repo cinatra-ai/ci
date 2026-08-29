@@ -4,19 +4,9 @@
   "skills-drift-gate.yml",
   "self-check.json",
   "source-leak-gate.test.mjs",
-  "source-leak-ratchet.test.mjs",
-  "source-leak.fixture.txt"
+  "source-leak-ratchet.test.mjs"
  ],
- "exemptFileBasenamesExpiry": {
-  "source-leak.fixture.txt": {
-   "untilPin": {
-    "file": ".github/workflows/self-source-leak-gate.yml",
-    "uses": "cinatra-ai/ci/.github/workflows/source-leak-gate.yml",
-    "sha": "83ca29ef8df0a33d11ba02568c61f2fdc56a3eaf"
-   },
-   "why": "the engine pinned by this repository's own caller has no real-path exclusion for the fixture; when the pin advances, this entry and the basename are removed together"
-  }
- },
+ "exemptFileBasenamesExpiry": {},
  "lineExcludes": [
   "source-leak-allow"
  ],
