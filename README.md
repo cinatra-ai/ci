@@ -225,6 +225,13 @@ validates its entries that way too — so a 100-character repository written as
 `<name>.git` is that repository, folds to it, and collides with any other
 spelling of it exactly like a bare entry would.
 
+Every finding carries **both spellings** of the reference it caught: `match` is
+the source-exact text, byte for byte as the file writes it (clone suffix
+included), while `repository` is the canonical `<org>/<name>` that text names —
+suffix off, both halves case-folded — which is the spelling the probe's request,
+its memo and the committed cache all key on, and a match that names no
+`<org>/<name>` token (a bare name, an issue id) carries no `repository` at all.
+
 The **npm-scope carve-out** — `@<org>/<name>` names a vendored workspace
 package, not a repository, so it is not a reference — **never excuses a name on
 the private list**: no package carries one of those names, and the form leaks the

@@ -391,40 +391,34 @@ function cloneUrlRe(name) {
     "g",
   );
 }
-// The KIND of YAML node a form's value stands at, carried in the key the
-// carve-out asks the legitimate-value set with.
+// The KIND of YAML node a form's value stands at, named as the collection that
+// answers for that kind. The two kinds are SEPARATE COLLECTIONS, and that is the
+// whole mechanism: a scalar value can never answer for a sequence because it is
+// never in the sequence collection, whatever either one spells. Sharing one
+// collection and telling the kinds apart by a marker inside the key cannot hold
+// — the parser decodes `"\0"` in a double-quoted scalar into a real NUL, so a
+// value can spell any marker a key uses.
 //
-// That set holds SCALARS and nothing else: legitimateActionValues adds a value
-// only when the parsed node is a string, because every Actions location that
-// takes a repository — a `uses:` target, a step's `with: repository:` — takes
-// one string. A scalar form therefore asks with the scalar's own text.
-//
-// A FLOW SEQUENCE is not a scalar. No Actions input takes a LIST at
-// `repository:`, so a parsed document never declares one, and the flow form is
-// STRUCTURALLY INELIGIBLE for the carve-out whatever the file holds. Asking with
-// the entry's bare text made that untrue: the matcher reduces the sequence to
-// one captured repository string, and a single honest
-// `with: repository: <org>/<repo>` step ANYWHERE in the same document then
-// answered for every `repositories: [<org>/<repo>]` line in it. The kind-tagged
-// key cannot be answered by a scalar — a NUL is not a character a YAML scalar
-// may carry, so no parsed value ever spells one — which is what keeps the two
-// node kinds apart inside one document.
-const SEQUENCE_NODE_KEY_PREFIX = "\u0000flow-sequence\u0000";
-function sequenceNodeKey(entry) { return `${SEQUENCE_NODE_KEY_PREFIX}${entry}`; }
+// The engine builds the SCALAR collection and no other: every Actions location
+// that takes a repository takes one scalar (a `uses:` target, a step's
+// `with: repository:`), so legitimateActionValues records scalars and nothing
+// else, and no parsed document declares a LIST at `repository:`.
+const SCALAR_NODE = "legitValues";
+const SEQUENCE_NODE = "legitSequences";
 
-// `value(m)` is the STRUCTURAL half of a form: the value the line carries, keyed
-// by the node kind it stands at, which must be one the file really declares at a
-// GitHub Actions location (see legitimateActionValues). A form that declares one
-// is excused only where the document agrees; a form without one — the clone URL,
+// `value(m)` is the STRUCTURAL half of a form: the value the line carries, at the
+// node kind it stands at, which must be one the file really declares at a GitHub
+// Actions location (see legitimateActionValues). A form that declares one is
+// excused only where the document agrees; a form without one — the clone URL,
 // which is a shell remote and belongs to no YAML location — is judged on its
 // grammar alone, unchanged.
 const FUNCTIONAL_REPO_REFS = [
-  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE, value: (m) => `${m[2]}@${m[3]}` },
-  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
-  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE, value: (m) => sequenceNodeKey(m[2]) },
+  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE, node: SCALAR_NODE, value: (m) => `${m[2]}@${m[3]}` },
+  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE, node: SCALAR_NODE, value: (m) => m[2] },
+  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE, node: SEQUENCE_NODE, value: (m) => m[2] },
   { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
-  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
-  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => sequenceNodeKey(m[2]) },
+  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE, node: SCALAR_NODE, value: (m) => m[2] },
+  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE, node: SEQUENCE_NODE, value: (m) => m[2] },
 ];
 
 // THE canonical token boundary — used by the tokenizer AND by every rule that
@@ -860,6 +854,34 @@ function orgPathRepoName(match) {
   return parts.length > 1 ? normalizeRepoName(parts[1]) : "";
 }
 
+// THE TWO FIELDS a finding carries about the reference it caught, and they are
+// not the same string. `match` is SOURCE-EXACT — the text as the file spells it,
+// byte for byte, so it can be found on the line it came from — while
+// `repository` is the canonical `<org>/<name>` that text names: the `.git` clone
+// suffix off and both halves case-folded, which is the spelling GitHub resolves
+// and the one the probe lane keys its request, its memo and its cache on. A
+// reader that had only `match` had to re-derive that fold, and `match` still
+// carries the suffix, so `<org>/<name>.git` and `<org>/<name>` read as two
+// repositories where the lane had already decided they are one.
+//
+// A match that names no `<org>/<name>` token — an issue id, a milestone number,
+// a bare repository name written without its owner — carries NO `repository`:
+// the canonical field states what the text says, and never a name inferred for
+// it.
+const CANONICAL_REPO_REF_RE = new RegExp(`(${ORG_CI})\\/(${REPO_NAME_SOURCE})${REPO_TOKEN_TAIL}`);
+function canonicalRepoRef(match) {
+  const m = CANONICAL_REPO_REF_RE.exec(String(match || ""));
+  return m ? `${m[1].toLowerCase()}/${normalizeRepoName(m[2])}` : "";
+}
+
+// Every finding both lanes emit is built through here, so the two spellings can
+// never drift apart: the probe lane spreads the candidate it was given into its
+// result, and whatever the static scan wrote is what the probe finding carries.
+function repoFinding(f) {
+  const repository = canonicalRepoRef(f.match);
+  return repository ? { ...f, repository } : f;
+}
+
 // ---------------------------------------------------------------------------
 // STRUCTURAL carve-outs: a machine form is excused only where the DOCUMENT says
 // it is one.
@@ -1116,6 +1138,10 @@ function canonicalLegitValue(v) {
   return `${canonicalUsesTarget(s.slice(0, at))}@${s.slice(at + 1)}`;
 }
 
+// SCALARS ONLY, in every reader below: a value is recorded when the parsed node
+// is a string and never otherwise, because a scalar is the only node kind a
+// GitHub Actions location dispatches. So the set can answer for a scalar form
+// and for no other node kind.
 function addLegitimateValue(values, v) {
   if (typeof v === "string" && v !== "") values.add(canonicalLegitValue(v));
 }
@@ -1205,13 +1231,14 @@ function legitimateActionValues(text, filePath) {
 //     and only where the caller actually knows the path. A caller with no path
 //     has no document either, so it gets no carve-out.
 //   - THE DOCUMENT. A form that declares a `value` is excused only when that
-//     value is one `context.legitValues` holds — the set the parsed file
-//     declares at an Actions location. No set, no carve-out.
+//     value is one the collection for its own NODE KIND holds — for a scalar,
+//     `context.legitValues`, the set the parsed file declares at an Actions
+//     location. No collection for that kind, no carve-out, which is the whole
+//     answer for a flow sequence: nothing builds a sequence collection.
 //
 // The clone URL declares neither: it is a shell remote, not a YAML location, and
 // it is judged on its grammar exactly as before.
 function functionalRefCovers(name, line, index, filePath, context) {
-  const legitValues = context ? context.legitValues : null;
   for (const f of FUNCTIONAL_REPO_REFS) {
     if (f.name !== name) continue;
     if (f.fileRe && !(filePath && f.fileRe.test(String(filePath)))) continue;
@@ -1220,7 +1247,17 @@ function functionalRefCovers(name, line, index, filePath, context) {
     while ((m = re.exec(line)) !== null) {
       if (index >= m.index && index < m.index + m[0].length) {
         if (!f.value) return true;
-        if (legitValues && legitValues.has(canonicalLegitValue(f.value(m)))) return true;
+        // The value is asked of the collection for its OWN NODE KIND, and the
+        // scan builds the scalar one only. A FLOW SEQUENCE is therefore excused
+        // by nothing in any real file — no Actions input takes a LIST at
+        // `repository:` (a checkout takes one string), so a parsed document
+        // never declares one and a sequence is a finding wherever it stands.
+        // The kinds cannot collide, because a scalar's text is never in the
+        // sequence collection: asked out of ONE collection by value, a single
+        // honest `with: repository: <org>/<repo>` step anywhere in a document
+        // excused every `repositories: [<org>/<repo>]` line in it.
+        const declared = context ? context[f.node] : null;
+        if (declared && declared.has(canonicalLegitValue(f.value(m)))) return true;
       }
       if (m.index === re.lastIndex) re.lastIndex++;
     }
@@ -2175,7 +2212,14 @@ function scanFile(relPath, rules, tally = null) {
   // The legitimate-value set is a property of the FILE, so it is parsed once,
   // and only where the file is YAML — nothing else has Actions locations. NULL
   // (not YAML, or not parseable) means no structural carve-out at all.
-  const context = { legitValues: YAML_FILE_RE.test(relPath) ? legitimateActionValues(text, relPath) : null };
+  // ONE COLLECTION PER NODE KIND (see SCALAR_NODE / SEQUENCE_NODE), so a scalar
+  // value can never answer for a sequence. There is no sequence collection to
+  // build: no Actions location takes a LIST at `repository:`, so a parsed
+  // document declares no sequence value at all.
+  const context = {
+    [SCALAR_NODE]: YAML_FILE_RE.test(relPath) ? legitimateActionValues(text, relPath) : null,
+    [SEQUENCE_NODE]: null,
+  };
   const findings = [];
   for (const rule of rules) {
     if (rule.pathExclude && rule.pathExclude(relPath)) continue;
@@ -2191,7 +2235,7 @@ function scanFile(relPath, rules, tally = null) {
         // excuses one specific form must not excuse every other token that
         // happens to share the line with it.
         if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, relPath, context))) {
-          findings.push({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) });
+          findings.push(repoFinding({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) }));
         }
         if (!localRe.global) break;
         if (m.index === localRe.lastIndex) localRe.lastIndex++;
@@ -2219,7 +2263,7 @@ function scanPath(relPath, pathRules) {
       while ((m = localRe.exec(seg)) !== null) {
         if (rule.contextExclude && rule.contextExclude(seg)) break;
         if (!(rule.matchExclude && rule.matchExclude(m[0], seg, m.index, relPath))) {
-          findings.push({ rule: rule.id, file: relPath, line: 0, column: 0, match: m[0], snippet: `path: ${relPath}` });
+          findings.push(repoFinding({ rule: rule.id, file: relPath, line: 0, column: 0, match: m[0], snippet: `path: ${relPath}` }));
         }
         if (!localRe.global) break;
         if (m.index === localRe.lastIndex) localRe.lastIndex++;
@@ -2548,7 +2592,7 @@ export {
   buildRules, scanFile, RULES, readRuleDefRange, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR, SCAN_UNREADABLE_ERROR,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
-  normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
+  normalizeRepoName, orgPathRepoName, canonicalRepoRef, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
   readUsesPins, canonicalUsesTarget, canonicalLegitValue, legitimateActionValues, isTrackedInScannedTree,
   parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
   setYamlLoader, isPlainObject, isPlainArray, ownItems, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,

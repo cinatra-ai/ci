@@ -9,7 +9,7 @@ import {
   buildRules, scanFile, RULES, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR, SCAN_UNREADABLE_ERROR,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
-  normalizeRepoName, orgPathRepoName, functionalRefCovers,
+  normalizeRepoName, orgPathRepoName, canonicalRepoRef, functionalRefCovers,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
@@ -45,13 +45,18 @@ import { loadAll as jsYamlLoadAll } from "../lib/vendor/js-yaml/js-yaml.mjs";
 // what keeps each test about one thing; a grammar case would otherwise have to
 // ship a whole workflow around every line.
 const EVERY_VALUE_IS_LEGITIMATE = { has: () => true };
+// The stand-in answers for EVERY NODE KIND the carve-out asks about — the
+// scalars a document declares and the lists it cannot — because what these cases
+// measure is the SPAN the grammar covers. Which kinds a real document can
+// declare is the structural half, and it is exercised through scanFile below.
+const EVERY_NODE_IS_LEGITIMATE = { legitValues: EVERY_VALUE_IS_LEGITIMATE, legitSequences: EVERY_VALUE_IS_LEGITIMATE };
 const GRAMMAR_FILE = ".github/workflows/grammar.yml";
 function matchRule(rule, line, { file = GRAMMAR_FILE, legitValues = EVERY_VALUE_IS_LEGITIMATE } = {}) {
   const re = new RegExp(rule.re.source, rule.re.flags);
   let m, found = 0;
   while ((m = re.exec(line)) !== null) {
     if (rule.contextExclude && rule.contextExclude(line)) return 0;
-    if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, file, { legitValues }))) found++;
+    if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, file, { ...EVERY_NODE_IS_LEGITIMATE, legitValues }))) found++;
     if (!re.global) break;
     if (m.index === re.lastIndex) re.lastIndex++;
   }
@@ -649,9 +654,12 @@ function stubFetch(responder) {
 function apiResponse(status, body) {
   return { status, json: async () => body };
 }
-// One nominated candidate, shaped exactly as scanFile emits it.
+// One nominated candidate, shaped exactly as scanFile emits it — which now
+// includes the canonical `repository` beside the source-exact `match`, built by
+// the same function the scan builds it with.
 function candidate(name, extra = {}) {
-  return { rule: PROBE_RULE_ID, file: "note.ts", line: 7, column: 1, match: `cinatra-ai/${name}`, snippet: `see cinatra-ai/${name}`, ...extra };
+  const match = `cinatra-ai/${name}`;
+  return { rule: PROBE_RULE_ID, file: "note.ts", line: 7, column: 1, match, repository: canonicalRepoRef(match), snippet: `see cinatra-ai/${name}`, ...extra };
 }
 function probeCtx(overrides = {}) {
   return makeProbeContext({ token: "t0ken", knownPublic: new Set(), apiBase: "https://api.example.test", ...overrides });
@@ -943,10 +951,11 @@ test("EVERY other form of a dispatch target still flags (a name-wide exemption w
   }
 });
 
-// The grammar harness for the hook itself: a workflow path and a set that calls
-// every value legitimate, so what is under test is the SPAN the grammar covers.
+// The grammar harness for the hook itself: a workflow path and a collection per
+// node kind that calls every value legitimate, so what is under test is the SPAN
+// the grammar covers.
 function grammarCovers(name, line, index) {
-  return functionalRefCovers(name, line, index, GRAMMAR_FILE, { legitValues: EVERY_VALUE_IS_LEGITIMATE });
+  return functionalRefCovers(name, line, index, GRAMMAR_FILE, EVERY_NODE_IS_LEGITIMATE);
 }
 
 test("the functional carve-out is per MATCH, not per line", () => {
@@ -994,6 +1003,15 @@ test("a `uses:` / `repository:` carve-out needs BOTH a file and the document's w
   const clone = "git clone https://github.com/cinatra-ai/wp-theme.git";
   assert.equal(functionalRefCovers("wp-theme", clone, clone.indexOf("cinatra-ai/wp-theme")), true,
     "the clone form is a shell remote: no file, no document, unchanged");
+  // ADDED: the node kinds are asked of SEPARATE collections, so the scalars a
+  // document declares cannot answer for a sequence however permissive they are —
+  // which is the whole defence, since a scalar's own text is not the question.
+  const seq = "repositories: [cinatra-ai/wp-theme]";
+  const seqAt = seq.indexOf("cinatra-ai/wp-theme");
+  assert.equal(functionalRefCovers("wp-theme", seq, seqAt, GRAMMAR_FILE, { legitValues: EVERY_VALUE_IS_LEGITIMATE }), false,
+    "a scalar collection that says yes to everything still excuses no sequence");
+  assert.equal(functionalRefCovers("wp-theme", seq, seqAt, GRAMMAR_FILE, EVERY_NODE_IS_LEGITIMATE), true,
+    "the grammar reads the span: what the sequence lacks is a collection, not a match");
 });
 
 // --------------------------------------------------------------------------
@@ -2779,41 +2797,59 @@ test("a `repositories:` FLOW SEQUENCE is not a value any Actions location carrie
   });
 });
 
-test("a legitimate SCALAR checkout does not excuse a FLOW SEQUENCE in the SAME document", () => {
+test("no SCALAR the document dispatches excuses a FLOW SEQUENCE in the SAME file", () => {
   // The case the two scans above cannot see, because each writes its own file:
-  // one document carrying BOTH forms. The workflow really checks out
-  // `cinatra-ai/wp-theme` at a step's `with:` (a scalar, excused), and the
-  // `repositories: [...]` line elsewhere in the same document is still a
-  // finding. Node kinds are kept apart INSIDE a file: the legitimate-value set
-  // holds the scalars the document declares, and the flow form asks with a
-  // sequence key no scalar can answer. Reduced to the entry's bare text — which
-  // is what the flow matcher captures — the honest step at line 7 excused every
-  // list in the file.
-  const wf = [
+  // one document carrying BOTH node kinds. REWRITTEN: this used to rest on the
+  // claim that no YAML scalar can spell the key the sequence asked with (it was
+  // NUL-prefixed) — but the parser decodes `"\0"` in a double-quoted scalar into
+  // a real NUL, so a dispatched scalar could spell exactly that key and answer
+  // for a sequence. The kinds are kept apart by SEPARATE COLLECTIONS now, so the
+  // cases below are about node kinds and about no key at all.
+  const REL = ".github/workflows/build.yml";
+  const SEQ = "          repositories: [cinatra-ai/wp-theme]";  // no Actions input takes a LIST
+  const wfWith = (dispatch) => [
     "name: build",                                    // 1
     "jobs:",                                          // 2
     "  build:",                                       // 3
     "    steps:",                                     // 4
-    "      - uses: actions/checkout@v4",              // 5
-    "        with:",                                  // 6
-    "          repository: cinatra-ai/wp-theme",      // 7  a real checkout input
-    "      - name: fan out",                          // 8
-    "        with:",                                  // 9
-    "          repositories: [cinatra-ai/wp-theme]",  // 10 no Actions input takes a LIST
+    ...dispatch,                                      // 5..
+    "      - name: fan out",
+    "        with:",
+    SEQ,
     "",
   ].join("\n");
-  const rel = ".github/workflows/build.yml";
+  // An honest checkout of the very repository the sequence names: a scalar, at a
+  // real Actions location, excused where it stands.
+  const HONEST_SCALAR = ["      - uses: actions/checkout@v4", "        with:", "          repository: cinatra-ai/wp-theme"];
+  // The same, spelled to land on the key the sequence used to ask with: the
+  // parser turns `\0` into a real NUL, and this scalar IS dispatched (a step's
+  // `uses:`), so the document really declares it. Its own line nominates nothing
+  // — the `0` of the escape is a name character in front of the token — so the
+  // sequence is the only finding either way.
+  const NUL_SCALAR = ['      - uses: "\\0flow-sequence\\0cinatra-ai/wp-theme"'];
   scanTree((t) => {
-    assert.deepEqual(t.lines(rel, wf), [10],
+    // CHANGED EXPECTATION (the defect): a scalar spelling the sequence's key,
+    // dispatched at a functional position, left the list unexcused — it used to
+    // excuse it, for zero findings on this file.
+    assert.deepEqual(t.lines(REL, wfWith(NUL_SCALAR)), [8],
+      "a dispatched scalar carrying a NUL does not answer for a sequence");
+    assert.deepEqual(t.lines(REL, wfWith(HONEST_SCALAR)), [10],
       "the flow sequence is a finding even though the same file legitimately checks the repository out");
-    const flagged = t.findings(rel, wf);
+    const flagged = t.findings(REL, wfWith(HONEST_SCALAR));
     assert.equal(flagged[0].rule, "SLG_PRIVATE_REPO_REF");
-    // NOT VACUOUS, both ways: the scalar step alone is clean, and the list alone
-    // is a finding — so what line 10 fails for is its node kind, nothing else.
-    assert.deepEqual(t.ids(rel, wf.split("\n").slice(0, 7).join("\n") + "\n"), []);
-    assert.deepEqual(t.ids(rel,
-      "jobs:\n  build:\n    steps:\n      - with:\n          repositories: [cinatra-ai/wp-theme]\n"),
-      ["SLG_PRIVATE_REPO_REF"]);
+    // ADDED: the two fields a finding carries — the source-exact text, and the
+    // canonical `<org>/<name>` the probe lane, the memo and the cache key on.
+    assert.equal(flagged[0].match, "cinatra-ai/wp-theme");
+    assert.equal(flagged[0].repository, "cinatra-ai/wp-theme");
+    // NOT VACUOUS, both ways: an ordinary sequence is a finding with NO scalar
+    // dispatch in the file at all, and each dispatch alone leaves the file clean
+    // — so what the list fails for is its node kind, nothing else.
+    assert.deepEqual(t.ids(REL, `jobs:\n  build:\n    steps:\n      - with:\n${SEQ}\n`),
+      ["SLG_PRIVATE_REPO_REF"], "a flow sequence needs no scalar in the file to be a finding");
+    for (const dispatch of [HONEST_SCALAR, NUL_SCALAR]) {
+      assert.deepEqual(t.ids(REL, `${["name: build", "jobs:", "  build:", "    steps:", ...dispatch].join("\n")}\n`), [],
+        "the dispatch alone is clean: the list is what fails");
+    }
   });
 });
 
@@ -3047,6 +3083,14 @@ test("a `.git` clone suffix names the SAME repository in the STATIC lane", () =>
   ]) {
     assert.equal(total(line), 0, `a dotted sibling is not the tracker: ${JSON.stringify(line)}`);
   }
+  // ADDED: the finding the SCAN emits carries both spellings — `match` exactly
+  // as the file writes it (clone suffix included) and `repository` canonical, so
+  // the suffix is off the name every reader keys on, in this lane too.
+  scanTree((t) => {
+    const [f] = t.findings("notes.txt", "clone cinatra-ai/engineering.git now\n");
+    assert.equal(f.match, "cinatra-ai/engineering.git");
+    assert.equal(f.repository, "cinatra-ai/engineering");
+  });
 });
 
 test("a `.git` clone suffix names the SAME repository in the PROBE lane", async () => {
@@ -3064,6 +3108,12 @@ test("a `.git` clone suffix names the SAME repository in the PROBE lane", async 
   assert.match(calls[0].url, /\/repos\/cinatra-ai\/some-new-repo$/, "the clone suffix never reaches the API path");
   assert.equal(out.length, 1);
   assert.equal(out[0].rule, PROBE_RULE_ID);
+  // ADDED (the gap this test left): it named the finding as one of the three
+  // places the suffix must be off, then asserted only the request and the memo.
+  // The finding carries BOTH spellings, and each is checked here: `match` is the
+  // source-exact text, suffix included, and `repository` is the canonical name.
+  assert.equal(out[0].match, "cinatra-ai/some-new-repo.git", "`match` stays exactly what the file spells");
+  assert.equal(out[0].repository, "cinatra-ai/some-new-repo", "and the canonical field is the name that was probed");
   assert.deepEqual([...ctx.cache.keys()], ["some-new-repo"], "and the memo is keyed by the canonical name");
 });
 
