@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +13,7 @@ import {
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins, canonicalUsesTarget, isTrackedInScannedTree,
+  readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
 } from "../source-leak-gate.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
@@ -28,12 +29,23 @@ import {
 // Replicates the scanner's per-line matching for a single rule on a string —
 // including matchExclude, which is per MATCH (contextExclude is per LINE), so a
 // line carrying a required functional form AND a leaked one scores 1, not 0.
-function matchRule(rule, line) {
+//
+// It is the GRAMMAR harness, and it says so out loud: it hands the rule a
+// workflow path and a legitimate-value set that answers YES to everything, so
+// what it measures is the carve-out GRAMMAR alone — does this spelling read as a
+// machine form? The STRUCTURAL half — whether the file really declares that
+// value at a GitHub Actions location — is a property of a whole document and is
+// exercised through scanFile against real files further down. Splitting them is
+// what keeps each test about one thing; a grammar case would otherwise have to
+// ship a whole workflow around every line.
+const EVERY_VALUE_IS_LEGITIMATE = { has: () => true };
+const GRAMMAR_FILE = ".github/workflows/grammar.yml";
+function matchRule(rule, line, { file = GRAMMAR_FILE, legitValues = EVERY_VALUE_IS_LEGITIMATE } = {}) {
   const re = new RegExp(rule.re.source, rule.re.flags);
   let m, found = 0;
   while ((m = re.exec(line)) !== null) {
     if (rule.contextExclude && rule.contextExclude(line)) return 0;
-    if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index))) found++;
+    if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, file, { legitValues }))) found++;
     if (!re.global) break;
     if (m.index === re.lastIndex) re.lastIndex++;
   }
@@ -775,23 +787,57 @@ test("EVERY other form of a dispatch target still flags (a name-wide exemption w
   }
 });
 
+// The grammar harness for the hook itself: a workflow path and a set that calls
+// every value legitimate, so what is under test is the SPAN the grammar covers.
+function grammarCovers(name, line, index) {
+  return functionalRefCovers(name, line, index, GRAMMAR_FILE, { legitValues: EVERY_VALUE_IS_LEGITIMATE });
+}
+
 test("the functional carve-out is per MATCH, not per line", () => {
   // The whole reason for replacing the name-wide exemption: one line may carry
   // a required reference AND a leaked one, and only the required one is excused.
   const rule = byId.get("SLG_PRIVATE_REPO_REF");
   const line = "uses: cinatra-ai/ops/.github/workflows/x.yml@main  # rationale in cinatra-ai/ops#0";
   assert.equal(matchRule(rule, line), 1, "the issue citation must still flag on a line with a legitimate `uses:`");
-  assert.equal(functionalRefCovers("ops", line, line.indexOf("cinatra-ai/ops")), true, "the `uses:` occurrence is covered");
-  assert.equal(functionalRefCovers("ops", line, line.lastIndexOf("cinatra-ai/ops")), false, "the citation is NOT covered");
+  assert.equal(grammarCovers("ops", line, line.indexOf("cinatra-ai/ops")), true, "the `uses:` occurrence is covered");
+  assert.equal(grammarCovers("ops", line, line.lastIndexOf("cinatra-ai/ops")), false, "the citation is NOT covered");
 });
 
 test("the functional carve-out is keyed to its own repository, never shared", () => {
   const line = "uses: cinatra-ai/ops/.github/workflows/x.yml@main";
-  assert.equal(functionalRefCovers("ops", line, line.indexOf("cinatra-ai/ops")), true);
-  assert.equal(functionalRefCovers("wp-theme", line, line.indexOf("cinatra-ai/ops")), false);
+  assert.equal(grammarCovers("ops", line, line.indexOf("cinatra-ai/ops")), true);
+  assert.equal(grammarCovers("wp-theme", line, line.indexOf("cinatra-ai/ops")), false);
   for (const f of FUNCTIONAL_REPO_REFS) {
     assert.ok(PRIVATE_REPO_NAMES.includes(f.name), `${f.name} carries a carve-out but is not on the private list`);
   }
+});
+
+test("a `uses:` / `repository:` carve-out needs BOTH a file and the document's word", () => {
+  // The structural contract, at the hook: the grammar is necessary and never
+  // sufficient. With no path there is no document, and with a document that
+  // declares nothing there is no legitimate value — so the same line that the
+  // grammar covers is covered in neither case. The clone form declares no YAML
+  // location at all and is unaffected: it is a shell remote.
+  const line = "uses: cinatra-ai/ops/.github/workflows/x.yml@main";
+  const at = line.indexOf("cinatra-ai/ops");
+  assert.equal(grammarCovers("ops", line, at), true, "grammar + a file + the value: covered");
+  assert.equal(functionalRefCovers("ops", line, at), false, "no path, no document, no carve-out");
+  assert.equal(functionalRefCovers("ops", line, at, GRAMMAR_FILE, { legitValues: new Set() }), false,
+    "a file that declares no such value excuses nothing");
+  assert.equal(
+    functionalRefCovers("ops", line, at, GRAMMAR_FILE,
+      { legitValues: new Set(["cinatra-ai/ops/.github/workflows/x.yml@main"]) }), true,
+    "the value the document declares is the value the carve-out excuses",
+  );
+  // A DIFFERENT ref is a different dispatch: the value must match whole.
+  assert.equal(
+    functionalRefCovers("ops", line, at, GRAMMAR_FILE,
+      { legitValues: new Set(["cinatra-ai/ops/.github/workflows/x.yml@v1"]) }), false,
+    "the same target at another ref is not this value",
+  );
+  const clone = "git clone https://github.com/cinatra-ai/wp-theme.git";
+  assert.equal(functionalRefCovers("wp-theme", clone, clone.indexOf("cinatra-ai/wp-theme")), true,
+    "the clone form is a shell remote: no file, no document, unchanged");
 });
 
 // --------------------------------------------------------------------------
@@ -1560,16 +1606,35 @@ test("expiry: a gate line that is not a `uses:` scalar is not a pin — config e
   // END TO END for the reader's grammar: a real gate call REPLACED by text no
   // runner accepts must never keep the exemption it justifies alive. The keyed
   // target is then simply absent, which is a config error and stops the run.
-  for (const value of [
-    `uses:${PIN_TARGET}@${PIN_A}`,                 // no whitespace after the key
-    `uses: "${PIN_TARGET}@${PIN_A}`,               // unmatched quote
-    `uses: ${PIN_TARGET}@${PIN_A} and then some`,  // trailing junk
+  for (const [value, reason] of [
+    // Not a mapping at all: the parser reads one plain scalar, so the job
+    // declares no `uses:` and the keyed target is absent.
+    [`uses:${PIN_TARGET}@${PIN_A}`, /carries no such `uses:` line/],
+    // A ref the `<target>@<ref>` grammar rejects: parsed, but not a dispatch.
+    [`uses: ${PIN_TARGET}@${PIN_A} and then some`, /carries no such `uses:` line/],
+    // An unbalanced quote is not YAML at all, and a caller nobody can parse is
+    // a caller nobody can key an exemption to.
+    [`uses: "${PIN_TARGET}@${PIN_A}`, /not parseable YAML/],
   ]) {
     const dir = expiryCase({ config: liveConfig });
     try {
       fs.writeFileSync(path.join(dir, ".github/workflows/caller.yml"), `name: caller\njobs:\n  gate:\n    ${value}\n`);
       const r = runExpiryGate(dir);
       assert.equal(r.status, 1, `an invalid gate line is not a pin: ${JSON.stringify(value)}`);
+      assert.match(r.err, /config error/);
+      assert.match(r.err, reason);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  // A STEP is not the caller's dispatch: an action a job happens to pin at the
+  // keyed target cannot answer for the reusable-workflow call the exemption
+  // names.
+  {
+    const dir = expiryCase({ config: liveConfig });
+    try {
+      fs.writeFileSync(path.join(dir, ".github/workflows/caller.yml"),
+        `name: caller\njobs:\n  gate:\n    steps:\n      - uses: ${PIN_TARGET}@${PIN_A}\n`);
+      const r = runExpiryGate(dir);
+      assert.equal(r.status, 1, "a step-level `uses:` is not a job-level dispatch");
       assert.match(r.err, /config error/);
       assert.match(r.err, /carries no such `uses:` line/);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -1812,60 +1877,82 @@ test("expiry: the PATH segments of a target keep their case", () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("readUsesPins: returns every `uses:` PIN as a { target, ref } pair, in file order", () => {
+test("readUsesPins: returns the JOB-LEVEL dispatches as { target, ref } pairs, in document order", () => {
   // It reports PAIRS, not a deduplicated bag of shas: an expiry is keyed to one
   // target, and only that target's ref may answer for it — so a caller must be
-  // able to tell WHICH line carried which ref.
+  // able to tell WHICH dispatch carried which ref.
   //
-  // The reader parses the carve-out's own `uses:` grammar, in which `@<ref>` is
-  // MANDATORY (GitHub rejects a ref-less cross-repository `uses:`). A ref-less
-  // line — `uses: o/c`, or a local `uses: ./.github/actions/x` — is therefore
-  // not a pin and is absent from the result. It never was one in substance: a
-  // ref-less entry could only ever fail the sha test, and reporting it as a
-  // `{ ref: "" }` pair merely changed which config error the expiry printed.
+  // It reads `jobs.<id>.uses` and nothing else. A STEP's `uses:` is an action a
+  // job runs, not the caller's dispatch of a reusable workflow, and an expiry
+  // keyed to one was never keyed to a caller. The value is then split with the
+  // carve-out's own `<target>@<ref>` grammar, in which `@<ref>` is MANDATORY
+  // (GitHub rejects a ref-less cross-repository `uses:`): a ref-less line and a
+  // LOCAL `uses: ./…` are not cross-repository dispatches and are absent from
+  // the result. Neither ever was one in substance — a ref-less entry could only
+  // fail the sha test, and reporting it merely changed which config error the
+  // expiry printed.
   const pins = readUsesPins(
-    `jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    steps:\n      - uses: o/a@${PIN_A}\n      - uses: o/b@v4\n      - uses: o/c\n      - uses: ./.github/actions/local\n      - uses: "o/d@${PIN_B}"\n`,
+    `jobs:\n`
+    + `  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    with:\n      ref: main\n`
+    + `  b:\n    uses: o/b@v4\n`
+    + `  c:\n    uses: o/c\n`
+    + `  d:\n    uses: ./.github/actions/local\n`
+    + `  e:\n    uses: "o/d@${PIN_B}"\n`
+    + `  f:\n    steps:\n      - uses: o/a@${PIN_A}\n`,
   );
   assert.deepEqual(pins, [
     { target: "o/r/.github/workflows/w.yml", ref: PIN_A },
-    { target: "o/a", ref: PIN_A },
     { target: "o/b", ref: "v4" },
     { target: "o/d", ref: PIN_B },
   ]);
 });
 
-test("readUsesPins: a line that is not the carve-out's `uses:` scalar is NOT a pin", () => {
-  // The defect this locks: the reader had its OWN loose pattern — no whitespace
-  // required after the key, quotes stripped without being matched, anything
-  // after the value ignored — so a real gate call could be deleted and replaced
-  // by text no runner accepts while the ref it named still answered for the
-  // exemption keyed to it.
-  for (const line of [
-    `uses:o/a@${PIN_A}`,                       // no whitespace after the key: not a YAML scalar
-    `uses: "o/a@${PIN_A}`,                     // unmatched quote
-    `uses: 'o/a@${PIN_A}"`,                    // mismatched quotes
-    `uses: o/a@${PIN_A} and then some`,        // trailing junk
+test("readUsesPins: only a real dispatch is a pin — text that spells one is not", () => {
+  // The defect class this locks, once and for all: a `uses:` line that a runner
+  // never dispatches must not answer for a keyed pin. Each spelling below was a
+  // separate review round while the reader tracked YAML by hand — a heredoc, a
+  // folded block, a `- |` item, a colon-carrying key, a whole-document scalar, a
+  // multi-line quoted scalar, an `env:` mapping whose key happens to be `uses`.
+  // The parser knows all of them for what they are: text.
+  const jobValue = (value) => readUsesPins(`name: caller\njobs:\n  gate:\n    ${value}\n`);
+  for (const value of [
+    `uses:o/a@${PIN_A}`,                       // no whitespace: one plain scalar, not a mapping
+    `uses: o/a@${PIN_A} and then some`,        // trailing junk: not a `<target>@<ref>`
     `uses: o/a@${PIN_A}#0`,                    // a comment-less `#` is a citation
     `# uses: o/a@${PIN_A}`,                    // a comment is prose about a step
-    `see uses: o/a@${PIN_A} in the old job`,   // the key does not own the line
   ]) {
-    assert.deepEqual(readUsesPins(`${line}\n`), [], `not a pin: ${JSON.stringify(line)}`);
+    assert.deepEqual(jobValue(value), [], `not a pin: ${JSON.stringify(value)}`);
   }
-  for (const line of [
+  for (const value of [
     `uses: o/a@${PIN_A}`,
-    `  - uses: o/a@${PIN_A}`,
-    `  - uses:\to/a@${PIN_A}`,
     `uses: "o/a@${PIN_A}"`,
     `uses: 'o/a@${PIN_A}'  # v1.2.3`,
   ]) {
-    assert.deepEqual(readUsesPins(`${line}\n`), [{ target: "o/a", ref: PIN_A }], `a pin: ${JSON.stringify(line)}`);
+    assert.deepEqual(jobValue(value), [{ target: "o/a", ref: PIN_A }], `a pin: ${JSON.stringify(value)}`);
   }
-  // A block scalar is shell text, not YAML: the `uses:` line inside the heredoc
-  // is not a pin, while the real step after the block still is.
-  assert.deepEqual(
-    readUsesPins(`jobs:\n  a:\n    steps:\n      - run: |\n          uses: o/x@${PIN_B}\n      - uses: o/a@${PIN_A}\n`),
-    [{ target: "o/a", ref: PIN_A }],
-  );
+  // Every multi-line TEXT form, each one a former round: the `uses:` inside is
+  // text, and only the real job-level dispatch is a pin.
+  const dispatch = `jobs:\n  gate:\n    uses: o/a@${PIN_A}\n`;
+  for (const text of [
+    `jobs:\n  a:\n    steps:\n      - run: |\n          cat <<'EOF' > x.yml\n          uses: o/x@${PIN_B}\n          EOF\n`,
+    `jobs:\n  a:\n    steps:\n      - run: >-\n          uses: o/x@${PIN_B}\n`,
+    `jobs:\n  a:\n    payloads:\n      - |\n        uses: o/x@${PIN_B}\n`,
+    `jobs:\n  a:\n    steps:\n      - run: &payload |\n          uses: o/x@${PIN_B}\n`,
+    `jobs:\n  a:\n    steps:\n      - run:x: |\n          uses: o/x@${PIN_B}\n`,
+    `jobs:\n  a:\n    steps:\n      - env:\n          uses: o/x@${PIN_B}\n`,
+    `jobs:\n  a:\n    steps:\n      - description: "\n          uses: o/x@${PIN_B}\n          "\n`,
+    `jobs:\n  a:\n    steps:\n      - "NOTE": "\n          uses: o/x@${PIN_B}\n          "\n`,
+  ]) {
+    assert.deepEqual(readUsesPins(text), [], `text is not a pin:\n${text}`);
+    assert.deepEqual(readUsesPins(`${dispatch}${text.replace(/^jobs:\n/, "")}`),
+      [{ target: "o/a", ref: PIN_A }], `only the real dispatch is a pin:\n${text}`);
+  }
+  // A `--- |` document is one string: it declares no jobs at all.
+  assert.deepEqual(readUsesPins(`--- |\njobs:\n  gate:\n    uses: o/a@${PIN_A}\n`), []);
+  // And a caller nobody can parse is NULL — a config error at the call site,
+  // never a silent "no pins".
+  assert.equal(readUsesPins(`jobs:\n  gate:\n    uses: "o/a@${PIN_A}\n`), null, "an unbalanced quote is not YAML");
+  assert.equal(readUsesPins("a: 1\na: 2\n"), null, "a duplicated key is not YAML");
 });
 
 // --------------------------------------------------------------------------
@@ -2148,10 +2235,36 @@ test("the clone-URL carve-out terminates at `.git`", () => {
   assert.ok(matchRule(rule, "git@github.com:cinatra-ai/ops.git") >= 1);
 });
 
+// --------------------------------------------------------------------------
+// STRUCTURAL carve-outs: the document decides, not the line.
+//
+// Every case below runs through scanFile against a REAL file, because that is
+// the only caller that has a document to parse. The grammar half — which
+// spellings read as a machine form at all — is exercised by matchRule above.
+// --------------------------------------------------------------------------
+
+// Runs `body` through the scanner as `rel`, from inside a throwaway tree, and
+// returns the rule ids (or the line numbers) it flags.
+function scanTree(cases) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-struct-")));
+  const cwd0 = process.cwd();
+  try {
+    process.chdir(dir);
+    return cases({
+      ids(rel, body) { return this.findings(rel, body).map((f) => f.rule); },
+      lines(rel, body) { return this.findings(rel, body).map((f) => f.line); },
+      findings(rel, body) {
+        fs.mkdirSync(path.dirname(rel) === "." ? "." : path.dirname(rel), { recursive: true });
+        fs.writeFileSync(rel, body);
+        return scanFile(rel, active);
+      },
+    });
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
 test("where the file path is known, `uses:` is excused only in a ROOT workflow or an action file", () => {
-  // The hook CAN see the path: scanFile passes it, so the restriction is real
-  // rather than a documented impossibility. A caller with no path (matchRule
-  // above, and any direct rule use) judges the grammar alone.
+  // The path restriction is real rather than a documented impossibility: scanFile
+  // passes it, and a caller that cannot name the file gets no carve-out at all.
   //
   // Paths reach the scan REPOSITORY-RELATIVE (`git ls-files`), and the workflow
   // arm is anchored at the root: GitHub executes `.github/workflows/` at the
@@ -2159,45 +2272,85 @@ test("where the file path is known, `uses:` is excused only in a ROOT workflow o
   // an ordinary document and the reference in it is prose. `action.ya?ml` stays
   // matched by basename at any depth — composite actions live in subdirectories.
   // (The test runs FROM the temp tree for exactly that reason: an absolute path
-  // is not a repository-relative one, and the old, depth-blind pattern is what
-  // let a nested copy pass.)
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-uses-")));
-  const cwd0 = process.cwd();
-  const line = "uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n";
-  const write = (rel) => {
-    const f = path.join(dir, rel);
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.writeFileSync(f, line);
-    return f;
-  };
-  const idsFor = (rel) => { write(rel); return scanFile(rel, active).map((f) => f.rule); };
-  try {
-    process.chdir(dir);
-    assert.deepEqual(idsFor(".github/workflows/deploy.yml"), []);
-    assert.deepEqual(idsFor(".github/workflows/deploy.yaml"), []);
-    assert.deepEqual(idsFor("./.github/workflows/deploy.yml"), []);
-    assert.deepEqual(idsFor("action.yml"), []);
-    assert.deepEqual(idsFor(".github/actions/notify/action.yaml"), []);
-    assert.deepEqual(idsFor("some/dir/action.yml"), []);
-    assert.deepEqual(idsFor("nested/.github/workflows/fake.yml"), ["SLG_PRIVATE_REPO_REF"]);
-    assert.deepEqual(idsFor("docs/.github/workflows/example.yaml"), ["SLG_PRIVATE_REPO_REF"]);
-    assert.deepEqual(idsFor("docs/runbook.md"), ["SLG_PRIVATE_REPO_REF"]);
-    assert.deepEqual(idsFor("templates/deploy.yml"), ["SLG_PRIVATE_REPO_REF"]);
-    // The path narrows the `uses:` form only: the checkout key is a legal
-    // machine form in any YAML, and stays excused.
-    fs.writeFileSync(path.join(dir, "compose.yml"), "repository: cinatra-ai/ops\n");
-    assert.deepEqual(scanFile("compose.yml", active).map((f) => f.rule), []);
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+  // is not a repository-relative one.)
+  const workflow = "name: deploy\njobs:\n  deploy:\n    uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n";
+  const action = "name: notify\nruns:\n  using: composite\n  steps:\n    - uses: cinatra-ai/ops/actions/notify@v1\n";
+  scanTree((t) => {
+    for (const rel of [".github/workflows/deploy.yml", ".github/workflows/deploy.yaml", "./.github/workflows/deploy.yml"]) {
+      assert.deepEqual(t.ids(rel, workflow), [], `a root workflow dispatches: ${rel}`);
+    }
+    for (const rel of ["action.yml", ".github/actions/notify/action.yaml", "some/dir/action.yml"]) {
+      assert.deepEqual(t.ids(rel, action), [], `a composite action dispatches: ${rel}`);
+    }
+    for (const rel of ["nested/.github/workflows/fake.yml", "docs/.github/workflows/example.yaml", "templates/deploy.yml"]) {
+      assert.deepEqual(t.ids(rel, workflow), ["SLG_PRIVATE_REPO_REF"], `not a file GitHub runs: ${rel}`);
+    }
+    // Not YAML at all: no document, no carve-out.
+    assert.deepEqual(t.ids("docs/runbook.md", workflow), ["SLG_PRIVATE_REPO_REF"]);
+  });
 });
 
-test("a YAML block scalar is TEXT: no carve-out excuses a line inside it", () => {
-  // The defect this locks: the carve-outs judge single lines, so a heredoc
-  // inside a root workflow's `run: |` block could spell a private repository in
-  // a machine form and be excused — in the one file class where the `uses:`
-  // carve-out is at its widest. A block scalar is shell (or prose) the runner
-  // never reads as YAML, so nothing in it is a machine form. The block ends at
-  // the first line indented back to the key, and the real mapping after it is
-  // excused exactly as before.
+test("`uses:` is excused only where the DOCUMENT dispatches that exact value", () => {
+  // The structural rule, in the file class where the carve-out is widest: the
+  // same line, in the same root workflow, is a machine form at a step and text
+  // everywhere else — and a value the document does not dispatch is never a
+  // machine form, however well it is spelled.
+  const rel = ".github/workflows/deploy.yml";
+  scanTree((t) => {
+    assert.deepEqual(t.ids(rel, "jobs:\n  build:\n    steps:\n      - uses: cinatra-ai/ops/actions/notify@v1\n"), [],
+      "a step's action is a dispatch");
+    assert.deepEqual(t.ids(rel, "jobs:\n  deploy:\n    uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n"), [],
+      "a job's reusable-workflow call is a dispatch");
+    assert.deepEqual(t.ids(rel, "on: push\nuses: cinatra-ai/ops/actions/notify@v1\n"), ["SLG_PRIVATE_REPO_REF"],
+      "a top-level `uses:` is not a step, whatever it spells");
+    assert.deepEqual(t.ids(rel, "jobs:\n  build:\n    outputs:\n      uses: cinatra-ai/ops/actions/notify@v1\n"),
+      ["SLG_PRIVATE_REPO_REF"], "a mapping under a job is not a step");
+  });
+});
+
+test("the `repository:` key is a machine form only at an Actions location — in any YAML", () => {
+  // `repository:` is a mapping key, so unlike `uses:` it is legal in ANY YAML
+  // file — but being YAML is necessary and not sufficient. It must stand where a
+  // runner reads it: a step's `with:`. A bare `repository: <org>/<repo>` at the
+  // top of a document is a key wearing a machine hat, and outside YAML entirely
+  // it is prose.
+  const step = (body) => `jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ${body}\n`;
+  scanTree((t) => {
+    for (const rel of [".github/workflows/x.yml", ".github/actions/n/action.yaml", "compose.yml", "deploy/values.yaml"]) {
+      assert.deepEqual(t.ids(rel, step("repository: cinatra-ai/ops")), [], `a checkout input is a machine form: ${rel}`);
+      assert.deepEqual(t.ids(rel, "repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"],
+        `a bare key at the document root is not a checkout: ${rel}`);
+    }
+    for (const rel of ["docs/runbook.md", "scripts/deploy.sh", "notes.txt", "src/app.ts"]) {
+      assert.deepEqual(t.ids(rel, step("repository: cinatra-ai/ops")), ["SLG_PRIVATE_REPO_REF"],
+        `outside YAML there is no document to read: ${rel}`);
+    }
+  });
+});
+
+test("a `repositories:` FLOW SEQUENCE is not a value any Actions location carries", () => {
+  // The grammar still reads a paired, fully validated sequence (matchRule
+  // covers that above), and the structural rule now decides whether the file
+  // actually carries such a value. No Actions input takes a LIST at
+  // `repository:` — a checkout takes one string — so a parsed document never
+  // declares one, and the sequence is a finding wherever it stands. Excusing it
+  // would mean excusing a value no runner ever reads.
+  const seq = "jobs:\n  build:\n    steps:\n      - with:\n          repositories: [cinatra-ai/wp-theme]\n";
+  scanTree((t) => {
+    assert.deepEqual(t.ids(".github/workflows/x.yml", seq), ["SLG_PRIVATE_REPO_REF"]);
+    assert.deepEqual(t.ids("compose.yml", "repositories: [cinatra-ai/wp-theme]\n"), ["SLG_PRIVATE_REPO_REF"]);
+    // Not vacuous: the SCALAR spelling of the same input, at the same location,
+    // is excused — so what fails here is the list, not the key.
+    assert.deepEqual(t.ids(".github/workflows/x.yml",
+      "jobs:\n  build:\n    steps:\n      - with:\n          repository: cinatra-ai/wp-theme\n"), []);
+  });
+});
+
+test("a heredoc, a folded block and a `- |` item are TEXT — the parser knows what a line cannot", () => {
+  // Three former review rounds in one file. A `run: |` heredoc, a `run: >-`
+  // folded block and a `- |` sequence item are strings the runner never reads as
+  // YAML, so no `uses:` inside them is a dispatch. The real step and the real
+  // `with:` mapping around them are unchanged.
   const wf = [
     "name: deploy",
     "jobs:",
@@ -2205,37 +2358,29 @@ test("a YAML block scalar is TEXT: no carve-out excuses a line inside it", () =>
     "    steps:",
     "      - uses: actions/checkout@v4",
     "        with:",
-    "          repository: cinatra-ai/ops",          // a real mapping: excused
+    "          repository: cinatra-ai/ops",          // 7: a real checkout input
     "      - run: |",
     "          cat <<'EOF' > out.yml",
-    "          uses: cinatra-ai/ops@main",           // heredoc text: a finding
+    "          uses: cinatra-ai/ops@main",           // 10: heredoc text, dispatched nowhere
     "",                                             // a blank line continues the block
-    "          repository: cinatra-ai/ops",          // still heredoc text: a finding
+    "          repository: cinatra-ai/ops",          // 12: text — but see below
     "          EOF",
     "      - run: >-",
-    "          uses: cinatra-ai/ops@main",           // folded block text: a finding
-    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // a real step: excused
+    "          uses: cinatra-ai/ops@main",           // 15: folded text
+    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 16: a real step
     "",
   ];
-  const expected = [10, 12, 15];
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-block-")));
-  const cwd0 = process.cwd();
-  try {
-    process.chdir(dir);
-    fs.mkdirSync(".github/workflows", { recursive: true });
-    fs.writeFileSync(".github/workflows/deploy.yml", wf.join("\n"));
-    const found = scanFile(".github/workflows/deploy.yml", active);
-    assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
-    assert.deepEqual(found.map((f) => f.line), expected,
-      "only the block-scalar lines flag — the `with: repository:` mapping and the real `uses:` step stay excused");
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+  scanTree((t) => {
+    assert.deepEqual(t.lines(".github/workflows/deploy.yml", wf.join("\n")), [10, 15],
+      "the heredoc and folded `uses:` values are dispatched nowhere in this file");
+  });
+  // Line 12 is the DUPLICATE case, and it is excused deliberately: this file
+  // really does check out `cinatra-ai/ops` at line 7, so the name is already in
+  // it and repeating it inside a heredoc reveals nothing the file does not
+  // already say. Membership is by VALUE for exactly that reason.
 });
 
-test("a block scalar opens on a sequence item, a colon-carrying key and a bare `|`", () => {
-  // The defect this locks: the opener was recognised only as a `key: |` mapping,
-  // so a sequence-item block (`- |`), a key that itself carries a colon
-  // (`run:x: |`) and a bare document indicator left their bodies to be judged as
-  // MAPPINGS — excused by the carve-out in the one file class where it is widest.
+test("a `- |` item, a colon-carrying key and a bare `|` document are TEXT too", () => {
   const wf = [
     "name: deploy",
     "jobs:",
@@ -2244,156 +2389,133 @@ test("a block scalar opens on a sequence item, a colon-carrying key and a bare `
     "      - name: write the payloads",
     "        payloads:",
     "          - |",
-    "            repository: cinatra-ai/ops",   // 8: sequence-item block text
-    "            uses: cinatra-ai/ops@main",    // 9: sequence-item block text
+    "            repository: cinatra-ai/ops",   // 8: text, and a value line 11 dispatches
+    "            uses: cinatra-ai/ops@main",    // 9: text, dispatched nowhere
     "        with:",
-    "          repository: cinatra-ai/ops",     // 11: a real mapping again: excused
+    "          repository: cinatra-ai/ops",     // 11: a real checkout input
     "      - run:x: |",
-    "          uses: cinatra-ai/ops@main",      // 13: a colon-carrying key opens too
+    "          uses: cinatra-ai/ops@main",      // 13: a colon-carrying key still opens a block
     "      - run: |",
-    "          uses: cinatra-ai/ops@main",      // 15: the plain `key: |` still works
-    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 16: excused
+    "          uses: cinatra-ai/ops@main",      // 15: the plain `key: |` block
+    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 16: a real step
     "",
   ];
-  const expected = [8, 9, 13, 15];
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-block2-")));
-  const cwd0 = process.cwd();
-  try {
-    process.chdir(dir);
-    fs.mkdirSync(".github/workflows", { recursive: true });
-    fs.writeFileSync(".github/workflows/deploy.yml", wf.join("\n"));
-    const found = scanFile(".github/workflows/deploy.yml", active);
-    assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
-    assert.deepEqual(found.map((f) => f.line), expected,
-      "every block body is text; the `with:` mapping and the real `uses:` step stay excused");
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
-  // The same lines are not PINS either — the expiry reader shares this context.
-  assert.deepEqual(
-    readUsesPins(wf.join("\n")),
-    [{ target: "cinatra-ai/ops/.github/workflows/deploy.yml", ref: "main" }],
-    "only the real step is a pin: a `uses:` inside any block scalar is text",
-  );
+  scanTree((t) => {
+    assert.deepEqual(t.lines(".github/workflows/deploy.yml", wf.join("\n")), [9, 13, 15]);
+    // A whole-document scalar carries no jobs at all, so nothing in it is a
+    // dispatch — including a `--- |` document, which opens one mid-stream.
+    assert.deepEqual(t.ids("doc.yml", "|\n  repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"]);
+    assert.deepEqual(t.ids("doc.yml", "--- |\njobs:\n  gate:\n    uses: cinatra-ai/ops@main\n"), ["SLG_PRIVATE_REPO_REF"]);
+    // Not vacuous: the same key, at a real Actions location, is excused.
+    assert.deepEqual(t.ids("doc.yml", "jobs:\n  a:\n    steps:\n      - with:\n          repository: cinatra-ai/ops\n"), []);
+  });
 });
 
-test("a bare `|` opens a top-level document scalar", () => {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-docscalar-")));
-  const cwd0 = process.cwd();
-  const idsFor = (body) => { fs.writeFileSync("doc.yml", body); return scanFile("doc.yml", active).map((f) => f.rule); };
-  try {
-    process.chdir(dir);
-    assert.deepEqual(idsFor("|\n  repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"],
-      "a document-level block scalar is text, so the key inside it excuses nothing");
-    // Not vacuous: the very same line, as a real mapping, is excused.
-    assert.deepEqual(idsFor("  repository: cinatra-ai/ops\n"), []);
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("a block-scalar header survives a trailing COMMENT that carries a `: |`", () => {
-  // A `#` opens a comment, so a `: ` standing inside it is not the header's
-  // separator. Reading only the LAST `: ` on the line and stopping there left
-  // `run: | # writes: |` looking like a plain mapping, and handed its whole body
-  // back to the carve-out — in the file class where the carve-out is widest.
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-blockcomment-")));
-  const cwd0 = process.cwd();
-  const idsFor = (body) => { fs.writeFileSync("doc.yml", body); return scanFile("doc.yml", active).map((f) => f.rule); };
-  try {
-    process.chdir(dir);
-    for (const header of ["run: | # writes: |", "run: >-  # folds: >", "run: | # note: this"]) {
-      assert.deepEqual(idsFor(`${header}\n  repository: cinatra-ai/ops\n`), ["SLG_PRIVATE_REPO_REF"],
-        `the comment is a comment: the block still opens: ${header}`);
-    }
-    // Not vacuous: under a comment LINE — which opens nothing — the same line is
-    // a real mapping and stays excused.
-    assert.deepEqual(idsFor("# writes: |\n  repository: cinatra-ai/ops\n"), []);
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("a MULTI-LINE quoted scalar is TEXT: its continuation lines are never excused", () => {
-  // The defect this locks: `description: "` opens ONE string value that runs to
-  // the next `"`, so the lines between are text — and the carve-out excused them
-  // (and the expiry reader read a `uses:` there as a live pin).
-  const wf = [
+test("a multi-line quoted scalar and a quoted KEY are TEXT", () => {
+  // `description: "` opens ONE string value that runs to the next `"`, so the
+  // lines between it are text — and a quoted key (`"NOTE": "`) opens exactly the
+  // same way. Both were review rounds; both are ordinary strings to a parser.
+  const wf = (key) => [
     "name: deploy",
     "jobs:",
     "  build:",
     "    steps:",
     "      - name: note",
-    '        description: "',
-    "          repository: cinatra-ai/ops",   // 7: inside the quoted scalar
-    "          uses: cinatra-ai/ops@main",    // 8: inside the quoted scalar
+    `        ${key}: "`,
+    "          repository: cinatra-ai/ops",   // 7: text, and a value line 11 dispatches
+    "          uses: cinatra-ai/ops@main",    // 8: text, dispatched nowhere
     '          "',
     "        with:",
-    "          repository: cinatra-ai/ops",   // 11: the scalar closed: excused again
-    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 12: excused
+    "          repository: cinatra-ai/ops",   // 11: a real checkout input
+    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 12: a real step
     "",
-  ];
-  const expected = [7, 8];
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-quoted-")));
-  const cwd0 = process.cwd();
-  try {
-    process.chdir(dir);
-    fs.mkdirSync(".github/workflows", { recursive: true });
-    fs.writeFileSync(".github/workflows/deploy.yml", wf.join("\n"));
-    const found = scanFile(".github/workflows/deploy.yml", active);
-    assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
-    assert.deepEqual(found.map((f) => f.line), expected,
-      "only the continuation lines flag — the mapping after the closing quote is excused");
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
-  assert.deepEqual(readUsesPins(wf.join("\n")),
-    [{ target: "cinatra-ai/ops/.github/workflows/deploy.yml", ref: "main" }],
-    "a `uses:` inside a multi-line quoted scalar is not a pin");
-});
-
-test("a quoted scalar that CLOSES on its own line changes nothing", () => {
-  // The narrow half of the same rule: single-line quotes — including the `\"`
-  // and `''` escapes — must not open a text region that swallows the mapping
-  // lines after them.
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-quoted1-")));
-  const cwd0 = process.cwd();
-  const idsFor = (opening) => {
-    const body = `steps:\n  - name: note\n    ${opening}\n    with:\n      repository: cinatra-ai/ops\n`;
-    fs.writeFileSync("compose.yml", body);
-    return scanFile("compose.yml", active).map((f) => f.rule);
-  };
-  try {
-    process.chdir(dir);
+  ].join("\n");
+  scanTree((t) => {
+    assert.deepEqual(t.lines(".github/workflows/deploy.yml", wf("description")), [8]);
+    assert.deepEqual(t.lines(".github/workflows/deploy.yml", wf('"NOTE"')), [8],
+      "a quoted key opens a quoted scalar exactly like a bare one");
+    // A quoted scalar that CLOSES on its own line opens no text region: the
+    // mapping under it is a mapping, including through the `\"` and `''` escapes.
     for (const opening of [
       'description: "just a note"',
       'description: "he said \\"hi\\""',
       "description: 'it''s fine'",
       'description: "a note"  # and a comment',
     ]) {
-      assert.deepEqual(idsFor(opening), [], `a closed quoted scalar excuses nothing after it: ${opening}`);
+      assert.deepEqual(
+        t.ids(".github/workflows/x.yml",
+          `jobs:\n  a:\n    steps:\n      - name: note\n        ${opening}\n        with:\n          repository: cinatra-ai/ops\n`),
+        [], `a closed quoted scalar excuses nothing after it: ${opening}`,
+      );
     }
-    // Not vacuous: leaving the same quote OPEN makes the mapping below it text.
-    assert.deepEqual(idsFor('description: "just a note'), ["SLG_PRIVATE_REPO_REF"]);
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
-test("the `repository:` carve-out is YAML-only where the path is known", () => {
-  // `repository:` is a mapping key, so unlike `uses:` it is legal in ANY YAML —
-  // but only in YAML. In a shell script or a Markdown runbook the same text is
-  // prose wearing a machine key as a hat, and it is a finding.
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-repokey-")));
-  const cwd0 = process.cwd();
-  const idsFor = (rel, body) => {
-    fs.mkdirSync(path.dirname(rel), { recursive: true });
-    fs.writeFileSync(rel, body);
-    return scanFile(rel, active).map((f) => f.rule);
-  };
-  try {
-    process.chdir(dir);
-    const scalar = "repository: cinatra-ai/ops\n";
-    const sequence = "repositories: [cinatra-ai/wp-theme]\n";
-    for (const rel of [".github/workflows/x.yml", ".github/actions/n/action.yaml", "compose.yml", "deploy/values.yaml"]) {
-      assert.deepEqual(idsFor(rel, scalar), [], `a YAML mapping key is a machine form: ${rel}`);
-      assert.deepEqual(idsFor(rel, sequence), [], `a YAML flow sequence is a machine form: ${rel}`);
-    }
-    for (const rel of ["docs/runbook.md", "scripts/deploy.sh", "notes.txt", "src/app.ts"]) {
-      assert.deepEqual(idsFor(rel, scalar), ["SLG_PRIVATE_REPO_REF"], `outside YAML the key is prose: ${rel}`);
-      assert.deepEqual(idsFor(rel, sequence), ["SLG_PRIVATE_REPO_REF"], `outside YAML the sequence is prose: ${rel}`);
-    }
-  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+test("an `env:` mapping whose key is `uses`, and an anchored block, are not dispatches", () => {
+  // Two more former rounds. `env:` takes a mapping of NAMES to values, so a
+  // variable that happens to be called `uses` is an environment variable, not a
+  // step; and an anchor between the key and the block indicator (`run: &payload |`)
+  // still opens a block scalar.
+  scanTree((t) => {
+    assert.deepEqual(
+      t.ids(".github/workflows/x.yml", "jobs:\n  a:\n    steps:\n      - env:\n          uses: cinatra-ai/ops@main\n"),
+      ["SLG_PRIVATE_REPO_REF"], "an env var named `uses` dispatches nothing");
+    assert.deepEqual(
+      t.ids(".github/workflows/x.yml", "jobs:\n  a:\n    steps:\n      - run: &payload |\n          uses: cinatra-ai/ops@main\n"),
+      ["SLG_PRIVATE_REPO_REF"], "an anchor does not make a heredoc a step");
+    // Not vacuous: the same value, as the step's own `uses:`, is a dispatch.
+    assert.deepEqual(t.ids(".github/workflows/x.yml", "jobs:\n  a:\n    steps:\n      - uses: cinatra-ai/ops@main\n"), []);
+  });
+});
+
+test("a value the file really dispatches is excused wherever it appears", () => {
+  // The other half of value-membership, stated once on its own: a name the file
+  // already carries in a live dispatch is not made secret by appearing again in
+  // a heredoc. What the gate stops is a private name a public file would not
+  // otherwise carry — and this file carries it either way.
+  const dispatched = "cinatra-ai/ops/.github/workflows/deploy.yml@main";
+  const wf = (inside) => "name: deploy\njobs:\n"
+    + `  deploy:\n    uses: ${dispatched}\n`
+    + `  build:\n    steps:\n      - run: |\n          uses: ${inside}\n`;
+  scanTree((t) => {
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", wf(dispatched)), [],
+      "the heredoc repeats a value this very file dispatches");
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", wf("cinatra-ai/ops/.github/workflows/deploy.yml@v1")),
+      ["SLG_PRIVATE_REPO_REF"], "another ref is another value, and this file dispatches nothing like it");
+  });
+});
+
+test("a YAML file that does not PARSE gets no carve-out at all", () => {
+  // Fail closed. A document nobody can read has no locations, so nothing in it
+  // stands at one — a broken file must never be a place to hide a reference.
+  const step = "jobs:\n  build:\n    steps:\n      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n";
+  scanTree((t) => {
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", step), [], "the file parses: the step is a dispatch");
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", `name: deploy\nname: deploy\n${step}`),
+      ["SLG_PRIVATE_REPO_REF"], "a duplicated key is not YAML, so there is no document to appeal to");
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", `${step}      - description: "unterminated\n`),
+      ["SLG_PRIVATE_REPO_REF"], "an unterminated quoted scalar is not YAML either");
+  });
+});
+
+test("the VENDORED YAML parser is the file its provenance records", () => {
+  // The drift guard for scripts/lib/vendor/js-yaml/. The engine parses YAML with
+  // a copy of a published MIT package, committed because the gate runs in
+  // consuming repositories' CI with no `npm install`. A copy nobody can verify
+  // is a copy nobody should trust, so the digest is recorded beside it and
+  // recomputed here: editing the parser, or refreshing it without updating
+  // PROVENANCE.md, fails this test.
+  const dir = path.join(import.meta.dirname, "..", "lib", "vendor", "js-yaml");
+  const digest = crypto.createHash("sha256").update(fs.readFileSync(path.join(dir, "js-yaml.mjs"))).digest("hex");
+  const provenance = fs.readFileSync(path.join(dir, "PROVENANCE.md"), "utf8");
+  const recorded = provenance.match(/vendored file sha256[^`]*`([0-9a-f]{64})`/);
+  assert.ok(recorded, "PROVENANCE.md must record the vendored file's sha256");
+  assert.equal(digest, recorded[1],
+    "scripts/lib/vendor/js-yaml/js-yaml.mjs no longer matches the digest in PROVENANCE.md — "
+    + "re-vendor from the published tarball and update the provenance in the same change");
+  assert.ok(fs.existsSync(path.join(dir, "LICENSE")), "the vendored copy ships its licence");
+  assert.match(provenance, /registry\.npmjs\.org/, "the provenance names the tarball it came from");
+  assert.match(provenance, /sha512-/, "the provenance records the registry integrity of that tarball");
 });
 
 // --------------------------------------------------------------------------

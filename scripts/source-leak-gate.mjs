@@ -36,13 +36,25 @@
  *     each stamped with the day it was confirmed and ignored once past its TTL.
  *     `--verify-cache` re-confirms every entry and rewrites those stamps.
  *
- * Zero runtime dependencies (node builtins only).
+ * No registry dependencies: node builtins, plus the VENDORED js-yaml copy
+ * committed at scripts/lib/vendor/js-yaml/ (MIT; provenance and digest beside
+ * it). The gate runs in callers' CI with no `npm install`, so everything it
+ * imports is committed under scripts/.
  */
 import { execFileSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveBaseRef, buildRenameMap, getAddedLineNumbers, getIntroducedPaths } from "./lib/touch-ratchet.mjs";
+// The YAML parser is VENDORED (scripts/lib/vendor/js-yaml/, MIT, provenance and
+// digest recorded beside it) and imported by relative path: this engine runs in
+// consuming repositories' CI with no `npm install`, so it may only import files
+// committed under `scripts/`. It is used for ONE thing — deciding whether a
+// value stands at a structurally valid GitHub Actions location — because nine
+// rounds of hand-tracked YAML context (block scalars, `- |` items, quoted
+// scalars, quoted keys, `--- |` documents, node properties) each missed one more
+// syntax form. A parser knows the syntax; a line scanner never will.
+import { loadAll as loadAllYaml } from "./lib/vendor/js-yaml/js-yaml.mjs";
 
 const SCANNER_VERSION = "0.1.0";
 const DEFAULT_DIFF_BASE_ENV = "SOURCE_LEAK_DIFF_BASE";
@@ -241,11 +253,11 @@ const SCALAR_TERMINATOR = "(?=[ \\t]+#|[ \\t]*$)";
 const USES_REF_TOKEN = "[A-Za-z0-9._/-]+";
 const USES_WORKFLOW_PATH = "\\/\\.github\\/workflows\\/[A-Za-z0-9._-]+\\.ya?ml";
 const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
-// Where the caller can tell the hook WHICH FILE the line came from, a `uses:`
-// step only exists in a workflow file or an action definition; anywhere else the
-// key is prose wearing YAML clothes and is not excused. When no path is
-// available (a rule exercised on a bare string) the restriction is simply not
-// applied — it can only ever narrow the carve-out, never widen it.
+// A `uses:` step only exists in a workflow file or an action definition;
+// anywhere else the key is prose wearing YAML clothes and is not excused. The
+// carve-out therefore needs the FILE: a caller that cannot say which file the
+// line came from has no document to judge it against either, and gets no
+// carve-out at all (see functionalRefCovers).
 //
 // The workflow path is ANCHORED AT THE REPOSITORY ROOT. GitHub runs workflows
 // out of the root `.github/workflows/` directory and nowhere else, so a
@@ -260,9 +272,9 @@ const USES_FILE_RE = /^(?:\.\/)?\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)actio
 // unlike `uses:` they are legal in ANY workflow, action or compose file — but
 // only in a YAML one. Outside YAML the key is prose wearing a machine key as a
 // hat: a shell script or a Markdown runbook that writes `repository: <org>/<repo>`
-// is spelling the name, not configuring a checkout, and it is a finding. As with
-// USES_FILE_RE the restriction applies only where a path is known, so it can
-// only ever narrow the carve-out.
+// is spelling the name, not configuring a checkout, and it is a finding. Being
+// YAML is necessary and not sufficient: the value must also stand at a real
+// Actions location in the parsed document (see legitimateActionValues).
 const YAML_FILE_RE = /\.ya?ml$/i;
 // `repository:` / `repositories:` has TWO forms, and they are SEPARATE grammars
 // on purpose:
@@ -344,7 +356,7 @@ function usesRefRe(name) {
 function repositoryKeyScalarRe(name) {
   const n = repoNameCi(name);
   return new RegExp(
-    `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}(["']?)${ORG_CI}\\/${n}\\1${SCALAR_TERMINATOR}`,
+    `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}(["']?)(${ORG_CI}\\/${n})\\1${SCALAR_TERMINATOR}`,
     "g",
   );
 }
@@ -352,7 +364,7 @@ function repositoryKeyFlowRe(name) {
   const n = repoNameCi(name);
   return new RegExp(
     `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}${FLOW_OPEN}`
-    + `(?:${FLOW_ENTRY}${FLOW_SEP})*(["']?)${ORG_CI}\\/${n}\\1`
+    + `(?:${FLOW_ENTRY}${FLOW_SEP})*(["']?)(${ORG_CI}\\/${n})\\1`
     + `(?:${FLOW_SEP}${FLOW_ENTRY})*${FLOW_TRAILING_COMMA}${FLOW_CLOSE}${SCALAR_TERMINATOR}`,
     "g",
   );
@@ -364,13 +376,18 @@ function cloneUrlRe(name) {
     "g",
   );
 }
+// `value(m)` is the STRUCTURAL half of a form: the scalar value the line carries,
+// which must be one the file really declares at a GitHub Actions location (see
+// legitimateActionValues). A form that declares one is excused only where the
+// document agrees; a form without one — the clone URL, which is a shell remote
+// and belongs to no YAML location — is judged on its grammar alone, unchanged.
 const FUNCTIONAL_REPO_REFS = [
-  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE },
-  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE },
-  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE },
+  { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE, value: (m) => `${m[2]}@${m[3]}` },
+  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
+  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
   { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
-  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE },
-  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE },
+  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
+  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
 ];
 
 // THE canonical token boundary — used by the tokenizer AND by every rule that
@@ -794,187 +811,111 @@ function orgPathRepoName(match) {
 }
 
 // ---------------------------------------------------------------------------
-// YAML multi-line TEXT: block scalars and multi-line quoted scalars.
+// STRUCTURAL carve-outs: a machine form is excused only where the DOCUMENT says
+// it is one.
 //
-// Every carve-out judges ONE LINE, and that is exactly what a multi-line scalar
-// defeats. Inside a `run: |` block the runner reads shell, never YAML, so a
-// heredoc line spelling `uses: <org>/<private>@main` (or `repository:
-// <org>/<private>`) is prose that happens to wear a mapping's clothes — and
-// excusing it handed every leak a two-line disguise inside the one file class
-// where the `uses:` carve-out is at its widest. A quoted scalar that runs over
-// several lines is the same disguise in different clothes: `description: "` on
-// one line and `  repository: <org>/<private>` on the next is ONE string value,
-// and its continuation lines are text no runner ever reads as a mapping.
+// Every carve-out used to judge ONE LINE, and a line cannot know what it is part
+// of. Nine review rounds each found one more YAML syntax form that hid a private
+// reference inside text a runner never dispatches — a `run: |` heredoc, a `- |`
+// sequence item, a key that carries its own colon, a quoted scalar running over
+// several lines, a `--- |` whole-document scalar, an anchor between the key and
+// the indicator, an `env:` mapping whose KEY happens to be `uses` — and each was
+// answered with one more hand-written tracker. Tracking YAML by hand ends here:
+// the file is PARSED, and the grammar carve-outs are granted only to values the
+// parsed document really carries at a GitHub Actions location.
 //
-// A block scalar OPENS on ANY line whose content — after optional indentation,
-// optional (repeatable) `- ` sequence markers and an optional mapping key — is a
-// block-scalar indicator: `|` or `>` with YAML's optional chomping and
-// indentation indicators, followed by nothing but an optional comment. That is
-// deliberately wider than "a `key: |` mapping": a sequence item (`- |`), a
-// nested one (`- - |`), a bare `|` opening a top-level document scalar, and a
-// key that itself contains a colon (`run:x: |`) all open blocks, and while they
-// did not, every line inside them was judged as a mapping — excused by the
-// carve-out, and read as a live pin by the expiry reader.
+// LEGITIMATE VALUES, per file, are every string at:
+//   - `jobs.<id>.uses`                    — a reusable-workflow call
+//   - `jobs.<id>.steps[].uses`            — an action / reusable step
+//   - `jobs.<id>.steps[].with.repository` — a checkout / dispatch input
+//   - `runs.steps[].uses`, `runs.steps[].with.repository` — a composite action
 //
-// It CONTINUES while lines are blank or indented deeper than the OPENING line's
-// first non-blank column — the dash column for `- |`, the key column for
-// `key: |`. The first line indented back to (or past) that column ends the block
-// and is itself judged normally, so a real `uses:` mapping after the block is
-// excused as before. Lines inside a block are never re-parsed, so at most one
-// block is ever open and its column IS the innermost boundary.
+// A `uses:` / `repository:` carve-out then applies to a line ONLY when the value
+// its grammar reads is a member of that set. Everything else is text: the
+// heredoc, the folded block, the quoted continuation, the `env:` mapping, the
+// document scalar. And where there is no set at all — the file is not YAML, the
+// path is unknown, or the document does not parse — there is no carve-out and
+// every private reference is a finding.
 //
-// A quoted scalar OPENS where a sequence item or a mapping VALUE begins with `"`
-// or `'` and that quote does not close on the same line (counting `\"` escapes
-// inside double quotes and `''` inside single quotes), and every following line
-// up to AND INCLUDING the one that closes it is text.
-//
-// Inside either form there is no carve-out and no pin.
+// Membership is by VALUE, not by line, and that is deliberate: a value the file
+// legitimately dispatches somewhere is not made secret by also appearing inside
+// a heredoc in the same file. The leak this gate exists to stop is a private
+// name a public file would not otherwise carry, and by the time the file
+// dispatches it, the file carries it.
 // ---------------------------------------------------------------------------
-// `|` or `>`, optional chomping/indentation indicators in either order, then
-// only an optional comment.
-const BLOCK_SCALAR_INDICATOR_RE = /^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/;
-const SEQUENCE_MARKERS_RE = /^(?:-[ \t]+)*/;
-// A `#` at the start of a token opens a YAML comment, so a "key" carrying one is
-// not a key at all — the line is a comment about a mapping, and prose opens
-// nothing.
-function hasCommentStart(s) { return /(?:^|[ \t])#/.test(s); }
+function isPlainObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 
-// The line's content after its indentation and any sequence markers, plus the
-// column the scalar would open at (the FIRST non-blank column, which for `- |`
-// is the dash). Null for a blank line or a comment.
-function scalarLead(line) {
-  const indent = /^[ \t]*/.exec(line)[0].length;
-  const afterIndent = line.slice(indent);
-  if (afterIndent === "" || afterIndent.startsWith("#")) return null;
-  const rest = afterIndent.slice(SEQUENCE_MARKERS_RE.exec(afterIndent)[0].length);
-  if (rest === "" || rest.startsWith("#")) return null;
-  return { column: indent, rest };
+function addLegitimateValue(values, v) {
+  if (typeof v === "string" && v !== "") values.add(v);
 }
 
-// The column a block scalar opens at on this line, or -1.
-function blockScalarOpenColumn(line) {
-  const lead = scalarLead(line);
-  if (!lead) return -1;
-  // A bare indicator: a sequence item (`- |`) or a top-level document scalar.
-  if (BLOCK_SCALAR_INDICATOR_RE.test(lead.rest)) return lead.column;
-  // Otherwise a mapping key, which is everything up to the LAST `: ` before the
-  // indicator — so a key that contains a colon (`run:x: |`) still opens. The
-  // separators are tried RIGHTMOST first, because that is what "the last one"
-  // means; a candidate whose key carries a `#` is a separator inside a COMMENT
-  // (`run: | # a: |`), so the scan keeps walking LEFT instead of giving up on
-  // the line — the real header stands to the left of the comment.
-  const sepRe = /:[ \t]+/g;
-  const seps = [];
-  let m;
-  while ((m = sepRe.exec(lead.rest)) !== null) {
-    seps.push([m.index, m.index + m[0].length]);
-    sepRe.lastIndex = m.index + 1;
+// `steps:` is the same shape in a workflow job and in a composite action.
+function collectStepValues(steps, values) {
+  if (!Array.isArray(steps)) return;
+  for (const step of steps) {
+    if (!isPlainObject(step)) continue;
+    addLegitimateValue(values, step.uses);
+    if (isPlainObject(step.with)) addLegitimateValue(values, step.with.repository);
   }
-  for (let i = seps.length - 1; i >= 0; i--) {
-    const key = lead.rest.slice(0, seps[i][0]);
-    if (hasCommentStart(key)) continue;
-    if (BLOCK_SCALAR_INDICATOR_RE.test(lead.rest.slice(seps[i][1]))) return lead.column;
-  }
-  return -1;
 }
 
-// The index of the quote that CLOSES an open quoted scalar in `s`, or -1.
-// Double quotes honour `\` escapes; single quotes honour the `''` doubling.
-function quotedScalarCloseIndex(s, quote) {
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (quote === '"') {
-      if (c === "\\") { i++; continue; }
-      if (c === '"') return i;
-    } else if (c === "'") {
-      if (s[i + 1] === "'") { i++; continue; }
-      return i;
+// The set of values this YAML file declares at a GitHub Actions location, or
+// NULL when the text is not parseable YAML — which is not a lesser answer: a
+// file the parser cannot read is a file whose structure nobody knows, and an
+// unknown structure excuses nothing.
+//
+// It parses with `loadAll` (every document in the stream) on js-yaml's default
+// schema, which resolves only standard YAML tags — no code, no custom types —
+// and every failure mode is caught, including the ones a parser throws for
+// duplicate keys and unresolvable tags.
+function legitimateActionValues(text) {
+  let docs;
+  try { docs = loadAllYaml(text); }
+  catch { return null; }
+  const values = new Set();
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    if (!isPlainObject(doc)) continue;
+    if (isPlainObject(doc.jobs)) {
+      for (const job of Object.values(doc.jobs)) {
+        if (!isPlainObject(job)) continue;
+        addLegitimateValue(values, job.uses);        // a reusable-workflow call
+        collectStepValues(job.steps, values);
+      }
     }
+    if (isPlainObject(doc.runs)) collectStepValues(doc.runs.steps, values); // composite action
   }
-  return -1;
-}
-
-// `{ quote, after }` when this line starts a quoted scalar value — a sequence
-// item or a mapping value beginning with `"` or `'` — else null. `after` is what
-// follows the opening quote ON THIS LINE, which is what decides whether the
-// scalar closes here.
-function quotedScalarOpen(line) {
-  const lead = scalarLead(line);
-  if (!lead) return null;
-  const value = quotedScalarValue(lead.rest);
-  if (value === null) return null;
-  return { quote: value[0], after: value.slice(1) };
-}
-
-// The quoted VALUE on a line, or null. A sequence item is the value itself; for
-// a mapping it is the text after the FIRST `: ` that is followed by a quote, so
-// a key carrying a colon (`run:x: "…`) is read as a key while a colon INSIDE the
-// value (`description: "a: b`) stays inside the value.
-function quotedScalarValue(rest) {
-  if (rest.startsWith('"') || rest.startsWith("'")) return rest;
-  const re = /:[ \t]+/g;
-  let m;
-  while ((m = re.exec(rest)) !== null) {
-    const key = rest.slice(0, m.index);
-    if (hasCommentStart(key)) return null;
-    const tail = rest.slice(m.index + m[0].length);
-    if (tail.startsWith('"') || tail.startsWith("'")) return tail;
-    re.lastIndex = m.index + 1;
-  }
-  return null;
-}
-
-// One boolean per line: is this line inside a multi-line scalar — a block scalar
-// or the continuation of a quoted one? Computed per FILE, because "am I inside
-// one?" is not a property any single line can answer.
-function blockScalarLineFlags(lines) {
-  const flags = new Array(lines.length).fill(false);
-  let openColumn = -1;   // the open block scalar's first non-blank column
-  let openQuote = null;  // the open quoted scalar's quote character
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (openQuote !== null) {
-      flags[i] = true; // text up to AND INCLUDING the line that closes the quote
-      if (quotedScalarCloseIndex(line, openQuote) !== -1) openQuote = null;
-      continue;
-    }
-    if (openColumn !== -1) {
-      if (line.trim() === "") { flags[i] = true; continue; }
-      const indent = /^[ \t]*/.exec(line)[0].length;
-      if (indent > openColumn) { flags[i] = true; continue; }
-      openColumn = -1; // the block ends AT this line, which is judged normally
-    }
-    const column = blockScalarOpenColumn(line);
-    if (column !== -1) { openColumn = column; continue; }
-    const quoted = quotedScalarOpen(line);
-    if (quoted && quotedScalarCloseIndex(quoted.after, quoted.quote) === -1) openQuote = quoted.quote;
-  }
-  return flags;
+  return values;
 }
 
 // True when the match at `index` sits INSIDE one of the required machine forms
 // for `name`. Span-based on purpose: a line may carry a functional reference and
 // a leaked one at once, and only the functional one is excused.
 //
-// `filePath` is optional and can only NARROW the carve-out: a form that declares
-// a `fileRe` (the `uses:` step, which exists in a workflow file or an action
-// definition and nowhere else; the `repository:` keys, which exist in YAML) is
-// excused only in such a file. A caller that has no path — a rule exercised on a
-// bare string — passes nothing and the form is judged on its grammar alone.
+// Two things must hold at once, and both can only ever NARROW the carve-out:
 //
-// `context.inBlockScalar` is the same kind of narrowing, one level up from the
-// grammar: a line the scan has established is inside a YAML multi-line scalar —
-// a block scalar, or a quoted scalar that runs over several lines — is text, and
-// NO machine grammar excuses text.
+//   - THE FILE. A form that declares a `fileRe` (the `uses:` step, which exists
+//     in a root workflow or an action definition and nowhere else; the
+//     `repository:` keys, which exist in YAML) is excused only in such a file,
+//     and only where the caller actually knows the path. A caller with no path
+//     has no document either, so it gets no carve-out.
+//   - THE DOCUMENT. A form that declares a `value` is excused only when that
+//     value is one `context.legitValues` holds — the set the parsed file
+//     declares at an Actions location. No set, no carve-out.
+//
+// The clone URL declares neither: it is a shell remote, not a YAML location, and
+// it is judged on its grammar exactly as before.
 function functionalRefCovers(name, line, index, filePath, context) {
-  if (context && context.inBlockScalar) return false;
+  const legitValues = context ? context.legitValues : null;
   for (const f of FUNCTIONAL_REPO_REFS) {
     if (f.name !== name) continue;
-    if (f.fileRe && filePath && !f.fileRe.test(String(filePath))) continue;
+    if (f.fileRe && !(filePath && f.fileRe.test(String(filePath)))) continue;
     const re = new RegExp(f.re.source, f.re.flags.includes("g") ? f.re.flags : `${f.re.flags}g`);
     let m;
     while ((m = re.exec(line)) !== null) {
-      if (index >= m.index && index < m.index + m[0].length) return true;
+      if (index >= m.index && index < m.index + m[0].length) {
+        if (!f.value) return true;
+        if (legitValues && legitValues.has(f.value(m))) return true;
+      }
       if (m.index === re.lastIndex) re.lastIndex++;
     }
   }
@@ -1051,34 +992,42 @@ function expiryFail(msg) {
   process.exit(1);
 }
 
-// Every `uses:` PIN in a workflow file, as `{ target, ref }` pairs in file
-// order: the target is the `<owner>/<repo>[/<path>]` before the `@`, the ref is
-// what stands after it. Pairs, not a bag of shas: an expiry is keyed to ONE
-// target, and only that target's ref may answer for it.
+// The `uses:` PINS a caller workflow really dispatches, as `{ target, ref }`
+// pairs in document order — every `jobs.<id>.uses`, the job-level
+// reusable-workflow call, and nothing else. Pairs, not a bag of shas: an expiry
+// is keyed to ONE target, and only that target's ref may answer for it.
 //
-// It reads the line with usesScalarSource — the SAME grammar the carve-out
-// uses — and a line that does not parse is NOT a pin. That is the whole point:
-// the earlier loose pattern took `uses:` plus any non-blank run, so
-// `uses:<target>@<old-sha>` (no whitespace after the key), an unbalanced quote
-// and a trailing-junk tail all still answered as the pin. A real gate call could
-// be deleted and replaced by text no runner accepts, and the exemption it was
-// keyed to stayed live. Now such a line is not a pin at all, the keyed target is
-// missing, and the expiry check reports a config error instead of a verdict.
+// It is STRUCTURAL, for the same reason the carve-out is. A pin is a dispatch,
+// and only the parser knows which text is one: a `uses:` line inside a `run: |`
+// heredoc, inside a folded block, inside a multi-line quoted scalar or under an
+// `env:` mapping is text no runner dispatches, and every one of those spellings
+// once answered for a keyed pin — a real gate call could be deleted and replaced
+// by prose while the sha it named kept an exemption alive. Reading the parsed
+// document instead of the lines ends the whole class, and it also drops the
+// step-level `uses:` values: a pinned ACTION inside a job is not the caller's
+// dispatch of the gate, and an expiry keyed to one was never keyed to a caller.
 //
-// It also reads the file with BLOCK-SCALAR awareness, for the same reason the
-// carve-out does: a `uses:` line inside a `run: |` block is shell text a runner
-// never dispatches, so it is not a pin either. Without that, a heredoc could
-// supply the sha for a gate call that had already been deleted.
-const USES_PIN_RE = new RegExp(usesScalarSource(`${ANY_ORG_PATH_SOURCE}${USES_TARGET_TAIL}`));
+// The value is split with the SAME `<target>@<ref>` grammar the carve-out uses
+// (the `@<ref>` is mandatory; GitHub rejects a ref-less cross-repository
+// `uses:`, and a local `uses: ./…` is not a cross-repository dispatch at all),
+// and the target comes back CASE-CANONICAL, so one dispatch has one spelling.
+//
+// NULL means the text is not parseable YAML: an unreadable caller is a config
+// error at the call site, never a silent "no pins".
+const USES_VALUE_RE = new RegExp(`^(${ANY_ORG_PATH_SOURCE}${USES_TARGET_TAIL})@(${USES_REF_TOKEN})$`);
 function readUsesPins(text) {
-  const lines = text.split(/\r?\n/);
-  const inBlockScalar = blockScalarLineFlags(lines);
+  let docs;
+  try { docs = loadAllYaml(text); }
+  catch { return null; }
   const pins = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (inBlockScalar[i]) continue;
-    const m = lines[i].match(USES_PIN_RE);
-    if (!m) continue;
-    pins.push({ target: m[2], ref: m[3] });
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    if (!isPlainObject(doc) || !isPlainObject(doc.jobs)) continue;
+    for (const job of Object.values(doc.jobs)) {
+      if (!isPlainObject(job) || typeof job.uses !== "string") continue;
+      const m = job.uses.match(USES_VALUE_RE);
+      if (!m) continue;
+      pins.push({ target: canonicalUsesTarget(m[1]), ref: m[2] });
+    }
   }
   return pins;
 }
@@ -1194,10 +1143,17 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
     // to this exemption, and letting one of them supply the sha is exactly how
     // an expiry outlives the pin it names.
     const wantedTarget = canonicalUsesTarget(pin.uses);
-    const forTarget = readUsesPins(text).filter((u) => canonicalUsesTarget(u.target) === wantedTarget);
+    const pins = readUsesPins(text);
+    if (pins === null) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not parseable YAML — a caller workflow nobody can read has no dispatch to be keyed to, "
+        + "and an exemption whose expiry cannot be evaluated does not stay in force");
+    }
+    const forTarget = pins.filter((u) => canonicalUsesTarget(u.target) === wantedTarget);
     if (forTarget.length === 0) {
       expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
-        + "which carries no such `uses:` line — an exemption whose pin cannot be found does not stay in force");
+        + "which carries no such `uses:` line — an exemption whose pin cannot be found does not stay in force "
+        + "(the pin must be a job-level `uses:` the caller really dispatches, not a step, a comment or a heredoc)");
     }
     const refs = [...new Set(forTarget.map((u) => u.ref.toLowerCase()))];
     if (refs.length > 1) {
@@ -1751,9 +1707,10 @@ function scanFile(relPath, rules) {
   const isSelf = SCANNER_REAL !== "" && realPathOf(relPath) === SCANNER_REAL;
   const defRange = isSelf ? readRuleDefRange(text) : { start: -1, end: -1 };
   const lines = text.split(/\r?\n/);
-  // Block-scalar context is a property of the FILE, so it is computed once, and
-  // only where the file is YAML — nothing else has block scalars.
-  const blockScalar = YAML_FILE_RE.test(relPath) ? blockScalarLineFlags(lines) : null;
+  // The legitimate-value set is a property of the FILE, so it is parsed once,
+  // and only where the file is YAML — nothing else has Actions locations. NULL
+  // (not YAML, or not parseable) means no structural carve-out at all.
+  const context = { legitValues: YAML_FILE_RE.test(relPath) ? legitimateActionValues(text) : null };
   const findings = [];
   for (const rule of rules) {
     if (rule.pathExclude && rule.pathExclude(relPath)) continue;
@@ -1768,7 +1725,6 @@ function scanFile(relPath, rules) {
         // matchExclude is per MATCH (contextExclude is per LINE): a rule that
         // excuses one specific form must not excuse every other token that
         // happens to share the line with it.
-        const context = { inBlockScalar: Boolean(blockScalar && blockScalar[i]) };
         if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, relPath, context))) {
           findings.push({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) });
         }
@@ -2097,7 +2053,7 @@ export {
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins, canonicalUsesTarget, blockScalarLineFlags, isTrackedInScannedTree,
+  readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,

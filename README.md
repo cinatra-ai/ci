@@ -27,10 +27,11 @@ consuming repo), operational runbooks, or secret material of any kind.
 ```
 .github/workflows/   Gate workflows (reusable workflow_call callers) and
                      org-level scheduled/self-check workflows
-scripts/             Gate engine scripts (Node, no runtime deps)
+scripts/             Gate engine scripts (Node built-ins; no registry deps)
   __tests__/         Unit test suite (node --test)
   __fixtures__/      Deterministic fixtures for the test suite
-  lib/vendor/        Vendored substrate (extension-ioc-gate)
+  lib/vendor/        Vendored third-party code and substrate (js-yaml,
+                     extension-ioc-gate) — see "Vendored code"
 config/              Shared profiles, baselines, and JSON config files
 templates/           Copy-paste caller workflow templates for consuming repos
 docs/                Org-wide conventions (release contract)
@@ -283,24 +284,27 @@ carve-out applies only where:
   `"` or `'` has to close the scalar. The terminator is a lookahead, so the
   excused span stops at the value — a citation inside the trailing comment still
   flags;
-- **the line is not inside a YAML block scalar** — a block-scalar header (`|`,
-  `|-`, `|+`, `>`, `>-`, `>+`, with YAML's optional indentation indicator) opens
-  a block wherever it stands: as a mapping value (`run: |`, and `run:x: |`,
-  whose key carries a colon of its own), as a sequence item (`- |`, `- - |`), or
-  as a bare indicator opening a document scalar — and the block runs while lines
-  are blank or indented deeper than the **opening line's first non-blank column**
-  (the dash for `- |`). **No line inside such a block is ever excused**: it is
-  shell or prose the runner never reads as YAML, so a heredoc line spelling
-  `uses: <org>/<repo>@main` inside a `run: |` step is a finding. The first line
-  indented back to that column ends the block and is judged normally, so a real
-  `uses:` mapping after it is excused as before;
-- **the line is not inside a multi-line quoted scalar** — a mapping value or
-  sequence item that opens with `"` or `'` and does not close on the same line
-  (counting `\"` escapes inside double quotes and `''` inside single quotes) is
-  ONE string value, so every line up to **and including** the one that closes it
-  is text and none of it is excused: `description: "` followed by
-  `  repository: <org>/<repo>` is a finding, while a quote that closes on its own
-  line changes nothing.
+- **the document says the value is a dispatch** — the grammar is necessary and
+  never sufficient. A `*.yml|*.yaml` file is **parsed** (with the vendored
+  js-yaml, below), and the parse yields the file's set of *legitimate values*:
+  every string at `jobs.<id>.uses` (a reusable-workflow call),
+  `jobs.<id>.steps[].uses` (an action), `jobs.<id>.steps[].with.repository` (a
+  checkout or dispatch input), and, for a composite action, `runs.steps[].uses`
+  and `runs.steps[].with.repository`. A `uses:` / `repository:` carve-out then
+  applies to a line **only when the value its grammar reads is a member of that
+  set**. If the file is not YAML, the path is unknown, or the document does not
+  parse, there is **no carve-out at all** and every private reference in it is a
+  finding.
+
+  This is what makes the multi-line text forms findings without a line scanner
+  having to recognise them: a heredoc under `run: |`, a folded `run: >-` body, a
+  `- |` sequence item, a key that carries its own colon (`run:x: |`), an anchored
+  block (`run: &payload |`), a `--- |` whole-document scalar, a quoted value
+  (bare or quoted-key) that runs over several lines, and an `env:` mapping whose
+  key happens to be `uses` are all *strings* to a parser, dispatched nowhere —
+  so nothing in them is excused. Membership is by **value**, not by line: a value
+  the same file really does dispatch stays excused wherever else it appears in
+  that file, because by then the file carries the name either way.
 
 Owner and repository **names fold case** — GitHub resolves them
 case-insensitively, so `uses: <Org>/<Repo>@main` is the same dispatch as the
@@ -332,8 +336,11 @@ is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
   delimiters, in which every entry must itself be a valid `<org>/<repo>` scalar
   (optionally quoted), with one optional trailing comma before `]` — YAML
   accepts `key: [<org>/<repo>,]` and so does the carve-out. The excused span is
-  the whole sequence, so *every* entry is excused, while an unclosed `[` — or
-  junk in any entry — excuses nothing. The owner of an entry is GitHub's login
+  the whole sequence, so *every* entry is excused by the grammar, while an
+  unclosed `[` — or junk in any entry — excuses nothing. In a real file the
+  structural rule then decides, and no GitHub Actions input takes a **list** at
+  `repository:` (a checkout takes one string), so a parsed document never
+  declares such a value and a flow sequence is a finding wherever it stands. The owner of an entry is GitHub's login
   grammar exactly (1–39 of `[A-Za-z0-9-]`, no leading, trailing or consecutive
   hyphen), so an entry such as `bad-/public` names an owner GitHub cannot issue,
   the sequence is not a machine form, and every private entry in it is a
@@ -396,13 +403,18 @@ and the exemption has EXPIRED: the run exits 1 and names the basename, the file,
 the target, both shas, and the fix — **the pull request that moves the pin
 deletes the basename and its expiry entry in the same change.**
 
-The pin line is read with the very same `uses:` scalar grammar the carve-out
-above uses — block scalars and multi-line quoted scalars included, so a `uses:`
-inside a `run: |` block, or inside a quoted value that runs over several lines,
-is not a pin either — and a line that does not parse — no whitespace after the key, an
-unmatched quote, a trailing tail — is not a pin at all: replacing a real gate
+The pin is read **structurally**, from the same parse: the caller workflow's
+pins are its `jobs.<id>.uses` values — the job-level reusable-workflow calls it
+actually dispatches — split with the carve-out's own `<target>@<ref>` grammar. A
+step's `uses:` is an action the job runs, not the caller's dispatch of the gate,
+and it cannot answer for a keyed target; neither can text that merely spells one
+(a heredoc, a folded block, a quoted continuation, an `env:` mapping). A value
+the `<target>@<ref>` grammar rejects — no whitespace after the key, a trailing
+tail, a ref-less or local `uses:` — is not a pin either, so replacing a real gate
 call with text no runner accepts makes the keyed target *missing* (a config
-error) instead of leaving the exemption it justifies quietly alive.
+error) instead of leaving the exemption it justifies quietly alive. A pin file
+that is **not parseable YAML** is likewise a config error: a caller nobody can
+read has no dispatch to be keyed to.
 
 The target is compared **case-canonically**: GitHub resolves the owner and
 repository halves case-insensitively, so `Some-Org/CI/.github/workflows/x.yml`
@@ -1948,7 +1960,8 @@ suite on every PR and push to `main`.
 ### Add a new gate
 
 1. Write the engine script at `scripts/<gate-name>.mjs` (Node built-ins only,
-   zero registry dependencies).
+   zero registry dependencies — anything else is vendored under
+   `scripts/lib/vendor/`, see "Vendored code").
 2. Add unit tests at `scripts/__tests__/<gate-name>.test.mjs` using
    `node:test`.
 3. Add the reusable workflow at `.github/workflows/<gate-name>.yml`.
@@ -1956,6 +1969,27 @@ suite on every PR and push to `main`.
    on this repo.
 5. Document the gate in this README (purpose, thin-caller snippet, inputs
    table, local run command where applicable, develop command).
+
+### Vendored code
+
+Gate engines run inside consuming repositories' CI with **no `npm install`**, so
+they may only import files committed under `scripts/`. Where an engine needs a
+third-party library, the library is vendored under `scripts/lib/vendor/<name>/`,
+verbatim, with its licence beside it:
+
+| file | what it is |
+| --- | --- |
+| [`scripts/lib/vendor/js-yaml/js-yaml.mjs`](scripts/lib/vendor/js-yaml/js-yaml.mjs) | the single-file ESM build of the `js-yaml` package (MIT), used by `source-leak-gate` to parse YAML and decide which values stand at a real GitHub Actions location |
+| [`scripts/lib/vendor/js-yaml/LICENSE`](scripts/lib/vendor/js-yaml/LICENSE) | the package's MIT licence, as published |
+| [`scripts/lib/vendor/js-yaml/PROVENANCE.md`](scripts/lib/vendor/js-yaml/PROVENANCE.md) | package, version, registry tarball URL and its `dist.integrity`, the vendored file's sha256, the date, and the refresh procedure |
+
+The copy is never edited in place, and it is **not** an npm dependency — there is
+no `package.json` entry for it. A drift test in
+`scripts/__tests__/source-leak-gate.test.mjs` recomputes the sha256 of
+`js-yaml.mjs` and compares it with the digest recorded in `PROVENANCE.md`, so
+refreshing the copy without updating its provenance (or editing it at all) fails
+the suite. The directory is excluded from the repository lint in
+`eslint.config.mjs` for the same reason: nobody may fix a finding in it.
 
 ### Update the vendored substrate (extension-ioc-gate)
 
