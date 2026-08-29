@@ -290,11 +290,19 @@ carve-out applies only where:
   every string at `jobs.<id>.uses` (a reusable-workflow call),
   `jobs.<id>.steps[].uses` (an action), `jobs.<id>.steps[].with.repository` (a
   checkout or dispatch input), and, for a composite action, `runs.steps[].uses`
-  and `runs.steps[].with.repository`. A `uses:` / `repository:` carve-out then
-  applies to a line **only when the value its grammar reads is a member of that
-  set**. If the file is not YAML, the path is unknown, or the document does not
-  parse, there is **no carve-out at all** and every private reference in it is a
-  finding. A document carrying a `__proto__`, `constructor` or `prototype`
+  and `runs.steps[].with.repository`. **Where those keys are read from is part
+  of the rule, not an aside**: `jobs.*` counts only in a repository-root
+  workflow (`.github/workflows/<file>.yml|.yaml`), and `runs.steps[]` only in an
+  `action.yml|.yaml` whose own `runs.using` is the string `composite` — the one
+  declaration that makes those steps a list GitHub runs. Any other file type, or
+  a document that does not carry the matching shape, yields **no legitimate
+  value at all**: a `runs:` tree in a workflow, a `jobs:` tree in an action file
+  or in a `compose.yml`, and a `node20` or `docker` action's `runs.steps` are
+  shapes nothing executes, so they dispatch nothing however well they are
+  spelled. A `uses:` / `repository:` carve-out then applies to a line **only
+  when the value its grammar reads is a member of that set**. If the file is not
+  YAML, the path is unknown, or the document does not parse, there is **no
+  carve-out at all** and every private reference in it is a finding. A document carrying a `__proto__`, `constructor` or `prototype`
   mapping key at any depth counts as one that does not parse (see "Vendored
   code"), and every key is read as an **own** property, so an inherited `jobs`
   is not a dispatch.
@@ -327,9 +335,12 @@ is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
   at any other depth never executes, so `nested/.github/workflows/fake.yml` is
   an ordinary document and the reference in it is prose.
 - `repository:` / `repositories:` is excused **only in a YAML file**
-  (`*.yml|*.yaml`) where the scan knows the path — it is an ordinary mapping key,
-  legal in any workflow, action or compose file, but outside YAML the same text
-  is prose wearing a machine key as a hat and is a finding. It has **two
+  (`*.yml|*.yaml`) where the scan knows the path — its grammar is that of an
+  ordinary mapping key, legal in any workflow, action or compose file, but
+  outside YAML the same text is prose wearing a machine key as a hat and is a
+  finding. Being YAML only gets it as far as the structural rule above, which
+  finds an Actions location for it in a root workflow or a composite action and
+  nowhere else. It has **two
   separate grammars**. The SCALAR form is exactly `<org>/<repo>` under the
   terminator rule above — end of line, a real
   comment, or its own closing quote. A `,` or `]` ends nothing there, because

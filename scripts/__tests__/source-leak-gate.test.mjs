@@ -1096,6 +1096,36 @@ test("probe deadline: an IN-FLIGHT request is cut at the deadline, not at its ow
   }
 });
 
+test("probe deadline: a body read the deadline cuts is the BUDGET finding, unmemoised", async () => {
+  // The defect this locks: the deadline can fire during the SECOND half of a
+  // request — the body read — as readily as during the first. That rejection was
+  // caught by the inner `res.json()` handler, converted into "malformed API
+  // response (200 without a boolean `private`)" and MEMOISED as a PROBE_ERROR,
+  // so the deadline guard never saw it: a lane that ran out of time reported a
+  // network fault it never had, and remembered the answer for the rest of the
+  // run.
+  //
+  // The stub answers 200 IMMEDIATELY and hangs in `json()`, which is exactly
+  // the shape a slow API has.
+  setProbeFetch(async (url, init) => ({
+    status: 200,
+    json: () => new Promise((_, reject) => {
+      const stuck = setTimeout(() => reject(new Error("the stub was never aborted")), 30_000);
+      init.signal.addEventListener("abort", () => {
+        clearTimeout(stuck);
+        reject(init.signal.reason ?? new Error("aborted"));
+      });
+    }),
+  }));
+  const ctx = probeCtx({ deadlineMs: 60, concurrency: 1, maxNames: 50 });
+  const out = await resolveProbeFindings([candidate("slow-body")], ctx);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].rule, PROBE_BUDGET_RULE_ID, "the deadline is a budget outcome, not a network fault");
+  assert.match(out[0].reason, /deadline/);
+  assert.match(out[0].snippet, /probe budget/);
+  assert.equal(ctx.cache.has("slow-body"), false, "and it is not memoised — the name was never actually answered");
+});
+
 test("probe deadline: a request opened past the deadline is never sent", async () => {
   const calls = stubFetch(() => apiResponse(200, { private: false }));
   const ctx = probeCtx({ deadlineMs: 60 });
@@ -1368,9 +1398,21 @@ test("cache: --verify-cache never launders an unresolved entry into a fresh stam
 
 test("the committed cache is valid, fresh-shaped, and holds nothing privately owned", () => {
   const f = path.join(import.meta.dirname, "..", "..", "config", "public-repos.json");
-  const loaded = loadKnownPublicRepos(f, { now: new Date(`${JSON.parse(fs.readFileSync(f, "utf8")).public[0].verifiedAt}T00:00:00Z`) });
+  const onDisk = JSON.parse(fs.readFileSync(f, "utf8"));
+  const loaded = loadKnownPublicRepos(f, { now: new Date(`${onDisk.public[0].verifiedAt}T00:00:00Z`) });
   assert.ok(loaded.entries.length >= 1, "the cache must load");
   assert.equal(loaded.ttlDays, PUBLIC_CACHE_TTL_DAYS);
+  // `entries` is the WRONG witness on its own: the loader keeps an entry there
+  // for `--verify-cache` even when its stamp is stale or its metadata is
+  // untrustworthy, so a file full of rejected entries passed an
+  // `entries.length` check. `names` is the set that actually clears a
+  // reference, and `warnings` / `ttlValid` are how the loader says it rejected
+  // anything — so assert on those.
+  assert.deepEqual(loaded.warnings, [], "a committed entry the loader had to complain about is not fresh-shaped");
+  assert.equal(loaded.ttlValid, true, "the file's own ttlDays must be usable");
+  for (const e of onDisk.public) {
+    assert.ok(loaded.names.has(e.name), `${e.name} must actually clear a reference, not merely be listed`);
+  }
   for (const e of loaded.entries) {
     assert.equal(PROBE_EXEMPT_NAMES.has(e.name), false, `${e.name} cannot be both cached-public and privately owned`);
   }
@@ -2168,7 +2210,6 @@ test("the clone carve-out is ANCHORED on the left: an npm scope is not a remote"
     "cinatra-ai/wp-theme.git",
     "gh repo clone cinatra-ai/wp-theme.git",
     '"cinatra-ai/wp-theme.git"',
-    "[cinatra-ai/wp-theme.git]",
   ]) {
     assert.equal(matchRule(rule, line), 0, `a clone remote is excused: ${JSON.stringify(line)}`);
   }
@@ -2176,6 +2217,11 @@ test("the clone carve-out is ANCHORED on the left: an npm scope is not a remote"
   for (const line of [
     "https://github.com/cinatra-ai/wp-theme.git/issues/0",
     "git@github.com:cinatra-ai/ops.git",                  // no clone carve-out for this name
+    // A `]` is not one of the documented terminators (end of line, whitespace, a
+    // quote, `,`, `;`, `)`). The left delimiter admits an opening bracket
+    // because prose brackets a remote it is quoting; a remote that ENDS at a `]`
+    // is that quotation, not a command, and the regex accepting `]` excused it.
+    "[cinatra-ai/wp-theme.git]",
   ]) {
     assert.ok(matchRule(rule, line) >= 1, `still a finding: ${JSON.stringify(line)}`);
   }
@@ -2303,6 +2349,39 @@ test("where the file path is known, `uses:` is excused only in a ROOT workflow o
   });
 });
 
+test("the value set is read only out of the file type that really carries the key", () => {
+  // The file gate above says WHERE a `uses:` line may be excused; this says
+  // where the VALUE SET that excuses it may be read from. The defect this locks:
+  // the collector took `jobs` and `runs.steps` off every parsed document,
+  // whatever the file was and whatever the document declared, so a shape nobody
+  // runs forged a carve-out — the composite case even passed with
+  // `using: composite` deleted, which is the one declaration that makes
+  // `runs.steps[]` a list of things GitHub runs.
+  const composite = (using) =>
+    `name: notify\nruns:\n  using: ${using}\n  steps:\n    - uses: cinatra-ai/ops/actions/notify@v1\n`;
+  const runsTree = "name: notify\nruns:\n  using: composite\n  steps:\n    - uses: cinatra-ai/ops/actions/notify@v1\n";
+  const jobsTree = "name: deploy\njobs:\n  deploy:\n    uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n";
+  scanTree((t) => {
+    // A composite action dispatches its steps.
+    assert.deepEqual(t.ids(".github/actions/notify/action.yml", composite("composite")), [],
+      "a composite action really does run its steps");
+    // The SAME file, one word different: a `node20` action runs an entry point,
+    // not a step list, so nothing in `runs.steps` is dispatched.
+    assert.deepEqual(t.ids(".github/actions/notify/action.yml", composite("node20")), ["SLG_PRIVATE_REPO_REF"],
+      "`using: node20` has no steps GitHub runs");
+    assert.deepEqual(t.ids(".github/actions/notify/action.yml", composite("docker")), ["SLG_PRIVATE_REPO_REF"],
+      "neither does `using: docker`");
+    // A `runs:` tree in a WORKFLOW is not an action definition: nothing reads it.
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", runsTree), ["SLG_PRIVATE_REPO_REF"],
+      "a workflow has no `runs:` tree a runner executes");
+    // And a `jobs:` tree in an ACTION file is not a workflow.
+    assert.deepEqual(t.ids(".github/workflows/deploy.yml", jobsTree), [],
+      "a root workflow's `jobs` is the dispatch it looks like");
+    assert.deepEqual(t.ids(".github/actions/notify/action.yml", jobsTree), ["SLG_PRIVATE_REPO_REF"],
+      "an action file has no `jobs` GitHub runs");
+  });
+});
+
 test("`uses:` is excused only where the DOCUMENT dispatches that exact value", () => {
   // The structural rule, in the file class where the carve-out is widest: the
   // same line, in the same root workflow, is a machine form at a step and text
@@ -2321,18 +2400,32 @@ test("`uses:` is excused only where the DOCUMENT dispatches that exact value", (
   });
 });
 
-test("the `repository:` key is a machine form only at an Actions location — in any YAML", () => {
-  // `repository:` is a mapping key, so unlike `uses:` it is legal in ANY YAML
-  // file — but being YAML is necessary and not sufficient. It must stand where a
-  // runner reads it: a step's `with:`. A bare `repository: <org>/<repo>` at the
-  // top of a document is a key wearing a machine hat, and outside YAML entirely
-  // it is prose.
+test("the `repository:` key is a machine form only at an Actions location a runner reads", () => {
+  // `repository:` is a mapping key, so unlike `uses:` its GRAMMAR is legal in
+  // ANY YAML file — but being YAML is necessary and not sufficient twice over.
+  // It must stand where a runner reads it (a step's `with:`), and that step must
+  // live in a file GitHub actually executes: a root workflow's `jobs`, or a
+  // composite action's `runs`. A `jobs:` tree in `compose.yml` is a document
+  // shape nobody runs, a bare `repository: <org>/<repo>` at the top of a
+  // document is a key wearing a machine hat, and outside YAML entirely it is
+  // prose.
   const step = (body) => `jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ${body}\n`;
+  const compositeStep = (body) =>
+    `runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n      with:\n        ${body}\n`;
   scanTree((t) => {
-    for (const rel of [".github/workflows/x.yml", ".github/actions/n/action.yaml", "compose.yml", "deploy/values.yaml"]) {
-      assert.deepEqual(t.ids(rel, step("repository: cinatra-ai/ops")), [], `a checkout input is a machine form: ${rel}`);
+    assert.deepEqual(t.ids(".github/workflows/x.yml", step("repository: cinatra-ai/ops")), [],
+      "a checkout input in a root workflow is a machine form");
+    assert.deepEqual(t.ids(".github/actions/n/action.yaml", compositeStep("repository: cinatra-ai/ops")), [],
+      "and so is one in a composite action");
+    for (const rel of [".github/workflows/x.yml", ".github/actions/n/action.yaml"]) {
       assert.deepEqual(t.ids(rel, "repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"],
         `a bare key at the document root is not a checkout: ${rel}`);
+    }
+    // A `jobs:` tree in a file GitHub never runs declares no Actions location,
+    // however well it is spelled.
+    for (const rel of ["compose.yml", "deploy/values.yaml", ".github/actions/n/action.yaml"]) {
+      assert.deepEqual(t.ids(rel, step("repository: cinatra-ai/ops")), ["SLG_PRIVATE_REPO_REF"],
+        `a \`jobs:\` tree here is not a workflow: ${rel}`);
     }
     for (const rel of ["docs/runbook.md", "scripts/deploy.sh", "notes.txt", "src/app.ts"]) {
       assert.deepEqual(t.ids(rel, step("repository: cinatra-ai/ops")), ["SLG_PRIVATE_REPO_REF"],
@@ -2455,10 +2548,13 @@ test("a `- |` item, a colon-carrying key and a bare `|` document are TEXT too", 
     assert.deepEqual(t.lines(".github/workflows/deploy.yml", wf.join("\n")), [9, 13, 15]);
     // A whole-document scalar carries no jobs at all, so nothing in it is a
     // dispatch — including a `--- |` document, which opens one mid-stream.
-    assert.deepEqual(t.ids("doc.yml", "|\n  repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"]);
-    assert.deepEqual(t.ids("doc.yml", "--- |\njobs:\n  gate:\n    uses: cinatra-ai/ops@main\n"), ["SLG_PRIVATE_REPO_REF"]);
+    // (In a root workflow, so the file type is never what is doing the work
+    // here: what fails is the document, exactly as the test claims.)
+    const doc = ".github/workflows/doc.yml";
+    assert.deepEqual(t.ids(doc, "|\n  repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"]);
+    assert.deepEqual(t.ids(doc, "--- |\njobs:\n  gate:\n    uses: cinatra-ai/ops@main\n"), ["SLG_PRIVATE_REPO_REF"]);
     // Not vacuous: the same key, at a real Actions location, is excused.
-    assert.deepEqual(t.ids("doc.yml", "jobs:\n  a:\n    steps:\n      - with:\n          repository: cinatra-ai/ops\n"), []);
+    assert.deepEqual(t.ids(doc, "jobs:\n  a:\n    steps:\n      - with:\n          repository: cinatra-ai/ops\n"), []);
   });
 });
 
@@ -2750,6 +2846,10 @@ test("aggregate: every active rule over one corpus agrees on the count", () => {
 // --------------------------------------------------------------------------
 
 const POLLUTED_SHA = "4d5e6f708192a3b4c5d607182930a4b5c6d7e8f9";
+// The value set is read out of the file type that carries the key, so every
+// direct call below names the file it is reading (see the provenance test
+// above); the guards under test are about the DOCUMENT, not about the path.
+const WORKFLOW_PATH = ".github/workflows/deploy.yml";
 // The published payload shape: an anchored mapping whose `__proto__` key carries
 // a whole fabricated dispatch, merged into the document root. Under 4.1.0 the
 // root's own keys stayed innocent while its PROTOTYPE supplied `jobs`.
@@ -2813,13 +2913,13 @@ test("a prototype-reaching mapping key makes the document unreadable at any dept
     assert.equal(parseYamlDocuments(`a:\n  - b:\n      ${key}: 1\n`), null,
       `\`${key}:\` inside a sequence is unreadable too`);
   }
-  assert.equal(legitimateActionValues(MERGE_PAYLOAD), null, "no value set at all");
+  assert.equal(legitimateActionValues(MERGE_PAYLOAD, WORKFLOW_PATH), null, "no value set at all");
   assert.equal(readUsesPins(MERGE_PAYLOAD), null, "no pins at all");
-  assert.equal(legitimateActionValues(PLAIN_PROTO_PAYLOAD), null);
+  assert.equal(legitimateActionValues(PLAIN_PROTO_PAYLOAD, WORKFLOW_PATH), null);
   assert.equal(readUsesPins(PLAIN_PROTO_PAYLOAD), null);
   // The honest twin still parses, still yields its value and still yields its
   // pin — the refusal is keyed to the key, not to the shape of a workflow.
-  assert.deepEqual([...legitimateActionValues(HONEST_CALLER)],
+  assert.deepEqual([...legitimateActionValues(HONEST_CALLER, WORKFLOW_PATH)],
     [`cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}`]);
   assert.deepEqual(readUsesPins(HONEST_CALLER),
     [{ target: "cinatra-ai/ops/.github/workflows/deploy.yml", ref: POLLUTED_SHA }]);
@@ -2892,7 +2992,7 @@ test("a parsed SEQUENCE is walked by own index — a polluted hole is not an ele
     assert.equal(steps[1].uses, forged, "the hole really does resolve through the prototype");
 
     setYamlLoader(() => [{ jobs: { build: { steps } } }]);
-    const values = legitimateActionValues("the loader decides, not this text");
+    const values = legitimateActionValues("the loader decides, not this text", WORKFLOW_PATH);
     assert.deepEqual([...values], ["actions/checkout@v4"],
       "only the OWN step is a step; the hole yields no legitimate value");
     assert.equal(values.has(forged), false, "and the inherited dispatch is not in the file");

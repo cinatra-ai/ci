@@ -267,7 +267,15 @@ const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
 // repository-relative (`git ls-files`), with an optional `./` prefix tolerated.
 // `action.ya?ml` stays matched by BASENAME at any depth — a composite action
 // legitimately lives in a subdirectory (`.github/actions/<name>/action.yml`).
-const USES_FILE_RE = /^(?:\.\/)?\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\.ya?ml$/;
+//
+// The two arms are named SEPARATELY because they are not interchangeable: a
+// workflow declares `jobs:` and an action declares `runs:`, and
+// legitimateActionValues reads each key only out of the file type that can
+// really carry it. USES_FILE_RE — the union — is only the coarse "could this
+// file run a `uses:` step at all" test the carve-out's file gate needs.
+const ROOT_WORKFLOW_FILE_RE = /^(?:\.\/)?\.github\/workflows\/[^/]+\.ya?ml$/;
+const ACTION_FILE_RE = /(?:^|\/)action\.ya?ml$/;
+const USES_FILE_RE = new RegExp(`${ROOT_WORKFLOW_FILE_RE.source}|${ACTION_FILE_RE.source}`);
 // The `repository:` / `repositories:` keys are ordinary YAML mapping keys, so
 // unlike `uses:` they are legal in ANY workflow, action or compose file — but
 // only in a YAML one. Outside YAML the key is prose wearing a machine key as a
@@ -299,9 +307,16 @@ const FLOW_SEP = "[ \\t]*,[ \\t]*";
 // gate called a leak. It is a single optional comma, not a separator that may
 // repeat — `[<org>/<repo>,,]` is still not YAML and still excuses nothing.
 const FLOW_TRAILING_COMMA = "(?:[ \\t]*,)?";
-// The clone URL terminates at `.git` PLUS a terminator. `<org>/<repo>.git` is a
-// remote; `<org>/<repo>.git/issues/0` is an issue citation with a remote's
+// The clone URL terminates at `.git` PLUS a terminator — end of line,
+// whitespace, a quote, `,`, `;` or `)`, and nothing else. `<org>/<repo>.git` is
+// a remote; `<org>/<repo>.git/issues/0` is an issue citation with a remote's
 // spelling, and it is a finding.
+//
+// A `]` is NOT a terminator here. The left delimiter admits an opening bracket
+// because a remote can be quoted or bracketed by the prose around it, but a
+// remote that ENDS at a `]` is a bracketed citation — a Markdown link label, a
+// list entry — rather than a command anybody runs, and the documented set never
+// contained one. It excused `[<org>/<repo>.git]`.
 //
 // It is also ANCHORED ON THE LEFT, which is what makes it a clone reference
 // rather than a substring of one. A clone reference is either a FULL REMOTE
@@ -320,7 +335,7 @@ const FLOW_TRAILING_COMMA = "(?:[ \\t]*,)?";
 // are not remotes anybody clones, but they spell the private name in full and
 // the carve-out excused every one of them. One delimiter, applied once in front
 // of an OPTIONAL remote prefix, is what makes that impossible to reintroduce.
-const CLONE_TERMINATOR = "(?=$|[\\s,;)\\]\"'`])";
+const CLONE_TERMINATOR = "(?=$|[\\s,;)\"'`])";
 const CLONE_REMOTE_PREFIX =
   "(?:https:\\/\\/github\\.com\\/|git@github\\.com:|ssh:\\/\\/git@github\\.com\\/)";
 const CLONE_LEFT = "(?<![^\\s=\"'`([{])";
@@ -1090,6 +1105,23 @@ function collectStepValues(steps, values) {
 // file the parser cannot read is a file whose structure nobody knows, and an
 // unknown structure excuses nothing.
 //
+// PROVENANCE IS STRUCTURAL, and the FILE is half of it. A key only dispatches
+// where GitHub reads it:
+//
+//   - `jobs.*` is read ONLY from a repository-root workflow
+//     (`.github/workflows/<file>.yml|.yaml`). Nothing runs the `jobs:` tree of
+//     an `action.yml` or of `docs/example.yml`.
+//   - `runs.steps[]` is read ONLY from an `action.yml|.yaml` whose own
+//     `runs.using` is the string `composite`. A `node20` or `docker` action has
+//     no steps GitHub runs, and a workflow has no `runs:` tree at all.
+//
+// Without that, ANY document shape forged a carve-out: a stray `runs: steps:`
+// tree in a workflow — or in an action that does not even declare
+// `using: composite` — handed the value set a dispatch the runner would never
+// make. Any other file type, or a document that does not carry the matching
+// shape, contributes NOTHING; the result is then an EMPTY set (the file parsed,
+// it just dispatches nothing), which is distinct from the NULL above.
+//
 // It parses through `parseYamlDocuments` (every document in the stream, on
 // js-yaml's default schema, which resolves only standard YAML tags — no code, no
 // custom types), so every failure mode lands on the same NULL: a syntax error, a
@@ -1097,23 +1129,36 @@ function collectStepValues(steps, values) {
 // prototype-reaching key. Every key below is read with `own()`, so an INHERITED
 // `jobs` — the whole point of a pollution payload — is not a carve-out; it is
 // not there.
-function legitimateActionValues(text) {
+function legitimateActionValues(text, filePath) {
   const docs = parseYamlDocuments(text);
   if (docs === null) return null;
   const values = new Set();
+  const p = filePath === undefined || filePath === null ? "" : String(filePath);
+  const isWorkflowFile = ROOT_WORKFLOW_FILE_RE.test(p);
+  const isActionFile = ACTION_FILE_RE.test(p);
+  if (!isWorkflowFile && !isActionFile) return values;  // no file type, no location
   for (const doc of ownItems(docs)) {
     if (!isPlainObject(doc)) continue;
-    const jobs = own(doc, "jobs");
-    if (isPlainObject(jobs)) {
-      for (const jobId of Object.getOwnPropertyNames(jobs)) {
-        const job = own(jobs, jobId);
-        if (!isPlainObject(job)) continue;
-        addLegitimateValue(values, own(job, "uses"));   // a reusable-workflow call
-        collectStepValues(own(job, "steps"), values);
+    if (isWorkflowFile) {
+      const jobs = own(doc, "jobs");
+      if (isPlainObject(jobs)) {
+        for (const jobId of Object.getOwnPropertyNames(jobs)) {
+          const job = own(jobs, jobId);
+          if (!isPlainObject(job)) continue;
+          addLegitimateValue(values, own(job, "uses"));   // a reusable-workflow call
+          collectStepValues(own(job, "steps"), values);
+        }
       }
     }
-    const runs = own(doc, "runs");
-    if (isPlainObject(runs)) collectStepValues(own(runs, "steps"), values); // composite action
+    if (isActionFile) {
+      const runs = own(doc, "runs");
+      // `using: composite` is the ONE declaration that makes `runs.steps[]` a
+      // list of things GitHub runs; the string is compared exactly, because
+      // that is the one spelling the runner accepts.
+      if (isPlainObject(runs) && own(runs, "using") === "composite") {
+        collectStepValues(own(runs, "steps"), values);
+      }
+    }
   }
   return values;
 }
@@ -1681,6 +1726,16 @@ function makeProbeContext({ token, knownPublic, apiBase, timeoutMs, maxNames, de
   };
 }
 
+// True when a rejection is the request being CUT rather than a fault of its
+// own. The signal is asked first — it is the authority on whether this request
+// was aborted — and the error's own name covers a stub or a runtime that
+// rejects with an abort error before the signal's own state is observable.
+function isAbortCut(e, signal) {
+  if (signal && signal.aborted) return true;
+  const n = e && e.name;
+  return n === "AbortError" || n === "TimeoutError";
+}
+
 // One verdict per distinct name: { state: "public" | "private" | "error", reason }.
 // Every non-public branch — including every branch that failed to produce an
 // answer — is a blocking state. There is no path that returns "public" without
@@ -1707,14 +1762,24 @@ async function resolveRepoVisibility(name, ctx) {
     ctx.calls++;
     const headers = { accept: "application/vnd.github+json", "user-agent": "source-leak-gate" };
     if (ctx.token) headers.authorization = `Bearer ${ctx.token}`;
+    const signal = AbortSignal.timeout(budgetMs);
     const res = await probeFetch(`${ctx.apiBase}/repos/${PROBE_ORG}/${encodeURIComponent(name)}`, {
       headers,
-      signal: AbortSignal.timeout(budgetMs),
+      signal,
     });
     const status = res && typeof res.status === "number" ? res.status : null;
     if (status === 200) {
       let body = null;
-      try { body = await res.json(); } catch { body = null; }
+      // A body read the ABORT cut is not a malformed response, and the two must
+      // be told apart HERE — before the conversion — because they get opposite
+      // treatment. Reading the body is the second half of the request, and the
+      // deadline fires during it as readily as during the headers; swallowing
+      // that rejection turned "we ran out of time" into "the API answered 200
+      // with no `private`", MEMOISED it as a PROBE_ERROR, and left the deadline
+      // guard below with nothing to classify. Rethrowing hands the abort to
+      // that guard, which reports the unmemoised budget finding.
+      try { body = await res.json(); }
+      catch (e) { if (isAbortCut(e, signal)) throw e; body = null; }
       if (!body || typeof body.private !== "boolean") {
         verdict = { state: "error", reason: "malformed API response (200 without a boolean `private`)" };
       } else {
@@ -1948,7 +2013,7 @@ function scanFile(relPath, rules) {
   // The legitimate-value set is a property of the FILE, so it is parsed once,
   // and only where the file is YAML — nothing else has Actions locations. NULL
   // (not YAML, or not parseable) means no structural carve-out at all.
-  const context = { legitValues: YAML_FILE_RE.test(relPath) ? legitimateActionValues(text) : null };
+  const context = { legitValues: YAML_FILE_RE.test(relPath) ? legitimateActionValues(text, relPath) : null };
   const findings = [];
   for (const rule of rules) {
     if (rule.pathExclude && rule.pathExclude(relPath)) continue;
