@@ -119,6 +119,45 @@ const PRIVATE_REPO_NAMES = [
 ];
 const PRIVATE_REPO_NAME_SET = new Set(PRIVATE_REPO_NAMES);
 
+// GitHub's repository-name grammar, written ONCE and shared by everything that
+// has to decide "is this a repository name?": the tokenizer both scanning lanes
+// use, the functional carve-out grammars below, and the committed public-repos
+// cache's entry validation. Two hand-kept copies would drift, and a name the
+// tokenizer nominates but the cache calls invalid (or the reverse) is exactly
+// the disagreement that produces a finding in one lane and a different finding
+// in the other.
+//
+// GitHub accepts 1..100 characters from `[A-Za-z0-9_.-]`, in ANY position: a
+// leading `_`, `.` or `-` is legal (`<org>/_shared`, `<org>/.github-private`,
+// `<org>/-secret`), and a grammar that demanded an alnum first silently dropped
+// every one of them. A token made of NOTHING BUT dots is not a name at all —
+// GitHub rejects `.`, `..` and every longer run — so the leading guard rejects a
+// dot run of ANY length that ends at the token boundary. The length is the
+// point: a guard that stopped at two dots read `<org>/...` (an ellipsis) as the
+// repository `.`, and then spent a probe request on a name that can only 404
+// into a fail-closed finding. The name may not END in a dot either, so a
+// sentence-final period ("… see <org>/<repo>.") stays punctuation instead of
+// being read into the name. `.git` is a clone-URL suffix, not part of the name;
+// normalizeRepoName() strips it once the tail below has confirmed it really is
+// a suffix — and only when what remains is itself a name.
+//
+// The 100-character ceiling is load-bearing rather than cosmetic: a longer run
+// of name characters is not a repository, and accepting it would spend a probe
+// request on a string that can only 404 — a 404 the gate then has to report as a
+// fail-closed finding. That is why the name must END AT A BOUNDARY (see
+// REPO_TOKEN_TAIL): an over-long run produces no match at all, instead of a
+// 100-character prefix nominated as a repository that cannot exist.
+const REPO_NAME_MAX = 100;
+const REPO_NAME_SOURCE =
+  "(?!\\.+(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_-])?";
+
+// An `<owner>/<repo>` scalar for ANY owner, in the same one grammar: the
+// flow-sequence carve-out below validates EVERY entry with it, so a sequence
+// that carries junk in a later entry is not a machine form and excuses nothing.
+// GitHub owners are 1..39 characters of `[A-Za-z0-9-]`.
+const OWNER_NAME_SOURCE = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})";
+const ANY_ORG_PATH_SOURCE = `${OWNER_NAME_SOURCE}\\/${REPO_NAME_SOURCE}`;
+
 // FUNCTIONAL references: the exact machine forms the organization's own
 // automation REQUIRES, for private repositories that are also dispatch targets.
 // These are the ONLY forms excused, and they are excused per MATCH, not per name
@@ -143,22 +182,33 @@ const PRIVATE_REPO_NAME_SET = new Set(PRIVATE_REPO_NAMES);
 // and each of them is a finding. So each form below is transcribed to its real
 // grammar and terminated explicitly.
 //
-// A YAML key carve-out is a MACHINE GRAMMAR, not a substring. Three things make
+// A YAML key carve-out is a MACHINE GRAMMAR, not a substring. Four things make
 // it exact:
 //
 //   1. THE KEY OWNS THE LINE. The key must be the line's first non-blank token
 //      (after an optional `- ` sequence marker). A `#` anywhere before it makes
 //      the line a COMMENT, and a comment is prose ABOUT a machine form, never
 //      the machine form itself: a commented-out step excuses nothing.
-//   2. THE SCALAR IS COMPLETE. After the value only end of line or a real YAML
+//   2. A KEY IS SEPARATED FROM ITS VALUE BY REAL WHITESPACE. YAML requires a
+//      space after a mapping key, so `uses:<org>/ops@main` and
+//      `repository:<org>/ops` are not scalars at all — they are text that
+//      happens to contain a colon, and no runner accepts them. The gap is
+//      `[ \t]+`; the earlier `[ \t]*` excused a form that cannot run.
+//   3. THE SCALAR IS COMPLETE. After the value only end of line or a real YAML
 //      comment (whitespace, then `#`) may follow — so a trailing `/issues/0`, an
 //      `#0` citation glued to the value, or any other junk leaves the carve-out.
 //      The whitespace before `#` is load-bearing: a comment-less `#` is an issue
 //      citation, not a comment. The terminator is a LOOKAHEAD, so the excused
 //      span stops at the value and a citation living in the trailing comment
 //      still flags.
-//   3. QUOTES MATCH. An opening quote is captured and the same quote is required
+//   4. QUOTES MATCH. An opening quote is captured and the same quote is required
 //      to close the scalar, so an unbalanced quote is not a machine form.
+//
+// CASE. GitHub resolves owner and repository names case-insensitively, so
+// `uses: Cinatra-AI/Ops@main` is the same dispatch as the lower-case spelling
+// and refusing it would refuse CORRECT input. Every carve-out therefore folds
+// case on the ORG and the NAME only (ciLiteral below). The KEY does not fold:
+// `uses:` is the one spelling a runner accepts, and `Uses:` is prose.
 //
 // `uses:` — GitHub accepts exactly `<org>/<repo>[/<path>]@<ref>` for a
 // cross-repository step: `<path>` is a reusable-workflow file under
@@ -168,6 +218,8 @@ const PRIVATE_REPO_NAME_SET = new Set(PRIVATE_REPO_NAMES);
 // `uses:` — and requiring it is what keeps a URL tail such as `/issues/1`
 // outside the exemption.
 const YAML_KEY_PREFIX = "^[ \\t]*(?:-[ \\t]+)?";
+// A mapping key and its value are separated by REAL whitespace (rule 2 above).
+const KEY_VALUE_GAP = "[ \\t]+";
 const SCALAR_TERMINATOR = "(?=[ \\t]+#|[ \\t]*$)";
 const USES_REF_TOKEN = "[A-Za-z0-9._/-]+";
 const USES_WORKFLOW_PATH = "\\/\\.github\\/workflows\\/[A-Za-z0-9._-]+\\.ya?ml";
@@ -178,67 +230,85 @@ const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
 // available (a rule exercised on a bare string) the restriction is simply not
 // applied — it can only ever narrow the carve-out, never widen it.
 const USES_FILE_RE = /(?:^|\/)\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\.ya?ml$/;
-// `repository:` / `repositories:` — a SCALAR `<org>/<repo>` and nothing else:
-// the value ends at end of line, a `#` comment, or the `,`/`]` of a flow
-// sequence. `/` and a comment-less `#` are deliberately NOT terminators, so a
-// `/issues/<n>` tail and an `#<n>` citation both fall out of the carve-out.
-const REPO_KEY_TERMINATOR = "(?=[ \\t]*[,\\]]|[ \\t]+#|[ \\t]*$)";
+// `repository:` / `repositories:` has TWO forms, and they are SEPARATE grammars
+// on purpose:
+//   - a SCALAR `key: <org>/<repo>`, ending only at end of line, at a real
+//     comment, or at its own closing quote. A `,` and a `]` are NOT terminators
+//     here: with no `[` ever opened there is no sequence to close, so
+//     `repository: <org>/ops,#0` is trailing junk — an issue citation wearing a
+//     machine key as a hat — and a finding. One terminator set serving both
+//     forms excused exactly that.
+//   - a FLOW SEQUENCE `key: [<org>/<repo>, <org>/<repo>]` with PAIRED
+//     delimiters, in which EVERY entry must itself be a valid `<org>/<repo>`
+//     scalar (ANY_ORG_PATH_SOURCE, optionally quoted). The excused span is the
+//     WHOLE sequence, so every entry is excused rather than only the first —
+//     while an unclosed `[`, or junk in any entry, matches nothing and excuses
+//     nothing.
+const FLOW_OPEN = "\\[[ \\t]*";
+const FLOW_CLOSE = "[ \\t]*\\]";
+const FLOW_SEP = "[ \\t]*,[ \\t]*";
 // The clone URL terminates at `.git` PLUS a terminator. `<org>/<repo>.git` is a
 // remote; `<org>/<repo>.git/issues/0` is an issue citation with a remote's
 // spelling, and it is a finding.
+//
+// It is also ANCHORED ON THE LEFT, which is what makes it a clone reference
+// rather than a substring of one. A clone reference is either a FULL REMOTE
+// (`https://github.com/<org>/<repo>.git`, `git@github.com:<org>/<repo>.git`,
+// `ssh://git@github.com/<org>/<repo>.git`) or the BARE `<org>/<repo>.git`
+// standing on its own — at the start of the line, after whitespace, or after an
+// opening quote or bracket. Never after an `@`: `@<org>/<repo>.git` is an npm
+// scope, not a remote, and an unanchored pattern excused it by matching from the
+// org onward.
 const CLONE_TERMINATOR = "(?=$|[\\s,;)\\]\"'`])";
+const CLONE_REMOTE_PREFIX =
+  "(?:https:\\/\\/github\\.com\\/|git@github\\.com:|ssh:\\/\\/git@github\\.com\\/)";
+const CLONE_BARE_LEFT = "(?<![^\\s\"'`([{])";
 function escapeForRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+// Case-folded literal: `ops` becomes `[oO][pP][sS]`. Folding a LITERAL rather
+// than setting the `i` flag keeps the fold where it belongs — the org and the
+// repository name — and leaves the YAML key case-sensitive.
+function ciLiteral(s) { return String(s).replace(/[A-Za-z]/g, (c) => `[${c.toLowerCase()}${c.toUpperCase()}]`); }
+const ORG_CI = ciLiteral("cinatra-ai");
+function repoNameCi(name) { return ciLiteral(escapeForRegex(name)); }
+const FLOW_ENTRY = `(?:"${ANY_ORG_PATH_SOURCE}"|'${ANY_ORG_PATH_SOURCE}'|${ANY_ORG_PATH_SOURCE})`;
 function usesRefRe(name) {
-  const n = escapeForRegex(name);
+  const n = repoNameCi(name);
   return new RegExp(
-    `${YAML_KEY_PREFIX}uses:[ \\t]*(["']?)cinatra-ai\\/${n}(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?@${USES_REF_TOKEN}\\1${SCALAR_TERMINATOR}`,
+    `${YAML_KEY_PREFIX}uses:${KEY_VALUE_GAP}(["']?)${ORG_CI}\\/${n}(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?@${USES_REF_TOKEN}\\1${SCALAR_TERMINATOR}`,
     "g",
   );
 }
-function repositoryKeyRe(name) {
-  const n = escapeForRegex(name);
+function repositoryKeyScalarRe(name) {
+  const n = repoNameCi(name);
   return new RegExp(
-    `${YAML_KEY_PREFIX}repositor(?:y|ies):[ \\t]*\\[?[ \\t]*(["']?)cinatra-ai\\/${n}\\1${REPO_KEY_TERMINATOR}`,
+    `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}(["']?)${ORG_CI}\\/${n}\\1${SCALAR_TERMINATOR}`,
+    "g",
+  );
+}
+function repositoryKeyFlowRe(name) {
+  const n = repoNameCi(name);
+  return new RegExp(
+    `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}${FLOW_OPEN}`
+    + `(?:${FLOW_ENTRY}${FLOW_SEP})*(["']?)${ORG_CI}\\/${n}\\1`
+    + `(?:${FLOW_SEP}${FLOW_ENTRY})*${FLOW_CLOSE}${SCALAR_TERMINATOR}`,
     "g",
   );
 }
 function cloneUrlRe(name) {
-  const n = escapeForRegex(name);
-  return new RegExp(`cinatra-ai\\/${n}\\.git${CLONE_TERMINATOR}`, "g");
+  const n = repoNameCi(name);
+  return new RegExp(
+    `(?:${CLONE_REMOTE_PREFIX}|${CLONE_BARE_LEFT})${ORG_CI}\\/${n}\\.git${CLONE_TERMINATOR}`,
+    "g",
+  );
 }
 const FUNCTIONAL_REPO_REFS = [
   { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE },
-  { name: "ops", label: "checkout / token-scope key", re: repositoryKeyRe("ops") },
+  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops") },
+  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops") },
   { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
-  { name: "wp-theme", label: "checkout / token-scope key", re: repositoryKeyRe("wp-theme") },
+  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme") },
+  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme") },
 ];
-
-// GitHub's repository-name grammar, written ONCE and shared by everything that
-// has to decide "is this a repository name?": the tokenizer both scanning lanes
-// use, and the committed public-repos cache's entry validation. Two hand-kept
-// copies would drift, and a name the tokenizer nominates but the cache calls
-// invalid (or the reverse) is exactly the disagreement that produces a finding
-// in one lane and a different finding in the other.
-//
-// GitHub accepts 1..100 characters from `[A-Za-z0-9_.-]`, in ANY position: a
-// leading `_`, `.` or `-` is legal (`<org>/_shared`, `<org>/.github-private`,
-// `<org>/-secret`), and a grammar that demanded an alnum first silently dropped
-// every one of them. `.` and `..` are not names (they are path segments), and
-// the name may not END in a dot, so a sentence-final period ("… see
-// <org>/<repo>.") stays punctuation instead of being read into the name and
-// 404-ing as a repository that does not exist. `.git` is a clone-URL suffix, not
-// part of the name; normalizeRepoName() strips it once the tail below has
-// confirmed it really is a suffix and not the head of a longer name.
-//
-// The 100-character ceiling is load-bearing rather than cosmetic: a longer run
-// of name characters is not a repository, and accepting it would spend a probe
-// request on a string that can only 404 — a 404 the gate then has to report as a
-// fail-closed finding. That is why the name must END AT A BOUNDARY (see
-// REPO_TOKEN_TAIL): an over-long run produces no match at all, instead of a
-// 100-character prefix nominated as a repository that cannot exist.
-const REPO_NAME_MAX = 100;
-const REPO_NAME_SOURCE =
-  "(?!\\.{1,2}(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_-])?";
 
 // THE canonical token boundary — used by the tokenizer AND by every rule that
 // matches a FIXED repository name, so "where does this name end?" has one answer.
@@ -630,9 +700,18 @@ const PROBE_ORG = "cinatra-ai";
 // Canonical form of a repository name: case-folded (GitHub names are
 // case-insensitive) with a trailing `.git` removed, so the remote in a clone URL
 // resolves to the repository it clones rather than to a name that does not exist.
+//
+// The suffix comes off ONLY when what remains is itself a repository name. A
+// token whose whole name IS `.git` is not a clone URL of anything — stripping it
+// left an empty string, and an empty name is what both lanes drop as "not a
+// repository", so the reference was excluded without ever being probed. When the
+// remainder is not a name, the token is the name AS WRITTEN and is judged like
+// any other.
 function normalizeRepoName(name) {
   const n = String(name || "").toLowerCase();
-  return n.endsWith(".git") ? n.slice(0, -4) : n;
+  if (!n.endsWith(".git")) return n;
+  const base = n.slice(0, -4);
+  return isValidRepoName(base) ? base : n;
 }
 
 // THE repository-name predicate, anchored on the ONE grammar the tokenizer uses
@@ -717,11 +796,20 @@ function loadConfig(configPath) {
 // repository's own pull requests is checked out at a fixed sha, so a carve-out
 // the current engine no longer needs can still be required by that one. Such an
 // exemption is keyed to the pin that justifies it through
-// `exemptFileBasenamesExpiry`: the entry names a file in the SCANNED tree and
-// the sha that file's `uses: ...@<sha>` line pins today. While the file still
-// pins that sha the exemption is live and the gate says nothing; the moment the
-// pin moves the gate fails and names the pair to delete. The exemption cannot
-// outlive its reason, and nobody has to remember it.
+// `exemptFileBasenamesExpiry`: the entry names a file in the SCANNED tree, the
+// exact `uses:` TARGET inside it, and the sha that target is pinned to today.
+// While that target still carries that sha the exemption is live and the gate
+// says nothing; the moment the pin moves the gate fails and names the pair to
+// delete. The exemption cannot outlive its reason, and nobody has to remember it.
+//
+// The TARGET is what makes the check honest. Keyed to "some sha in the file",
+// the exemption survived the very edit it exists to catch: move the gate
+// reference to `@main` and leave an unrelated `actions/checkout@<sha>` in place,
+// and the file still carried the keyed sha, so the expiry stayed silent while
+// the pin it names was gone. The comparison is now against the ref of THAT
+// target and nothing else — any other `uses:` line in the file is irrelevant,
+// and a target that is missing, that appears twice with different refs, or that
+// is not pinned to a commit sha at all is a config error rather than a verdict.
 //
 // An expiry entry only ever time-boxes a LIVE exemption, so a basename listed
 // here but absent from exemptFileBasenames is a config error, as is an entry
@@ -735,21 +823,21 @@ function expiryFail(msg) {
   process.exit(1);
 }
 
-// Every `uses: <ref>@<sha>` pin in a workflow file, deduplicated. A file that
-// carries more than one DISTINCT sha cannot key an expiry (which sha would it
-// be?), so the caller rejects that rather than guessing.
+// Every `uses:` line in a workflow file, as `{ target, ref }` pairs in file
+// order: the target is what stands before the last `@` (the reusable-workflow
+// path or the action), the ref is what stands after it (empty when there is no
+// `@`). Pairs, not a bag of shas: an expiry is keyed to ONE target, and only
+// that target's ref may answer for it.
 function readUsesPins(text) {
-  const shas = new Set();
-  const unpinned = [];
+  const pins = [];
   for (const line of text.split("\n")) {
     const m = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)/);
     if (!m) continue;
-    const at = m[1].lastIndexOf("@");
-    const ref = at === -1 ? "" : m[1].slice(at + 1);
-    if (FULL_SHA_RE.test(ref)) shas.add(ref.toLowerCase());
-    else unpinned.push(m[1]);
+    const value = m[1].replace(/^["']/, "").replace(/["']$/, "");
+    const at = value.lastIndexOf("@");
+    pins.push({ target: at === -1 ? value : value.slice(0, at), ref: at === -1 ? "" : value.slice(at + 1) });
   }
-  return { shas: [...shas], unpinned };
+  return pins;
 }
 
 function enforceBasenameExpiries(config, exemptFiles, configPath) {
@@ -770,9 +858,11 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
     const pin = entry.untilPin;
     if (!pin || typeof pin !== "object" || Array.isArray(pin)
       || typeof pin.file !== "string" || !pin.file.trim()
+      || typeof pin.uses !== "string" || !pin.uses.trim()
       || typeof pin.sha !== "string" || !FULL_SHA_RE.test(pin.sha)) {
       expiryFail(`config error: ${where}['${basename}'].untilPin must be `
-        + "{ file: <path in the scanned repository>, sha: <40-character commit sha> }");
+        + "{ file: <path in the scanned repository>, uses: <the `uses:` target that file pins>, "
+        + "sha: <40-character commit sha> }");
     }
     let text;
     try { text = fs.readFileSync(pin.file, "utf8"); }
@@ -780,19 +870,28 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
       expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
         + "which is not readable in the scanned repository — an exemption whose expiry cannot be checked does not stay in force");
     }
-    const { shas, unpinned } = readUsesPins(text);
-    if (shas.length === 0) {
-      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
-        + `which carries no \`uses: <ref>@<sha>\` line pinning a commit sha${unpinned.length ? ` (unpinned: ${unpinned.join(", ")})` : ""}`);
+    // ONLY the keyed target answers. Every other `uses:` line in the file — an
+    // action the job happens to pin, a second reusable workflow — is irrelevant
+    // to this exemption, and letting one of them supply the sha is exactly how
+    // an expiry outlives the pin it names.
+    const forTarget = readUsesPins(text).filter((u) => u.target === pin.uses);
+    if (forTarget.length === 0) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
+        + "which carries no such `uses:` line — an exemption whose pin cannot be found does not stay in force");
     }
-    if (shas.length > 1) {
-      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
-        + `which pins ${shas.length} different shas (${shas.join(", ")}) — key the exemption to a file with a single pin`);
+    const refs = [...new Set(forTarget.map((u) => u.ref.toLowerCase()))];
+    if (refs.length > 1) {
+      expiryFail(`config error: ${pin.file} pins \`${pin.uses}\` at ${refs.length} different refs `
+        + `(${refs.join(", ")}) — the '${basename}' exemption cannot be keyed to an ambiguous target`);
     }
-    const pinned = shas[0];
+    const pinned = refs[0];
+    if (!FULL_SHA_RE.test(pinned)) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
+        + `which is not pinned to a commit sha (it references ${pinned ? `\`${pinned}\`` : "no ref at all"})`);
+    }
     if (pinned === pin.sha.toLowerCase()) continue; // live: the reason still holds
-    expiryFail(`the '${basename}' file-basename exemption has EXPIRED: ${pin.file} now pins ${pinned}, `
-      + `not ${pin.sha.toLowerCase()}, the sha the exemption was keyed to. `
+    expiryFail(`the '${basename}' file-basename exemption has EXPIRED: ${pin.file} now pins `
+      + `\`${pin.uses}\` at ${pinned}, not ${pin.sha.toLowerCase()}, the sha the exemption was keyed to. `
       + `Delete "${basename}" from exemptFileBasenames AND its exemptFileBasenamesExpiry entry `
       + "in the same change that moved the pin.");
   }

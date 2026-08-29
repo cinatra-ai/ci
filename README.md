@@ -264,12 +264,21 @@ carve-out applies only where:
   an optional `- ` sequence marker. A `#` anywhere before it makes the line a
   comment, and a comment is prose *about* a machine form: `# uses: <org>/<repo>@main`
   and `see uses: <org>/<repo>@main in the old job` are findings;
+- **the key is separated from its value by real whitespace** — YAML requires a
+  space (or tab) after a mapping key, so `uses:<org>/<repo>@main` and
+  `repository:<org>/<repo>` are not scalars at all, no runner accepts them, and
+  they are findings;
 - **the scalar is complete** — after the value only end of line or a real YAML
   comment (whitespace, then `#`) may follow. Trailing junk, a `/issues/1` tail
   and a comment-less `#1` all leave the carve-out. Quotes must match: an opening
   `"` or `'` has to close the scalar. The terminator is a lookahead, so the
   excused span stops at the value — a citation inside the trailing comment still
   flags.
+
+Owner and repository **names fold case** — GitHub resolves them
+case-insensitively, so `uses: <Org>/<Repo>@main` is the same dispatch as the
+lower-case spelling and is excused with it. The **key** does not fold: `uses:`
+is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
 
 - `uses:` matches only the grammar GitHub accepts for a cross-repository step,
   `<org>/<repo>[/<path>]@<ref>` — `<path>` a reusable-workflow file under
@@ -280,14 +289,23 @@ carve-out applies only where:
   knows the file path — a repository walk always does — a `uses:` step is
   excused only in `.github/workflows/*.yml|.yaml` or an `action.yml|.yaml`,
   because that is the only place one can run.
-- `repository:` / `repositories:` matches exactly `<org>/<repo>` as the complete
-  scalar under the same terminator rule, plus the `,`/`]` of a flow sequence — so
-  `repository: <org>/<repo>/issues/1` and `repository: <org>/<repo>#1` are
-  findings, not machine forms.
+- `repository:` / `repositories:` has **two separate grammars**. The SCALAR form
+  is exactly `<org>/<repo>` under the terminator rule above — end of line, a real
+  comment, or its own closing quote. A `,` or `]` ends nothing there, because
+  nothing was opened: `repository: <org>/<repo>,#1`, `repository: <org>/<repo>/issues/1`
+  and `repository: <org>/<repo>#1` are findings, not machine forms. The FLOW
+  SEQUENCE form is `key: [<org>/<repo>, <org>/<repo>]` with **paired**
+  delimiters, in which every entry must itself be a valid `<org>/<repo>` scalar
+  (optionally quoted); the excused span is the whole sequence, so *every* entry
+  is excused, while an unclosed `[` — or junk in any entry — excuses nothing.
 - the **clone URL** terminates at `.git` plus a terminator (end of line,
   whitespace, a quote, `,`, `;`, `)`), so `<org>/<repo>.git` is a remote while
   `<org>/<repo>.git/issues/1` is a citation wearing a remote's spelling — and a
-  finding.
+  finding. It is anchored on the left as well: a clone reference is a full remote
+  (`https://github.com/<org>/<repo>.git`, `git@github.com:<org>/<repo>.git`,
+  `ssh://git@github.com/<org>/<repo>.git`) or a bare `<org>/<repo>.git` at the
+  start of a line, after whitespace, or after an opening quote or bracket —
+  never after an `@`, because `@<org>/<repo>.git` is an npm scope, not a remote.
 
 ### Per-repo config
 
@@ -308,7 +326,8 @@ engine lacks a fix is a debt, not a rule — and an undated debt is never paid.
   "some-fixture.txt": {
     "untilPin": {
       "file": ".github/workflows/my-caller.yml",
-      "sha": "<the 40-character commit sha that file pins today>"
+      "uses": "<org>/<repo>/.github/workflows/<workflow>.yml",
+      "sha": "<the 40-character commit sha that target is pinned to today>"
     },
     "why": "one sentence: what the pinned engine cannot do yet"
   }
@@ -316,15 +335,23 @@ engine lacks a fix is a debt, not a rule — and an undated debt is never paid.
 ```
 
 Before every scan the gate reads `untilPin.file` out of the **scanned** tree and
-takes the sha its `uses: <ref>@<sha>` line pins. Same sha, and the exemption is
-live and the gate says nothing about it. A different sha, and the exemption has
-EXPIRED: the run exits 1 and names the basename, the file, both shas, and the
-fix — **the pull request that moves the pin deletes the basename and its expiry
-entry in the same change.** A basename listed in the map but not in
-`exemptFileBasenames`, an entry of the wrong shape, a pin file that cannot be
-read, and a pin file carrying no single `uses: <ref>@<sha>` commit sha are all
-config errors (exit 1): an exemption whose expiry cannot be evaluated must never
-stay quietly in force.
+takes the ref of the one `uses:` line whose target is `untilPin.uses`. Same sha,
+and the exemption is live and the gate says nothing about it. A different sha,
+and the exemption has EXPIRED: the run exits 1 and names the basename, the file,
+the target, both shas, and the fix — **the pull request that moves the pin
+deletes the basename and its expiry entry in the same change.**
+
+`untilPin.uses` is what binds the expiry to the reference it is actually about.
+Keyed to "some sha in the file", an exemption survived the very edit it exists to
+catch — move the gate reference to `@main`, leave an unrelated
+`actions/checkout@<sha>` in place, and the keyed sha was still "in the file".
+Only the named target answers now; every other `uses:` line is irrelevant, in
+either direction. A basename listed in the map but not in `exemptFileBasenames`,
+an entry of the wrong shape (a missing `file`, `uses` or 40-character `sha`), a
+pin file that cannot be read, a named target that is absent, that appears twice
+with different refs, or that is not pinned to a commit sha are all config errors
+(exit 1): an exemption whose expiry cannot be evaluated must never stay quietly
+in force.
 
 ### Run locally
 

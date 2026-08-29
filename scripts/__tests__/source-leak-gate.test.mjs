@@ -667,10 +667,13 @@ test("a FIXTURE basename exemption exists only while a pin-keyed expiry justifie
   }
   const entry = expiry["source-leak.fixture.txt"];
   assert.ok(entry && entry.untilPin, "the fixture exemption must be keyed to a pin, never open-ended");
+  assert.ok(entry.untilPin.uses, "the pin must name the exact `uses:` target, never just the file");
   const pinFile = path.join(import.meta.dirname, "..", "..", entry.untilPin.file);
-  const { shas } = readUsesPins(fs.readFileSync(pinFile, "utf8"));
-  assert.deepEqual(shas, [String(entry.untilPin.sha).toLowerCase()],
-    `${entry.untilPin.file} no longer pins the sha the exemption is keyed to — delete the basename AND the expiry entry`);
+  const refs = readUsesPins(fs.readFileSync(pinFile, "utf8"))
+    .filter((u) => u.target === entry.untilPin.uses)
+    .map((u) => u.ref.toLowerCase());
+  assert.deepEqual(refs, [String(entry.untilPin.sha).toLowerCase()],
+    `${entry.untilPin.file} no longer pins ${entry.untilPin.uses} at the sha the exemption is keyed to — delete the basename AND the expiry entry`);
 });
 
 test("the committed public-repos cache parses and holds only confirmed-public names", () => {
@@ -1289,8 +1292,9 @@ function expiryTree(files) {
   }
   return dir;
 }
-function workflowPinning(sha) {
-  return `name: caller\njobs:\n  gate:\n    uses: some-org/ci/.github/workflows/gate.yml@${sha} # v0.0.0\n`;
+const PIN_TARGET = "some-org/ci/.github/workflows/gate.yml";
+function workflowPinning(ref) {
+  return `name: caller\njobs:\n  gate:\n    uses: ${PIN_TARGET}@${ref} # v0.0.0\n`;
 }
 // One tree, one knob: `notes.txt` carries a marker, and the config exempts it by
 // basename under an expiry keyed to `.github/workflows/caller.yml`.
@@ -1314,7 +1318,7 @@ function runExpiryGate(dir) {
 const liveConfig = {
   exemptFileBasenames: ["notes.txt"],
   exemptFileBasenamesExpiry: {
-    "notes.txt": { untilPin: { file: ".github/workflows/caller.yml", sha: PIN_A }, why: "keyed to the pinned engine" },
+    "notes.txt": { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET, sha: PIN_A }, why: "keyed to the pinned engine" },
   },
 };
 
@@ -1342,6 +1346,7 @@ test("expiry: a moved pin EXPIRES the exemption — exit 1 naming both shas and 
     assert.match(r.err, /EXPIRED/);
     assert.match(r.err, /notes\.txt/);
     assert.match(r.err, /\.github\/workflows\/caller\.yml/);
+    assert.ok(r.err.includes(PIN_TARGET), "the message must name the `uses:` target the exemption is keyed to");
     assert.ok(r.err.includes(PIN_B), "the message must name the sha the file pins NOW");
     assert.ok(r.err.includes(PIN_A), "the message must name the sha the exemption was keyed to");
     assert.match(r.err, /exemptFileBasenames AND its exemptFileBasenamesExpiry entry/);
@@ -1359,25 +1364,70 @@ test("expiry: an unreadable pin file is a config error, never a silent exemption
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("expiry: a pin file with no `uses: <ref>@<sha>` line is a config error", () => {
+test("expiry: the KEYED TARGET being unpinned is a config error, whatever other lines pin", () => {
+  // The defect this locks: the check accepted ANY sha anywhere in the pin file,
+  // so moving the gate reference to `@main` while an unrelated
+  // `actions/checkout@<sha>` stayed put left the exemption silently alive.
   const dir = expiryCase({ config: liveConfig });
   try {
-    fs.writeFileSync(path.join(dir, ".github/workflows/caller.yml"), "name: caller\njobs:\n  gate:\n    uses: some-org/ci/.github/workflows/gate.yml@main\n");
+    fs.writeFileSync(
+      path.join(dir, ".github/workflows/caller.yml"),
+      `name: caller\njobs:\n  gate:\n    uses: ${PIN_TARGET}@main\n    steps:\n      - uses: actions/checkout@${PIN_A}\n`,
+    );
     const r = runExpiryGate(dir);
-    assert.equal(r.status, 1);
+    assert.equal(r.status, 1, "an unpinned target is a config error even though another line carries the keyed sha");
     assert.match(r.err, /config error/);
-    assert.match(r.err, /no `uses: <ref>@<sha>` line/);
+    assert.match(r.err, /not pinned to a commit sha/);
+    assert.ok(r.err.includes(PIN_TARGET), "the message names the target that is not pinned");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("expiry: a file pinning several different shas cannot key an exemption", () => {
+test("expiry: an unrelated line's sha never answers for the keyed target", () => {
+  // Same shape, one step further: the keyed target is pinned to a DIFFERENT sha
+  // while an unrelated action carries the keyed one. The verdict must be EXPIRED,
+  // read off the target alone.
+  const dir = expiryCase({ pinnedSha: PIN_B, config: liveConfig });
+  try {
+    fs.appendFileSync(path.join(dir, ".github/workflows/caller.yml"), `    steps:\n      - uses: actions/checkout@${PIN_A}\n`);
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /EXPIRED/);
+    assert.ok(r.err.includes(PIN_B), "the target's own ref is the one compared");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: another action pinned to another sha does not disturb a LIVE exemption", () => {
   const dir = expiryCase({ config: liveConfig });
   try {
     fs.appendFileSync(path.join(dir, ".github/workflows/caller.yml"), `    steps:\n      - uses: actions/checkout@${PIN_B}\n`);
     const r = runExpiryGate(dir);
+    assert.equal(r.status, 0, `an unrelated pin is irrelevant, got ${r.status}: ${r.err}`);
+    assert.equal(/EXPIRED|config error/.test(r.err), false, r.err);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a MISSING target is a config error, even when the file pins the keyed sha elsewhere", () => {
+  const dir = expiryCase({ config: liveConfig });
+  try {
+    fs.writeFileSync(
+      path.join(dir, ".github/workflows/caller.yml"),
+      `name: caller\njobs:\n  gate:\n    steps:\n      - uses: actions/checkout@${PIN_A}\n`,
+    );
+    const r = runExpiryGate(dir);
     assert.equal(r.status, 1);
     assert.match(r.err, /config error/);
-    assert.match(r.err, /different shas/);
+    assert.match(r.err, /carries no such `uses:` line/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: the keyed target pinned twice at DIFFERENT refs cannot key an exemption", () => {
+  const dir = expiryCase({ config: liveConfig });
+  try {
+    fs.appendFileSync(path.join(dir, ".github/workflows/caller.yml"), `  gate2:\n    uses: ${PIN_TARGET}@${PIN_B}\n`);
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /different refs/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1385,9 +1435,10 @@ test("expiry: a malformed entry is a config error, named", () => {
   for (const [label, entry] of [
     ["no untilPin", { why: "x" }],
     ["untilPin is a string", { untilPin: ".github/workflows/caller.yml" }],
-    ["no sha", { untilPin: { file: ".github/workflows/caller.yml" } }],
-    ["sha is a branch", { untilPin: { file: ".github/workflows/caller.yml", sha: "main" } }],
-    ["no file", { untilPin: { sha: PIN_A } }],
+    ["no sha", { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET } }],
+    ["sha is a branch", { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET, sha: "main" } }],
+    ["no file", { untilPin: { uses: PIN_TARGET, sha: PIN_A } }],
+    ["no uses target", { untilPin: { file: ".github/workflows/caller.yml", sha: PIN_A } }],
   ]) {
     const dir = expiryCase({ config: { exemptFileBasenames: ["notes.txt"], exemptFileBasenamesExpiry: { "notes.txt": entry } } });
     try {
@@ -1419,12 +1470,20 @@ test("expiry: the expiry map itself must be an object", () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("readUsesPins: deduplicates identical pins and reports refs that are not commit shas", () => {
-  const { shas, unpinned } = readUsesPins(
-    `jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    steps:\n      - uses: o/a@${PIN_A}\n      - uses: o/b@v4\n`,
+test("readUsesPins: returns every `uses:` line as a { target, ref } pair, in file order", () => {
+  // It reports PAIRS, not a deduplicated bag of shas: an expiry is keyed to one
+  // target, and only that target's ref may answer for it — so a caller must be
+  // able to tell WHICH line carried which ref.
+  const pins = readUsesPins(
+    `jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    steps:\n      - uses: o/a@${PIN_A}\n      - uses: o/b@v4\n      - uses: o/c\n      - uses: "o/d@${PIN_B}"\n`,
   );
-  assert.deepEqual(shas, [PIN_A]);
-  assert.deepEqual(unpinned, ["o/b@v4"]);
+  assert.deepEqual(pins, [
+    { target: "o/r/.github/workflows/w.yml", ref: PIN_A },
+    { target: "o/a", ref: PIN_A },
+    { target: "o/b", ref: "v4" },
+    { target: "o/c", ref: "" },
+    { target: "o/d", ref: PIN_B },
+  ]);
 });
 
 // --------------------------------------------------------------------------
@@ -1474,6 +1533,115 @@ test("a carve-out scalar must be COMPLETE: trailing junk leaves the exemption", 
   assert.equal(matchRule(rule, "uses: cinatra-ai/ops@main  # pinned by the release job"), 0);
   assert.equal(matchRule(rule, "repository: cinatra-ai/ops  # the operations repository"), 0);
   assert.equal(matchRule(rule, "uses: cinatra-ai/ops@main  # see cinatra-ai/ops#0"), 1);
+});
+
+test("a carve-out key is SEPARATED from its value by real whitespace", () => {
+  // The defect this locks: the key/value gap was `[ \t]*`, so `uses:<org>/<repo>@main`
+  // — which is not a YAML scalar at all, and which no runner accepts — was
+  // excused as a machine form.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "uses:cinatra-ai/ops@main",
+    "  - uses:cinatra-ai/ops/.github/workflows/deploy.yml@main",
+    "repository:cinatra-ai/ops",
+    "repositories:[cinatra-ai/wp-theme]",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `no space after the key is not a scalar: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    "uses: cinatra-ai/ops@main",
+    "  - uses:\tcinatra-ai/ops@main",
+    "repository: cinatra-ai/ops",
+    "  repositories: [cinatra-ai/wp-theme]",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `the spaced form is the machine form: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the SCALAR and FLOW-SEQUENCE checkout forms are separate grammars", () => {
+  // The defect this locks: one terminator set served both forms, so `,` and `]`
+  // ended a scalar that had never opened a sequence — and trailing junk after a
+  // comma was excused. The sequence form now needs PAIRED delimiters, and it
+  // validates EVERY entry, not just the first.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "repository: cinatra-ai/ops,#0",                     // nothing was opened: this is a citation
+    "repository: cinatra-ai/ops, and then some",
+    "repository: cinatra-ai/ops]",
+    "repositories: [cinatra-ai/wp-theme",                // unclosed
+    "repositories: [cinatra-ai/wp-theme, junk]",         // an entry that is not `<org>/<repo>`
+    "repositories: cinatra-ai/wp-theme]",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `not a paired, fully validated sequence: ${JSON.stringify(line)}`);
+  }
+  // A real flow sequence excuses EVERY entry, in either quoting, with any owner
+  // in the other entries, under the same trailing-comment rule.
+  for (const line of [
+    "repositories: [cinatra-ai/wp-theme, cinatra-ai/wp-theme]",
+    'repositories: ["cinatra-ai/wp-theme", cinatra-ai/ops]',
+    "  repositories: [ other-org/public, cinatra-ai/wp-theme ]  # both checkouts",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `every entry of a real sequence is excused: ${JSON.stringify(line)}`);
+  }
+});
+
+test("owner and repository names fold CASE, the YAML key does not", () => {
+  // GitHub resolves owner/repository names case-insensitively, so
+  // `uses: Cinatra-AI/Ops@main` is the same dispatch as the lower-case spelling:
+  // refusing it refused correct input.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "uses: Cinatra-AI/Ops@main",
+    "uses: cinatra-ai/OPS/.github/workflows/deploy.yml@main",
+    "repository: CINATRA-AI/OPS",
+    "  repositories: [Cinatra-AI/WP-Theme]",
+    'REMOTE="https://github.com/Cinatra-AI/WP-Theme.git"',
+    "git clone git@github.com:CINATRA-AI/wp-theme.git",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a correct dispatch in another case is still a dispatch: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    "see Cinatra-AI/Ops#0 for the rationale",
+    "the CINATRA-AI/WP-Theme staging remote",
+    "Uses: cinatra-ai/ops@main",                          // the KEY is case-sensitive: this is prose
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `case never excuses a non-machine form: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the clone carve-out is ANCHORED on the left: an npm scope is not a remote", () => {
+  // The defect this locks: the clone pattern was unanchored, so it matched from
+  // the org onward inside `@<org>/<repo>.git` — the npm-scoped spelling — and
+  // excused it as a clone URL.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    'import x from "@cinatra-ai/wp-theme.git";',
+    "@cinatra-ai/wp-theme.git",
+    "see x@cinatra-ai/wp-theme.git",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `an \`@\` before the org is not a clone reference: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    // the three full remotes…
+    "git clone https://github.com/cinatra-ai/wp-theme.git",
+    "git clone git@github.com:cinatra-ai/wp-theme.git",
+    "git clone ssh://git@github.com/cinatra-ai/wp-theme.git",
+    'REMOTE="https://github.com/cinatra-ai/wp-theme.git"',
+    // …and the bare form standing on its own.
+    "cinatra-ai/wp-theme.git",
+    "gh repo clone cinatra-ai/wp-theme.git",
+    '"cinatra-ai/wp-theme.git"',
+    "[cinatra-ai/wp-theme.git]",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a clone remote is excused: ${JSON.stringify(line)}`);
+  }
+  // …and the citations wearing a remote's spelling are unchanged.
+  for (const line of [
+    "https://github.com/cinatra-ai/wp-theme.git/issues/0",
+    "git@github.com:cinatra-ai/ops.git",                  // no clone carve-out for this name
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `still a finding: ${JSON.stringify(line)}`);
+  }
 });
 
 test("a `uses:` ref may contain slashes (branch names do), but never whitespace, `@` or `#`", () => {
@@ -1594,6 +1762,42 @@ test("a `.git` clone suffix names the SAME repository, in every lane", () => {
   }
 });
 
+test("a token of nothing but dots is not a repository name, and is never nominated", () => {
+  // GitHub rejects `.`, `..` and every longer run. The guard used to stop at two
+  // dots, so an ellipsis (`<org>/...`) was nominated as the repository `.` and
+  // spent a probe request on a name that can only 404.
+  for (const name of [".", "..", "...", "....."]) {
+    assert.equal(isValidRepoName(name), false, `${JSON.stringify(name)} is not a name`);
+  }
+  assert.equal(isValidRepoName(".github-private"), true);
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  const nameOf = (line) => {
+    const m = new RegExp(probe.re.source, probe.re.flags).exec(line);
+    return m ? m[0].split("/")[1] : null;
+  };
+  for (const line of ["see cinatra-ai/... for the rest", "see cinatra-ai/.. here", "see cinatra-ai/. here"]) {
+    assert.equal(nameOf(line), null, `nothing to nominate in ${JSON.stringify(line)}`);
+    assert.equal(matchRule(probe, line), 0, `and no candidate: ${JSON.stringify(line)}`);
+  }
+  assert.equal(nameOf("see cinatra-ai/.github-private here"), ".github-private", "a leading dot is still a name");
+});
+
+test("`<org>/.git` is a NAME, not an empty clone suffix — it is nominated and probed", async () => {
+  // The defect this locks: `.git` is a valid name under the grammar, but
+  // normalisation stripped the suffix to an EMPTY base, and both lanes drop an
+  // empty name — so the reference was excluded without ever being asked about.
+  assert.equal(normalizeRepoName(".git"), ".git", "stripping would leave no name at all");
+  assert.equal(normalizeRepoName("ops.git"), "ops", "a real clone suffix still comes off");
+  assert.equal(orgPathRepoName("cinatra-ai/.git"), ".git");
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  assert.equal(matchRule(probe, "see cinatra-ai/.git here"), 1, "it is nominated like any other name");
+  const calls = stubFetch(() => apiResponse(404, { message: "Not Found" }));
+  const out = await resolveProbeFindings([candidate(".git")], probeCtx());
+  assert.equal(calls.length, 1, "the name is actually asked about");
+  assert.equal(out.length, 1, "and a 404 is a finding");
+  assert.equal(out[0].rule, PROBE_RULE_ID);
+});
+
 // --------------------------------------------------------------------------
 // A numeric issue reference must TERMINATE.
 // --------------------------------------------------------------------------
@@ -1654,6 +1858,14 @@ test("aggregate: every active rule over one corpus agrees on the count", () => {
     // Terminated issue references.
     ["the eng#0abc digest is not an issue", 0],
     ["rationale in eng#0 here", 1],
+    // The machine grammars, exactly: the gap, the paired sequence, the case
+    // fold, and the anchored clone form.
+    ["uses:cinatra-ai/ops@main", 1],
+    ["repository: cinatra-ai/ops,#0", 1],
+    ["  repositories: [cinatra-ai/wp-theme, cinatra-ai/wp-theme]", 0],
+    ["uses: Cinatra-AI/Ops@main", 0],
+    ['import x from "@cinatra-ai/wp-theme.git";', 1],
+    ["see cinatra-ai/... for the rest", 0],
   ];
   for (const [line, expected] of corpus) {
     assert.equal(total(line), expected, `${expected} finding(s) expected for ${JSON.stringify(line)}`);
