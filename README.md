@@ -283,14 +283,24 @@ carve-out applies only where:
   `"` or `'` has to close the scalar. The terminator is a lookahead, so the
   excused span stops at the value — a citation inside the trailing comment still
   flags;
-- **the line is not inside a YAML block scalar** — a mapping whose value is a
-  block-scalar header (`|`, `|-`, `|+`, `>`, `>-`, `>+`, with YAML's optional
-  indentation indicator) opens a block that runs while lines are blank or
-  indented deeper than the key, and **no line inside such a block is ever
-  excused**: it is shell or prose the runner never reads as YAML, so a heredoc
-  line spelling `uses: <org>/<repo>@main` inside a `run: |` step is a finding.
-  The first line indented back to the key ends the block and is judged normally,
-  so a real `uses:` mapping after it is excused as before.
+- **the line is not inside a YAML block scalar** — a block-scalar header (`|`,
+  `|-`, `|+`, `>`, `>-`, `>+`, with YAML's optional indentation indicator) opens
+  a block wherever it stands: as a mapping value (`run: |`, and `run:x: |`,
+  whose key carries a colon of its own), as a sequence item (`- |`, `- - |`), or
+  as a bare indicator opening a document scalar — and the block runs while lines
+  are blank or indented deeper than the **opening line's first non-blank column**
+  (the dash for `- |`). **No line inside such a block is ever excused**: it is
+  shell or prose the runner never reads as YAML, so a heredoc line spelling
+  `uses: <org>/<repo>@main` inside a `run: |` step is a finding. The first line
+  indented back to that column ends the block and is judged normally, so a real
+  `uses:` mapping after it is excused as before;
+- **the line is not inside a multi-line quoted scalar** — a mapping value or
+  sequence item that opens with `"` or `'` and does not close on the same line
+  (counting `\"` escapes inside double quotes and `''` inside single quotes) is
+  ONE string value, so every line up to **and including** the one that closes it
+  is text and none of it is excused: `description: "` followed by
+  `  repository: <org>/<repo>` is a finding, while a quote that closes on its own
+  line changes nothing.
 
 Owner and repository **names fold case** — GitHub resolves them
 case-insensitively, so `uses: <Org>/<Repo>@main` is the same dispatch as the
@@ -370,7 +380,12 @@ engine lacks a fix is a debt, not a rule — and an undated debt is never paid.
 `untilPin.file` names the **caller workflow that actually runs**, and only that:
 it must be a repository-relative `.github/workflows/<file>.yml|.yaml` path (no
 `..`, no absolute segments), must be **tracked** in the scanned tree, and must
-not be a symlink. Any other readable file — a `README.md`, a path climbing out of
+not be a symlink. It must also name **one literal file**: a value carrying a
+pathspec pattern character (`*`, `?`, `[`, `\`) or a leading `-` is a config
+error before git is asked anything, and "tracked" means git — asked with
+`--literal-pathspecs` — lists exactly that path and nothing else, so an
+untracked file literally named `.github/workflows/*.yml` can no longer pass on
+the strength of some other workflow the glob would have matched. Any other readable file — a `README.md`, a path climbing out of
 the tree, a link — could carry the keyed target at the keyed sha long after the
 real caller moved, so each of those is a config error rather than a verdict.
 
@@ -382,8 +397,9 @@ the target, both shas, and the fix — **the pull request that moves the pin
 deletes the basename and its expiry entry in the same change.**
 
 The pin line is read with the very same `uses:` scalar grammar the carve-out
-above uses — block scalars included, so a `uses:` inside a `run: |` block is not
-a pin either — and a line that does not parse — no whitespace after the key, an
+above uses — block scalars and multi-line quoted scalars included, so a `uses:`
+inside a `run: |` block, or inside a quoted value that runs over several lines,
+is not a pin either — and a line that does not parse — no whitespace after the key, an
 unmatched quote, a trailing tail — is not a pin at all: replacing a real gate
 call with text no runner accepts makes the keyed target *missing* (a config
 error) instead of leaving the exemption it justifies quietly alive.

@@ -12,7 +12,7 @@ import {
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins, canonicalUsesTarget,
+  readUsesPins, canonicalUsesTarget, isTrackedInScannedTree,
 } from "../source-leak-gate.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
@@ -1686,6 +1686,52 @@ test("expiry: an UNTRACKED workflow is a config error — it is not the caller t
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("expiry: untilPin.file may not be a PATHSPEC PATTERN — a literal `*.yml` is not the caller", () => {
+  // The defect this locks: `git ls-files --error-unmatch -- <file>` reads its
+  // argument as a PATHSPEC, so an untracked file literally named
+  // `.github/workflows/*.yml` was reported "tracked" on the strength of some
+  // other workflow matching the glob, and the exemption stayed live keyed to a
+  // file nothing runs. A pattern is now refused before git is asked at all, and
+  // the tracked check itself asks git with `--literal-pathspecs` and compares the
+  // answer byte-for-byte with the path it asked about.
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml": workflowPinning(PIN_A),
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/*.yml"), null, 1),
+  });
+  try {
+    // The literal wildcard file EXISTS and carries the keyed pin — and is untracked.
+    fs.writeFileSync(path.join(dir, ".github/workflows/*.yml"), workflowPinning(PIN_A));
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, "a pattern is not the caller workflow, whatever it matches");
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /must name ONE file/);
+    // Not vacuous: the real tracked workflow in the SAME tree keys a live exemption.
+    fs.writeFileSync(path.join(dir, "config/gate.json"),
+      JSON.stringify(expiryConfigFor(".github/workflows/caller.yml"), null, 1));
+    const ok = runExpiryGate(dir);
+    assert.equal(ok.status, 0, `the tracked caller keys a live exemption: ${ok.err}`);
+    assert.equal(/EXPIRED|config error/.test(ok.err), false, ok.err);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("isTrackedInScannedTree answers about the PATH, not about what a pathspec matches", () => {
+  // The engine-level half of the same defect: git must be asked with
+  // `--literal-pathspecs`, and its answer must BE the path that was asked about.
+  const dir = expiryTree({
+    ".github/workflows/real.yml": workflowPinning(PIN_A),
+  });
+  const cwd0 = process.cwd();
+  try {
+    fs.writeFileSync(path.join(dir, ".github/workflows/*.yml"), workflowPinning(PIN_A));
+    process.chdir(dir);
+    assert.equal(isTrackedInScannedTree(".github/workflows/real.yml"), true);
+    assert.equal(isTrackedInScannedTree(".github/workflows/*.yml"), false,
+      "an untracked literal file is untracked, even though the glob would match a tracked one");
+    assert.equal(isTrackedInScannedTree(".github/workflows/absent.yml"), false);
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("expiry: a `uses:` inside a block scalar is NOT the pin", () => {
   // Same rule as the carve-out: a `uses:` line inside a `run: |` block is shell
   // text no runner dispatches, so it cannot answer for a keyed target.
@@ -2182,6 +2228,145 @@ test("a YAML block scalar is TEXT: no carve-out excuses a line inside it", () =>
     assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
     assert.deepEqual(found.map((f) => f.line), expected,
       "only the block-scalar lines flag — the `with: repository:` mapping and the real `uses:` step stay excused");
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a block scalar opens on a sequence item, a colon-carrying key and a bare `|`", () => {
+  // The defect this locks: the opener was recognised only as a `key: |` mapping,
+  // so a sequence-item block (`- |`), a key that itself carries a colon
+  // (`run:x: |`) and a bare document indicator left their bodies to be judged as
+  // MAPPINGS — excused by the carve-out in the one file class where it is widest.
+  const wf = [
+    "name: deploy",
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - name: write the payloads",
+    "        payloads:",
+    "          - |",
+    "            repository: cinatra-ai/ops",   // 8: sequence-item block text
+    "            uses: cinatra-ai/ops@main",    // 9: sequence-item block text
+    "        with:",
+    "          repository: cinatra-ai/ops",     // 11: a real mapping again: excused
+    "      - run:x: |",
+    "          uses: cinatra-ai/ops@main",      // 13: a colon-carrying key opens too
+    "      - run: |",
+    "          uses: cinatra-ai/ops@main",      // 15: the plain `key: |` still works
+    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 16: excused
+    "",
+  ];
+  const expected = [8, 9, 13, 15];
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-block2-")));
+  const cwd0 = process.cwd();
+  try {
+    process.chdir(dir);
+    fs.mkdirSync(".github/workflows", { recursive: true });
+    fs.writeFileSync(".github/workflows/deploy.yml", wf.join("\n"));
+    const found = scanFile(".github/workflows/deploy.yml", active);
+    assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
+    assert.deepEqual(found.map((f) => f.line), expected,
+      "every block body is text; the `with:` mapping and the real `uses:` step stay excused");
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+  // The same lines are not PINS either — the expiry reader shares this context.
+  assert.deepEqual(
+    readUsesPins(wf.join("\n")),
+    [{ target: "cinatra-ai/ops/.github/workflows/deploy.yml", ref: "main" }],
+    "only the real step is a pin: a `uses:` inside any block scalar is text",
+  );
+});
+
+test("a bare `|` opens a top-level document scalar", () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-docscalar-")));
+  const cwd0 = process.cwd();
+  const idsFor = (body) => { fs.writeFileSync("doc.yml", body); return scanFile("doc.yml", active).map((f) => f.rule); };
+  try {
+    process.chdir(dir);
+    assert.deepEqual(idsFor("|\n  repository: cinatra-ai/ops\n"), ["SLG_PRIVATE_REPO_REF"],
+      "a document-level block scalar is text, so the key inside it excuses nothing");
+    // Not vacuous: the very same line, as a real mapping, is excused.
+    assert.deepEqual(idsFor("  repository: cinatra-ai/ops\n"), []);
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a block-scalar header survives a trailing COMMENT that carries a `: |`", () => {
+  // A `#` opens a comment, so a `: ` standing inside it is not the header's
+  // separator. Reading only the LAST `: ` on the line and stopping there left
+  // `run: | # writes: |` looking like a plain mapping, and handed its whole body
+  // back to the carve-out — in the file class where the carve-out is widest.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-blockcomment-")));
+  const cwd0 = process.cwd();
+  const idsFor = (body) => { fs.writeFileSync("doc.yml", body); return scanFile("doc.yml", active).map((f) => f.rule); };
+  try {
+    process.chdir(dir);
+    for (const header of ["run: | # writes: |", "run: >-  # folds: >", "run: | # note: this"]) {
+      assert.deepEqual(idsFor(`${header}\n  repository: cinatra-ai/ops\n`), ["SLG_PRIVATE_REPO_REF"],
+        `the comment is a comment: the block still opens: ${header}`);
+    }
+    // Not vacuous: under a comment LINE — which opens nothing — the same line is
+    // a real mapping and stays excused.
+    assert.deepEqual(idsFor("# writes: |\n  repository: cinatra-ai/ops\n"), []);
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a MULTI-LINE quoted scalar is TEXT: its continuation lines are never excused", () => {
+  // The defect this locks: `description: "` opens ONE string value that runs to
+  // the next `"`, so the lines between are text — and the carve-out excused them
+  // (and the expiry reader read a `uses:` there as a live pin).
+  const wf = [
+    "name: deploy",
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - name: note",
+    '        description: "',
+    "          repository: cinatra-ai/ops",   // 7: inside the quoted scalar
+    "          uses: cinatra-ai/ops@main",    // 8: inside the quoted scalar
+    '          "',
+    "        with:",
+    "          repository: cinatra-ai/ops",   // 11: the scalar closed: excused again
+    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // 12: excused
+    "",
+  ];
+  const expected = [7, 8];
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-quoted-")));
+  const cwd0 = process.cwd();
+  try {
+    process.chdir(dir);
+    fs.mkdirSync(".github/workflows", { recursive: true });
+    fs.writeFileSync(".github/workflows/deploy.yml", wf.join("\n"));
+    const found = scanFile(".github/workflows/deploy.yml", active);
+    assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
+    assert.deepEqual(found.map((f) => f.line), expected,
+      "only the continuation lines flag — the mapping after the closing quote is excused");
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+  assert.deepEqual(readUsesPins(wf.join("\n")),
+    [{ target: "cinatra-ai/ops/.github/workflows/deploy.yml", ref: "main" }],
+    "a `uses:` inside a multi-line quoted scalar is not a pin");
+});
+
+test("a quoted scalar that CLOSES on its own line changes nothing", () => {
+  // The narrow half of the same rule: single-line quotes — including the `\"`
+  // and `''` escapes — must not open a text region that swallows the mapping
+  // lines after them.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-quoted1-")));
+  const cwd0 = process.cwd();
+  const idsFor = (opening) => {
+    const body = `steps:\n  - name: note\n    ${opening}\n    with:\n      repository: cinatra-ai/ops\n`;
+    fs.writeFileSync("compose.yml", body);
+    return scanFile("compose.yml", active).map((f) => f.rule);
+  };
+  try {
+    process.chdir(dir);
+    for (const opening of [
+      'description: "just a note"',
+      'description: "he said \\"hi\\""',
+      "description: 'it''s fine'",
+      'description: "a note"  # and a comment',
+    ]) {
+      assert.deepEqual(idsFor(opening), [], `a closed quoted scalar excuses nothing after it: ${opening}`);
+    }
+    // Not vacuous: leaving the same quote OPEN makes the mapping below it text.
+    assert.deepEqual(idsFor('description: "just a note'), ["SLG_PRIVATE_REPO_REF"]);
   } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

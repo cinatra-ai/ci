@@ -794,41 +794,160 @@ function orgPathRepoName(match) {
 }
 
 // ---------------------------------------------------------------------------
-// YAML block scalars: TEXT, not mappings.
+// YAML multi-line TEXT: block scalars and multi-line quoted scalars.
 //
-// Every carve-out judges ONE LINE, and that is exactly what a block scalar
+// Every carve-out judges ONE LINE, and that is exactly what a multi-line scalar
 // defeats. Inside a `run: |` block the runner reads shell, never YAML, so a
 // heredoc line spelling `uses: <org>/<private>@main` (or `repository:
 // <org>/<private>`) is prose that happens to wear a mapping's clothes — and
 // excusing it handed every leak a two-line disguise inside the one file class
-// where the `uses:` carve-out is at its widest.
+// where the `uses:` carve-out is at its widest. A quoted scalar that runs over
+// several lines is the same disguise in different clothes: `description: "` on
+// one line and `  repository: <org>/<private>` on the next is ONE string value,
+// and its continuation lines are text no runner ever reads as a mapping.
 //
-// A block scalar OPENS on a mapping line whose value is a block-scalar header —
-// `|`, `|-`, `|+`, `>`, `>-`, `>+`, with YAML's optional indentation indicator,
-// followed by nothing but an optional comment — and CONTINUES while lines are
-// blank or indented deeper than the KEY. The first line indented back to (or
-// past) the key ends the block and is itself judged normally, so a real `uses:`
-// mapping after the block is excused as before.
+// A block scalar OPENS on ANY line whose content — after optional indentation,
+// optional (repeatable) `- ` sequence markers and an optional mapping key — is a
+// block-scalar indicator: `|` or `>` with YAML's optional chomping and
+// indentation indicators, followed by nothing but an optional comment. That is
+// deliberately wider than "a `key: |` mapping": a sequence item (`- |`), a
+// nested one (`- - |`), a bare `|` opening a top-level document scalar, and a
+// key that itself contains a colon (`run:x: |`) all open blocks, and while they
+// did not, every line inside them was judged as a mapping — excused by the
+// carve-out, and read as a live pin by the expiry reader.
+//
+// It CONTINUES while lines are blank or indented deeper than the OPENING line's
+// first non-blank column — the dash column for `- |`, the key column for
+// `key: |`. The first line indented back to (or past) that column ends the block
+// and is itself judged normally, so a real `uses:` mapping after the block is
+// excused as before. Lines inside a block are never re-parsed, so at most one
+// block is ever open and its column IS the innermost boundary.
+//
+// A quoted scalar OPENS where a sequence item or a mapping VALUE begins with `"`
+// or `'` and that quote does not close on the same line (counting `\"` escapes
+// inside double quotes and `''` inside single quotes), and every following line
+// up to AND INCLUDING the one that closes it is text.
+//
+// Inside either form there is no carve-out and no pin.
 // ---------------------------------------------------------------------------
-// Group 1 is everything before the key (indentation plus any `- ` sequence
-// markers), so its length IS the key's column.
-const BLOCK_SCALAR_HEADER_RE =
-  /^([ \t]*(?:-[ \t]+)*)(?:"[^"]*"|'[^']*'|[^#\s"'][^:#]*):[ \t]+[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/;
-// One boolean per line: is this line inside a block scalar? Computed per FILE,
-// because "am I inside one?" is not a property any single line can answer.
+// `|` or `>`, optional chomping/indentation indicators in either order, then
+// only an optional comment.
+const BLOCK_SCALAR_INDICATOR_RE = /^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/;
+const SEQUENCE_MARKERS_RE = /^(?:-[ \t]+)*/;
+// A `#` at the start of a token opens a YAML comment, so a "key" carrying one is
+// not a key at all — the line is a comment about a mapping, and prose opens
+// nothing.
+function hasCommentStart(s) { return /(?:^|[ \t])#/.test(s); }
+
+// The line's content after its indentation and any sequence markers, plus the
+// column the scalar would open at (the FIRST non-blank column, which for `- |`
+// is the dash). Null for a blank line or a comment.
+function scalarLead(line) {
+  const indent = /^[ \t]*/.exec(line)[0].length;
+  const afterIndent = line.slice(indent);
+  if (afterIndent === "" || afterIndent.startsWith("#")) return null;
+  const rest = afterIndent.slice(SEQUENCE_MARKERS_RE.exec(afterIndent)[0].length);
+  if (rest === "" || rest.startsWith("#")) return null;
+  return { column: indent, rest };
+}
+
+// The column a block scalar opens at on this line, or -1.
+function blockScalarOpenColumn(line) {
+  const lead = scalarLead(line);
+  if (!lead) return -1;
+  // A bare indicator: a sequence item (`- |`) or a top-level document scalar.
+  if (BLOCK_SCALAR_INDICATOR_RE.test(lead.rest)) return lead.column;
+  // Otherwise a mapping key, which is everything up to the LAST `: ` before the
+  // indicator — so a key that contains a colon (`run:x: |`) still opens. The
+  // separators are tried RIGHTMOST first, because that is what "the last one"
+  // means; a candidate whose key carries a `#` is a separator inside a COMMENT
+  // (`run: | # a: |`), so the scan keeps walking LEFT instead of giving up on
+  // the line — the real header stands to the left of the comment.
+  const sepRe = /:[ \t]+/g;
+  const seps = [];
+  let m;
+  while ((m = sepRe.exec(lead.rest)) !== null) {
+    seps.push([m.index, m.index + m[0].length]);
+    sepRe.lastIndex = m.index + 1;
+  }
+  for (let i = seps.length - 1; i >= 0; i--) {
+    const key = lead.rest.slice(0, seps[i][0]);
+    if (hasCommentStart(key)) continue;
+    if (BLOCK_SCALAR_INDICATOR_RE.test(lead.rest.slice(seps[i][1]))) return lead.column;
+  }
+  return -1;
+}
+
+// The index of the quote that CLOSES an open quoted scalar in `s`, or -1.
+// Double quotes honour `\` escapes; single quotes honour the `''` doubling.
+function quotedScalarCloseIndex(s, quote) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote === '"') {
+      if (c === "\\") { i++; continue; }
+      if (c === '"') return i;
+    } else if (c === "'") {
+      if (s[i + 1] === "'") { i++; continue; }
+      return i;
+    }
+  }
+  return -1;
+}
+
+// `{ quote, after }` when this line starts a quoted scalar value — a sequence
+// item or a mapping value beginning with `"` or `'` — else null. `after` is what
+// follows the opening quote ON THIS LINE, which is what decides whether the
+// scalar closes here.
+function quotedScalarOpen(line) {
+  const lead = scalarLead(line);
+  if (!lead) return null;
+  const value = quotedScalarValue(lead.rest);
+  if (value === null) return null;
+  return { quote: value[0], after: value.slice(1) };
+}
+
+// The quoted VALUE on a line, or null. A sequence item is the value itself; for
+// a mapping it is the text after the FIRST `: ` that is followed by a quote, so
+// a key carrying a colon (`run:x: "…`) is read as a key while a colon INSIDE the
+// value (`description: "a: b`) stays inside the value.
+function quotedScalarValue(rest) {
+  if (rest.startsWith('"') || rest.startsWith("'")) return rest;
+  const re = /:[ \t]+/g;
+  let m;
+  while ((m = re.exec(rest)) !== null) {
+    const key = rest.slice(0, m.index);
+    if (hasCommentStart(key)) return null;
+    const tail = rest.slice(m.index + m[0].length);
+    if (tail.startsWith('"') || tail.startsWith("'")) return tail;
+    re.lastIndex = m.index + 1;
+  }
+  return null;
+}
+
+// One boolean per line: is this line inside a multi-line scalar — a block scalar
+// or the continuation of a quoted one? Computed per FILE, because "am I inside
+// one?" is not a property any single line can answer.
 function blockScalarLineFlags(lines) {
   const flags = new Array(lines.length).fill(false);
-  let keyIndent = -1;
+  let openColumn = -1;   // the open block scalar's first non-blank column
+  let openQuote = null;  // the open quoted scalar's quote character
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (keyIndent !== -1) {
+    if (openQuote !== null) {
+      flags[i] = true; // text up to AND INCLUDING the line that closes the quote
+      if (quotedScalarCloseIndex(line, openQuote) !== -1) openQuote = null;
+      continue;
+    }
+    if (openColumn !== -1) {
       if (line.trim() === "") { flags[i] = true; continue; }
       const indent = /^[ \t]*/.exec(line)[0].length;
-      if (indent > keyIndent) { flags[i] = true; continue; }
-      keyIndent = -1; // the block ends AT this line, which is judged normally
+      if (indent > openColumn) { flags[i] = true; continue; }
+      openColumn = -1; // the block ends AT this line, which is judged normally
     }
-    const m = BLOCK_SCALAR_HEADER_RE.exec(line);
-    if (m) keyIndent = m[1].length;
+    const column = blockScalarOpenColumn(line);
+    if (column !== -1) { openColumn = column; continue; }
+    const quoted = quotedScalarOpen(line);
+    if (quoted && quotedScalarCloseIndex(quoted.after, quoted.quote) === -1) openQuote = quoted.quote;
   }
   return flags;
 }
@@ -844,8 +963,9 @@ function blockScalarLineFlags(lines) {
 // bare string — passes nothing and the form is judged on its grammar alone.
 //
 // `context.inBlockScalar` is the same kind of narrowing, one level up from the
-// grammar: a line the scan has established is inside a YAML block scalar is
-// text, and NO machine grammar excuses text.
+// grammar: a line the scan has established is inside a YAML multi-line scalar —
+// a block scalar, or a quoted scalar that runs over several lines — is text, and
+// NO machine grammar excuses text.
 function functionalRefCovers(name, line, index, filePath, context) {
   if (context && context.inBlockScalar) return false;
   for (const f of FUNCTIONAL_REPO_REFS) {
@@ -988,11 +1108,30 @@ function canonicalUsesTarget(target) {
 // a verdict — an exemption whose expiry cannot be honestly evaluated never stays
 // in force.
 const PIN_FILE_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+// Characters git would read as PATHSPEC MAGIC rather than as a file name, plus a
+// leading `-`, which git would read as an option. `untilPin.file` names ONE
+// tracked file, so a value carrying any of them is a config error before git is
+// ever asked (see the call site): the question "is this file tracked?" has no
+// answer for a pattern.
+const PIN_FILE_PATHSPEC_CHARS = ["*", "?", "[", "\\"];
+function pinFileIsPathspecPattern(relFile) {
+  return relFile.startsWith("-") || PIN_FILE_PATHSPEC_CHARS.some((c) => relFile.includes(c));
+}
+// Tracked means "git lists exactly THIS path", not "git found something for this
+// argument". `git ls-files --error-unmatch -- <file>` treats its argument as a
+// pathspec, so an UNTRACKED literal file named `.github/workflows/*.yml` exited 0
+// on the strength of some other workflow matching the glob — and keyed a live
+// exemption to a file nothing runs. `--literal-pathspecs` turns the argument back
+// into a file name, and the output is compared byte-for-byte with the path that
+// was asked about, so a match on any other path is untracked.
 function isTrackedInScannedTree(relFile) {
+  let out;
   try {
-    execFileSync("git", ["ls-files", "--error-unmatch", "--", relFile], { stdio: "ignore" });
-    return true;
+    out = execFileSync("git", ["--literal-pathspecs", "ls-files", "--error-unmatch", "--", relFile],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch { return false; }
+  const listed = String(out).split("\n").filter((l) => l !== "");
+  return listed.length === 1 && listed[0] === relFile;
 }
 
 function enforceBasenameExpiries(config, exemptFiles, configPath) {
@@ -1024,6 +1163,11 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
         + `.github/workflows/<file>.yml|.yaml path — '${pin.file}' is not one. A pin lives in the caller `
         + "workflow that actually runs; any other readable file could carry the keyed target at the keyed "
         + "sha long after the real caller moved");
+    }
+    if (pinFileIsPathspecPattern(pin.file)) {
+      expiryFail(`config error: ${where}['${basename}'].untilPin.file must name ONE file — `
+        + `'${pin.file}' carries a pathspec pattern character (*, ?, [, \\) or a leading '-'. `
+        + "A pattern is not the caller workflow that runs, and git would answer for whatever it matches");
     }
     let pinStat;
     try { pinStat = fs.lstatSync(pin.file); }
@@ -1953,7 +2097,7 @@ export {
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins, canonicalUsesTarget, blockScalarLineFlags,
+  readUsesPins, canonicalUsesTarget, blockScalarLineFlags, isTrackedInScannedTree,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,
