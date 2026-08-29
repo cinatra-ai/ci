@@ -14,7 +14,12 @@ import {
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
   readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
+  parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
+  isPlainObject, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
 } from "../source-leak-gate.mjs";
+// The VENDORED parser, imported directly for the one test that has to inspect
+// what the PARSER produced rather than what the engine decided about it.
+import { loadAll as jsYamlLoadAll } from "../lib/vendor/js-yaml/js-yaml.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
 // actually exercises the real list — list membership, the per-match carve-outs
@@ -2680,3 +2685,248 @@ test("aggregate: every active rule over one corpus agrees on the count", () => {
     assert.equal(total(line), expected, `${expected} finding(s) expected for ${JSON.stringify(line)}`);
   }
 });
+
+// --------------------------------------------------------------------------
+// PROTOTYPE POLLUTION: a parsed document is attacker-shaped input.
+//
+// The engine's two structural readers decide who gets a carve-out
+// (legitimateActionValues) and which pin is live (readUsesPins), and both answer
+// by reading `jobs` off a parsed document. A YAML document that reaches the
+// JavaScript prototype chain therefore forges BOTH: a private name excused
+// because "the file dispatches it", and an expired exemption kept alive because
+// "the caller still pins that sha" — neither of which the file says.
+//
+// js-yaml 4.1.0 guarded a directly written `__proto__` key but not the MERGE
+// path, so the merge form below produced exactly that. The vendored parser is
+// 4.1.1, which fixes it — and NONE of the tests here depend on that, because a
+// dependency's next version is a bug nobody has found yet. Each case is written
+// against the ENGINE's guards, and each guard alone is sufficient.
+// --------------------------------------------------------------------------
+
+const POLLUTED_SHA = "4d5e6f708192a3b4c5d607182930a4b5c6d7e8f9";
+// The published payload shape: an anchored mapping whose `__proto__` key carries
+// a whole fabricated dispatch, merged into the document root. Under 4.1.0 the
+// root's own keys stayed innocent while its PROTOTYPE supplied `jobs`.
+const MERGE_PAYLOAD = [
+  "payload: &payload",
+  "  __proto__:",
+  "    jobs:",
+  "      gate:",
+  `        uses: cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}`,
+  "<<: *payload",
+  "name: harmless",
+  "",
+].join("\n");
+// The same forgery without the merge: a plain `__proto__` mapping at the root.
+const PLAIN_PROTO_PAYLOAD = [
+  "__proto__:",
+  "  jobs:",
+  "    gate:",
+  `      uses: cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}`,
+  "",
+].join("\n");
+// The HONEST twin: the same dispatch, declared the way a real caller declares
+// it. Every refusal below is measured against this, so "the gate refuses
+// everything" can never pass for "the gate is safe".
+const HONEST_CALLER = [
+  "name: harmless",
+  "jobs:",
+  "  gate:",
+  `    uses: cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}`,
+  "",
+].join("\n");
+
+test("a document that reaches the prototype chain buys NO carve-out, in either form", () => {
+  // Both halves of the finding, end to end through scanFile: the private name in
+  // the payload is a FINDING, because a document carrying a prototype-reaching
+  // key is a document whose structure nobody can state — the same answer a
+  // syntax error gets, and for the same reason.
+  const rel = ".github/workflows/deploy.yml";
+  scanTree((t) => {
+    assert.deepEqual(t.ids(rel, MERGE_PAYLOAD), ["SLG_PRIVATE_REPO_REF"],
+      "the merge form (`<<:` onto a `__proto__` payload) must not fabricate a dispatch");
+    assert.deepEqual(t.ids(rel, PLAIN_PROTO_PAYLOAD), ["SLG_PRIVATE_REPO_REF"],
+      "a plain `__proto__` mapping must not fabricate a dispatch either");
+    // NOT VACUOUS: the identical dispatch, honestly declared, is still excused.
+    // Without this leg the two assertions above would also pass if the carve-out
+    // had simply been deleted.
+    assert.deepEqual(t.ids(rel, HONEST_CALLER), [],
+      "a real caller that really dispatches the value keeps its carve-out");
+  });
+});
+
+test("a prototype-reaching mapping key makes the document unreadable at any depth", () => {
+  // `__proto__`, `constructor` and `prototype` are refused wholesale rather than
+  // sanitised, and the refusal is not limited to the document root: the payload
+  // that matters is always nested. No workflow, action or compose file needs
+  // those keys, so the refusal costs nothing real.
+  for (const key of PROTOTYPE_KEYS) {
+    assert.equal(parseYamlDocuments(`${key}:\n  a: 1\n`), null, `a root \`${key}:\` key is unreadable`);
+    assert.equal(parseYamlDocuments(`on: push\njobs:\n  a:\n    steps:\n      - with:\n          ${key}: 1\n`), null,
+      `a nested \`${key}:\` key is unreadable too`);
+    assert.equal(parseYamlDocuments(`a:\n  - b:\n      ${key}: 1\n`), null,
+      `\`${key}:\` inside a sequence is unreadable too`);
+  }
+  assert.equal(legitimateActionValues(MERGE_PAYLOAD), null, "no value set at all");
+  assert.equal(readUsesPins(MERGE_PAYLOAD), null, "no pins at all");
+  assert.equal(legitimateActionValues(PLAIN_PROTO_PAYLOAD), null);
+  assert.equal(readUsesPins(PLAIN_PROTO_PAYLOAD), null);
+  // The honest twin still parses, still yields its value and still yields its
+  // pin — the refusal is keyed to the key, not to the shape of a workflow.
+  assert.deepEqual([...legitimateActionValues(HONEST_CALLER)],
+    [`cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}`]);
+  assert.deepEqual(readUsesPins(HONEST_CALLER),
+    [{ target: "cinatra-ai/ops/.github/workflows/deploy.yml", ref: POLLUTED_SHA }]);
+});
+
+test("hasPrototypeKey walks own properties, follows containers, and survives cycles", () => {
+  assert.equal(hasPrototypeKey({ a: { b: [{ c: 1 }] } }, new Set()), false, "an ordinary document is clean");
+  assert.equal(hasPrototypeKey([[{ deep: { prototype: 1 } }]], new Set()), true, "nested inside sequences");
+  // An INHERITED `__proto__`-ish key is not the document's own key, so it does
+  // not make the document unreadable — the own-property reads below are what
+  // makes it harmless, and confusing the two would refuse ordinary files.
+  assert.equal(hasPrototypeKey(Object.assign(Object.create({ constructor: 1 }), { a: 1 }), new Set()), false);
+  // YAML anchors make cycles; the walk must terminate rather than recurse away.
+  const cyclic = { a: {} };
+  cyclic.a.back = cyclic;
+  assert.equal(hasPrototypeKey(cyclic, new Set()), false, "a cyclic document terminates");
+  const cyclicBad = { a: { prototype: 1 } };
+  cyclicBad.a.back = cyclicBad;
+  assert.equal(hasPrototypeKey(cyclicBad, new Set()), true, "and a cyclic one still gets caught");
+});
+
+test("the readers read OWN properties only — an inherited `jobs` is not there", () => {
+  // The guard that does not depend on the parser at all. Whatever a future
+  // parser hands back, a key the document does not OWN is not a key the engine
+  // will read, and an object whose prototype has been replaced is not a mapping
+  // the engine will read at all.
+  const forged = {
+    jobs: { gate: { uses: `cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}` } },
+    runs: { steps: [{ uses: `cinatra-ai/ops/actions/notify@${POLLUTED_SHA}` }] },
+  };
+  const doc = Object.create(forged);
+  doc.name = "harmless";
+
+  // The two predicates every read in legitimateActionValues and readUsesPins
+  // goes through, on the forged document.
+  assert.equal(isPlainObject(doc), false,
+    "an object whose prototype is neither Object.prototype nor null is not a mapping this engine reads");
+  assert.equal(own(doc, "jobs"), undefined, "`jobs` is inherited, so it is absent");
+  assert.equal(own(doc, "runs"), undefined, "`runs` is inherited, so it is absent");
+  assert.equal(own(doc, "name"), "harmless", "and an OWN key is still read normally");
+
+  // Same forgery one level down: an ordinary root whose `jobs` mapping inherits
+  // its job. `Object.getOwnPropertyNames` is what the reader enumerates, so the
+  // inherited job id is never visited.
+  const jobs = Object.create({ gate: { uses: `cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}` } });
+  assert.deepEqual(Object.getOwnPropertyNames(jobs), [], "no job ids to enumerate");
+  assert.equal(own(jobs, "gate"), undefined, "the inherited job is absent");
+
+  // A null-prototype mapping IS ordinary (js-yaml never returns one, but a
+  // future parser might, and refusing it would be a refusal on valid input).
+  const bare = Object.assign(Object.create(null), { jobs: { gate: { uses: "a/b@c" } } });
+  assert.equal(isPlainObject(bare), true, "a null-prototype mapping is still a mapping");
+  assert.deepEqual(own(bare, "jobs"), { gate: { uses: "a/b@c" } });
+});
+
+test("a builtin prototype that changed shape during a parse ABORTS the run", () => {
+  // Guard (c): the last line of defence. If the interpreter this gate reasons
+  // with has been edited by the input it was reading, then nothing the run has
+  // said — including the clean verdicts already printed — can be trusted, so the
+  // run ends with a NAMED error instead of a result.
+  const snapshot = snapshotPrototypes();
+  assert.doesNotThrow(() => assertPrototypesUnpolluted(snapshot), "a clean interpreter is silent");
+
+  Object.prototype.jobs = { gate: { uses: `cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}` } };
+  try {
+    assert.throws(
+      () => assertPrototypesUnpolluted(snapshot),
+      (e) => {
+        assert.equal(e.name, PROTOTYPE_POLLUTION_ERROR, "the error is NAMED, not a generic failure");
+        assert.match(e.message, /Object\.prototype changed shape/);
+        assert.match(e.message, /added jobs/, "it names what changed");
+        assert.match(e.message, /aborted rather than completed/, "and says the run's output is void");
+        return true;
+      },
+    );
+  } finally {
+    delete Object.prototype.jobs;
+  }
+  assert.doesNotThrow(() => assertPrototypesUnpolluted(snapshot), "and it is silent again once cleaned up");
+
+  // A REMOVED name is a change too: deletion is as much an edit as addition.
+  const arraySnapshot = snapshotPrototypes();
+  const flatten = Array.prototype.flat;
+  delete Array.prototype.flat;
+  try {
+    assert.throws(() => assertPrototypesUnpolluted(arraySnapshot), (e) => {
+      assert.equal(e.name, PROTOTYPE_POLLUTION_ERROR);
+      assert.match(e.message, /Array\.prototype changed shape .*removed flat/);
+      return true;
+    });
+  } finally {
+    Object.defineProperty(Array.prototype, "flat", { value: flatten, writable: true, configurable: true, enumerable: false });
+  }
+  assert.doesNotThrow(() => assertPrototypesUnpolluted(snapshotPrototypes()));
+});
+
+test("a PIN FILE that reaches the prototype chain is a CONFIG ERROR, not a live pin", () => {
+  // The other half of the finding. An expiry is keyed to a sha the caller really
+  // pins; a payload document that forges `jobs.<id>.uses` would keep an expired
+  // basename exemption alive forever. Unreadable means unreadable: the exemption
+  // whose expiry cannot be evaluated does not stay in force.
+  const forgedCaller = [
+    "payload: &payload",
+    "  __proto__:",
+    "    jobs:",
+    "      gate:",
+    `        uses: ${PIN_TARGET}@${PIN_A}`,
+    "<<: *payload",
+    "name: caller",
+    "",
+  ].join("\n");
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml": forgedCaller,
+    "config/gate.json": JSON.stringify(liveConfig, null, 1),
+  });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, `a forged pin file must be a config error, got ${r.status}: ${r.err}`);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /not parseable YAML/);
+    assert.match(r.err, /__proto__/, "the message names why the document was refused");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+
+  // NOT VACUOUS: the same tree with the pin honestly declared is green, so the
+  // refusal above is about the payload and not about the fixture.
+  const honest = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml": workflowPinning(PIN_A),
+    "config/gate.json": JSON.stringify(liveConfig, null, 1),
+  });
+  try {
+    assert.equal(runExpiryGate(honest).status, 0, "the honest caller keeps its live exemption");
+  } finally { fs.rmSync(honest, { recursive: true, force: true }); }
+});
+
+test("the vendored parser itself no longer pollutes through the merge path", () => {
+  // The dependency half of the fix, asserted directly rather than assumed from a
+  // version string: 4.1.0 set the merge target's prototype here. This is a
+  // REGRESSION guard on the vendored copy — if a future re-vendor reintroduces
+  // it, the engine's own guards still hold (every test above), but the operator
+  // should be told the parser moved backwards.
+  const docs = parseYamlDocumentsUnguarded(MERGE_PAYLOAD);
+  for (const doc of docs) {
+    assert.equal(Object.getPrototypeOf(doc), Object.prototype,
+      "the merge must not replace the document's prototype");
+    assert.equal(Object.hasOwn(doc, "jobs"), false, "and it declares no `jobs` of its own");
+  }
+});
+
+// Parses with the vendored parser directly, bypassing the engine's refusals, so
+// the test above can inspect what the PARSER produced rather than what the
+// engine decided to do about it.
+function parseYamlDocumentsUnguarded(text) {
+  return jsYamlLoadAll(text);
+}

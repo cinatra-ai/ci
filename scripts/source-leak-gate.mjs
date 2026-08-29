@@ -843,7 +843,168 @@ function orgPathRepoName(match) {
 // name a public file would not otherwise carry, and by the time the file
 // dispatches it, the file carries it.
 // ---------------------------------------------------------------------------
-function isPlainObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+// ---------------------------------------------------------------------------
+// PARSING A DOCUMENT IS NOT TRUSTING IT.
+//
+// Everything below this line reads parsed YAML, and a parsed document is
+// ATTACKER-SHAPED INPUT: the text comes from the repository being scanned, and
+// the whole point of the scan is that some of that text may be hostile. A YAML
+// parser that lets a document reach the JavaScript prototype chain turns this
+// engine's two structural readers into forgery tools — an INHERITED `jobs` is a
+// dispatch the file never declares, and it buys both halves of the gate at once:
+// a carve-out that excuses a private name (legitimateActionValues) and a live
+// `uses:` pin that keeps an expired exemption alive (readUsesPins).
+//
+// That was not hypothetical. js-yaml 4.1.0 guarded a directly written
+// `__proto__` mapping key but not the MERGE path, so
+//
+//     payload: &payload
+//       __proto__:
+//         jobs: { gate: { uses: <org>/<repo>/.github/workflows/w.yml@<sha> } }
+//     <<: *payload
+//
+// produced a document with two innocent own keys whose PROTOTYPE carried a
+// fabricated `jobs`. The vendored parser is now 4.1.1, which fixes it.
+//
+// The version is not the defence. THREE independent guards are, and each one
+// alone is sufficient — a parser is a dependency, and a dependency's next
+// version is a bug nobody has found yet:
+//
+//   (a) OWN PROPERTIES ONLY. Every read of a parsed document goes through
+//       `own()`, and a value whose prototype is neither `Object.prototype` nor
+//       `null` is not a mapping this engine will read at all. An inherited key
+//       is not "a key we found"; it is a key that is not there.
+//   (b) A POLLUTING KEY MAKES THE DOCUMENT UNREADABLE. A mapping key named
+//       `__proto__`, `constructor` or `prototype` at ANY depth means the file
+//       is not a document whose structure anyone can state, so it gets the same
+//       answer as a syntax error: NULL. No carve-out for anything in it, and a
+//       config error if it is a pin file. No legitimate workflow, action or
+//       compose file needs those keys, so the refusal costs nothing real.
+//   (c) IF THE PROCESS IS POLLUTED, THE RUN IS OVER. The own-property names of
+//       `Object.prototype`, `Array.prototype` and `Function.prototype` are
+//       snapshotted before every parse and compared after it. A difference means
+//       the interpreter this gate is reasoning with has been edited underneath
+//       it, and NOTHING it says afterwards can be trusted — not this file's
+//       verdict, not the clean ones already printed. So it aborts the whole run
+//       with a named error and a non-zero exit rather than reporting a result.
+// ---------------------------------------------------------------------------
+
+// Mapping keys that reach the prototype chain in one parser or another. Refused
+// wholesale rather than sanitised: sanitising means keeping the document and
+// arguing about which parts of it are safe.
+const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+const PROTOTYPE_POLLUTION_ERROR = "PrototypePollutionError";
+
+// A mapping this engine will read: a real object whose prototype is the
+// ordinary one (or none at all). An object with any other prototype has had its
+// chain replaced, and its inherited keys are exactly the forgery — so it is not
+// a mapping, and `own()` on it answers undefined for everything.
+function isPlainObject(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+// THE only way this engine reads a key off a parsed document. `doc.jobs` walks
+// the prototype chain; `own(doc, "jobs")` does not.
+function own(obj, key) {
+  if (obj === null || typeof obj !== "object") return undefined;
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+// The prototypes whose shape a parse must never change, snapshotted as their
+// own-property NAMES. Names, not descriptors: a parse that adds `jobs` to
+// `Object.prototype` shows up here, and that is the whole class.
+const GUARDED_PROTOTYPES = [
+  ["Object.prototype", Object.prototype],
+  ["Array.prototype", Array.prototype],
+  ["Function.prototype", Function.prototype],
+];
+
+function snapshotPrototypes() {
+  return GUARDED_PROTOTYPES.map(([label, target]) => [label, target, Object.getOwnPropertyNames(target)]);
+}
+
+// Throws — never returns a verdict — when a builtin prototype changed shape.
+// Exported so the guard itself is testable without having to actually corrupt a
+// scan.
+function assertPrototypesUnpolluted(snapshot) {
+  for (const [label, target, before] of snapshot) {
+    const after = Object.getOwnPropertyNames(target);
+    const beforeSet = new Set(before);
+    const afterSet = new Set(after);
+    const added = after.filter((k) => !beforeSet.has(k));
+    const removed = before.filter((k) => !afterSet.has(k));
+    if (added.length === 0 && removed.length === 0) continue;
+    const changes = [
+      added.length ? `added ${added.join(", ")}` : "",
+      removed.length ? `removed ${removed.join(", ")}` : "",
+    ].filter(Boolean).join("; ");
+    const err = new Error(
+      `${label} changed shape during a YAML parse (${changes}). The interpreter this gate reasons with has `
+      + "been edited by the input it was reading, so every verdict in this run — including the clean ones already "
+      + "printed — is untrustworthy. The run is aborted rather than completed.",
+    );
+    err.name = PROTOTYPE_POLLUTION_ERROR;
+    throw err;
+  }
+}
+
+// True when any mapping in the parsed value carries a prototype-reaching key.
+// Walks OWN property names (an inherited key is not the document's), follows
+// only data properties (a getter is not a mapping value a YAML document can
+// declare), and remembers what it has seen because YAML anchors make cycles.
+function hasPrototypeKey(value, seen) {
+  if (value === null || typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) if (hasPrototypeKey(item, seen)) return true;
+    return false;
+  }
+  if (value instanceof Map) {
+    for (const [k, v] of value) {
+      if (typeof k === "string" && PROTOTYPE_KEYS.has(k)) return true;
+      if (hasPrototypeKey(k, seen) || hasPrototypeKey(v, seen)) return true;
+    }
+    return false;
+  }
+  if (value instanceof Set) {
+    for (const item of value) if (hasPrototypeKey(item, seen)) return true;
+    return false;
+  }
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (PROTOTYPE_KEYS.has(key)) return true;
+    const desc = Object.getOwnPropertyDescriptor(value, key);
+    if (!desc || !("value" in desc)) continue;
+    if (hasPrototypeKey(desc.value, seen)) return true;
+  }
+  return false;
+}
+
+// THE single parse entry point for this engine. Every reader below goes through
+// it, so the three guards cannot be bypassed by adding a fourth reader later.
+//
+// NULL means "no document anyone can state the structure of" — a syntax error,
+// a duplicate key, an unresolvable tag, or a prototype-reaching key. Callers
+// already treat NULL as "excuses nothing / config error at the call site", which
+// is exactly the right answer for a hostile document too.
+//
+// The pollution guard runs even when the parse THREW: a parser that throws
+// halfway can have written a prototype before it failed, and "it errored" is not
+// evidence that it did nothing.
+function parseYamlDocuments(text) {
+  const snapshot = snapshotPrototypes();
+  let docs;
+  let threw = false;
+  try { docs = loadAllYaml(text); }
+  catch { threw = true; }
+  assertPrototypesUnpolluted(snapshot);
+  if (threw || !Array.isArray(docs)) return null;
+  if (hasPrototypeKey(docs, new Set())) return null;
+  return docs;
+}
 
 function addLegitimateValue(values, v) {
   if (typeof v === "string" && v !== "") values.add(v);
@@ -854,8 +1015,9 @@ function collectStepValues(steps, values) {
   if (!Array.isArray(steps)) return;
   for (const step of steps) {
     if (!isPlainObject(step)) continue;
-    addLegitimateValue(values, step.uses);
-    if (isPlainObject(step.with)) addLegitimateValue(values, step.with.repository);
+    addLegitimateValue(values, own(step, "uses"));
+    const withInputs = own(step, "with");
+    if (isPlainObject(withInputs)) addLegitimateValue(values, own(withInputs, "repository"));
   }
 }
 
@@ -864,25 +1026,30 @@ function collectStepValues(steps, values) {
 // file the parser cannot read is a file whose structure nobody knows, and an
 // unknown structure excuses nothing.
 //
-// It parses with `loadAll` (every document in the stream) on js-yaml's default
-// schema, which resolves only standard YAML tags — no code, no custom types —
-// and every failure mode is caught, including the ones a parser throws for
-// duplicate keys and unresolvable tags.
+// It parses through `parseYamlDocuments` (every document in the stream, on
+// js-yaml's default schema, which resolves only standard YAML tags — no code, no
+// custom types), so every failure mode lands on the same NULL: a syntax error, a
+// duplicate key, an unresolvable tag, and a document carrying a
+// prototype-reaching key. Every key below is read with `own()`, so an INHERITED
+// `jobs` — the whole point of a pollution payload — is not a carve-out; it is
+// not there.
 function legitimateActionValues(text) {
-  let docs;
-  try { docs = loadAllYaml(text); }
-  catch { return null; }
+  const docs = parseYamlDocuments(text);
+  if (docs === null) return null;
   const values = new Set();
-  for (const doc of Array.isArray(docs) ? docs : []) {
+  for (const doc of docs) {
     if (!isPlainObject(doc)) continue;
-    if (isPlainObject(doc.jobs)) {
-      for (const job of Object.values(doc.jobs)) {
+    const jobs = own(doc, "jobs");
+    if (isPlainObject(jobs)) {
+      for (const jobId of Object.getOwnPropertyNames(jobs)) {
+        const job = own(jobs, jobId);
         if (!isPlainObject(job)) continue;
-        addLegitimateValue(values, job.uses);        // a reusable-workflow call
-        collectStepValues(job.steps, values);
+        addLegitimateValue(values, own(job, "uses"));   // a reusable-workflow call
+        collectStepValues(own(job, "steps"), values);
       }
     }
-    if (isPlainObject(doc.runs)) collectStepValues(doc.runs.steps, values); // composite action
+    const runs = own(doc, "runs");
+    if (isPlainObject(runs)) collectStepValues(own(runs, "steps"), values); // composite action
   }
   return values;
 }
@@ -1012,19 +1179,24 @@ function expiryFail(msg) {
 // `uses:`, and a local `uses: ./…` is not a cross-repository dispatch at all),
 // and the target comes back CASE-CANONICAL, so one dispatch has one spelling.
 //
-// NULL means the text is not parseable YAML: an unreadable caller is a config
-// error at the call site, never a silent "no pins".
+// NULL means the text is not a document whose structure anyone can state — a
+// syntax error, or a prototype-reaching mapping key. An unreadable caller is a
+// config error at the call site, never a silent "no pins".
 const USES_VALUE_RE = new RegExp(`^(${ANY_ORG_PATH_SOURCE}${USES_TARGET_TAIL})@(${USES_REF_TOKEN})$`);
 function readUsesPins(text) {
-  let docs;
-  try { docs = loadAllYaml(text); }
-  catch { return null; }
+  const docs = parseYamlDocuments(text);
+  if (docs === null) return null;
   const pins = [];
-  for (const doc of Array.isArray(docs) ? docs : []) {
-    if (!isPlainObject(doc) || !isPlainObject(doc.jobs)) continue;
-    for (const job of Object.values(doc.jobs)) {
-      if (!isPlainObject(job) || typeof job.uses !== "string") continue;
-      const m = job.uses.match(USES_VALUE_RE);
+  for (const doc of docs) {
+    if (!isPlainObject(doc)) continue;
+    const jobs = own(doc, "jobs");
+    if (!isPlainObject(jobs)) continue;
+    for (const jobId of Object.getOwnPropertyNames(jobs)) {
+      const job = own(jobs, jobId);
+      if (!isPlainObject(job)) continue;
+      const uses = own(job, "uses");
+      if (typeof uses !== "string") continue;
+      const m = uses.match(USES_VALUE_RE);
       if (!m) continue;
       pins.push({ target: canonicalUsesTarget(m[1]), ref: m[2] });
     }
@@ -1146,7 +1318,9 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
     const pins = readUsesPins(text);
     if (pins === null) {
       expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
-        + "which is not parseable YAML — a caller workflow nobody can read has no dispatch to be keyed to, "
+        + "which is not parseable YAML (a syntax error, or a `__proto__` / `constructor` / `prototype` mapping "
+        + "key, which makes the document unreadable on purpose) — a caller workflow nobody can read has no "
+        + "dispatch to be keyed to, "
         + "and an exemption whose expiry cannot be evaluated does not stay in force");
     }
     const forTarget = pins.filter((u) => canonicalUsesTarget(u.target) === wantedTarget);
@@ -2045,7 +2219,19 @@ function isMainModule() {
   }
 }
 if (isMainModule()) {
-  main().catch((e) => { console.error("[source-leak-gate] scanner failed:", e.message); process.exit(2); });
+  main().catch((e) => {
+    // A polluted interpreter is reported as ITSELF, not as a generic failure.
+    // Everything this run printed before the abort was computed by a runtime the
+    // scanned input had already edited, so the operator has to be told that the
+    // OUTPUT is void — not merely that the scan stopped.
+    if (e && e.name === PROTOTYPE_POLLUTION_ERROR) {
+      console.error(`[source-leak-gate] ${PROTOTYPE_POLLUTION_ERROR}: ${e.message}`);
+      console.error("[source-leak-gate] ABORTED — discard this run's output entirely and re-run on a clean checkout.");
+      process.exit(2);
+    }
+    console.error("[source-leak-gate] scanner failed:", e.message);
+    process.exit(2);
+  });
 }
 
 export {
@@ -2054,6 +2240,8 @@ export {
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
   readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
+  parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
+  isPlainObject, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,

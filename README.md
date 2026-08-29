@@ -294,7 +294,10 @@ carve-out applies only where:
   applies to a line **only when the value its grammar reads is a member of that
   set**. If the file is not YAML, the path is unknown, or the document does not
   parse, there is **no carve-out at all** and every private reference in it is a
-  finding.
+  finding. A document carrying a `__proto__`, `constructor` or `prototype`
+  mapping key at any depth counts as one that does not parse (see "Vendored
+  code"), and every key is read as an **own** property, so an inherited `jobs`
+  is not a dispatch.
 
   This is what makes the multi-line text forms findings without a line scanner
   having to recognise them: a heredoc under `run: |`, a folded `run: >-` body, a
@@ -1979,7 +1982,7 @@ verbatim, with its licence beside it:
 
 | file | what it is |
 | --- | --- |
-| [`scripts/lib/vendor/js-yaml/js-yaml.mjs`](scripts/lib/vendor/js-yaml/js-yaml.mjs) | the single-file ESM build of the `js-yaml` package (MIT), used by `source-leak-gate` to parse YAML and decide which values stand at a real GitHub Actions location |
+| [`scripts/lib/vendor/js-yaml/js-yaml.mjs`](scripts/lib/vendor/js-yaml/js-yaml.mjs) | the single-file ESM build of the `js-yaml` package, **4.1.1** (MIT), used by `source-leak-gate` to parse YAML and decide which values stand at a real GitHub Actions location |
 | [`scripts/lib/vendor/js-yaml/LICENSE`](scripts/lib/vendor/js-yaml/LICENSE) | the package's MIT licence, as published |
 | [`scripts/lib/vendor/js-yaml/PROVENANCE.md`](scripts/lib/vendor/js-yaml/PROVENANCE.md) | package, version, registry tarball URL and its `dist.integrity`, the vendored file's sha256, the date, and the refresh procedure |
 
@@ -1990,6 +1993,24 @@ no `package.json` entry for it. A drift test in
 refreshing the copy without updating its provenance (or editing it at all) fails
 the suite. The directory is excluded from the repository lint in
 `eslint.config.mjs` for the same reason: nobody may fix a finding in it.
+
+A parsed document is **attacker-shaped input** — the text comes from the
+repository being scanned — so the engine never trusts the parser to be the whole
+defence. js-yaml 4.1.0 protected a directly written `__proto__` mapping key but
+not the **merge** path (`<<:`), so a document could set a parsed object's
+prototype and make the engine read an *inherited* `jobs` — a dispatch the file
+never declares, which forges both a carve-out and a live `uses:` pin at once.
+4.1.1 fixes the parser, and independently of the parser version the engine (a)
+reads **own properties only**, and treats a value whose prototype is neither
+`Object.prototype` nor `null` as absent; (b) treats a document carrying a
+`__proto__`, `constructor` or `prototype` mapping key **at any depth** as
+unparsable — no carve-out for anything in it, and a config error if it is a pin
+file; and (c) snapshots the own-property names of `Object.prototype`,
+`Array.prototype` and `Function.prototype` before every parse and compares them
+after, aborting the **whole run** with a named `PrototypePollutionError` and a
+non-zero exit if any of them changed — a run whose interpreter was edited by its
+own input has no trustworthy verdict to report, including the clean ones it
+already printed.
 
 ### Update the vendored substrate (extension-ioc-gate)
 
