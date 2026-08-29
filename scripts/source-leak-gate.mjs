@@ -376,18 +376,40 @@ function cloneUrlRe(name) {
     "g",
   );
 }
-// `value(m)` is the STRUCTURAL half of a form: the scalar value the line carries,
-// which must be one the file really declares at a GitHub Actions location (see
-// legitimateActionValues). A form that declares one is excused only where the
-// document agrees; a form without one — the clone URL, which is a shell remote
-// and belongs to no YAML location — is judged on its grammar alone, unchanged.
+// The KIND of YAML node a form's value stands at, carried in the key the
+// carve-out asks the legitimate-value set with.
+//
+// That set holds SCALARS and nothing else: legitimateActionValues adds a value
+// only when the parsed node is a string, because every Actions location that
+// takes a repository — a `uses:` target, a step's `with: repository:` — takes
+// one string. A scalar form therefore asks with the scalar's own text.
+//
+// A FLOW SEQUENCE is not a scalar. No Actions input takes a LIST at
+// `repository:`, so a parsed document never declares one, and the flow form is
+// STRUCTURALLY INELIGIBLE for the carve-out whatever the file holds. Asking with
+// the entry's bare text made that untrue: the matcher reduces the sequence to
+// one captured repository string, and a single honest
+// `with: repository: <org>/<repo>` step ANYWHERE in the same document then
+// answered for every `repositories: [<org>/<repo>]` line in it. The kind-tagged
+// key cannot be answered by a scalar — a NUL is not a character a YAML scalar
+// may carry, so no parsed value ever spells one — which is what keeps the two
+// node kinds apart inside one document.
+const SEQUENCE_NODE_KEY_PREFIX = "\u0000flow-sequence\u0000";
+function sequenceNodeKey(entry) { return `${SEQUENCE_NODE_KEY_PREFIX}${entry}`; }
+
+// `value(m)` is the STRUCTURAL half of a form: the value the line carries, keyed
+// by the node kind it stands at, which must be one the file really declares at a
+// GitHub Actions location (see legitimateActionValues). A form that declares one
+// is excused only where the document agrees; a form without one — the clone URL,
+// which is a shell remote and belongs to no YAML location — is judged on its
+// grammar alone, unchanged.
 const FUNCTIONAL_REPO_REFS = [
   { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE, value: (m) => `${m[2]}@${m[3]}` },
   { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
-  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
+  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE, value: (m) => sequenceNodeKey(m[2]) },
   { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
   { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
-  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => m[2] },
+  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE, value: (m) => sequenceNodeKey(m[2]) },
 ];
 
 // THE canonical token boundary — used by the tokenizer AND by every rule that
@@ -906,6 +928,35 @@ function isPlainObject(v) {
   return proto === Object.prototype || proto === null;
 }
 
+// The sequence twin of isPlainObject. `Array.isArray` alone is not enough: an
+// array whose own prototype has been REPLACED inherits from the forgery, so it
+// is not a sequence this engine walks as one (it falls through to the ordinary
+// own-property walk, which reads nothing it does not own).
+function isPlainArray(v) {
+  if (!Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Array.prototype || proto === null;
+}
+
+// THE only way this engine walks a parsed sequence. `for (const x of arr)` reads
+// indices 0..length-1 THROUGH THE PROTOTYPE CHAIN, so a polluted
+// `Array.prototype[1]` supplies a value for a HOLE the document does not
+// contain — an inherited step, an inherited document, an inherited job — which
+// is exactly the payload the own-property rule exists to refuse. Own numeric
+// indices only: a hole is ABSENT, a named own property (`arr.jobs = …`) is not
+// an element, and an accessor is not a value a YAML document can declare.
+function ownItems(v) {
+  if (!isPlainArray(v)) return [];
+  const out = [];
+  for (const key of Object.keys(v)) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(key)) continue;
+    const desc = Object.getOwnPropertyDescriptor(v, key);
+    if (!desc || !("value" in desc)) continue;
+    out.push(desc.value);
+  }
+  return out;
+}
+
 // THE only way this engine reads a key off a parsed document. `doc.jobs` walks
 // the prototype chain; `own(doc, "jobs")` does not.
 function own(obj, key) {
@@ -959,10 +1010,13 @@ function hasPrototypeKey(value, seen) {
   if (value === null || typeof value !== "object") return false;
   if (seen.has(value)) return false;
   seen.add(value);
-  if (Array.isArray(value)) {
-    for (const item of value) if (hasPrototypeKey(item, seen)) return true;
+  if (isPlainArray(value)) {
+    for (const item of ownItems(value)) if (hasPrototypeKey(item, seen)) return true;
     return false;
   }
+  // An `Array.isArray` value whose prototype has been replaced is NOT handled
+  // here: it falls through to the own-property walk at the bottom, which visits
+  // its own indices and nothing it inherits.
   if (value instanceof Map) {
     for (const [k, v] of value) {
       if (typeof k === "string" && PROTOTYPE_KEYS.has(k)) return true;
@@ -983,6 +1037,17 @@ function hasPrototypeKey(value, seen) {
   return false;
 }
 
+// THE test seam for the parser, and the only indirection in front of it.
+// Production leaves it null and parses with the VENDORED js-yaml; a test installs
+// a loader that behaves the way a hostile parser would — polluting a builtin
+// prototype mid-parse, or handing back a shape js-yaml never produces — so the
+// guards below can be exercised through the real scan path instead of only
+// through their own comparator. `setYamlLoader(null)` puts the vendored loader
+// back, and nothing but a test ever calls it.
+let yamlLoaderImpl = null;
+function setYamlLoader(fn) { yamlLoaderImpl = fn || null; }
+function yamlLoad(text) { return (yamlLoaderImpl || loadAllYaml)(text); }
+
 // THE single parse entry point for this engine. Every reader below goes through
 // it, so the three guards cannot be bypassed by adding a fourth reader later.
 //
@@ -998,10 +1063,10 @@ function parseYamlDocuments(text) {
   const snapshot = snapshotPrototypes();
   let docs;
   let threw = false;
-  try { docs = loadAllYaml(text); }
+  try { docs = yamlLoad(text); }
   catch { threw = true; }
   assertPrototypesUnpolluted(snapshot);
-  if (threw || !Array.isArray(docs)) return null;
+  if (threw || !isPlainArray(docs)) return null;
   if (hasPrototypeKey(docs, new Set())) return null;
   return docs;
 }
@@ -1012,8 +1077,7 @@ function addLegitimateValue(values, v) {
 
 // `steps:` is the same shape in a workflow job and in a composite action.
 function collectStepValues(steps, values) {
-  if (!Array.isArray(steps)) return;
-  for (const step of steps) {
+  for (const step of ownItems(steps)) {
     if (!isPlainObject(step)) continue;
     addLegitimateValue(values, own(step, "uses"));
     const withInputs = own(step, "with");
@@ -1037,7 +1101,7 @@ function legitimateActionValues(text) {
   const docs = parseYamlDocuments(text);
   if (docs === null) return null;
   const values = new Set();
-  for (const doc of docs) {
+  for (const doc of ownItems(docs)) {
     if (!isPlainObject(doc)) continue;
     const jobs = own(doc, "jobs");
     if (isPlainObject(jobs)) {
@@ -1187,7 +1251,7 @@ function readUsesPins(text) {
   const docs = parseYamlDocuments(text);
   if (docs === null) return null;
   const pins = [];
-  for (const doc of docs) {
+  for (const doc of ownItems(docs)) {
     if (!isPlainObject(doc)) continue;
     const jobs = own(doc, "jobs");
     if (!isPlainObject(jobs)) continue;
@@ -1268,7 +1332,7 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
         + "an expiry entry only ever time-boxes a live exemption; list the basename or delete the expiry entry");
     }
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      expiryFail(`config error: ${where}['${basename}'] must be an object carrying untilPin { file, sha }`);
+      expiryFail(`config error: ${where}['${basename}'] must be an object carrying untilPin { file, uses, sha }`);
     }
     const pin = entry.untilPin;
     if (!pin || typeof pin !== "object" || Array.isArray(pin)
@@ -2241,7 +2305,7 @@ export {
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
   readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
   parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
-  isPlainObject, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
+  setYamlLoader, isPlainObject, isPlainArray, ownItems, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,

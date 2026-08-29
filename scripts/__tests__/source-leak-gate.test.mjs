@@ -15,10 +15,11 @@ import {
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
   readUsesPins, canonicalUsesTarget, legitimateActionValues, isTrackedInScannedTree,
   parseYamlDocuments, assertPrototypesUnpolluted, snapshotPrototypes, hasPrototypeKey,
-  isPlainObject, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
+  setYamlLoader, isPlainObject, isPlainArray, ownItems, own, PROTOTYPE_KEYS, PROTOTYPE_POLLUTION_ERROR,
 } from "../source-leak-gate.mjs";
-// The VENDORED parser, imported directly for the one test that has to inspect
-// what the PARSER produced rather than what the engine decided about it.
+// The VENDORED parser, imported directly by the tests that have to inspect what
+// the PARSER produced rather than what the engine decided about it, and by the
+// hostile-loader tests, which parse honestly and misbehave around the parse.
 import { loadAll as jsYamlLoadAll } from "../lib/vendor/js-yaml/js-yaml.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
@@ -1578,21 +1579,28 @@ test("expiry: the keyed target pinned twice at DIFFERENT refs cannot key an exem
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("expiry: a malformed entry is a config error, named", () => {
-  for (const [label, entry] of [
-    ["no untilPin", { why: "x" }],
-    ["untilPin is a string", { untilPin: ".github/workflows/caller.yml" }],
-    ["no sha", { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET } }],
-    ["sha is a branch", { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET, sha: "main" } }],
-    ["no file", { untilPin: { uses: PIN_TARGET, sha: PIN_A } }],
-    ["no uses target", { untilPin: { file: ".github/workflows/caller.yml", sha: PIN_A } }],
+test("expiry: a malformed entry is a config error, named — and it names all THREE keys", () => {
+  // Each message states the shape the operator has to write, so it has to state
+  // the REAL one: an entry is `untilPin { file, uses, sha }`, and a diagnostic
+  // that named only `{ file, sha }` sent the reader back with an entry the very
+  // next check rejects for the missing `uses` target.
+  const SHAPE = /untilPin must be \{ file: [^}]*uses: [^}]*sha: [^}]*\}/;
+  for (const [label, entry, expected] of [
+    ["the entry is not an object at all", "just-a-string", /must be an object carrying untilPin \{ file, uses, sha \}/],
+    ["the entry is an array", [".github/workflows/caller.yml"], /must be an object carrying untilPin \{ file, uses, sha \}/],
+    ["no untilPin", { why: "x" }, SHAPE],
+    ["untilPin is a string", { untilPin: ".github/workflows/caller.yml" }, SHAPE],
+    ["no sha", { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET } }, SHAPE],
+    ["sha is a branch", { untilPin: { file: ".github/workflows/caller.yml", uses: PIN_TARGET, sha: "main" } }, SHAPE],
+    ["no file", { untilPin: { uses: PIN_TARGET, sha: PIN_A } }, SHAPE],
+    ["no uses target", { untilPin: { file: ".github/workflows/caller.yml", sha: PIN_A } }, SHAPE],
   ]) {
     const dir = expiryCase({ config: { exemptFileBasenames: ["notes.txt"], exemptFileBasenamesExpiry: { "notes.txt": entry } } });
     try {
       const r = runExpiryGate(dir);
       assert.equal(r.status, 1, `${label}: expected exit 1`);
       assert.match(r.err, /config error/, label);
-      assert.match(r.err, /untilPin must be/, label);
+      assert.match(r.err, expected, label);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }
 });
@@ -2351,6 +2359,44 @@ test("a `repositories:` FLOW SEQUENCE is not a value any Actions location carrie
   });
 });
 
+test("a legitimate SCALAR checkout does not excuse a FLOW SEQUENCE in the SAME document", () => {
+  // The case the two scans above cannot see, because each writes its own file:
+  // one document carrying BOTH forms. The workflow really checks out
+  // `cinatra-ai/wp-theme` at a step's `with:` (a scalar, excused), and the
+  // `repositories: [...]` line elsewhere in the same document is still a
+  // finding. Node kinds are kept apart INSIDE a file: the legitimate-value set
+  // holds the scalars the document declares, and the flow form asks with a
+  // sequence key no scalar can answer. Reduced to the entry's bare text — which
+  // is what the flow matcher captures — the honest step at line 7 excused every
+  // list in the file.
+  const wf = [
+    "name: build",                                    // 1
+    "jobs:",                                          // 2
+    "  build:",                                       // 3
+    "    steps:",                                     // 4
+    "      - uses: actions/checkout@v4",              // 5
+    "        with:",                                  // 6
+    "          repository: cinatra-ai/wp-theme",      // 7  a real checkout input
+    "      - name: fan out",                          // 8
+    "        with:",                                  // 9
+    "          repositories: [cinatra-ai/wp-theme]",  // 10 no Actions input takes a LIST
+    "",
+  ].join("\n");
+  const rel = ".github/workflows/build.yml";
+  scanTree((t) => {
+    assert.deepEqual(t.lines(rel, wf), [10],
+      "the flow sequence is a finding even though the same file legitimately checks the repository out");
+    const flagged = t.findings(rel, wf);
+    assert.equal(flagged[0].rule, "SLG_PRIVATE_REPO_REF");
+    // NOT VACUOUS, both ways: the scalar step alone is clean, and the list alone
+    // is a finding — so what line 10 fails for is its node kind, nothing else.
+    assert.deepEqual(t.ids(rel, wf.split("\n").slice(0, 7).join("\n") + "\n"), []);
+    assert.deepEqual(t.ids(rel,
+      "jobs:\n  build:\n    steps:\n      - with:\n          repositories: [cinatra-ai/wp-theme]\n"),
+      ["SLG_PRIVATE_REPO_REF"]);
+  });
+});
+
 test("a heredoc, a folded block and a `- |` item are TEXT — the parser knows what a line cannot", () => {
   // Three former review rounds in one file. A `run: |` heredoc, a `run: >-`
   // folded block and a `- |` sequence item are strings the runner never reads as
@@ -2829,7 +2875,83 @@ test("the readers read OWN properties only — an inherited `jobs` is not there"
   assert.deepEqual(own(bare, "jobs"), { gate: { uses: "a/b@c" } });
 });
 
-test("a builtin prototype that changed shape during a parse ABORTS the run", () => {
+test("a parsed SEQUENCE is walked by own index — a polluted hole is not an element", () => {
+  // `for (const x of arr)` reads 0..length-1 THROUGH the prototype chain, so a
+  // polluted `Array.prototype[1]` hands a HOLE a value the document never
+  // contained: an inherited step whose `uses:` forges a dispatch, an inherited
+  // document whose `jobs` forges a pin. YAML cannot spell a hole, so the seam
+  // hands the readers the document a hostile parser would return; the walk must
+  // see own indices only.
+  const forged = `cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}`;
+  const steps = [{ uses: "actions/checkout@v4" }];
+  steps.length = 2;                       // index 1 is a HOLE, not a value
+  const docsWithHole = [{ name: "caller" }];
+  docsWithHole.length = 2;                // so is this one
+  try {
+    Array.prototype[1] = { uses: forged, jobs: { gate: { uses: forged } } };
+    assert.equal(steps[1].uses, forged, "the hole really does resolve through the prototype");
+
+    setYamlLoader(() => [{ jobs: { build: { steps } } }]);
+    const values = legitimateActionValues("the loader decides, not this text");
+    assert.deepEqual([...values], ["actions/checkout@v4"],
+      "only the OWN step is a step; the hole yields no legitimate value");
+    assert.equal(values.has(forged), false, "and the inherited dispatch is not in the file");
+
+    setYamlLoader(() => docsWithHole);
+    assert.deepEqual(readUsesPins("the loader decides, not this text"), [],
+      "an inherited DOCUMENT is not a document either, so it pins nothing");
+
+    // The walk the two readers share, and the predicate under it.
+    assert.deepEqual(ownItems(steps), [{ uses: "actions/checkout@v4" }]);
+    assert.deepEqual(ownItems(Object.assign([], { 0: "a", jobs: "not an element" })), ["a"]);
+    assert.equal(isPlainArray(steps), true);
+    assert.equal(isPlainArray(Object.setPrototypeOf([], { 0: forged })), false,
+      "an array whose prototype has been replaced is not the parser's own sequence");
+    assert.deepEqual(ownItems(Object.setPrototypeOf([], { 0: forged })), []);
+    // The pollution walker reads own indices too: an inherited element cannot
+    // make a clean document unreadable, and a hole is not a place to hide one.
+    const holed = [{ a: 1 }];
+    holed.length = 2;
+    assert.equal(hasPrototypeKey(holed, new Set()), false, "the inherited element is not the document's");
+  } finally {
+    setYamlLoader(null);
+    delete Array.prototype[1];
+  }
+  assert.equal(Object.hasOwn(Array.prototype, "1"), false, "the pollution is cleaned up");
+});
+
+test("a parser that pollutes DURING a parse aborts the ENGINE'S SCAN PATH", () => {
+  // The comparator test below proves the guard reports a changed prototype; this
+  // one proves the guard is WIRED to the parse — that a run cannot reach a
+  // verdict past a parser that edited the interpreter halfway through, which is
+  // exactly what a 4.1.0-class parser bug does. The seam installs a loader that
+  // parses honestly and pollutes around the parse, and the named abort must come
+  // back out of scanFile.
+  const rel = ".github/workflows/deploy.yml";
+  setYamlLoader((text) => {
+    Object.prototype.jobs = { gate: { uses: `cinatra-ai/ops/.github/workflows/deploy.yml@${POLLUTED_SHA}` } };
+    return jsYamlLoadAll(text);
+  });
+  try {
+    scanTree((t) => {
+      assert.throws(() => t.findings(rel, HONEST_CALLER), (e) => {
+        assert.equal(e.name, PROTOTYPE_POLLUTION_ERROR, "the abort is NAMED, not a generic scanner failure");
+        assert.match(e.message, /Object\.prototype changed shape during a YAML parse/);
+        assert.match(e.message, /added jobs/, "and it names what the parse added");
+        assert.match(e.message, /aborted rather than completed/);
+        return true;
+      }, "a polluted parse must abort the scan instead of returning findings");
+    });
+  } finally {
+    setYamlLoader(null);
+    delete Object.prototype.jobs;
+  }
+  // NOT VACUOUS: with the vendored loader back, that same file scans to a verdict.
+  scanTree((t) => assert.deepEqual(t.ids(rel, HONEST_CALLER), [],
+    "the honest caller is excused again once the parser behaves"));
+});
+
+test("assertPrototypesUnpolluted NAMES a builtin prototype that changed shape (the comparator alone)", () => {
   // Guard (c): the last line of defence. If the interpreter this gate reasons
   // with has been edited by the input it was reading, then nothing the run has
   // said — including the clean verdicts already printed — can be trusted, so the
