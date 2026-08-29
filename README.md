@@ -138,6 +138,13 @@ the record and a repository with submodules stays scannable; its name is still
 path-scanned. Content is scanned **whatever bytes it carries**: a `NUL` byte is
 not a "binary" marker and stops nothing, so a leak cannot be hidden behind one.
 
+The run's `Scanned N files` diagnostic (and the JSON summary's
+`scannedFileCount`) counts the files this run actually **read**, never the
+candidate set: a file skipped before it was opened — an exempt basename, an
+exempt directory, a non-regular entry — is stated beside the count
+(`Scanned 12 files (2 exempt, 1 not regular)`) instead of being counted as
+coverage the run did not have.
+
 ### Ratchet modes
 
 - **line** (default): only findings on lines the PR added (and paths the PR
@@ -212,7 +219,11 @@ repository — claimed by the probe, never mistaken for the listed one, and neve
 claimed by both at once. The rules that match a fixed private name (the tracker,
 the private proof host) use the same boundary, so `<name>.sibling` and
 `sibling.<name>` are other names while `<name>.` at the end of a sentence still
-resolves.
+resolves. The 1..100 ceiling belongs to the **name**, not to the spelling: a
+written reference is a name plus that optional suffix, and the committed cache
+validates its entries that way too — so a 100-character repository written as
+`<name>.git` is that repository, folds to it, and collides with any other
+spelling of it exactly like a bare entry would.
 
 The **npm-scope carve-out** — `@<org>/<name>` names a vendored workspace
 package, not a repository, so it is not a reference — **never excuses a name on

@@ -206,6 +206,33 @@ test("a selected file the engine cannot read stops the RUN — exit 2, naming th
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("the run diagnostic counts files SCANNED, and states what it skipped", () => {
+  // ADDED. CHANGED EXPECTATION: "Scanned N files" reported the CANDIDATE count,
+  // so an exempt file — skipped before scanFile ever opened it — was counted as
+  // coverage the run never had. Two candidates with one exempt is "Scanned 1
+  // files (1 exempt)".
+  const scanner = path.join(import.meta.dirname, "..", "source-leak-gate.mjs");
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-scan-count-")));
+  try {
+    fs.writeFileSync(path.join(dir, "notes.md"), "clean text\n");
+    fs.writeFileSync(path.join(dir, "skipme.md"), "clean text\n");
+    fs.mkdirSync(path.join(dir, "config"));
+    fs.writeFileSync(path.join(dir, "config", "gate.json"),
+      `${JSON.stringify({ exemptFileBasenames: ["skipme.md"] }, null, 1)}\n`);
+    spawnSync("git", ["init", "-q"], { cwd: dir });
+    spawnSync("git", ["add", "-A"], { cwd: dir });
+    const r = spawnSync(
+      "node",
+      [scanner, "--profile", "default", "--ratchet-mode", "off", "--config", "config/gate.json", "--exit-on-match"],
+      { cwd: dir, encoding: "utf8", env: { ...process.env, GITHUB_TOKEN: "", GH_TOKEN: "" } },
+    );
+    assert.equal(r.status, 0, `expected a clean run: ${r.stderr}`);
+    assert.match(r.stderr, /Scanned 1 files \(1 exempt\), 0 gated finding\(s\)/,
+      `the exempt file is stated, never counted as scanned: ${r.stderr}`);
+    assert.match(r.stderr, /source-leak-gate: clean\./, "and the clean line is unchanged");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a SYMBOLIC LINK is scanned as the link text git stores for it", () => {
   // ADDED. CHANGED CONTRACT: a non-regular selected path returned [] (clean), and
   // stat FOLLOWED the link, so the leak living in the link text itself — which is
@@ -1101,6 +1128,49 @@ test("ONE name grammar, ONE canonical form: the cache loads what the tokenizer r
     const d = writeCache(dir, {
       ttlDays: 7,
       public: [{ name: "CI", verifiedAt: "2026-03-12" }, { name: "ci", verifiedAt: "2026-03-12" }],
+    });
+    const dup = loadKnownPublicRepos(d, { now: "2026-03-12T00:00:00Z" });
+    assert.equal(dup.names.size, 0, "a folded duplicate clears nothing");
+    assert.equal(dup.warnings.length, 1);
+    assert.match(dup.warnings[0], /more than once/);
+    assert.deepEqual(dup.entries, [{ name: "ci", verifiedAt: "2026-03-12" }]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: the name ceiling is measured on the BASE — `.git` is not part of the name", () => {
+  // ADDED. CHANGED CONTRACT: the loader measured the 100-character ceiling
+  // against the WHOLE entry, so a 97-character repository spelled as a clone was
+  // rejected as "not a repository name" — and, rejected before folding, it also
+  // escaped the folded-duplicate check and left another entry for the same name
+  // trusted instead of resolved live.
+  const dir = tmpdir();
+  try {
+    for (const len of [96, 97, REPO_NAME_MAX]) {
+      const base = "a".repeat(len);
+      for (const spelling of [base, `${base}.git`]) {
+        // ADDED EXPECTATION: every base length loads FOLDED to the base with no
+        // warning; the 97- and 100-character clone spellings were the rejected ones.
+        const f = writeCache(dir, { ttlDays: 7, public: [{ name: spelling, verifiedAt: "2026-03-12" }] });
+        const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+        assert.deepEqual([...loaded.names], [base], `a ${len}-character base spelled ${JSON.stringify(spelling.slice(len))}`);
+        assert.deepEqual(loaded.warnings, [], "a grammar-valid spelling is not a warning");
+      }
+    }
+    // ADDED EXPECTATION: past the ceiling the BASE is not a name, in either spelling.
+    const tooLong = "a".repeat(REPO_NAME_MAX + 1);
+    for (const spelling of [tooLong, `${tooLong}.git`]) {
+      const f = writeCache(dir, { ttlDays: 7, public: [{ name: spelling, verifiedAt: "2026-03-12" }] });
+      const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+      assert.equal(loaded.names.size, 0, "101 characters is not a repository name");
+      assert.equal(loaded.warnings.length, 1);
+      assert.match(loaded.warnings[0], /not a repository name/);
+    }
+    // ADDED EXPECTATION: a clone spelling now REACHES duplicate detection, so
+    // `NAME.git` beside `name` is the folded-duplicate invalidation — one
+    // warning, and no spelling of the name cleared.
+    const d = writeCache(dir, {
+      ttlDays: 7,
+      public: [{ name: "CI.git", verifiedAt: "2026-03-12" }, { name: "ci", verifiedAt: "2026-03-12" }],
     });
     const dup = loadKnownPublicRepos(d, { now: "2026-03-12T00:00:00Z" });
     assert.equal(dup.names.size, 0, "a folded duplicate clears nothing");
@@ -2950,7 +3020,11 @@ test("an over-long run is NOT truncated to a name that must 404", () => {
 // `.git` is a clone suffix, recognised BEFORE the dotted-sibling boundary.
 // --------------------------------------------------------------------------
 
-test("a `.git` clone suffix names the SAME repository, in every lane", () => {
+test("a `.git` clone suffix names the SAME repository in the STATIC lane", () => {
+  // RENAMED (it said "in every lane" while building probe-DISABLED rules over
+  // private-list-owned names — every line here is decided by static matching and
+  // no request is ever made). The probe lane is the test below.
+  //
   // The defect this locks: `.git` was normalised away only AFTER the
   // dotted-sibling boundary had already rejected the token, so the clone form of
   // a private repository produced no finding in either lane.
@@ -2973,6 +3047,24 @@ test("a `.git` clone suffix names the SAME repository, in every lane", () => {
   ]) {
     assert.equal(total(line), 0, `a dotted sibling is not the tracker: ${JSON.stringify(line)}`);
   }
+});
+
+test("a `.git` clone suffix names the SAME repository in the PROBE lane", async () => {
+  // ADDED (the split half). An UNLISTED name is the only way into the probe: a
+  // private-list member never reaches it. The suffix must be off the name in
+  // all three places the lane uses it — the request it sends, the finding it
+  // returns and the memo it keeps — or the clone form would spend a second
+  // request on a name GitHub does not have.
+  const probe = buildRules({}, "default", null, { probe: true }).find((r) => r.id === PROBE_RULE_ID);
+  assert.equal(matchRule(probe, "clone cinatra-ai/some-new-repo.git now"), 1, "the clone form is nominated");
+  const calls = stubFetch(() => apiResponse(200, { private: true }));
+  const ctx = probeCtx();
+  const out = await resolveProbeFindings([candidate("some-new-repo.git")], ctx);
+  assert.equal(calls.length, 1, "one name, one request");
+  assert.match(calls[0].url, /\/repos\/cinatra-ai\/some-new-repo$/, "the clone suffix never reaches the API path");
+  assert.equal(out.length, 1);
+  assert.equal(out[0].rule, PROBE_RULE_ID);
+  assert.deepEqual([...ctx.cache.keys()], ["some-new-repo"], "and the memo is keyed by the canonical name");
 });
 
 test("a token of nothing but dots is not a repository name, and is never nominated", () => {

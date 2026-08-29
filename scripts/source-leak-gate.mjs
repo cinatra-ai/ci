@@ -841,6 +841,19 @@ function isValidRepoName(name) {
   return s.length >= 1 && s.length <= REPO_NAME_MAX && REPO_NAME_RE.test(s);
 }
 
+// A WRITTEN reference to a repository: a name, or that name with the `.git`
+// clone suffix the tokenizer reads off it. The two halves are judged
+// separately, exactly as normalizeRepoName() strips the suffix — a name is at
+// most REPO_NAME_MAX characters, and the four the clone suffix adds are not part
+// of it. Measuring the ceiling against `<base>.git` called a 97-character
+// repository spelled as a clone "not a repository name", which is a name the
+// tokenizer resolves and the cache would then have to send to a live probe.
+function isValidRepoReference(name) {
+  const s = String(name ?? "");
+  if (isValidRepoName(s)) return true;
+  return s.toLowerCase().endsWith(".git") && isValidRepoName(s.slice(0, -4));
+}
+
 // The repository half of an `<org>/<name>` token the shared tokenizer matched.
 function orgPathRepoName(match) {
   const parts = String(match || "").split("/");
@@ -1692,9 +1705,15 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
     // repository name" — a name GitHub resolves, and one the tokenizer folds to
     // `ci` — and sent it to a live probe whose verdict the network can change.
     // One grammar means one canonical form on both sides of the comparison.
+    //
+    // The entry is validated as BASE plus an optional `.git` (isValidRepoReference),
+    // never as one string against the name ceiling: a rejection here happens
+    // BEFORE folding, so a rejected alias also escapes the folded-duplicate
+    // check below and leaves its twin trusted — one spelling of a name deciding
+    // that another spelling of the same name needs no probe.
     const rawName = rawEntry.name;
     const nameIsString = typeof rawName === "string";
-    if (!nameIsString || !isValidRepoName(rawName)) {
+    if (!nameIsString || !isValidRepoReference(rawName)) {
       invalid++;
       warnings.push(
         `public-repos cache entry ${label} has an invalid "name" `
@@ -2114,7 +2133,11 @@ function scanUnreadable(relPath, cause) {
   return err;
 }
 
-function scanFile(relPath, rules) {
+// `tally` is the caller's scan record: this function is the only place that
+// knows whether a selected file was actually READ, so the run diagnostic counts
+// what it did rather than what it was handed. Optional — every other caller
+// scans one file and already knows the answer.
+function scanFile(relPath, rules, tally = null) {
   // lstat, never stat: what git stores for a symbolic link is its LINK TEXT, so
   // the link is the file to scan, not a window onto whatever it points at.
   let stat;
@@ -2137,10 +2160,12 @@ function scanFile(relPath, rules) {
     // PRINTED by path — on the record, never a silent clean — and the entry's
     // NAME is still scanned by scanPath.
     process.stderr.write(`[source-leak-gate] not a regular file, no content to scan: ${relPath}\n`);
+    if (tally) tally.notRegular++;
     return [];
   } else {
     try { text = fs.readFileSync(relPath, "utf8"); } catch (e) { throw scanUnreadable(relPath, e); }
   }
+  if (tally) tally.scanned++;
   // Content carrying a NUL byte is scanned like any other selected file. "Looks
   // binary" was a heuristic that returned clean for a file nobody had examined,
   // so a leak had only to carry one NUL to be waved through; a NUL stops nothing.
@@ -2385,6 +2410,12 @@ async function main() {
     return shouldScan(p, scanExtensions, skipDirs, skipDirPrefixes, skipFilePatterns);
   });
 
+  // "Scanned N files" must be the files this run actually READ. Counting the
+  // candidate set instead reported the exempt files and the non-regular entries
+  // — the ones printed as excluded a few lines above — as scanned, so the
+  // number an operator reads beside "clean" claimed coverage the run never had.
+  // The skipped categories are stated beside it, not folded into it.
+  const scanTally = { scanned: 0, notRegular: 0, exempt: 0 };
   let findings = [];
   for (const f of candidates) {
     // The exemption decides BEFORE the file is opened. It read the same either
@@ -2392,11 +2423,15 @@ async function main() {
     // FAILS the run, an exempt file must not be able to fail it — the operator
     // has already said this one is not scanned.
     const base = f.split("/").pop();
-    if (exemptFiles.has(base) || exemptDirs.some((pre) => f.startsWith(pre))) continue;
-    const fileFindings = scanFile(f, rules);
+    if (exemptFiles.has(base) || exemptDirs.some((pre) => f.startsWith(pre))) { scanTally.exempt++; continue; }
+    const fileFindings = scanFile(f, rules, scanTally);
     if (!fileFindings.length) continue;
     findings.push(...fileFindings);
   }
+  const skippedNote = [
+    scanTally.exempt ? `${scanTally.exempt} exempt` : "",
+    scanTally.notRegular ? `${scanTally.notRegular} not regular` : "",
+  ].filter(Boolean).join(", ");
 
   // File-name (path) scan: extension-INDEPENDENT candidate set (a leaky-named
   // binary counts), re-applying every exclusion (private/skip/exempt/gate-own)
@@ -2465,10 +2500,11 @@ async function main() {
   if (args["write-gate-baseline"]) writeGateBaseline(findings, args["write-gate-baseline"]);
 
   if (format === "json") {
-    process.stdout.write(JSON.stringify(buildSummary(findings, gateFindings, profile, candidates.length), null, 2) + "\n");
+    process.stdout.write(JSON.stringify(buildSummary(findings, gateFindings, profile, scanTally.scanned), null, 2) + "\n");
   } else if (!quiet) {
     for (const f of gateFindings) process.stdout.write(`${f.rule}\t${f.file}:${f.line}:${f.column}\t${f.match}\t${f.snippet}\n`);
-    process.stderr.write(`Scanned ${candidates.length} files, ${gateFindings.length} gated finding(s)` + (ratchetNote ? ` (${ratchetNote})` : "") + "\n");
+    process.stderr.write(`Scanned ${scanTally.scanned} files` + (skippedNote ? ` (${skippedNote})` : "")
+      + `, ${gateFindings.length} gated finding(s)` + (ratchetNote ? ` (${ratchetNote})` : "") + "\n");
     process.stderr.write(`  ${probeNote}\n`);
     for (const [r, c] of Object.entries(countBy(gateFindings, (f) => f.rule)).sort((a, b) => b[1] - a[1])) {
       process.stderr.write(`  ${r}: ${c}\n`);
