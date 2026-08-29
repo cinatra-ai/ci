@@ -287,14 +287,23 @@ const FLOW_TRAILING_COMMA = "(?:[ \\t]*,)?";
 // rather than a substring of one. A clone reference is either a FULL REMOTE
 // (`https://github.com/<org>/<repo>.git`, `git@github.com:<org>/<repo>.git`,
 // `ssh://git@github.com/<org>/<repo>.git`) or the BARE `<org>/<repo>.git`
-// standing on its own — at the start of the line, after whitespace, or after an
-// opening quote or bracket. Never after an `@`: `@<org>/<repo>.git` is an npm
-// scope, not a remote, and an unanchored pattern excused it by matching from the
-// org onward.
+// standing on its own — and BOTH forms take the SAME left delimiter: start of
+// text, whitespace, an opening quote or bracket, or the `=` of a shell/env
+// assignment (`REMOTE=https://github.com/<org>/<repo>.git` is the machine form,
+// spelled the way scripts actually spell it). Never after an `@`:
+// `@<org>/<repo>.git` is an npm scope, not a remote, and an unanchored pattern
+// excused it by matching from the org onward.
+//
+// The delimiter binds the REMOTE FORMS too, not just the bare one. While it
+// guarded only the bare alternative, any junk could carry a remote:
+// `xhttps://github.com/<org>/<repo>.git`, `xgit@github.com:…` and `xssh://…`
+// are not remotes anybody clones, but they spell the private name in full and
+// the carve-out excused every one of them. One delimiter, applied once in front
+// of an OPTIONAL remote prefix, is what makes that impossible to reintroduce.
 const CLONE_TERMINATOR = "(?=$|[\\s,;)\\]\"'`])";
 const CLONE_REMOTE_PREFIX =
   "(?:https:\\/\\/github\\.com\\/|git@github\\.com:|ssh:\\/\\/git@github\\.com\\/)";
-const CLONE_BARE_LEFT = "(?<![^\\s\"'`([{])";
+const CLONE_LEFT = "(?<![^\\s=\"'`([{])";
 function escapeForRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 // Case-folded literal: `ops` becomes `[oO][pP][sS]`. Folding a LITERAL rather
 // than setting the `i` flag keeps the fold where it belongs — the org and the
@@ -343,7 +352,7 @@ function repositoryKeyFlowRe(name) {
 function cloneUrlRe(name) {
   const n = repoNameCi(name);
   return new RegExp(
-    `(?:${CLONE_REMOTE_PREFIX}|${CLONE_BARE_LEFT})${ORG_CI}\\/${n}\\.git${CLONE_TERMINATOR}`,
+    `${CLONE_LEFT}(?:${CLONE_REMOTE_PREFIX})?${ORG_CI}\\/${n}\\.git${CLONE_TERMINATOR}`,
     "g",
   );
 }
@@ -1053,6 +1062,20 @@ function probeFetch(url, init) {
 
 function isoDay(d) { return new Date(d).toISOString().slice(0, 10); }
 
+// Whole UTC calendar days since the epoch. Freshness is measured in DAYS, so it
+// is computed on days: a stamp is a day, not an instant, and a fraction of a day
+// must not decide whether a name is still vouched for.
+function utcDayIndex(d) { return Math.floor(new Date(d).getTime() / 86_400_000); }
+
+// One short, quotable label for a cache entry, so a warning can NAME the entry
+// it is about even when that entry has no usable `name` to quote.
+function cacheEntryLabel(entry) {
+  let s;
+  try { s = JSON.stringify(entry); } catch { s = undefined; }
+  if (typeof s !== "string") s = String(entry);
+  return s.length > 120 ? `${s.slice(0, 117)}...` : s;
+}
+
 // A `verifiedAt` stamp is trustworthy only if it is a REAL calendar day that is
 // not in the future. `new Date("2026-02-30T00:00:00Z")` does not throw — it
 // normalises to March 2nd — so a shape check plus "did it parse?" accepts a day
@@ -1078,11 +1101,19 @@ function verifiedAtVerdict(stamp, now) {
 //
 // VALIDATION IS FAIL-CLOSED. The failure mode this guards is not a crash, it is
 // a cache that quietly keeps vouching:
-//   - STRUCTURE (not an object, no `public` array, a name that is not a
-//     repository name, a `verifiedAt` that is not a YYYY-MM-DD day) THROWS. The
-//     file is malformed, and the caller decides what that means — main() turns
-//     it into the usual gate failure. Throwing rather than exiting keeps the
-//     loader testable.
+//   - The FILE's structure (not JSON, not an object, no `public` array) THROWS.
+//     There is nothing to read, the caller decides what that means — main()
+//     turns it into the usual gate failure. Throwing rather than exiting keeps
+//     the loader testable.
+//   - An ENTRY that is not an object, or whose `name`/`verifiedAt` is not a JSON
+//     STRING (and, for the name, a real repository name), is INVALID: it never
+//     enters the fresh set, so the name it was going to clear is resolved live,
+//     and one warning names the entry. The types are checked, not coerced —
+//     `{"name": 123}` used to stringify into the perfectly good name `123` and
+//     clear `<org>/123` with no probe at all, and `"verifiedAt": ["2026-08-28"]`
+//     stringified into a day that then read as fresh. A malformed entry must
+//     never clear a name; it also must not take the whole cache down with it,
+//     which is why it warns and is skipped rather than throwing.
 //   - `ttlDays` must be an INTEGER in 1..PUBLIC_CACHE_TTL_DAYS when present. An
 //     arbitrarily large TTL (or 0, or a fraction, or a string) is not a slightly
 //     wrong policy, it is the freshness rule switched off — so the WHOLE cache is
@@ -1116,16 +1147,41 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
   const fresh = new Set();
   let stale = 0, invalid = 0;
   for (const rawEntry of parsed.public) {
+    const label = cacheEntryLabel(rawEntry);
     if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
-      throw new Error(`public-repos cache entries must be objects with "name" and "verifiedAt" (${p})`);
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${label} is not an object with a "name" and a "verifiedAt" `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
     }
-    const name = normalizeRepoName(rawEntry.name);
-    if (!isValidRepoName(rawEntry.name) || name !== String(rawEntry.name || "").toLowerCase()) {
-      throw new Error(`public-repos cache has an invalid repository name: ${JSON.stringify(rawEntry.name)} (${p})`);
+    // TYPE FIRST, then grammar. A non-string name coerced to a string is a name
+    // nobody wrote and nobody verified, and it would clear a repository for free.
+    const rawName = rawEntry.name;
+    const nameIsString = typeof rawName === "string";
+    const name = nameIsString ? normalizeRepoName(rawName) : "";
+    if (!nameIsString || !isValidRepoName(rawName) || name !== rawName.toLowerCase()) {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${label} has an invalid "name" `
+        + `(${nameIsString ? "not a repository name" : "not a JSON string"}) `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
     }
-    if (!ISO_DAY_RE.test(String(rawEntry.verifiedAt || ""))) {
-      throw new Error(`public-repos cache entry ${JSON.stringify(rawEntry.name)} needs a YYYY-MM-DD "verifiedAt" (${p})`);
+    if (typeof rawEntry.verifiedAt !== "string") {
+      invalid++;
+      warnings.push(
+        `public-repos cache entry ${label} has an invalid "verifiedAt" (not a JSON string) `
+        + `— treated as stale and resolved live (${p})`,
+      );
+      continue;
     }
+    // The NAME is usable, so the entry stays listed for `--verify-cache` even
+    // when its stamp cannot be trusted: a refresh re-probes it and repairs the
+    // stamp. An entry with no usable name is not listed — there is nothing to
+    // probe — so the same refresh drops it from the file.
     entries.push({ name, verifiedAt: rawEntry.verifiedAt });
 
     const verdict = verifiedAtVerdict(rawEntry.verifiedAt, now);
@@ -1138,8 +1194,12 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
       continue;
     }
     if (!ttlOk) continue; // the whole cache is ignored; entries are still listed for --verify-cache
-    const ageDays = (now.getTime() - verdict.at.getTime()) / 86_400_000;
-    if (ageDays <= ttlDays) fresh.add(name); else stale++;
+    // Age in whole UTC CALENDAR DAYS, and the comparison is STRICT. The contract
+    // is that an entry expires BY `verifiedAt + ttlDays`, so the entry stamped
+    // exactly that many days ago is already out of date: `<=` trusted it for one
+    // more day than the TTL it is named for.
+    const ageDays = utcDayIndex(now) - utcDayIndex(verdict.at);
+    if (ageDays < ttlDays) fresh.add(name); else stale++;
   }
 
   if (!ttlOk) {
@@ -1154,7 +1214,7 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
   }
   const note = `${fresh.size} fresh cached public name(s)`
     + (stale ? `, ${stale} past the ${ttlDays}-day TTL (resolved live)` : "")
-    + (invalid ? `, ${invalid} with an untrustworthy stamp (resolved live)` : "");
+    + (invalid ? `, ${invalid} with untrustworthy metadata (resolved live)` : "");
   return { names: fresh, entries, path: p, ttlDays, ttlValid: true, warnings, note };
 }
 
@@ -1316,7 +1376,12 @@ function serializePublicRepoCache(obj) {
   const head = { ...obj };
   delete head.public;
   const headJson = JSON.stringify(head, null, 2).slice(1, -1).replace(/\n$/, "").replace(/\s+$/, "");
-  return `{${headJson},\n  "public": [\n${entries.join(",\n")}\n  ]\n}\n`;
+  // The separating comma belongs to the head, not to `"public"`: a cache with no
+  // other top-level field (no `$comment`, no `ttlDays` — the documented default)
+  // serialised as `{,` and was not JSON at all, so the very next read of the file
+  // the writer had just produced threw.
+  const headPart = headJson ? `${headJson},` : "";
+  return `{${headPart}\n  "public": [\n${entries.join(",\n")}\n  ]\n}\n`;
 }
 
 // `--verify-cache`: re-confirm every committed cache entry against the API and

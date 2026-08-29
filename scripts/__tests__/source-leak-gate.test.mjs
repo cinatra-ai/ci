@@ -1100,23 +1100,98 @@ test("cache: a stale entry is PROBED rather than trusted", async () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("cache: malformed entries are hard errors, never silently ignored", () => {
+test("cache: a malformed FILE is a hard error", () => {
+  // The FILE's structure still throws: there is nothing to read, so the caller
+  // (main()) turns it into the usual gate failure.
   const dir = tmpdir();
-  const bad = [
-    { public: ["ci"] },                                            // legacy bare string
-    { public: [{ name: "ci" }] },                                  // no verifiedAt
-    { public: [{ name: "ci", verifiedAt: "10-03-2026" }] },        // wrong date shape
-    { public: [{ name: "bad name", verifiedAt: "2026-03-10" }] },  // invalid repo name
-    { public: [{ name: "ci.git", verifiedAt: "2026-03-10" }] },    // a clone suffix is not a name
-    { public: [{ name: "has/slash", verifiedAt: "2026-03-10" }] }, // a slash is not a name character
-    { ttlDays: 7 },                                                // no public array
-  ];
   try {
-    for (const obj of bad) {
+    for (const obj of [{ ttlDays: 7 }, { public: {} }, [], "nope", null]) {
       const f = writeCache(dir, obj);
       assert.throws(() => loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" }),
         `should reject ${JSON.stringify(obj)}`);
     }
+    const f = path.join(dir, "public-repos.json");
+    fs.writeFileSync(f, "{not json");
+    assert.throws(() => loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" }), /valid JSON/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: a malformed ENTRY never clears a name — it is stale, with one warning", () => {
+  // CHANGED EXPECTATION (was: every one of these throws). The types are now
+  // CHECKED rather than coerced, and a single bad entry must not decide the fate
+  // of the whole file: it is skipped with one warning naming it, and the name it
+  // was going to clear is resolved live. What the old code got wrong is the
+  // COERCION — `{"name": 123}` stringified into the perfectly good name `123`
+  // and cleared `<org>/123` with no probe at all, and `["2026-03-12"]`
+  // stringified into a day that then read as fresh. Both are entries below.
+  const dir = tmpdir();
+  const bad = [
+    { entry: "ci", why: /not an object/ },                              // legacy bare string
+    { entry: null, why: /not an object/ },                              // a null is not an entry
+    { entry: ["ci", "2026-03-12"], why: /not an object/ },              // nor is an array
+    { entry: { name: 123, verifiedAt: "2026-03-12" }, why: /not a JSON string/ },
+    { entry: { verifiedAt: "2026-03-12" }, why: /name/ },               // no name at all
+    { entry: { name: "ci", verifiedAt: ["2026-03-12"] }, why: /not a JSON string/ },
+    { entry: { name: "ci" }, why: /verifiedAt/ },                       // no verifiedAt
+    { entry: { name: "ci", verifiedAt: "10-03-2026" }, why: /verifiedAt/ },
+    { entry: { name: "bad name", verifiedAt: "2026-03-12" }, why: /not a repository name/ },
+    { entry: { name: "ci.git", verifiedAt: "2026-03-12" }, why: /not a repository name/ },
+    { entry: { name: "has/slash", verifiedAt: "2026-03-12" }, why: /not a repository name/ },
+  ];
+  try {
+    for (const { entry, why } of bad) {
+      const label = JSON.stringify(entry);
+      const f = writeCache(dir, { ttlDays: 7, public: [entry] });
+      const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+      assert.equal(loaded.names.size, 0, `${label} must clear nothing`);
+      assert.equal(loaded.warnings.length, 1, `${label} must raise exactly one warning`);
+      assert.match(loaded.warnings[0], why, label);
+      assert.match(loaded.note, /untrustworthy/, label);
+    }
+    // A good entry alongside a bad one is unaffected: the bad entry is skipped,
+    // not the file.
+    const f = writeCache(dir, {
+      ttlDays: 7,
+      public: [{ name: 123, verifiedAt: "2026-03-12" }, { name: "good-repo", verifiedAt: "2026-03-12" }],
+    });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    assert.deepEqual([...loaded.names], ["good-repo"]);
+    // The unusable entry is not listed either: there is no name to re-probe, so
+    // `--verify-cache` drops it instead of laundering it into a stamped one.
+    assert.deepEqual(loaded.entries, [{ name: "good-repo", verifiedAt: "2026-03-12" }]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: a coerced-name entry is RESOLVED LIVE, and the live answer wins", async () => {
+  // End to end: the numeric name the loader refuses to trust costs an API call,
+  // and the API's answer — not the cache — decides.
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, { ttlDays: 7, public: [{ name: 123, verifiedAt: "2026-03-12" }] });
+    const loaded = loadKnownPublicRepos(f, { now: "2026-03-12T00:00:00Z" });
+    const calls = stubFetch(() => apiResponse(200, { private: true }));
+    const out = await resolveProbeFindings([candidate("123")], probeCtx({ knownPublic: loaded.names }));
+    assert.equal(calls.length, 1, "a coerced name must not clear the repository for free");
+    assert.equal(out.length, 1, "and the live answer wins");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cache: an entry expires BY verifiedAt + ttlDays, measured in UTC calendar days", () => {
+  // CHANGED EXPECTATION (was: `ageDays <= ttlDays`, so the entry at exactly the
+  // expiry instant was still trusted — one day more than the TTL it is named
+  // for). The clock is injected, so the boundary is asserted, not approximated.
+  const dir = tmpdir();
+  try {
+    const f = writeCache(dir, { ttlDays: 7, public: [{ name: "boundary-repo", verifiedAt: "2026-08-28" }] });
+    const fresh = loadKnownPublicRepos(f, { now: "2026-09-03T23:59:59Z" });
+    assert.equal(fresh.names.has("boundary-repo"), true, "one second before the expiry it is still fresh");
+    const expired = loadKnownPublicRepos(f, { now: "2026-09-04T00:00:00Z" });
+    assert.equal(expired.names.has("boundary-repo"), false, "at verifiedAt + ttlDays it has expired");
+    assert.match(expired.note, /TTL/);
+    // Whole UTC days, so the hour of the day never decides: every instant inside
+    // the last fresh day is fresh, and every instant of the expiry day is not.
+    assert.equal(loadKnownPublicRepos(f, { now: "2026-09-03T00:00:00Z" }).names.has("boundary-repo"), true);
+    assert.equal(loadKnownPublicRepos(f, { now: "2026-09-04T23:59:59Z" }).names.has("boundary-repo"), false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1247,6 +1322,21 @@ test("the committed cache is valid, fresh-shaped, and holds nothing privately ow
   for (const e of loaded.entries) {
     assert.equal(PROBE_EXEMPT_NAMES.has(e.name), false, `${e.name} cannot be both cached-public and privately owned`);
   }
+});
+
+test("the serializer emits JSON with or without other top-level fields", () => {
+  // A cache carrying only `public` — no `$comment`, and no `ttlDays` because the
+  // documented default applies — serialised as `{,` and was not JSON at all, so
+  // the writer produced a file the very next read could not parse.
+  const bare = serializePublicRepoCache({ public: [{ name: "still-public", verifiedAt: "2026-03-12" }] });
+  assert.deepEqual(JSON.parse(bare), { public: [{ name: "still-public", verifiedAt: "2026-03-12" }] });
+  const full = serializePublicRepoCache({ $comment: "why", ttlDays: 7, public: [{ name: "still-public", verifiedAt: "2026-03-12" }] });
+  assert.deepEqual(JSON.parse(full), {
+    $comment: "why", ttlDays: 7, public: [{ name: "still-public", verifiedAt: "2026-03-12" }],
+  });
+  // And the round trip is stable: reserialising what parsed changes nothing.
+  assert.equal(serializePublicRepoCache(JSON.parse(bare)), bare);
+  assert.equal(serializePublicRepoCache(JSON.parse(full)), full);
 });
 
 test("the committed cache is already in the generator's canonical form", () => {
@@ -1765,6 +1855,35 @@ test("the clone carve-out is ANCHORED on the left: an npm scope is not a remote"
     "git@github.com:cinatra-ai/ops.git",                  // no clone carve-out for this name
   ]) {
     assert.ok(matchRule(rule, line) >= 1, `still a finding: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the clone carve-out anchors the FULL REMOTES too: junk before a remote is not a remote", () => {
+  // The defect this locks: the left delimiter guarded only the BARE form, so any
+  // junk could carry a full remote — `xhttps://github.com/<org>/<repo>.git` is
+  // not a remote anybody clones, but it spells the private name in full and the
+  // carve-out excused it. Now one delimiter sits in front of an OPTIONAL remote
+  // prefix, so both forms answer to it.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "xhttps://github.com/cinatra-ai/wp-theme.git",
+    "xgit@github.com:cinatra-ai/wp-theme.git",
+    "xssh://git@github.com/cinatra-ai/wp-theme.git",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `junk before a remote is not a remote: ${JSON.stringify(line)}`);
+  }
+  // The clean remotes are unchanged — at the start of a line, after whitespace,
+  // after an opening quote or bracket, and after the `=` of an assignment.
+  for (const line of [
+    "https://github.com/cinatra-ai/wp-theme.git",
+    "git clone https://github.com/cinatra-ai/wp-theme.git",
+    "git clone git@github.com:cinatra-ai/wp-theme.git",
+    "git clone ssh://git@github.com/cinatra-ai/wp-theme.git",
+    "REMOTE=https://github.com/cinatra-ai/wp-theme.git",
+    'REMOTE="https://github.com/cinatra-ai/wp-theme.git"',
+    "(https://github.com/cinatra-ai/wp-theme.git)",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `a clone remote is excused: ${JSON.stringify(line)}`);
   }
 });
 

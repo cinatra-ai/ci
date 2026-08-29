@@ -234,9 +234,18 @@ cache that keeps vouching is the failure that matters:
   calendar date** (`2026-02-30` does not — `Date` silently normalises it to March
   2nd) and is **not in the future** (UTC). An entry that fails either check is
   treated as stale and resolved live; it is never counted as verified.
-- A structurally malformed file (no `public` array, an entry that is not an
-  object, a name that is not a repository name, a `verifiedAt` that is not a
-  `YYYY-MM-DD` day) fails the run outright.
+- Freshness is measured in whole **UTC calendar days**, and an entry expires
+  **by** `verifiedAt + ttlDays`: the entry stamped exactly that many days ago is
+  already out of date, so a 7-day TTL vouches for seven days and not an eighth.
+- `name` and `verifiedAt` must be JSON **strings** (and `name` a real repository
+  name). Types are checked, never coerced: `{"name": 123}` would otherwise
+  stringify into the perfectly good name `123` and clear that repository with no
+  probe at all. An entry that is not an object, or whose `name`/`verifiedAt`
+  fails this, is **invalid** — skipped with one warning naming it, and the name
+  it was going to clear is resolved live. One bad entry never decides the fate of
+  the file, and never clears a name.
+- A malformed **file** (not JSON, not an object, no `public` array) still fails
+  the run outright: there is nothing to read.
 
 `--verify-cache` re-confirms every entry and rewrites those stamps, dropping any
 repository that is no longer public; a weekly workflow runs it and opens a pull
@@ -310,11 +319,14 @@ is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
 - the **clone URL** terminates at `.git` plus a terminator (end of line,
   whitespace, a quote, `,`, `;`, `)`), so `<org>/<repo>.git` is a remote while
   `<org>/<repo>.git/issues/1` is a citation wearing a remote's spelling — and a
-  finding. It is anchored on the left as well: a clone reference is a full remote
-  (`https://github.com/<org>/<repo>.git`, `git@github.com:<org>/<repo>.git`,
-  `ssh://git@github.com/<org>/<repo>.git`) or a bare `<org>/<repo>.git` at the
-  start of a line, after whitespace, or after an opening quote or bracket —
-  never after an `@`, because `@<org>/<repo>.git` is an npm scope, not a remote.
+  finding. It is anchored on the left as well, and the anchor binds the full
+  remotes (`https://github.com/<org>/<repo>.git`,
+  `git@github.com:<org>/<repo>.git`, `ssh://git@github.com/<org>/<repo>.git`)
+  exactly as it binds the bare `<org>/<repo>.git`: the reference must start a
+  line or follow whitespace, an opening quote or bracket, or the `=` of a
+  shell/env assignment (`REMOTE=https://github.com/<org>/<repo>.git`). So
+  `xhttps://github.com/<org>/<repo>.git` is not a remote and is a finding, and
+  neither is anything after an `@`, because `@<org>/<repo>.git` is an npm scope.
 
 ### Per-repo config
 
