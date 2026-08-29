@@ -282,7 +282,15 @@ carve-out applies only where:
   and a comment-less `#1` all leave the carve-out. Quotes must match: an opening
   `"` or `'` has to close the scalar. The terminator is a lookahead, so the
   excused span stops at the value — a citation inside the trailing comment still
-  flags.
+  flags;
+- **the line is not inside a YAML block scalar** — a mapping whose value is a
+  block-scalar header (`|`, `|-`, `|+`, `>`, `>-`, `>+`, with YAML's optional
+  indentation indicator) opens a block that runs while lines are blank or
+  indented deeper than the key, and **no line inside such a block is ever
+  excused**: it is shell or prose the runner never reads as YAML, so a heredoc
+  line spelling `uses: <org>/<repo>@main` inside a `run: |` step is a finding.
+  The first line indented back to the key ends the block and is judged normally,
+  so a real `uses:` mapping after it is excused as before.
 
 Owner and repository **names fold case** — GitHub resolves them
 case-insensitively, so `uses: <Org>/<Repo>@main` is the same dispatch as the
@@ -301,8 +309,12 @@ is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
   because that is the only place one can run: a `.github/workflows/` directory
   at any other depth never executes, so `nested/.github/workflows/fake.yml` is
   an ordinary document and the reference in it is prose.
-- `repository:` / `repositories:` has **two separate grammars**. The SCALAR form
-  is exactly `<org>/<repo>` under the terminator rule above — end of line, a real
+- `repository:` / `repositories:` is excused **only in a YAML file**
+  (`*.yml|*.yaml`) where the scan knows the path — it is an ordinary mapping key,
+  legal in any workflow, action or compose file, but outside YAML the same text
+  is prose wearing a machine key as a hat and is a finding. It has **two
+  separate grammars**. The SCALAR form is exactly `<org>/<repo>` under the
+  terminator rule above — end of line, a real
   comment, or its own closing quote. A `,` or `]` ends nothing there, because
   nothing was opened: `repository: <org>/<repo>,#1`, `repository: <org>/<repo>/issues/1`
   and `repository: <org>/<repo>#1` are findings, not machine forms. The FLOW
@@ -355,6 +367,13 @@ engine lacks a fix is a debt, not a rule — and an undated debt is never paid.
 }
 ```
 
+`untilPin.file` names the **caller workflow that actually runs**, and only that:
+it must be a repository-relative `.github/workflows/<file>.yml|.yaml` path (no
+`..`, no absolute segments), must be **tracked** in the scanned tree, and must
+not be a symlink. Any other readable file — a `README.md`, a path climbing out of
+the tree, a link — could carry the keyed target at the keyed sha long after the
+real caller moved, so each of those is a config error rather than a verdict.
+
 Before every scan the gate reads `untilPin.file` out of the **scanned** tree and
 takes the ref of the one `uses:` line whose target is `untilPin.uses`. Same sha,
 and the exemption is live and the gate says nothing about it. A different sha,
@@ -363,10 +382,18 @@ the target, both shas, and the fix — **the pull request that moves the pin
 deletes the basename and its expiry entry in the same change.**
 
 The pin line is read with the very same `uses:` scalar grammar the carve-out
-above uses, so a line that does not parse — no whitespace after the key, an
+above uses — block scalars included, so a `uses:` inside a `run: |` block is not
+a pin either — and a line that does not parse — no whitespace after the key, an
 unmatched quote, a trailing tail — is not a pin at all: replacing a real gate
 call with text no runner accepts makes the keyed target *missing* (a config
 error) instead of leaving the exemption it justifies quietly alive.
+
+The target is compared **case-canonically**: GitHub resolves the owner and
+repository halves case-insensitively, so `Some-Org/CI/.github/workflows/x.yml`
+is the same dispatch as `some-org/ci/.github/workflows/x.yml` and answers for it
+— while everything after them is a path inside the checkout, where file names
+stay case-sensitive. Two spellings of the same target at different refs are
+therefore the ambiguous-target config error, not an evasion of it.
 
 `untilPin.uses` is what binds the expiry to the reference it is actually about.
 Keyed to "some sha in the file", an exemption survived the very edit it exists to
@@ -375,8 +402,9 @@ catch — move the gate reference to `@main`, leave an unrelated
 Only the named target answers now; every other `uses:` line is irrelevant, in
 either direction. A basename listed in the map but not in `exemptFileBasenames`,
 an entry of the wrong shape (a missing `file`, `uses` or 40-character `sha`), a
-pin file that cannot be read, a named target that is absent, that appears twice
-with different refs, or that is not pinned to a commit sha are all config errors
+`file` that is not a tracked, non-symlink repository-root workflow or that
+cannot be read, a named target that is absent, that appears twice with different
+refs, or that is not pinned to a commit sha are all config errors
 (exit 1): an exemption whose expiry cannot be evaluated must never stay quietly
 in force.
 

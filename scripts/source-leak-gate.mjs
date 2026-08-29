@@ -256,6 +256,14 @@ const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
 // `action.ya?ml` stays matched by BASENAME at any depth — a composite action
 // legitimately lives in a subdirectory (`.github/actions/<name>/action.yml`).
 const USES_FILE_RE = /^(?:\.\/)?\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\.ya?ml$/;
+// The `repository:` / `repositories:` keys are ordinary YAML mapping keys, so
+// unlike `uses:` they are legal in ANY workflow, action or compose file — but
+// only in a YAML one. Outside YAML the key is prose wearing a machine key as a
+// hat: a shell script or a Markdown runbook that writes `repository: <org>/<repo>`
+// is spelling the name, not configuring a checkout, and it is a finding. As with
+// USES_FILE_RE the restriction applies only where a path is known, so it can
+// only ever narrow the carve-out.
+const YAML_FILE_RE = /\.ya?ml$/i;
 // `repository:` / `repositories:` has TWO forms, and they are SEPARATE grammars
 // on purpose:
 //   - a SCALAR `key: <org>/<repo>`, ending only at end of line, at a real
@@ -358,11 +366,11 @@ function cloneUrlRe(name) {
 }
 const FUNCTIONAL_REPO_REFS = [
   { name: "ops", label: "reusable-workflow / action reference (`uses:`)", re: usesRefRe("ops"), fileRe: USES_FILE_RE },
-  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops") },
-  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops") },
+  { name: "ops", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("ops"), fileRe: YAML_FILE_RE },
+  { name: "ops", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("ops"), fileRe: YAML_FILE_RE },
   { name: "wp-theme", label: "git clone URL", re: cloneUrlRe("wp-theme") },
-  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme") },
-  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme") },
+  { name: "wp-theme", label: "checkout / token-scope key (scalar)", re: repositoryKeyScalarRe("wp-theme"), fileRe: YAML_FILE_RE },
+  { name: "wp-theme", label: "checkout / token-scope key (flow sequence)", re: repositoryKeyFlowRe("wp-theme"), fileRe: YAML_FILE_RE },
 ];
 
 // THE canonical token boundary — used by the tokenizer AND by every rule that
@@ -666,10 +674,10 @@ const RULES = [
     id: "SLG_PRIVATE_REPO_REF",
     description: "Reference to a private cinatra-ai repository (bare GitHub path-form)",
     re: new RegExp(PRIVATE_ORG_PATH_TOKEN_SOURCE, "gi"),
-    matchExclude(match, line, index, filePath) {
+    matchExclude(match, line, index, filePath, context) {
       const name = orgPathRepoName(match);
       if (!name || !PRIVATE_REPO_NAME_SET.has(name)) return true;
-      return functionalRefCovers(name, line, index, filePath);
+      return functionalRefCovers(name, line, index, filePath, context);
     },
   },
   {
@@ -785,16 +793,61 @@ function orgPathRepoName(match) {
   return parts.length > 1 ? normalizeRepoName(parts[1]) : "";
 }
 
+// ---------------------------------------------------------------------------
+// YAML block scalars: TEXT, not mappings.
+//
+// Every carve-out judges ONE LINE, and that is exactly what a block scalar
+// defeats. Inside a `run: |` block the runner reads shell, never YAML, so a
+// heredoc line spelling `uses: <org>/<private>@main` (or `repository:
+// <org>/<private>`) is prose that happens to wear a mapping's clothes — and
+// excusing it handed every leak a two-line disguise inside the one file class
+// where the `uses:` carve-out is at its widest.
+//
+// A block scalar OPENS on a mapping line whose value is a block-scalar header —
+// `|`, `|-`, `|+`, `>`, `>-`, `>+`, with YAML's optional indentation indicator,
+// followed by nothing but an optional comment — and CONTINUES while lines are
+// blank or indented deeper than the KEY. The first line indented back to (or
+// past) the key ends the block and is itself judged normally, so a real `uses:`
+// mapping after the block is excused as before.
+// ---------------------------------------------------------------------------
+// Group 1 is everything before the key (indentation plus any `- ` sequence
+// markers), so its length IS the key's column.
+const BLOCK_SCALAR_HEADER_RE =
+  /^([ \t]*(?:-[ \t]+)*)(?:"[^"]*"|'[^']*'|[^#\s"'][^:#]*):[ \t]+[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/;
+// One boolean per line: is this line inside a block scalar? Computed per FILE,
+// because "am I inside one?" is not a property any single line can answer.
+function blockScalarLineFlags(lines) {
+  const flags = new Array(lines.length).fill(false);
+  let keyIndent = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (keyIndent !== -1) {
+      if (line.trim() === "") { flags[i] = true; continue; }
+      const indent = /^[ \t]*/.exec(line)[0].length;
+      if (indent > keyIndent) { flags[i] = true; continue; }
+      keyIndent = -1; // the block ends AT this line, which is judged normally
+    }
+    const m = BLOCK_SCALAR_HEADER_RE.exec(line);
+    if (m) keyIndent = m[1].length;
+  }
+  return flags;
+}
+
 // True when the match at `index` sits INSIDE one of the required machine forms
 // for `name`. Span-based on purpose: a line may carry a functional reference and
 // a leaked one at once, and only the functional one is excused.
 //
 // `filePath` is optional and can only NARROW the carve-out: a form that declares
 // a `fileRe` (the `uses:` step, which exists in a workflow file or an action
-// definition and nowhere else) is excused only in such a file. A caller that has
-// no path — a rule exercised on a bare string — passes nothing and the form is
-// judged on its grammar alone.
-function functionalRefCovers(name, line, index, filePath) {
+// definition and nowhere else; the `repository:` keys, which exist in YAML) is
+// excused only in such a file. A caller that has no path — a rule exercised on a
+// bare string — passes nothing and the form is judged on its grammar alone.
+//
+// `context.inBlockScalar` is the same kind of narrowing, one level up from the
+// grammar: a line the scan has established is inside a YAML block scalar is
+// text, and NO machine grammar excuses text.
+function functionalRefCovers(name, line, index, filePath, context) {
+  if (context && context.inBlockScalar) return false;
   for (const f of FUNCTIONAL_REPO_REFS) {
     if (f.name !== name) continue;
     if (f.fileRe && filePath && !f.fileRe.test(String(filePath))) continue;
@@ -891,15 +944,55 @@ function expiryFail(msg) {
 // be deleted and replaced by text no runner accepts, and the exemption it was
 // keyed to stayed live. Now such a line is not a pin at all, the keyed target is
 // missing, and the expiry check reports a config error instead of a verdict.
+//
+// It also reads the file with BLOCK-SCALAR awareness, for the same reason the
+// carve-out does: a `uses:` line inside a `run: |` block is shell text a runner
+// never dispatches, so it is not a pin either. Without that, a heredoc could
+// supply the sha for a gate call that had already been deleted.
 const USES_PIN_RE = new RegExp(usesScalarSource(`${ANY_ORG_PATH_SOURCE}${USES_TARGET_TAIL}`));
 function readUsesPins(text) {
+  const lines = text.split(/\r?\n/);
+  const inBlockScalar = blockScalarLineFlags(lines);
   const pins = [];
-  for (const line of text.split(/\r?\n/)) {
-    const m = line.match(USES_PIN_RE);
+  for (let i = 0; i < lines.length; i++) {
+    if (inBlockScalar[i]) continue;
+    const m = lines[i].match(USES_PIN_RE);
     if (!m) continue;
     pins.push({ target: m[2], ref: m[3] });
   }
   return pins;
+}
+
+// GitHub resolves the OWNER and REPOSITORY halves of a `uses:` target
+// case-insensitively — `Some-Org/CI/...` dispatches exactly what
+// `some-org/ci/...` dispatches — while everything after them is a PATH inside
+// the checkout, and file names are case-sensitive. So the comparison folds
+// precisely those two segments and nothing else. Compared literally, one
+// case-variant spelling of the configured target answered "no such line" (a
+// refusal on valid input) while a SECOND, case-variant spelling at another sha
+// slipped past the duplicate-target check and left the exemption live on an
+// ambiguous pin.
+function canonicalUsesTarget(target) {
+  const parts = String(target || "").split("/");
+  if (parts.length < 2) return String(target || "");
+  return [parts[0].toLowerCase(), parts[1].toLowerCase(), ...parts.slice(2)].join("/");
+}
+
+// `untilPin.file` names the CALLER WORKFLOW whose pin justifies the exemption,
+// and these three constraints are what make it one instead of "any file that
+// happens to contain the target at the old sha". A README, or a path climbing
+// out of the tree with `..`, could carry that line forever while the real caller
+// moved on; a symlink can point at one. So the path must be a repository-root
+// workflow file (the only place a caller can run), must be TRACKED in the
+// scanned tree, and must be a regular file. Anything else is a config error, not
+// a verdict — an exemption whose expiry cannot be honestly evaluated never stays
+// in force.
+const PIN_FILE_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+function isTrackedInScannedTree(relFile) {
+  try {
+    execFileSync("git", ["ls-files", "--error-unmatch", "--", relFile], { stdio: "ignore" });
+    return true;
+  } catch { return false; }
 }
 
 function enforceBasenameExpiries(config, exemptFiles, configPath) {
@@ -926,6 +1019,26 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
         + "{ file: <path in the scanned repository>, uses: <the `uses:` target that file pins>, "
         + "sha: <40-character commit sha> }");
     }
+    if (!PIN_FILE_RE.test(pin.file)) {
+      expiryFail(`config error: ${where}['${basename}'].untilPin.file must be a repository-relative `
+        + `.github/workflows/<file>.yml|.yaml path — '${pin.file}' is not one. A pin lives in the caller `
+        + "workflow that actually runs; any other readable file could carry the keyed target at the keyed "
+        + "sha long after the real caller moved");
+    }
+    let pinStat;
+    try { pinStat = fs.lstatSync(pin.file); }
+    catch {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not readable in the scanned repository — an exemption whose expiry cannot be checked does not stay in force");
+    }
+    if (pinStat.isSymbolicLink()) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, which is a SYMLINK — `
+        + "the pin must be the tracked workflow itself, because a link can point at any file that still carries the keyed sha");
+    }
+    if (!isTrackedInScannedTree(pin.file)) {
+      expiryFail(`config error: the '${basename}' exemption is keyed to the pin in ${pin.file}, `
+        + "which is not tracked in the scanned repository — an untracked file is not the caller that runs");
+    }
     let text;
     try { text = fs.readFileSync(pin.file, "utf8"); }
     catch {
@@ -936,7 +1049,8 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
     // action the job happens to pin, a second reusable workflow — is irrelevant
     // to this exemption, and letting one of them supply the sha is exactly how
     // an expiry outlives the pin it names.
-    const forTarget = readUsesPins(text).filter((u) => u.target === pin.uses);
+    const wantedTarget = canonicalUsesTarget(pin.uses);
+    const forTarget = readUsesPins(text).filter((u) => canonicalUsesTarget(u.target) === wantedTarget);
     if (forTarget.length === 0) {
       expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
         + "which carries no such `uses:` line — an exemption whose pin cannot be found does not stay in force");
@@ -1493,6 +1607,9 @@ function scanFile(relPath, rules) {
   const isSelf = SCANNER_REAL !== "" && realPathOf(relPath) === SCANNER_REAL;
   const defRange = isSelf ? readRuleDefRange(text) : { start: -1, end: -1 };
   const lines = text.split(/\r?\n/);
+  // Block-scalar context is a property of the FILE, so it is computed once, and
+  // only where the file is YAML — nothing else has block scalars.
+  const blockScalar = YAML_FILE_RE.test(relPath) ? blockScalarLineFlags(lines) : null;
   const findings = [];
   for (const rule of rules) {
     if (rule.pathExclude && rule.pathExclude(relPath)) continue;
@@ -1507,7 +1624,8 @@ function scanFile(relPath, rules) {
         // matchExclude is per MATCH (contextExclude is per LINE): a rule that
         // excuses one specific form must not excuse every other token that
         // happens to share the line with it.
-        if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, relPath))) {
+        const context = { inBlockScalar: Boolean(blockScalar && blockScalar[i]) };
+        if (!(rule.matchExclude && rule.matchExclude(m[0], line, m.index, relPath, context))) {
           findings.push({ rule: rule.id, file: relPath, line: lineno, column: m.index + 1, match: m[0], snippet: line.trim().slice(0, 200) });
         }
         if (!localRe.global) break;
@@ -1835,7 +1953,7 @@ export {
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins,
+  readUsesPins, canonicalUsesTarget, blockScalarLineFlags,
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS,

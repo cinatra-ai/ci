@@ -12,7 +12,7 @@ import {
   PRIVATE_REPO_NAMES, PROBE_EXEMPT_NAMES, FUNCTIONAL_REPO_REFS,
   PROBE_RULE_ID, PROBE_ERROR_RULE_ID, PROBE_BUDGET_RULE_ID,
   PROBE_MAX_NAMES, PUBLIC_CACHE_TTL_DAYS, isValidRepoName, REPO_NAME_MAX,
-  readUsesPins,
+  readUsesPins, canonicalUsesTarget,
 } from "../source-leak-gate.mjs";
 
 // NAMING CONVENTION. Real private repository names appear ONLY where a test
@@ -1380,6 +1380,12 @@ function expiryTree(files) {
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content);
   }
+  // `untilPin.file` must be TRACKED in the scanned tree — an untracked file is
+  // not the caller that runs — so the fixture tree is a real repository with its
+  // files in the index. (The untracked and symlinked cases are exercised on
+  // purpose in their own tests below.)
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["add", "-A"], { cwd: dir });
   return dir;
 }
 const PIN_TARGET = "some-org/ci/.github/workflows/gate.yml";
@@ -1595,6 +1601,171 @@ test("expiry: the expiry map itself must be an object", () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// ---------------------------------------------------------------------------
+// `untilPin.file` names the CALLER WORKFLOW, not "any file carrying the line".
+// ---------------------------------------------------------------------------
+
+function expiryConfigFor(file) {
+  return {
+    exemptFileBasenames: ["notes.txt"],
+    exemptFileBasenamesExpiry: { "notes.txt": { untilPin: { file, uses: PIN_TARGET, sha: PIN_A }, why: "keyed to the pinned engine" } },
+  };
+}
+
+test("expiry: untilPin.file must be a repository-root workflow — a README carrying the line is not a pin", () => {
+  // The defect this locks: any readable path was accepted, so a document that
+  // merely QUOTES the target at the old sha kept the exemption alive while the
+  // real caller had already moved.
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    "README.md": workflowPinning(PIN_A),
+    "config/gate.json": JSON.stringify(expiryConfigFor("README.md"), null, 1),
+  });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, "a README is not a caller workflow, even carrying the keyed pin");
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /must be a repository-relative/);
+    assert.match(r.err, /README\.md/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: untilPin.file may not climb out of the scanned tree", () => {
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    "config/gate.json": JSON.stringify(expiryConfigFor("../outside/caller.yml"), null, 1),
+  });
+  const outside = path.join(path.dirname(dir), "outside");
+  try {
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "caller.yml"), workflowPinning(PIN_A));
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, "a path outside the scanned tree is not a pin, whatever it carries");
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /must be a repository-relative/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("expiry: a SYMLINKED workflow is a config error — a link points anywhere", () => {
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/real.yml": workflowPinning(PIN_A),
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/link.yml"), null, 1),
+  });
+  try {
+    fs.symlinkSync("real.yml", path.join(dir, ".github/workflows/link.yml"));
+    spawnSync("git", ["add", "-A"], { cwd: dir }); // tracked, and STILL refused
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /SYMLINK/);
+    assert.match(r.err, /link\.yml/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: an UNTRACKED workflow is a config error — it is not the caller that runs", () => {
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/untracked.yml"), null, 1),
+  });
+  try {
+    fs.mkdirSync(path.join(dir, ".github/workflows"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".github/workflows/untracked.yml"), workflowPinning(PIN_A));
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, "an untracked file carrying the keyed pin does not keep the exemption alive");
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /not tracked/);
+    // Not vacuous: the SAME file, once tracked, keys a live exemption.
+    spawnSync("git", ["add", "-A"], { cwd: dir });
+    const ok = runExpiryGate(dir);
+    assert.equal(ok.status, 0, `the tracked workflow keys a live exemption: ${ok.err}`);
+    assert.equal(/EXPIRED|config error/.test(ok.err), false, ok.err);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a `uses:` inside a block scalar is NOT the pin", () => {
+  // Same rule as the carve-out: a `uses:` line inside a `run: |` block is shell
+  // text no runner dispatches, so it cannot answer for a keyed target.
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml":
+      `name: caller\njobs:\n  gate:\n    steps:\n      - run: |\n          cat <<'EOF' > x.yml\n          uses: ${PIN_TARGET}@${PIN_A}\n          EOF\n`,
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/caller.yml"), null, 1),
+  });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, "a heredoc line is not a pin, so the keyed target is simply absent");
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /carries no such `uses:` line/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// The keyed target is compared CASE-CANONICALLY (owner + repository only).
+// ---------------------------------------------------------------------------
+
+test("canonicalUsesTarget folds the owner and repository, never the path", () => {
+  assert.equal(canonicalUsesTarget("Some-Org/CI/.github/workflows/Gate.yml"), "some-org/ci/.github/workflows/Gate.yml");
+  assert.equal(canonicalUsesTarget("Some-Org/CI"), "some-org/ci");
+  assert.equal(canonicalUsesTarget("actions/Checkout"), "actions/checkout");
+});
+
+test("expiry: a case-variant spelling of the keyed target IS the target", () => {
+  // The refusal cost this removes: GitHub resolves `Some-Org/CI/...` and
+  // `some-org/ci/...` to the same dispatch, so a caller spelling the target with
+  // different case was refused as "no such line" on input that is perfectly
+  // valid.
+  const variant = "Some-Org/CI/.github/workflows/gate.yml";
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml": `name: caller\njobs:\n  gate:\n    uses: ${variant}@${PIN_A}\n`,
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/caller.yml"), null, 1),
+  });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 0, `a case-variant spelling of the same dispatch is the pin: ${r.err}`);
+    assert.equal(/EXPIRED|config error/.test(r.err), false, r.err);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: case variants at DIFFERENT refs are an ambiguous target, not an evasion", () => {
+  // The defect this locks: compared literally, a SECOND `uses:` line spelling
+  // the same target in different case slipped past the duplicate check, so the
+  // exemption stayed live on a target the file pins twice at two shas.
+  const variant = "Some-Org/CI/.github/workflows/gate.yml";
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml":
+      `name: caller\njobs:\n  gate:\n    uses: ${PIN_TARGET}@${PIN_A}\n  gate2:\n    uses: ${variant}@${PIN_B}\n`,
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/caller.yml"), null, 1),
+  });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /different refs/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: the PATH segments of a target keep their case", () => {
+  // Only the owner and repository fold: a checkout's file names are
+  // case-sensitive, so `…/workflows/Gate.yml` is a different workflow.
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    ".github/workflows/caller.yml": `name: caller\njobs:\n  gate:\n    uses: some-org/ci/.github/workflows/Gate.yml@${PIN_A}\n`,
+    "config/gate.json": JSON.stringify(expiryConfigFor(".github/workflows/caller.yml"), null, 1),
+  });
+  try {
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 1, "a differently-cased PATH is a different workflow");
+    assert.match(r.err, /config error/);
+    assert.match(r.err, /carries no such `uses:` line/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("readUsesPins: returns every `uses:` PIN as a { target, ref } pair, in file order", () => {
   // It reports PAIRS, not a deduplicated bag of shas: an expiry is keyed to one
   // target, and only that target's ref may answer for it — so a caller must be
@@ -1643,6 +1814,12 @@ test("readUsesPins: a line that is not the carve-out's `uses:` scalar is NOT a p
   ]) {
     assert.deepEqual(readUsesPins(`${line}\n`), [{ target: "o/a", ref: PIN_A }], `a pin: ${JSON.stringify(line)}`);
   }
+  // A block scalar is shell text, not YAML: the `uses:` line inside the heredoc
+  // is not a pin, while the real step after the block still is.
+  assert.deepEqual(
+    readUsesPins(`jobs:\n  a:\n    steps:\n      - run: |\n          uses: o/x@${PIN_B}\n      - uses: o/a@${PIN_A}\n`),
+    [{ target: "o/a", ref: PIN_A }],
+  );
 });
 
 // --------------------------------------------------------------------------
@@ -1964,6 +2141,73 @@ test("where the file path is known, `uses:` is excused only in a ROOT workflow o
     // machine form in any YAML, and stays excused.
     fs.writeFileSync(path.join(dir, "compose.yml"), "repository: cinatra-ai/ops\n");
     assert.deepEqual(scanFile("compose.yml", active).map((f) => f.rule), []);
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a YAML block scalar is TEXT: no carve-out excuses a line inside it", () => {
+  // The defect this locks: the carve-outs judge single lines, so a heredoc
+  // inside a root workflow's `run: |` block could spell a private repository in
+  // a machine form and be excused — in the one file class where the `uses:`
+  // carve-out is at its widest. A block scalar is shell (or prose) the runner
+  // never reads as YAML, so nothing in it is a machine form. The block ends at
+  // the first line indented back to the key, and the real mapping after it is
+  // excused exactly as before.
+  const wf = [
+    "name: deploy",
+    "jobs:",
+    "  build:",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+    "        with:",
+    "          repository: cinatra-ai/ops",          // a real mapping: excused
+    "      - run: |",
+    "          cat <<'EOF' > out.yml",
+    "          uses: cinatra-ai/ops@main",           // heredoc text: a finding
+    "",                                             // a blank line continues the block
+    "          repository: cinatra-ai/ops",          // still heredoc text: a finding
+    "          EOF",
+    "      - run: >-",
+    "          uses: cinatra-ai/ops@main",           // folded block text: a finding
+    "      - uses: cinatra-ai/ops/.github/workflows/deploy.yml@main",  // a real step: excused
+    "",
+  ];
+  const expected = [10, 12, 15];
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-block-")));
+  const cwd0 = process.cwd();
+  try {
+    process.chdir(dir);
+    fs.mkdirSync(".github/workflows", { recursive: true });
+    fs.writeFileSync(".github/workflows/deploy.yml", wf.join("\n"));
+    const found = scanFile(".github/workflows/deploy.yml", active);
+    assert.deepEqual(found.map((f) => f.rule), expected.map(() => "SLG_PRIVATE_REPO_REF"));
+    assert.deepEqual(found.map((f) => f.line), expected,
+      "only the block-scalar lines flag — the `with: repository:` mapping and the real `uses:` step stay excused");
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the `repository:` carve-out is YAML-only where the path is known", () => {
+  // `repository:` is a mapping key, so unlike `uses:` it is legal in ANY YAML —
+  // but only in YAML. In a shell script or a Markdown runbook the same text is
+  // prose wearing a machine key as a hat, and it is a finding.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-repokey-")));
+  const cwd0 = process.cwd();
+  const idsFor = (rel, body) => {
+    fs.mkdirSync(path.dirname(rel), { recursive: true });
+    fs.writeFileSync(rel, body);
+    return scanFile(rel, active).map((f) => f.rule);
+  };
+  try {
+    process.chdir(dir);
+    const scalar = "repository: cinatra-ai/ops\n";
+    const sequence = "repositories: [cinatra-ai/wp-theme]\n";
+    for (const rel of [".github/workflows/x.yml", ".github/actions/n/action.yaml", "compose.yml", "deploy/values.yaml"]) {
+      assert.deepEqual(idsFor(rel, scalar), [], `a YAML mapping key is a machine form: ${rel}`);
+      assert.deepEqual(idsFor(rel, sequence), [], `a YAML flow sequence is a machine form: ${rel}`);
+    }
+    for (const rel of ["docs/runbook.md", "scripts/deploy.sh", "notes.txt", "src/app.ts"]) {
+      assert.deepEqual(idsFor(rel, scalar), ["SLG_PRIVATE_REPO_REF"], `outside YAML the key is prose: ${rel}`);
+      assert.deepEqual(idsFor(rel, sequence), ["SLG_PRIVATE_REPO_REF"], `outside YAML the sequence is prose: ${rel}`);
+    }
   } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
