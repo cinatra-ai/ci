@@ -1374,11 +1374,22 @@ function pinFileIsPathspecPattern(relFile) {
 function isTrackedInScannedTree(relFile) {
   let out;
   try {
-    out = execFileSync("git", ["--literal-pathspecs", "ls-files", "--error-unmatch", "--", relFile],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    out = execFileSync("git", ["--literal-pathspecs", "ls-files", "-z", "--error-unmatch", "--", relFile],
+      { stdio: ["ignore", "pipe", "ignore"] });
   } catch { return false; }
-  const listed = String(out).split("\n").filter((l) => l !== "");
-  return listed.length === 1 && listed[0] === relFile;
+  // `-z` and a BYTE comparison: line-terminated output is C-quoted
+  // (`core.quotePath`) for any name outside ASCII, so a tracked workflow whose
+  // name carries a diaeresis came back as `"w\303\266rk.yml"` and read as
+  // untracked — a config error reported for a file git lists.
+  const listed = [];
+  let start = 0;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] !== 0) continue;
+    listed.push(out.subarray(start, i));
+    start = i + 1;
+  }
+  if (start < out.length) listed.push(out.subarray(start));
+  return listed.length === 1 && listed[0].equals(Buffer.from(relFile, "utf8"));
 }
 
 function enforceBasenameExpiries(config, exemptFiles, configPath) {
@@ -2087,11 +2098,27 @@ function readRuleDefRange(text) {
 // (see main()'s handler) instead of passing quietly.
 const SCAN_MAX_BYTES = 64_000_000;
 const SCAN_TOO_LARGE_ERROR = "ScanFileTooLargeError";
+// The same rule for the other way a read can end without content: a selected
+// file the engine cannot stat or read FAILS the run by name. A swallowed errno
+// reported "no findings" for a file nobody opened, which is the one verdict an
+// unread file may never receive.
+const SCAN_UNREADABLE_ERROR = "ScanFileUnreadableError";
+
+function scanUnreadable(relPath, cause) {
+  const err = new Error(
+    `${relPath} could not be read (${(cause && cause.message) || String(cause)}) — a file this engine cannot `
+    + "read is never reported clean. Repair the file, or exclude it deliberately (skipDirs / "
+    + "exemptFileBasenames) so the exclusion is on the record.",
+  );
+  err.name = SCAN_UNREADABLE_ERROR;
+  return err;
+}
 
 function scanFile(relPath, rules) {
+  // lstat, never stat: what git stores for a symbolic link is its LINK TEXT, so
+  // the link is the file to scan, not a window onto whatever it points at.
   let stat;
-  try { stat = fs.statSync(relPath); } catch { return []; }
-  if (!stat.isFile()) return [];
+  try { stat = fs.lstatSync(relPath); } catch (e) { throw scanUnreadable(relPath, e); }
   if (stat.size > SCAN_MAX_BYTES) {
     const err = new Error(
       `${relPath} is ${stat.size} bytes, past the ${SCAN_MAX_BYTES}-byte scan limit — a file this engine `
@@ -2102,8 +2129,21 @@ function scanFile(relPath, rules) {
     throw err;
   }
   let text;
-  try { text = fs.readFileSync(relPath, "utf8"); } catch { return []; }
-  if (text.includes("\0")) return [];
+  if (stat.isSymbolicLink()) {
+    try { text = fs.readlinkSync(relPath, "utf8"); } catch (e) { throw scanUnreadable(relPath, e); }
+  } else if (!stat.isFile()) {
+    // git stores no content for a submodule gitlink (a directory in the working
+    // tree), so there is no content this engine can scan. The exclusion is
+    // PRINTED by path — on the record, never a silent clean — and the entry's
+    // NAME is still scanned by scanPath.
+    process.stderr.write(`[source-leak-gate] not a regular file, no content to scan: ${relPath}\n`);
+    return [];
+  } else {
+    try { text = fs.readFileSync(relPath, "utf8"); } catch (e) { throw scanUnreadable(relPath, e); }
+  }
+  // Content carrying a NUL byte is scanned like any other selected file. "Looks
+  // binary" was a heuristic that returned clean for a file nobody had examined,
+  // so a leak had only to carry one NUL to be waved through; a NUL stops nothing.
   const isSelf = SCANNER_REAL !== "" && realPathOf(relPath) === SCANNER_REAL;
   const defRange = isSelf ? readRuleDefRange(text) : { start: -1, end: -1 };
   const lines = text.split(/\r?\n/);
@@ -2459,8 +2499,8 @@ if (isMainModule()) {
       console.error("[source-leak-gate] ABORTED — discard this run's output entirely and re-run on a clean checkout.");
       process.exit(2);
     }
-    if (e && e.name === SCAN_TOO_LARGE_ERROR) {
-      console.error(`[source-leak-gate] ${SCAN_TOO_LARGE_ERROR}: ${e.message}`);
+    if (e && (e.name === SCAN_TOO_LARGE_ERROR || e.name === SCAN_UNREADABLE_ERROR)) {
+      console.error(`[source-leak-gate] ${e.name}: ${e.message}`);
       process.exit(2);
     }
     console.error("[source-leak-gate] scanner failed:", e.message);
@@ -2469,7 +2509,7 @@ if (isMainModule()) {
 }
 
 export {
-  buildRules, scanFile, RULES, readRuleDefRange, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR,
+  buildRules, scanFile, RULES, readRuleDefRange, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR, SCAN_UNREADABLE_ERROR,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers, isValidRepoName, REPO_NAME_MAX,

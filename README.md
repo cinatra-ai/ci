@@ -128,7 +128,15 @@ Every file the scan selects is **read and scanned whatever its size** — an
 unread file is never reported clean, so a leak cannot be padded past the gate —
 and the one limit left is a resource cap (`64,000,000` bytes, what the engine can
 hold in a single string) whose breach **fails the run**, naming the file and its
-size, instead of passing it.
+size, instead of passing it. A selected file the engine cannot stat or read
+**fails the run** the same way, naming the file and the error, rather than
+counting as clean. A selected **symbolic link** is scanned as the link text git
+stores for it, not as whatever it points at. A selected entry that is neither a
+regular file nor a link — a submodule gitlink, for which git stores no content —
+is **excluded from the content scan and printed by path**, so the exclusion is on
+the record and a repository with submodules stays scannable; its name is still
+path-scanned. Content is scanned **whatever bytes it carries**: a `NUL` byte is
+not a "binary" marker and stops nothing, so a leak cannot be hidden behind one.
 
 ### Ratchet modes
 
@@ -433,9 +441,12 @@ it must be a repository-relative `.github/workflows/<file>.yml|.yaml` path (no
 not be a symlink. It must also name **one literal file**: a value carrying a
 pathspec pattern character (`*`, `?`, `[`, `\`) or a leading `-` is a config
 error before git is asked anything, and "tracked" means git — asked with
-`--literal-pathspecs` — lists exactly that path and nothing else, so an
-untracked file literally named `.github/workflows/*.yml` can no longer pass on
-the strength of some other workflow the glob would have matched. Any other readable file — a `README.md`, a path climbing out of
+`--literal-pathspecs` and `-z`, its `NUL`-separated answer compared byte for
+byte — lists exactly that path and nothing else, so an untracked file literally
+named `.github/workflows/*.yml` can no longer pass on the strength of some other
+workflow the glob would have matched, and a tracked workflow whose name carries a
+non-ASCII character (which line-terminated `ls-files` output would C-quote) is
+read as the tracked file it is. Any other readable file — a `README.md`, a path climbing out of
 the tree, a link — could carry the keyed target at the keyed sha long after the
 real caller moved, so each of those is a config error rather than a verdict.
 

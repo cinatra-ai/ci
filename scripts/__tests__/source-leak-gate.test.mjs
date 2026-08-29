@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  buildRules, scanFile, RULES, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR,
+  buildRules, scanFile, RULES, SCAN_MAX_BYTES, SCAN_TOO_LARGE_ERROR, SCAN_UNREADABLE_ERROR,
   setProbeFetch, makeProbeContext, resolveRepoVisibility, resolveProbeFindings,
   loadKnownPublicRepos, verifyPublicRepoCache, serializePublicRepoCache,
   normalizeRepoName, orgPathRepoName, functionalRefCovers,
@@ -147,6 +147,95 @@ test("a big file is SCANNED, and the resource cap fails the run instead of passi
       assert.match(e.message, new RegExp(String(SCAN_MAX_BYTES + 1)), "and its size");
       return true;
     });
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a selected file the engine cannot stat or read FAILS the run, by name", () => {
+  // ADDED. CHANGED CONTRACT: a statSync or readFileSync failure returned [], and
+  // the caller reads [] as CLEAN, so a file nobody could open passed the gate
+  // silently. Both failures are now the named run failure the resource cap is.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-unreadable-")));
+  try {
+    const absent = path.join(dir, "absent.md");
+    assert.throws(() => scanFile(absent, active), (e) => {
+      assert.equal(e.name, SCAN_UNREADABLE_ERROR, "a stat failure is NAMED, not a generic scanner error");
+      assert.match(e.message, /absent\.md/, "and it names the file");
+      assert.match(e.message, /ENOENT/, "and the error");
+      return true;
+    });
+    // A file that stats but whose READ throws (a permission error, an I/O error)
+    // is the same failure — stubbed, because the errno is what is under test.
+    const f = path.join(dir, "note.md");
+    fs.writeFileSync(f, "clean text\n");
+    const realRead = fs.readFileSync;
+    fs.readFileSync = (target, ...rest) => {
+      if (String(target) === f) {
+        const e = new Error(`EACCES: permission denied, open '${f}'`);
+        e.code = "EACCES";
+        throw e;
+      }
+      return realRead(target, ...rest);
+    };
+    try {
+      assert.throws(() => scanFile(f, active), (e) => {
+        assert.equal(e.name, SCAN_UNREADABLE_ERROR, "a read failure is the same named failure");
+        assert.match(e.message, /note\.md/);
+        assert.match(e.message, /EACCES/);
+        return true;
+      });
+    } finally { fs.readFileSync = realRead; }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a selected file the engine cannot read stops the RUN — exit 2, naming the file", () => {
+  // ADDED. The operator-facing half: a tracked file the scan selects but cannot
+  // open ends the run, instead of counting towards "Scanned N files ... clean".
+  const scanner = path.join(import.meta.dirname, "..", "source-leak-gate.mjs");
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-unreadable-run-")));
+  try {
+    fs.writeFileSync(path.join(dir, "notes.md"), "clean text\n");
+    spawnSync("git", ["init", "-q"], { cwd: dir });
+    spawnSync("git", ["add", "-A"], { cwd: dir });
+    fs.rmSync(path.join(dir, "notes.md")); // tracked, selected, and gone
+    const r = spawnSync("node", [scanner, "--profile", "default", "--ratchet-mode", "off", "--exit-on-match"],
+      { cwd: dir, encoding: "utf8", env: { ...process.env, GITHUB_TOKEN: "", GH_TOKEN: "" } });
+    assert.equal(r.status, 2, `an unreadable selected file fails the run: ${r.stderr}`);
+    assert.match(r.stderr, new RegExp(SCAN_UNREADABLE_ERROR));
+    assert.match(r.stderr, /notes\.md/);
+    assert.equal(/source-leak-gate: clean\./.test(r.stderr), false, "and the run never reports itself clean");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a SYMBOLIC LINK is scanned as the link text git stores for it", () => {
+  // ADDED. CHANGED CONTRACT: a non-regular selected path returned [] (clean), and
+  // stat FOLLOWED the link, so the leak living in the link text itself — which is
+  // the whole of what git stores for a symlink — was never read.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-symlink-")));
+  try {
+    const link = path.join(dir, "runbook.md");
+    // Dangling on purpose: stat would have thrown, and the link TEXT is the file.
+    fs.symlinkSync("cinatra-ai/ops/runbook.md", link);
+    const findings = scanFile(link, active);
+    assert.deepEqual(findings.map((f) => f.rule), ["SLG_PRIVATE_REPO_REF"],
+      "the private name in the link text is a finding");
+    assert.equal(findings[0].snippet, "cinatra-ai/ops/runbook.md", "the link text is what was scanned");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("content carrying a NUL byte is scanned like any other selected file", () => {
+  // ADDED. CHANGED CONTRACT: decoded content containing a NUL returned [], so
+  // "looks binary" was a way past the gate — one NUL byte in front of the leak.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-nul-")));
+  const cwd0 = process.cwd();
+  try {
+    process.chdir(dir);
+    const rel = ".github/workflows/nul.yml";
+    fs.mkdirSync(".github/workflows", { recursive: true });
+    // A leading NUL, and a private name in a `run: |` block the document does not
+    // dispatch — so no structural carve-out excuses it.
+    fs.writeFileSync(rel, "\0name: x\njobs:\n  b:\n    steps:\n      - run: |\n          uses: cinatra-ai/ops@main\n");
+    assert.deepEqual(scanFile(rel, active).map((f) => f.rule), ["SLG_PRIVATE_REPO_REF"],
+      "a NUL stops nothing: the file is read, parsed and scanned");
   } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1950,6 +2039,31 @@ test("isTrackedInScannedTree answers about the PATH, not about what a pathspec m
     assert.equal(isTrackedInScannedTree(".github/workflows/*.yml"), false,
       "an untracked literal file is untracked, even though the glob would match a tracked one");
     assert.equal(isTrackedInScannedTree(".github/workflows/absent.yml"), false);
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("expiry: a tracked workflow whose NAME is not ASCII is tracked, and its pin is honoured", () => {
+  // ADDED. CHANGED CONTRACT: `git ls-files` was read line-terminated, and git
+  // C-quotes any name outside ASCII (`core.quotePath`), so the literal
+  // comparison answered "untracked" for a file git lists — a config error on a
+  // valid name. The answer is now read `-z` and compared byte for byte.
+  const wf = ".github/workflows/wörkflow.yml"; // a letter with a diaeresis
+  const dir = expiryTree({
+    "notes.txt": `${EXPIRY_MARKER}\n`,
+    [wf]: workflowPinning(PIN_A),
+    "config/gate.json": JSON.stringify(expiryConfigFor(wf), null, 1),
+  });
+  const cwd0 = process.cwd();
+  try {
+    // Not vacuous: line-terminated output really does C-quote this name.
+    assert.match(spawnSync("git", ["ls-files"], { cwd: dir, encoding: "utf8" }).stdout, /\\303\\266/,
+      "the fixture name is one git quotes");
+    process.chdir(dir);
+    assert.equal(isTrackedInScannedTree(wf), true, "git lists it, so it is tracked");
+    process.chdir(cwd0);
+    const r = runExpiryGate(dir);
+    assert.equal(r.status, 0, `the non-ASCII caller keys a live exemption: ${r.err}`);
+    assert.equal(/EXPIRED|config error/.test(r.err), false, r.err);
   } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
