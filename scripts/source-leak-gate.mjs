@@ -154,8 +154,25 @@ const REPO_NAME_SOURCE =
 // An `<owner>/<repo>` scalar for ANY owner, in the same one grammar: the
 // flow-sequence carve-out below validates EVERY entry with it, so a sequence
 // that carries junk in a later entry is not a machine form and excuses nothing.
-// GitHub owners are 1..39 characters of `[A-Za-z0-9-]`.
-const OWNER_NAME_SOURCE = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})";
+//
+// The owner is GitHub's LOGIN grammar, exactly: 1..39 characters of
+// `[A-Za-z0-9-]` that may neither begin nor end with a hyphen nor carry two
+// hyphens in a row. The looser `[A-Za-z0-9][A-Za-z0-9-]{0,38}` accepted logins
+// GitHub rejects, and that laxness ran the wrong way: `bad-/public` parsed as a
+// valid entry, so `repositories: [bad-/public, <org>/ops]` read as a functional
+// sequence and the private entry rode out on it. An entry whose owner cannot
+// exist makes the sequence NOT a machine form, and every private entry in it is
+// a finding.
+//
+// The leading lookahead is what actually holds the 39-character CEILING: the
+// hyphen rule alone is written as 38 repetitions of `-?[A-Za-z0-9]`, and each
+// repetition may carry a hyphen, so on its own it would accept a 77-character
+// login. The lookahead measures the whole run of login characters first — the
+// same shape REPO_NAME_MAX uses for repository names, and for the same reason:
+// a login GitHub cannot issue must produce NO match, never a truncated prefix.
+const OWNER_NAME_MAX = 39;
+const OWNER_NAME_SOURCE =
+  `(?=[A-Za-z0-9-]{1,${OWNER_NAME_MAX}}(?![A-Za-z0-9-]))[A-Za-z0-9](?:-?[A-Za-z0-9]){0,${OWNER_NAME_MAX - 1}}`;
 const ANY_ORG_PATH_SOURCE = `${OWNER_NAME_SOURCE}\\/${REPO_NAME_SOURCE}`;
 
 // FUNCTIONAL references: the exact machine forms the organization's own
@@ -229,7 +246,16 @@ const USES_ACTION_PATH = "(?:\\/[A-Za-z0-9._-]+)+";
 // key is prose wearing YAML clothes and is not excused. When no path is
 // available (a rule exercised on a bare string) the restriction is simply not
 // applied — it can only ever narrow the carve-out, never widen it.
-const USES_FILE_RE = /(?:^|\/)\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\.ya?ml$/;
+//
+// The workflow path is ANCHORED AT THE REPOSITORY ROOT. GitHub runs workflows
+// out of the root `.github/workflows/` directory and nowhere else, so a
+// `.github/workflows/` folder at any other depth is an ordinary directory whose
+// files never execute: `nested/.github/workflows/fake.yml` is a document that
+// looks like a workflow, and the reference in it is prose. Paths arrive
+// repository-relative (`git ls-files`), with an optional `./` prefix tolerated.
+// `action.ya?ml` stays matched by BASENAME at any depth — a composite action
+// legitimately lives in a subdirectory (`.github/actions/<name>/action.yml`).
+const USES_FILE_RE = /^(?:\.\/)?\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\.ya?ml$/;
 // `repository:` / `repositories:` has TWO forms, and they are SEPARATE grammars
 // on purpose:
 //   - a SCALAR `key: <org>/<repo>`, ending only at end of line, at a real
@@ -247,6 +273,12 @@ const USES_FILE_RE = /(?:^|\/)\.github\/workflows\/[^/]+\.ya?ml$|(?:^|\/)action\
 const FLOW_OPEN = "\\[[ \\t]*";
 const FLOW_CLOSE = "[ \\t]*\\]";
 const FLOW_SEP = "[ \\t]*,[ \\t]*";
+// YAML accepts ONE optional trailing comma before the closing bracket, so
+// `repositories: [<org>/<repo>,]` is a real flow sequence a runner reads exactly
+// like the comma-less spelling. Refusing it was a refusal cost: valid input the
+// gate called a leak. It is a single optional comma, not a separator that may
+// repeat — `[<org>/<repo>,,]` is still not YAML and still excuses nothing.
+const FLOW_TRAILING_COMMA = "(?:[ \\t]*,)?";
 // The clone URL terminates at `.git` PLUS a terminator. `<org>/<repo>.git` is a
 // remote; `<org>/<repo>.git/issues/0` is an issue citation with a remote's
 // spelling, and it is a finding.
@@ -271,12 +303,26 @@ function ciLiteral(s) { return String(s).replace(/[A-Za-z]/g, (c) => `[${c.toLow
 const ORG_CI = ciLiteral("cinatra-ai");
 function repoNameCi(name) { return ciLiteral(escapeForRegex(name)); }
 const FLOW_ENTRY = `(?:"${ANY_ORG_PATH_SOURCE}"|'${ANY_ORG_PATH_SOURCE}'|${ANY_ORG_PATH_SOURCE})`;
+// The optional tail of a `uses:` target: a reusable-workflow file under
+// `.github/workflows/` or an action directory path.
+const USES_TARGET_TAIL = `(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?`;
+// THE `uses:` scalar grammar, written ONCE and parameterised by the TARGET it
+// has to match. The carve-out below asks for one specific private repository;
+// the expiry reader (readUsesPins) asks for any `<owner>/<repo>` target. They
+// are the SAME line grammar — key owns the line, real whitespace after the key,
+// matching quotes or none, a mandatory `@<ref>`, then only a real comment or end
+// of line — and sharing the source is what keeps them from drifting apart. A
+// second, looser reader is how `uses:<target>@<sha>` (no whitespace: not a
+// scalar, no runner accepts it) came to answer for a pin that no longer exists.
+//
+// Groups: 1 = the opening quote (backreferenced to close), 2 = the target,
+// 3 = the ref.
+function usesScalarSource(targetSource) {
+  return `${YAML_KEY_PREFIX}uses:${KEY_VALUE_GAP}(["']?)(${targetSource})@(${USES_REF_TOKEN})\\1${SCALAR_TERMINATOR}`;
+}
 function usesRefRe(name) {
   const n = repoNameCi(name);
-  return new RegExp(
-    `${YAML_KEY_PREFIX}uses:${KEY_VALUE_GAP}(["']?)${ORG_CI}\\/${n}(?:${USES_WORKFLOW_PATH}|${USES_ACTION_PATH})?@${USES_REF_TOKEN}\\1${SCALAR_TERMINATOR}`,
-    "g",
-  );
+  return new RegExp(usesScalarSource(`${ORG_CI}\\/${n}${USES_TARGET_TAIL}`), "g");
 }
 function repositoryKeyScalarRe(name) {
   const n = repoNameCi(name);
@@ -290,7 +336,7 @@ function repositoryKeyFlowRe(name) {
   return new RegExp(
     `${YAML_KEY_PREFIX}repositor(?:y|ies):${KEY_VALUE_GAP}${FLOW_OPEN}`
     + `(?:${FLOW_ENTRY}${FLOW_SEP})*(["']?)${ORG_CI}\\/${n}\\1`
-    + `(?:${FLOW_SEP}${FLOW_ENTRY})*${FLOW_CLOSE}${SCALAR_TERMINATOR}`,
+    + `(?:${FLOW_SEP}${FLOW_ENTRY})*${FLOW_TRAILING_COMMA}${FLOW_CLOSE}${SCALAR_TERMINATOR}`,
     "g",
   );
 }
@@ -823,19 +869,26 @@ function expiryFail(msg) {
   process.exit(1);
 }
 
-// Every `uses:` line in a workflow file, as `{ target, ref }` pairs in file
-// order: the target is what stands before the last `@` (the reusable-workflow
-// path or the action), the ref is what stands after it (empty when there is no
-// `@`). Pairs, not a bag of shas: an expiry is keyed to ONE target, and only
-// that target's ref may answer for it.
+// Every `uses:` PIN in a workflow file, as `{ target, ref }` pairs in file
+// order: the target is the `<owner>/<repo>[/<path>]` before the `@`, the ref is
+// what stands after it. Pairs, not a bag of shas: an expiry is keyed to ONE
+// target, and only that target's ref may answer for it.
+//
+// It reads the line with usesScalarSource — the SAME grammar the carve-out
+// uses — and a line that does not parse is NOT a pin. That is the whole point:
+// the earlier loose pattern took `uses:` plus any non-blank run, so
+// `uses:<target>@<old-sha>` (no whitespace after the key), an unbalanced quote
+// and a trailing-junk tail all still answered as the pin. A real gate call could
+// be deleted and replaced by text no runner accepts, and the exemption it was
+// keyed to stayed live. Now such a line is not a pin at all, the keyed target is
+// missing, and the expiry check reports a config error instead of a verdict.
+const USES_PIN_RE = new RegExp(usesScalarSource(`${ANY_ORG_PATH_SOURCE}${USES_TARGET_TAIL}`));
 function readUsesPins(text) {
   const pins = [];
-  for (const line of text.split("\n")) {
-    const m = line.match(/^\s*(?:-\s*)?uses:\s*(\S+)/);
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(USES_PIN_RE);
     if (!m) continue;
-    const value = m[1].replace(/^["']/, "").replace(/["']$/, "");
-    const at = value.lastIndexOf("@");
-    pins.push({ target: at === -1 ? value : value.slice(0, at), ref: at === -1 ? "" : value.slice(at + 1) });
+    pins.push({ target: m[2], ref: m[3] });
   }
   return pins;
 }
@@ -887,7 +940,7 @@ function enforceBasenameExpiries(config, exemptFiles, configPath) {
     const pinned = refs[0];
     if (!FULL_SHA_RE.test(pinned)) {
       expiryFail(`config error: the '${basename}' exemption is keyed to \`uses: ${pin.uses}\` in ${pin.file}, `
-        + `which is not pinned to a commit sha (it references ${pinned ? `\`${pinned}\`` : "no ref at all"})`);
+        + `which is not pinned to a commit sha (it references \`${pinned}\`)`);
     }
     if (pinned === pin.sha.toLowerCase()) continue; // live: the reason still holds
     expiryFail(`the '${basename}' file-basename exemption has EXPIRED: ${pin.file} now pins `

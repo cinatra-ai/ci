@@ -287,8 +287,11 @@ is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
   The `@<ref>` is mandatory (GitHub rejects a ref-less cross-repo `uses:`), and
   requiring it is what keeps `uses: <org>/<repo>/issues/1` out. Where the scan
   knows the file path — a repository walk always does — a `uses:` step is
-  excused only in `.github/workflows/*.yml|.yaml` or an `action.yml|.yaml`,
-  because that is the only place one can run.
+  excused only in the **repository-root** `.github/workflows/*.yml|.yaml` or in
+  an `action.yml|.yaml` at any depth (composite actions live in subdirectories),
+  because that is the only place one can run: a `.github/workflows/` directory
+  at any other depth never executes, so `nested/.github/workflows/fake.yml` is
+  an ordinary document and the reference in it is prose.
 - `repository:` / `repositories:` has **two separate grammars**. The SCALAR form
   is exactly `<org>/<repo>` under the terminator rule above — end of line, a real
   comment, or its own closing quote. A `,` or `]` ends nothing there, because
@@ -296,8 +299,14 @@ is the one spelling a runner accepts, so `Uses: <org>/<repo>@main` is prose.
   and `repository: <org>/<repo>#1` are findings, not machine forms. The FLOW
   SEQUENCE form is `key: [<org>/<repo>, <org>/<repo>]` with **paired**
   delimiters, in which every entry must itself be a valid `<org>/<repo>` scalar
-  (optionally quoted); the excused span is the whole sequence, so *every* entry
-  is excused, while an unclosed `[` — or junk in any entry — excuses nothing.
+  (optionally quoted), with one optional trailing comma before `]` — YAML
+  accepts `key: [<org>/<repo>,]` and so does the carve-out. The excused span is
+  the whole sequence, so *every* entry is excused, while an unclosed `[` — or
+  junk in any entry — excuses nothing. The owner of an entry is GitHub's login
+  grammar exactly (1–39 of `[A-Za-z0-9-]`, no leading, trailing or consecutive
+  hyphen), so an entry such as `bad-/public` names an owner GitHub cannot issue,
+  the sequence is not a machine form, and every private entry in it is a
+  finding.
 - the **clone URL** terminates at `.git` plus a terminator (end of line,
   whitespace, a quote, `,`, `;`, `)`), so `<org>/<repo>.git` is a remote while
   `<org>/<repo>.git/issues/1` is a citation wearing a remote's spelling — and a
@@ -340,6 +349,12 @@ and the exemption is live and the gate says nothing about it. A different sha,
 and the exemption has EXPIRED: the run exits 1 and names the basename, the file,
 the target, both shas, and the fix — **the pull request that moves the pin
 deletes the basename and its expiry entry in the same change.**
+
+The pin line is read with the very same `uses:` scalar grammar the carve-out
+above uses, so a line that does not parse — no whitespace after the key, an
+unmatched quote, a trailing tail — is not a pin at all: replacing a real gate
+call with text no runner accepts makes the keyed target *missing* (a config
+error) instead of leaving the exemption it justifies quietly alive.
 
 `untilPin.uses` is what binds the expiry to the reference it is actually about.
 Keyed to "some sha in the file", an exemption survived the very edit it exists to

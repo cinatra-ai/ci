@@ -1460,6 +1460,41 @@ test("expiry: an entry for a basename that is NOT exempt is a config error", () 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("expiry: a gate line that is not a `uses:` scalar is not a pin — config error, not a verdict", () => {
+  // END TO END for the reader's grammar: a real gate call REPLACED by text no
+  // runner accepts must never keep the exemption it justifies alive. The keyed
+  // target is then simply absent, which is a config error and stops the run.
+  for (const value of [
+    `uses:${PIN_TARGET}@${PIN_A}`,                 // no whitespace after the key
+    `uses: "${PIN_TARGET}@${PIN_A}`,               // unmatched quote
+    `uses: ${PIN_TARGET}@${PIN_A} and then some`,  // trailing junk
+  ]) {
+    const dir = expiryCase({ config: liveConfig });
+    try {
+      fs.writeFileSync(path.join(dir, ".github/workflows/caller.yml"), `name: caller\njobs:\n  gate:\n    ${value}\n`);
+      const r = runExpiryGate(dir);
+      assert.equal(r.status, 1, `an invalid gate line is not a pin: ${JSON.stringify(value)}`);
+      assert.match(r.err, /config error/);
+      assert.match(r.err, /carries no such `uses:` line/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  // The well-formed spellings — bare, quoted, with or without a trailing
+  // comment — are pins, and the exemption they key stays live and silent.
+  for (const value of [
+    `uses: ${PIN_TARGET}@${PIN_A}`,
+    `uses: "${PIN_TARGET}@${PIN_A}"`,
+    `uses: '${PIN_TARGET}@${PIN_A}'  # v0.0.0`,
+  ]) {
+    const dir = expiryCase({ config: liveConfig });
+    try {
+      fs.writeFileSync(path.join(dir, ".github/workflows/caller.yml"), `name: caller\njobs:\n  gate:\n    ${value}\n`);
+      const r = runExpiryGate(dir);
+      assert.equal(r.status, 0, `a well-formed pin keeps the exemption live: ${JSON.stringify(value)} — ${r.err}`);
+      assert.equal(/EXPIRED|config error/.test(r.err), false, r.err);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
 test("expiry: the expiry map itself must be an object", () => {
   const dir = expiryCase({ config: { exemptFileBasenames: ["notes.txt"], exemptFileBasenamesExpiry: ["notes.txt"] } });
   try {
@@ -1470,20 +1505,54 @@ test("expiry: the expiry map itself must be an object", () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("readUsesPins: returns every `uses:` line as a { target, ref } pair, in file order", () => {
+test("readUsesPins: returns every `uses:` PIN as a { target, ref } pair, in file order", () => {
   // It reports PAIRS, not a deduplicated bag of shas: an expiry is keyed to one
   // target, and only that target's ref may answer for it — so a caller must be
   // able to tell WHICH line carried which ref.
+  //
+  // The reader parses the carve-out's own `uses:` grammar, in which `@<ref>` is
+  // MANDATORY (GitHub rejects a ref-less cross-repository `uses:`). A ref-less
+  // line — `uses: o/c`, or a local `uses: ./.github/actions/x` — is therefore
+  // not a pin and is absent from the result. It never was one in substance: a
+  // ref-less entry could only ever fail the sha test, and reporting it as a
+  // `{ ref: "" }` pair merely changed which config error the expiry printed.
   const pins = readUsesPins(
-    `jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    steps:\n      - uses: o/a@${PIN_A}\n      - uses: o/b@v4\n      - uses: o/c\n      - uses: "o/d@${PIN_B}"\n`,
+    `jobs:\n  a:\n    uses: o/r/.github/workflows/w.yml@${PIN_A} # v1\n    steps:\n      - uses: o/a@${PIN_A}\n      - uses: o/b@v4\n      - uses: o/c\n      - uses: ./.github/actions/local\n      - uses: "o/d@${PIN_B}"\n`,
   );
   assert.deepEqual(pins, [
     { target: "o/r/.github/workflows/w.yml", ref: PIN_A },
     { target: "o/a", ref: PIN_A },
     { target: "o/b", ref: "v4" },
-    { target: "o/c", ref: "" },
     { target: "o/d", ref: PIN_B },
   ]);
+});
+
+test("readUsesPins: a line that is not the carve-out's `uses:` scalar is NOT a pin", () => {
+  // The defect this locks: the reader had its OWN loose pattern — no whitespace
+  // required after the key, quotes stripped without being matched, anything
+  // after the value ignored — so a real gate call could be deleted and replaced
+  // by text no runner accepts while the ref it named still answered for the
+  // exemption keyed to it.
+  for (const line of [
+    `uses:o/a@${PIN_A}`,                       // no whitespace after the key: not a YAML scalar
+    `uses: "o/a@${PIN_A}`,                     // unmatched quote
+    `uses: 'o/a@${PIN_A}"`,                    // mismatched quotes
+    `uses: o/a@${PIN_A} and then some`,        // trailing junk
+    `uses: o/a@${PIN_A}#0`,                    // a comment-less `#` is a citation
+    `# uses: o/a@${PIN_A}`,                    // a comment is prose about a step
+    `see uses: o/a@${PIN_A} in the old job`,   // the key does not own the line
+  ]) {
+    assert.deepEqual(readUsesPins(`${line}\n`), [], `not a pin: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    `uses: o/a@${PIN_A}`,
+    `  - uses: o/a@${PIN_A}`,
+    `  - uses:\to/a@${PIN_A}`,
+    `uses: "o/a@${PIN_A}"`,
+    `uses: 'o/a@${PIN_A}'  # v1.2.3`,
+  ]) {
+    assert.deepEqual(readUsesPins(`${line}\n`), [{ target: "o/a", ref: PIN_A }], `a pin: ${JSON.stringify(line)}`);
+  }
 });
 
 // --------------------------------------------------------------------------
@@ -1585,6 +1654,61 @@ test("the SCALAR and FLOW-SEQUENCE checkout forms are separate grammars", () => 
   }
 });
 
+test("a flow sequence's OWNERS must be logins GitHub can issue", () => {
+  // The defect this locks: the owner grammar accepted a trailing or doubled
+  // hyphen, so `bad-/public` parsed as a valid entry — the sequence read as a
+  // machine form and carried the private entry out with it. GitHub logins are
+  // 1..39 of `[A-Za-z0-9-]` with no leading, trailing or consecutive hyphen; an
+  // entry whose owner cannot exist makes the sequence not a machine form, and
+  // every private entry in it is a finding.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "repositories: [bad-/public, cinatra-ai/ops]",
+    "repositories: [a--b/x, cinatra-ai/ops]",
+    "repositories: [-a/x, cinatra-ai/ops]",
+    "repositories: [cinatra-ai/ops, bad-/public]",
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `an impossible owner voids the sequence: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    "repositories: [other-org/public, cinatra-ai/ops]",
+    "repositories: [a-b-c/x, cinatra-ai/ops]",
+    "repositories: [a/x, cinatra-ai/ops]",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `every owner is a real login: ${JSON.stringify(line)}`);
+  }
+  // The 39-character ceiling is real, hyphens included: the hyphen rule alone
+  // would have accepted a 77-character login.
+  const maxOwner = "a".repeat(39);
+  const maxHyphenated = "a-".repeat(20).slice(0, 39);
+  assert.equal(matchRule(rule, `repositories: [${maxOwner}/x, cinatra-ai/ops]`), 0);
+  assert.equal(matchRule(rule, `repositories: [${maxHyphenated}/x, cinatra-ai/ops]`), 0);
+  assert.ok(matchRule(rule, `repositories: [${maxOwner}a/x, cinatra-ai/ops]`) >= 1, "40 characters is not a login");
+  assert.ok(matchRule(rule, `repositories: [${"a-".repeat(21).slice(0, 41)}/x, cinatra-ai/ops]`) >= 1, "41 hyphenated characters is not a login");
+});
+
+test("a flow sequence may carry ONE optional trailing comma", () => {
+  // The refusal cost this removes: `repositories: [<org>/<repo>,]` is valid YAML
+  // — a flow sequence may end with a separator — and a runner reads it exactly
+  // like the comma-less spelling, so refusing it called correct input a leak.
+  const rule = byId.get("SLG_PRIVATE_REPO_REF");
+  for (const line of [
+    "repositories: [cinatra-ai/wp-theme,]",
+    "repositories: [cinatra-ai/wp-theme, ]",
+    "  repositories: [ other-org/public, cinatra-ai/wp-theme, ]  # both checkouts",
+    "repositories: [cinatra-ai/ops, other-org/public,]",
+  ]) {
+    assert.equal(matchRule(rule, line), 0, `one trailing comma is still YAML: ${JSON.stringify(line)}`);
+  }
+  for (const line of [
+    "repositories: [cinatra-ai/wp-theme,,]",     // not a separator that repeats
+    "repositories: [cinatra-ai/wp-theme,",       // still unclosed
+    "repositories: [,cinatra-ai/wp-theme]",      // a LEADING comma is not YAML
+  ]) {
+    assert.ok(matchRule(rule, line) >= 1, `not a flow sequence: ${JSON.stringify(line)}`);
+  }
+});
+
 test("owner and repository names fold CASE, the YAML key does not", () => {
   // GitHub resolves owner/repository names case-insensitively, so
   // `uses: Cinatra-AI/Ops@main` is the same dispatch as the lower-case spelling:
@@ -1682,11 +1806,21 @@ test("the clone-URL carve-out terminates at `.git`", () => {
   assert.ok(matchRule(rule, "git@github.com:cinatra-ai/ops.git") >= 1);
 });
 
-test("where the file path is known, `uses:` is excused only in a workflow or action file", () => {
+test("where the file path is known, `uses:` is excused only in a ROOT workflow or an action file", () => {
   // The hook CAN see the path: scanFile passes it, so the restriction is real
   // rather than a documented impossibility. A caller with no path (matchRule
   // above, and any direct rule use) judges the grammar alone.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slg-uses-"));
+  //
+  // Paths reach the scan REPOSITORY-RELATIVE (`git ls-files`), and the workflow
+  // arm is anchored at the root: GitHub executes `.github/workflows/` at the
+  // repository root and nowhere else, so `nested/.github/workflows/fake.yml` is
+  // an ordinary document and the reference in it is prose. `action.ya?ml` stays
+  // matched by basename at any depth — composite actions live in subdirectories.
+  // (The test runs FROM the temp tree for exactly that reason: an absolute path
+  // is not a repository-relative one, and the old, depth-blind pattern is what
+  // let a nested copy pass.)
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "slg-uses-")));
+  const cwd0 = process.cwd();
   const line = "uses: cinatra-ai/ops/.github/workflows/deploy.yml@main\n";
   const write = (rel) => {
     const f = path.join(dir, rel);
@@ -1694,19 +1828,24 @@ test("where the file path is known, `uses:` is excused only in a workflow or act
     fs.writeFileSync(f, line);
     return f;
   };
-  const idsFor = (rel) => scanFile(write(rel), active).map((f) => f.rule);
+  const idsFor = (rel) => { write(rel); return scanFile(rel, active).map((f) => f.rule); };
   try {
+    process.chdir(dir);
     assert.deepEqual(idsFor(".github/workflows/deploy.yml"), []);
     assert.deepEqual(idsFor(".github/workflows/deploy.yaml"), []);
+    assert.deepEqual(idsFor("./.github/workflows/deploy.yml"), []);
     assert.deepEqual(idsFor("action.yml"), []);
     assert.deepEqual(idsFor(".github/actions/notify/action.yaml"), []);
+    assert.deepEqual(idsFor("some/dir/action.yml"), []);
+    assert.deepEqual(idsFor("nested/.github/workflows/fake.yml"), ["SLG_PRIVATE_REPO_REF"]);
+    assert.deepEqual(idsFor("docs/.github/workflows/example.yaml"), ["SLG_PRIVATE_REPO_REF"]);
     assert.deepEqual(idsFor("docs/runbook.md"), ["SLG_PRIVATE_REPO_REF"]);
     assert.deepEqual(idsFor("templates/deploy.yml"), ["SLG_PRIVATE_REPO_REF"]);
     // The path narrows the `uses:` form only: the checkout key is a legal
     // machine form in any YAML, and stays excused.
     fs.writeFileSync(path.join(dir, "compose.yml"), "repository: cinatra-ai/ops\n");
-    assert.deepEqual(scanFile(path.join(dir, "compose.yml"), active).map((f) => f.rule), []);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    assert.deepEqual(scanFile("compose.yml", active).map((f) => f.rule), []);
+  } finally { process.chdir(cwd0); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 // --------------------------------------------------------------------------
