@@ -50,6 +50,12 @@ import {
   classifyLandedShape,
   collectLandedChain,
   PR_COMMITS_API_CAP,
+  parentsOf,
+  mergedTreeOf,
+  resolveQueuedPr,
+  verifyQueuedApprovedHead,
+  resolveQueueCandidate,
+  analyzeMergeGroup,
 } from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -3751,5 +3757,239 @@ test("§7 PUSH ARM: a SQUASH landing of the same PR is bound exactly as before (
   assert.ok(!report.findings.some((f) => f.code === "rebase-landing"));
   assert.deepEqual(report.findings.filter((f) => f.severity === "error"), [], JSON.stringify(report.findings));
   assert.ok(forkPoint);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+
+// =========================================================================
+// QUEUE ARM (merge_group) — engineering#658 item 2.
+//
+// The group's pull request is resolved from data that BINDS it to this group:
+// the merge-group head's PARENTS and the queue's pull-request list. Everything
+// the arm then judges — the approved head at enqueue, the approval's standing,
+// the verification-boundary record (parsed by the SAME parser the pre-merge arm
+// uses) and the queue candidate (the group head's tree equals the queued head
+// merged onto the group's base) — hangs off that binding, so missing or
+// ambiguous membership FAILS CLOSED rather than picking a pull request.
+// =========================================================================
+
+const Q_BASE = "1".repeat(40);   // the merge group's base
+const Q_HEAD = "2".repeat(40);   // the queued pull request's head at enqueue
+const Q_HEAD2 = "3".repeat(40);  // a second queued pull request's head
+const Q_GROUP = "4".repeat(40);  // the merge-group head commit
+const Q_OLD = "5".repeat(40);    // the head an approval was cast on, since moved
+
+const Q_REVIEWED_LINE = "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)";
+
+function qDeclared(body) { return parseTrailers(body); }
+
+function qBaseCtx(over = {}) {
+  return {
+    changedFiles: ["src/x.ts"], rangeIdentities: [], messageBySha: {},
+    defaults: DEFAULTS_OK, repoSuite: null, apiBound: true,
+    prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
+    queueCandidate: { ok: true },
+    ...over,
+  };
+}
+
+test("QUEUE ARM: a group with exactly ONE queued pull request whose approved head, approval and record hold is CLEAN", () => {
+  const membership = resolveQueuedPr({
+    groupHeadSha: Q_GROUP,
+    parents: [Q_BASE, Q_HEAD],
+    queuePulls: [{ number: 42, head: { sha: Q_HEAD } }],
+  });
+  assert.equal(membership.status, "resolved");
+  assert.equal(membership.number, 42);
+  assert.equal(membership.headAtEnqueue, Q_HEAD, "the head at enqueue is the group head's parent, never the live PR head");
+
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const approvedHeadCheck = verifyQueuedApprovedHead({
+    headAtEnqueue: membership.headAtEnqueue, reviews,
+    prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
+  });
+  assert.ok(approvedHeadCheck.ok, JSON.stringify(approvedHeadCheck));
+
+  const declared = qDeclared(["Assisted-by: none", Q_REVIEWED_LINE].join("\n"));
+  const r = analyzeMergeGroup(qBaseCtx({
+    membership, approvedHeadCheck, reviews, approverLogins: ["groganz"],
+    reviewedHeadSha: membership.headAtEnqueue, declaredReviewedBy: declared.reviewed,
+  }));
+  assert.deepEqual(r.findings.filter((f) => f.severity === "error"), [], JSON.stringify(r.findings));
+});
+
+test("QUEUE ARM: a group whose pull request head MOVED AFTER the approval FAILS", () => {
+  const membership = resolveQueuedPr({
+    groupHeadSha: Q_GROUP,
+    parents: [Q_BASE, Q_HEAD],
+    queuePulls: [{ number: 42, head: { sha: Q_HEAD } }],
+  });
+  assert.equal(membership.status, "resolved");
+  // the approval was cast on Q_OLD; the enqueued head is Q_HEAD.
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_OLD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const approvedHeadCheck = verifyQueuedApprovedHead({
+    headAtEnqueue: membership.headAtEnqueue, reviews,
+    prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
+  });
+  assert.equal(approvedHeadCheck.ok, false);
+  const r = analyzeMergeGroup(qBaseCtx({
+    membership, approvedHeadCheck, reviews, approverLogins: ["groganz"],
+    reviewedHeadSha: membership.headAtEnqueue,
+  }));
+  const f = r.findings.find((x) => x.code === "queue-approved-head");
+  assert.ok(f, JSON.stringify(r.findings));
+  assert.equal(f.severity, "error");
+  assert.match(f.message, /moved after the approval/);
+});
+
+test("QUEUE ARM: a group with TWO candidate pull requests FAILS CLOSED (never picks one)", () => {
+  const membership = resolveQueuedPr({
+    groupHeadSha: Q_GROUP,
+    parents: [Q_BASE, Q_HEAD, Q_HEAD2],
+    queuePulls: [{ number: 42, head: { sha: Q_HEAD } }, { number: 43, head: { sha: Q_HEAD2 } }],
+  });
+  assert.equal(membership.status, "ambiguous");
+  assert.equal(membership.number, null, "an ambiguous group must not resolve to a pull request");
+  const r = analyzeMergeGroup(qBaseCtx({ membership }));
+  const f = r.findings.find((x) => x.code === "queue-membership-ambiguous");
+  assert.ok(f, JSON.stringify(r.findings));
+  assert.equal(f.severity, "error");
+  assert.match(f.message, /#42/);
+  assert.match(f.message, /#43/);
+});
+
+test("QUEUE ARM: a group whose pull request cannot be bound at all FAILS CLOSED", () => {
+  // the queue list carries a pull request whose head is NOT a parent of the
+  // group head — no binding, so nothing is assumed.
+  const membership = resolveQueuedPr({
+    groupHeadSha: Q_GROUP,
+    parents: [Q_BASE, Q_HEAD],
+    queuePulls: [{ number: 99, head: { sha: Q_HEAD2 } }],
+  });
+  assert.equal(membership.status, "unresolved");
+  assert.equal(membership.number, null);
+  const r = analyzeMergeGroup(qBaseCtx({ membership }));
+  assert.ok(r.findings.some((x) => x.code === "queue-membership-unresolved"), JSON.stringify(r.findings));
+  // an empty parent list or an empty queue list is likewise unresolved.
+  assert.equal(resolveQueuedPr({ groupHeadSha: Q_GROUP, parents: [], queuePulls: [{ number: 42, head: { sha: Q_HEAD } }] }).status, "unresolved");
+  assert.equal(resolveQueuedPr({ groupHeadSha: Q_GROUP, parents: [Q_BASE, Q_HEAD], queuePulls: [] }).status, "unresolved");
+});
+
+test("QUEUE ARM: a record that is PROOF-FAILED (a required context concluded non-success) FAILS with the pre-merge arm's own finding code", () => {
+  const membership = resolveQueuedPr({
+    groupHeadSha: Q_GROUP, parents: [Q_BASE, Q_HEAD],
+    queuePulls: [{ number: 42, head: { sha: Q_HEAD } }],
+  });
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const approvedHeadCheck = verifyQueuedApprovedHead({
+    headAtEnqueue: membership.headAtEnqueue, reviews,
+    prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
+  });
+  // the record declares the gate arm; one required context concluded failure.
+  const checkRuns = [
+    { name: "source-leak-gate / source-leak-gate", status: "completed", conclusion: "success", completed_at: "2026-06-12T10:00:00Z" },
+    { name: "ci / build-test", status: "completed", conclusion: "failure", completed_at: "2026-06-12T10:00:00Z" },
+  ];
+  const r = analyzeMergeGroup(qBaseCtx({
+    membership, approvedHeadCheck, reviews, approverLogins: ["groganz"],
+    reviewedHeadSha: membership.headAtEnqueue,
+    declaredGateArm: gateParsed(), suiteFile: SUITE_FILE, checkRuns,
+  }));
+  assert.ok(r.findings.some((f) => f.code === "gate-suite-fabricated"), JSON.stringify(r.findings));
+});
+
+test("QUEUE ARM: a PRESERVED-FAILING record (a Reviewed-by claim nobody cast) FAILS with the pre-merge arm's own finding code", () => {
+  const membership = resolveQueuedPr({
+    groupHeadSha: Q_GROUP, parents: [Q_BASE, Q_HEAD],
+    queuePulls: [{ number: 42, head: { sha: Q_HEAD } }],
+  });
+  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const approvedHeadCheck = verifyQueuedApprovedHead({
+    headAtEnqueue: membership.headAtEnqueue, reviews,
+    prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
+  });
+  // The SAME parser the pre-merge arm uses reads the record off the pull
+  // request body; the claim is about a review that was never cast.
+  const declared = qDeclared("Assisted-by: none\nReviewed-by: Mallory Forge <mallory@x.io> (@mallory, tier=maintainer)");
+  assert.equal(declared.reviewed.length, 1);
+  const r = analyzeMergeGroup(qBaseCtx({
+    membership, approvedHeadCheck, reviews, approverLogins: ["groganz"],
+    reviewedHeadSha: membership.headAtEnqueue, declaredReviewedBy: declared.reviewed,
+  }));
+  assert.ok(r.findings.some((f) => f.code === "reviewed-by-fabricated"), JSON.stringify(r.findings));
+});
+
+test("QUEUE ARM: the queue candidate — the group head's TREE equals the queued head merged onto the group's base", () => {
+  const { dir, g } = tmpGitRepo();
+  fs.writeFileSync(path.join(dir, "base.txt"), "base\n");
+  g("add", "-A"); g("commit", "-q", "-m", "base commit");
+  const base = g("rev-parse", "HEAD").stdout.trim();
+  g("checkout", "-q", "-b", "feature");
+  fs.writeFileSync(path.join(dir, "feat.txt"), "feat\n");
+  g("add", "-A"); g("commit", "-q", "-m", "feat: queued work");
+  const prHead = g("rev-parse", "HEAD").stdout.trim();
+  // the base moves on main, exactly as a queue builds against the current base
+  g("checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "base.txt"), "base moved\n");
+  g("add", "-A"); g("commit", "-q", "-m", "chore: base moves");
+  const movedBase = g("rev-parse", "HEAD").stdout.trim();
+  // the merge-group candidate: the queued head merged onto that base
+  const mergeRes = g("merge", "-q", "--no-ff", prHead, "-m", "merge group candidate");
+  assert.equal(mergeRes.status, 0, mergeRes.stderr);
+  const groupHead = g("rev-parse", "HEAD").stdout.trim();
+
+  // the parents of the group head carry the binding the membership resolves on
+  const parents = parentsOf(groupHead, dir);
+  assert.deepEqual(parents, [movedBase, prHead]);
+
+  // the expected tree is computable without checking anything out
+  assert.equal(mergedTreeOf(movedBase, prHead, dir), treeOf(groupHead, dir));
+
+  const ok = resolveQueueCandidate({ groupHeadSha: groupHead, baseSha: movedBase, prHeadSha: prHead, cwd: dir });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+
+  // a group head carrying anything BEYOND the queued head merged onto the base
+  // is not the queue candidate.
+  fs.writeFileSync(path.join(dir, "smuggled.txt"), "not reviewed\n");
+  g("add", "-A"); g("commit", "-q", "-m", "chore: smuggled");
+  const tampered = g("rev-parse", "HEAD").stdout.trim();
+  const bad = resolveQueueCandidate({ groupHeadSha: tampered, baseSha: movedBase, prHeadSha: prHead, cwd: dir });
+  assert.equal(bad.ok, false, JSON.stringify(bad));
+  const r = analyzeMergeGroup(qBaseCtx({
+    membership: { status: "resolved", number: 42, headAtEnqueue: prHead, candidates: [] },
+    approvedHeadCheck: { ok: true },
+    queueCandidate: bad,
+  }));
+  assert.ok(r.findings.some((f) => f.code === "queue-candidate-mismatch"), JSON.stringify(r.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("QUEUE ARM: an UNRESOLVABLE queue candidate fails closed, never passes", () => {
+  const { dir } = tmpGitRepo();
+  const unresolvable = resolveQueueCandidate({ groupHeadSha: Q_GROUP, baseSha: Q_BASE, prHeadSha: Q_HEAD, cwd: dir });
+  assert.equal(unresolvable.ok, undefined, JSON.stringify(unresolvable));
+  const r = analyzeMergeGroup(qBaseCtx({
+    membership: { status: "resolved", number: 42, headAtEnqueue: Q_HEAD, candidates: [] },
+    approvedHeadCheck: { ok: true },
+    queueCandidate: unresolvable,
+  }));
+  assert.ok(r.findings.some((f) => f.code === "queue-candidate-unverifiable"), JSON.stringify(r.findings));
+  // a missing base or head is likewise unverifiable, never true.
+  assert.equal(resolveQueueCandidate({ groupHeadSha: Q_GROUP, baseSha: null, prHeadSha: Q_HEAD, cwd: dir }).ok, undefined);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("QUEUE ARM CLI: --arm merge-group runs and fails closed with no API context", () => {
+  const { dir, g } = tmpGitRepo();
+  fs.writeFileSync(path.join(dir, "base.txt"), "base\n");
+  g("add", "-A"); g("commit", "-q", "-m", "base commit");
+  const res = spawnSync("node", [GATE, "--arm", "merge-group", "--mode", "warn", "--format", "json", "--high-risk-defaults", path.join(import.meta.dirname, "..", "..", "config", "high-risk-defaults.json")], {
+    cwd: dir, encoding: "utf8", env: { ...process.env, GITHUB_ACTIONS: "", GITHUB_REPOSITORY: "", GITHUB_SHA: "" },
+  });
+  assert.equal(res.status, 0, res.stderr);
+  const report = JSON.parse(res.stdout);
+  assert.equal(report.arm, "merge-group");
+  assert.ok(report.apiSkippedReason, "no API context must be reported, not silently passed");
+  assert.ok(report.findings.some((f) => f.code === "queue-membership-unresolved"), JSON.stringify(report.findings));
   fs.rmSync(dir, { recursive: true, force: true });
 });

@@ -11,12 +11,18 @@ name: truthful-attribution-gate
 #     at the merged SHA AND every required context must have concluded green;
 #   - high-risk paths (§3, fail-closed config) require a tier=maintainer human.
 #
-# Two arms run from one workflow:
+# Three arms run from one workflow:
 #   - pre-merge  (pull_request): truth-checks the claims that exist before merge
 #     (branch-commit Assisted-by, approvals, contexts, high-risk mapping). The
 #     synthesized squash message itself is NOT readable pre-merge (detection
 #     limit, §5) — that is the post-merge arm's job.
 #   - post-merge (push to default branch): validates the squash RECORD itself.
+#   - merge-group (merge_group): judges the QUEUE CANDIDATE — resolves the
+#     group's pull request from the candidate's parents and the queue's
+#     pull-request list, then validates its approved head at enqueue, the
+#     approval's standing, the verification-boundary record for that head, and
+#     that the candidate's tree is the enqueued head merged onto the group's
+#     base. Missing or ambiguous membership fails closed.
 # A third ORG WATCHDOG (scheduled, outside any target repo) is a separate
 # workflow; it is not part of this reusable gate.
 #
@@ -189,6 +195,37 @@ jobs:
           # that anti-fabrication was skipped).
           MERGE_SHA="${GITHUB_SHA:-HEAD}"
           args=( --arm post-merge --mode "$MODE" --repo "$GITHUB_REPOSITORY" --commit "$MERGE_SHA" )
+          [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
+          [ -n "$GATE_SUITE" ] && args+=( --gate-suite "$GATE_SUITE" )
+          node .truthful-attribution-gate/scripts/truthful-attribution-gate.mjs "${args[@]}"
+
+      # QUEUE ARM (merge_group). GitHub's merge queue builds a CANDIDATE commit —
+      # the enqueued pull request's head merged onto the queue's base — and asks
+      # the required checks to judge that commit. Neither other arm can: the
+      # pre-merge arm is handed a pull request number, the post-merge arm a commit
+      # already on the default branch. So this arm hands the engine the group's
+      # head and base and the engine resolves the pull request from data that
+      # BINDS it to this group (the head's parents plus the queue's pull-request
+      # list), validates the approved head AT ENQUEUE, the approval's standing,
+      # the verification-boundary record for that head, and the queue candidate
+      # (the group head's tree equals the enqueued head merged onto the base).
+      # Missing or ambiguous membership FAILS CLOSED — no pull request is guessed.
+      - name: Run truthful-attribution-gate (merge-group)
+        if: github.event_name == 'merge_group'
+        id: mergegroup
+        continue-on-error: ${{ inputs.mode == 'warn' }}
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          CONFIG: ${{ inputs.config }}
+          GATE_SUITE: ${{ inputs.gate_suite }}
+          MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          args=( --arm merge-group --mode "$MODE" --repo "$GITHUB_REPOSITORY" )
+          [ -n "$MERGE_GROUP_HEAD" ] && args+=( --merge-group-head "$MERGE_GROUP_HEAD" )
+          [ -n "$MERGE_GROUP_BASE" ] && args+=( --merge-group-base "$MERGE_GROUP_BASE" )
           [ -n "$CONFIG" ] && args+=( --config "$CONFIG" )
           [ -n "$GATE_SUITE" ] && args+=( --gate-suite "$GATE_SUITE" )
           node .truthful-attribution-gate/scripts/truthful-attribution-gate.mjs "${args[@]}"
