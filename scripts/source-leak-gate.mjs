@@ -1823,9 +1823,13 @@ function loadKnownPublicRepos(explicitPath, options = {}) {
   return { names: fresh, entries, path: p, ttlDays, ttlValid: true, warnings, note };
 }
 
-function makeProbeContext({ token, knownPublic, apiBase, timeoutMs, maxNames, deadlineMs, concurrency }) {
+function makeProbeContext({ token, knownPublic, apiBase, timeoutMs, maxNames, deadlineMs, concurrency, now }) {
   return {
     token: token || "", knownPublic: knownPublic || new Set(),
+    // Every deadline read in this lane goes through ONE clock, so a caller can
+    // hand the lane a clock it controls and assert the boundary instead of
+    // approximating it.
+    now: typeof now === "function" ? now : Date.now,
     apiBase: apiBase || DEFAULT_API_BASE, timeoutMs: timeoutMs || PROBE_TIMEOUT_MS,
     maxNames: Number.isFinite(maxNames) ? maxNames : PROBE_MAX_NAMES,
     deadlineMs: Number.isFinite(deadlineMs) ? deadlineMs : PROBE_DEADLINE_MS,
@@ -1858,9 +1862,17 @@ async function resolveRepoVisibility(name, ctx) {
   // Capping here both bounds the wall clock and aborts everything still in
   // flight the moment the deadline passes — the signal fires at exactly the
   // deadline for every outstanding request.
+  const nowMs = ctx.now || Date.now;
   const requestTimeoutMs = ctx.timeoutMs || PROBE_TIMEOUT_MS;
-  const remainingMs = ctx.deadlineAt === undefined ? Infinity : ctx.deadlineAt - Date.now();
+  const remainingMs = ctx.deadlineAt === undefined ? Infinity : ctx.deadlineAt - nowMs();
   const budgetMs = Math.min(requestTimeoutMs, remainingMs);
+  // WHOSE clock this request runs on is settled HERE, from the two numbers
+  // themselves, and never re-derived afterwards by comparing a timer's firing
+  // against the wall clock. A timer may fire a whisker BEFORE the clock reaches
+  // the instant it was scheduled for, and that one millisecond used to reclass
+  // the lane's own cut as the request's own timeout: a MEMOISED unresolved
+  // error where the unmemoised fail-closed budget outcome belongs.
+  const budgetIsDeadline = remainingMs <= requestTimeoutMs;
   const deadlineReason = `past the ${ctx.deadlineMs}ms per-run deadline`;
   // Already out of time: never open a request that cannot finish.
   if (budgetMs <= 0) return { state: "deadline", reason: deadlineReason };
@@ -1878,12 +1890,12 @@ async function resolveRepoVisibility(name, ctx) {
   const CUT = Symbol("probe budget cut");
   let timer = null;
   const cut = new Promise((resolve) => { timer = setTimeout(() => resolve(CUT), budgetMs); });
-  const overdue = () => signal.aborted || (ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt);
+  const overdue = () => signal.aborted || (ctx.deadlineAt !== undefined && nowMs() >= ctx.deadlineAt);
   // What an overrun MEANS depends on whose clock ran out: past the lane
   // deadline it is the budget outcome (unmemoised — the name was never
   // answered), and with lane time still left it is the request's own timeout,
   // which is an ordinary unresolved probe.
-  const cutVerdict = () => (ctx.deadlineAt !== undefined && Date.now() >= ctx.deadlineAt
+  const cutVerdict = () => (budgetIsDeadline || (ctx.deadlineAt !== undefined && nowMs() >= ctx.deadlineAt)
     ? { state: "deadline", reason: deadlineReason }
     : { state: "error", reason: `network error: no answer inside the ${budgetMs}ms request timeout` });
   // The LOSER of a race still settles, and a rejection nobody reads is an
@@ -1969,7 +1981,8 @@ async function resolveNamesWithinBudget(names, ctx) {
   }
   // Published on the context so every request this lane opens can cap its own
   // timeout to what is left of it (see resolveRepoVisibility).
-  const deadline = Date.now() + ctx.deadlineMs;
+  const nowMs = ctx.now || Date.now;
+  const deadline = nowMs() + ctx.deadlineMs;
   ctx.deadlineAt = deadline;
   let next = 0;
   const worker = async () => {
@@ -1977,7 +1990,7 @@ async function resolveNamesWithinBudget(names, ctx) {
       const i = next++;
       if (i >= queue.length) return;
       const name = queue[i];
-      if (Date.now() >= deadline) { unasked.set(name, `past the ${ctx.deadlineMs}ms per-run deadline`); continue; }
+      if (nowMs() >= deadline) { unasked.set(name, `past the ${ctx.deadlineMs}ms per-run deadline`); continue; }
       const verdict = await resolveRepoVisibility(name, ctx);
       // Cut mid-flight by the deadline: the same unasked/fail-closed bucket as a
       // name we never got to, so it reads as "could not verify", never as clean.
