@@ -92,7 +92,7 @@ import { fileURLToPath } from "node:url";
 export const GATE_VERSION = "0.3.0";
 
 const VALID_MODES = ["warn", "enforce"];
-const VALID_ARMS = ["pre-merge", "post-merge"];
+const VALID_ARMS = ["pre-merge", "post-merge", "merge-group"];
 const VALID_FORMATS = ["text", "json"];
 
 const VALUE_FLAGS = new Set([
@@ -104,6 +104,9 @@ const VALUE_FLAGS = new Set([
   // Optional override for the branch whose first-parent history the §6
   // correction discovery scans (default: auto-resolved origin/HEAD -> main).
   "default-branch",
+  // The merge_group event's candidate commit and the base the queue built it
+  // on (github.event.merge_group.head_sha / .base_sha).
+  "merge-group-head", "merge-group-base",
 ]);
 const BOOLEAN_FLAGS = new Set(["quiet"]);
 
@@ -1098,6 +1101,135 @@ export function resolveMergedPr({ commitSha, message, declaredPr, listPullsForCo
     if (bound(pr)) return { number: c.n, pr, source: c.source };
   }
   return { number: null, pr: null, source: "none" };
+}
+
+
+// ===========================================================================
+// MERGE-QUEUE ARM (the `merge_group` event).
+//
+// GitHub's merge queue builds a CANDIDATE commit — the queued pull request's
+// head merged onto the queue's base — and asks the required checks to judge THAT
+// commit. The gate's other two arms cannot: the pre-merge arm is handed a pull
+// request number by the event, and the post-merge arm is handed a commit that is
+// already on the default branch. So the queue arm must first answer "which pull
+// request is this group?" — and it must answer it from data that BINDS the two,
+// never from a guess (the same failure `resolveMergedPr` exists to prevent: a
+// wrong pull request produces an internally consistent verdict about a different
+// change). The binding here is structural: the candidate's PARENTS are the base
+// and the enqueued head, and the queue's pull-request list says which pull
+// requests GitHub itself associates with the candidate. A pull request qualifies
+// only when it appears in BOTH. Exactly one qualifier => resolved; none or more
+// than one => the group is unresolvable/ambiguous and the arm FAILS CLOSED.
+//
+// The head the arm then judges is the head AT ENQUEUE — the group head's own
+// parent — never the pull request's live head, which may have moved since the
+// queue took the entry. That is precisely what makes "the review's commit id
+// equals the pull request's head at enqueue" a checkable statement.
+// ===========================================================================
+
+/** Parent commit shas of a commit, in order (local git). Empty on any failure. */
+export function parentsOf(commit, cwd = process.cwd()) {
+  if (!commit) return [];
+  try {
+    const out = execFileSync("git", ["--literal-pathspecs", "rev-parse", "--end-of-options", `${commit}^@`], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.split("\n").map((s) => s.trim().toLowerCase()).filter((s) => /^[0-9a-f]{40}$/.test(s));
+  } catch { return []; }
+}
+
+/**
+ * The TREE a merge of `headSha` onto `baseSha` produces, without touching the
+ * working tree (`git merge-tree --write-tree`). A conflict, an unknown object or
+ * any other failure returns null — which the caller reports as UNVERIFIABLE, the
+ * fail-closed direction, never as a match.
+ */
+export function mergedTreeOf(baseSha, headSha, cwd = process.cwd()) {
+  if (!baseSha || !headSha) return null;
+  try {
+    const out = execFileSync("git", ["--literal-pathspecs", "merge-tree", "--write-tree", "--end-of-options", baseSha, headSha], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const first = String(out).split("\n", 1)[0].trim().toLowerCase();
+    return /^[0-9a-f]{40}$/.test(first) ? first : null;
+  } catch { return null; }
+}
+
+/**
+ * Resolve the pull request a merge group is FOR, from the group head's parents
+ * and the queue's pull-request list. Returns
+ *   { status: "resolved", number, pr, headAtEnqueue, candidates }
+ *   { status: "ambiguous", number: null, ..., candidates }   (> 1 qualifier)
+ *   { status: "unresolved", number: null, ..., candidates: [] }
+ * Ambiguity and absence are NOT resolved by preference of any kind: a queue entry
+ * that does not resolve to exactly one pull request is a queue entry this gate
+ * refuses to bless.
+ */
+export function resolveQueuedPr({ groupHeadSha = null, parents = [], queuePulls = [] } = {}) {
+  const parentSet = new Set((Array.isArray(parents) ? parents : [])
+    .filter((s) => typeof s === "string" && s !== "").map((s) => s.toLowerCase()));
+  const candidates = [];
+  for (const p of Array.isArray(queuePulls) ? queuePulls : []) {
+    const number = Number(p?.number);
+    const head = typeof p?.head?.sha === "string" ? p.head.sha.toLowerCase() : null;
+    if (!Number.isFinite(number) || !head) continue;
+    if (!parentSet.has(head)) continue;
+    if (candidates.some((c) => c.number === number)) continue;
+    candidates.push({ number, pr: p, headAtEnqueue: head });
+  }
+  if (candidates.length === 1) return { status: "resolved", ...candidates[0], groupHeadSha, candidates };
+  if (candidates.length > 1) return { status: "ambiguous", number: null, pr: null, headAtEnqueue: null, groupHeadSha, candidates };
+  return { status: "unresolved", number: null, pr: null, headAtEnqueue: null, groupHeadSha, candidates: [] };
+}
+
+/**
+ * The approved head of a queued pull request: a LIVE, QUALIFIED approval (the
+ * §5 latest-review semantics `resolveApprovedHeads` already owns — non-self,
+ * non-dismissed, not superseded, peer standing at least) must sit on the head
+ * the queue enqueued. An approval on an older head means the head moved after
+ * the approval, and the queue candidate is not the reviewed change.
+ */
+export function verifyQueuedApprovedHead({ headAtEnqueue, reviews, prAuthorLogin = null, permissionByLogin = null } = {}) {
+  const want = typeof headAtEnqueue === "string" && headAtEnqueue !== "" ? headAtEnqueue.toLowerCase() : null;
+  if (!want) return { ok: false, approvedHeads: [], reason: `the queued pull request's head at enqueue is unknown — failing closed` };
+  if (!Array.isArray(reviews)) return { ok: false, approvedHeads: [], reason: `the queued pull request's reviews could not be read — failing closed` };
+  const approvedHeads = resolveApprovedHeads(reviews, { prAuthorLogin, permissionByLogin });
+  if (approvedHeads.length === 0) {
+    return { ok: false, approvedHeads, reason: `no live, qualified approval stands on the queued pull request (enqueued head ${want.slice(0, 8)})` };
+  }
+  if (!approvedHeads.some((h) => String(h).toLowerCase() === want)) {
+    return {
+      ok: false,
+      approvedHeads,
+      reason: `the standing approval sits at ${String(approvedHeads[0]).slice(0, 8)} but the enqueued head is ${want.slice(0, 8)} — the head moved after the approval`,
+    };
+  }
+  return { ok: true, approvedHeads, reason: null };
+}
+
+/**
+ * The QUEUE CANDIDATE predicate: the merge-group head's tree must equal the tree
+ * of the queued pull request head merged onto the group's base. Anything the
+ * local git cannot resolve (an unfetched object, a conflicted merge) is
+ * `ok: undefined` — unverifiable, which the arm reports as a finding.
+ */
+export function resolveQueueCandidate({
+  groupHeadSha, baseSha, prHeadSha,
+  treeOf: treeOfFn = treeOf, mergedTreeOf: mergedTreeOfFn = mergedTreeOf,
+  cwd = process.cwd(),
+} = {}) {
+  if (!groupHeadSha || !baseSha || !prHeadSha) {
+    return { ok: undefined, groupTree: null, expectedTree: null, reason: `the merge group's head, base or enqueued head is unknown — the queue candidate cannot be verified` };
+  }
+  const groupTree = treeOfFn(groupHeadSha, cwd);
+  if (!groupTree) return { ok: undefined, groupTree: null, expectedTree: null, reason: `the merge-group head ${String(groupHeadSha).slice(0, 8)} could not be resolved to a tree — the queue candidate cannot be verified` };
+  const expectedTree = mergedTreeOfFn(baseSha, prHeadSha, cwd);
+  if (!expectedTree) return { ok: undefined, groupTree, expectedTree: null, reason: `the queued head ${String(prHeadSha).slice(0, 8)} merged onto the group base ${String(baseSha).slice(0, 8)} could not be resolved to a tree — the queue candidate cannot be verified` };
+  if (groupTree === expectedTree) return { ok: true, groupTree, expectedTree, reason: null };
+  return {
+    ok: false, groupTree, expectedTree,
+    reason: `the merge-group head's tree ${groupTree.slice(0, 8)} is not the tree of the queued head merged onto the group's base (${expectedTree.slice(0, 8)}) — the candidate carries something the queued pull request does not`,
+  };
 }
 
 // ===========================================================================
@@ -2497,6 +2629,70 @@ export function analyzePreMerge(ctx) {
   return { findings, highRisk: hr.highRisk, highRiskMatched: hr.matched };
 }
 
+
+/**
+ * QUEUE ARM analysis (the `merge_group` event).
+ *
+ * Three queue-specific facts, then the record itself. The record is NOT judged
+ * by a second implementation: `analyzePreMerge` is called with the queued pull
+ * request's context (its declared record parsed by the SAME `parseTrailers`, its
+ * approvals, its check-runs, and the reviewed head pinned to the head AT
+ * ENQUEUE), so a record that fails in the queue fails with exactly the codes it
+ * would have failed with pre-merge.
+ *
+ * ctx (beyond everything analyzePreMerge reads):
+ *   membership        — resolveQueuedPr's verdict (required);
+ *   approvedHeadCheck — verifyQueuedApprovedHead's verdict;
+ *   queueCandidate    — resolveQueueCandidate's verdict.
+ * A missing verdict is a FAILED verdict: this arm never passes on absence.
+ */
+export function analyzeMergeGroup(ctx) {
+  const findings = [];
+  const membership = ctx.membership || { status: "unresolved", number: null, candidates: [] };
+
+  if (membership.status === "ambiguous") {
+    const names = (membership.candidates || []).map((c) => `#${c.number}`).join(", ");
+    findings.push({
+      code: "queue-membership-ambiguous",
+      severity: "error",
+      message: `the merge group binds to ${(membership.candidates || []).length} candidate pull requests (${names}) — a queue entry must resolve to exactly one; failing closed rather than picking one`,
+    });
+  } else if (membership.status !== "resolved") {
+    findings.push({
+      code: "queue-membership-unresolved",
+      severity: "error",
+      message: `no pull request could be bound to this merge group from the group head's parents and the queue's pull-request list — failing closed`,
+    });
+  } else {
+    const ah = ctx.approvedHeadCheck;
+    if (!ah || ah.ok !== true) {
+      findings.push({
+        code: "queue-approved-head",
+        severity: "error",
+        message: `pull request #${membership.number}: ${(ah && ah.reason) || "the approved head at enqueue could not be verified — failing closed"}`,
+      });
+    }
+    const qc = ctx.queueCandidate;
+    if (!qc || qc.ok === undefined) {
+      findings.push({
+        code: "queue-candidate-unverifiable",
+        severity: "error",
+        message: `pull request #${membership.number}: ${(qc && qc.reason) || "the queue candidate could not be verified — failing closed"}`,
+      });
+    } else if (qc.ok === false) {
+      findings.push({ code: "queue-candidate-mismatch", severity: "error", message: `pull request #${membership.number}: ${qc.reason}` });
+    }
+  }
+
+  const record = analyzePreMerge(ctx);
+  return {
+    findings: [...findings, ...record.findings],
+    highRisk: record.highRisk,
+    highRiskMatched: record.highRiskMatched,
+    membership,
+  };
+}
+
 // ===========================================================================
 // §6 — CORRECTION DISCOVERY: the pure selection rule (the testable half).
 //
@@ -3041,7 +3237,7 @@ function main() {
   // honest about its own detection limits rather than silently passing.
   const repo = args.repo || process.env.GITHUB_REPOSITORY || "";
   let client = null;
-  if (repo && (args.pr || arm === "post-merge")) {
+  if (repo && (args.pr || arm === "post-merge" || arm === "merge-group")) {
     try { client = makeGhClient({ repo }); } catch { client = null; }
   }
 
@@ -3130,6 +3326,92 @@ function main() {
       ctx.apiBound = false;
     }
     result = analyzePreMerge(ctx);
+  } else if (arm === "merge-group") {
+    // QUEUE ARM. The group's pull request is resolved from the group head's
+    // PARENTS and the queue's pull-request list; everything below hangs off that
+    // binding, and an unresolvable or ambiguous group produces findings rather
+    // than a verdict about some pull request the queue never enqueued.
+    const groupHeadArg = args["merge-group-head"] || process.env.GITHUB_SHA || "HEAD";
+    const groupHeadSha = resolveCommitSha(groupHeadArg) || groupHeadArg;
+    const groupBaseArg = args["merge-group-base"] || null;
+    const groupBaseSha = groupBaseArg ? (resolveCommitSha(groupBaseArg) || groupBaseArg) : null;
+    const ctx = {
+      changedFiles: [], rangeIdentities: [], messageBySha: {},
+      agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
+      defaults, repoSuite, apiBound: false,
+      membership: { status: "unresolved", number: null, candidates: [] },
+      parentSuiteFile: { ok: false, reason: "no merge-group base" },
+    };
+    // The candidate's own changed set / branch identities, measured base..HEAD —
+    // and ONLY when the checkout's HEAD is the group head (what actions/checkout
+    // gives on a merge_group event). Anything else leaves them empty rather than
+    // measuring a different tree and calling it this candidate.
+    let headIsCheckout = false;
+    try { headIsCheckout = resolveCommitSha("HEAD") === groupHeadSha; } catch { headIsCheckout = false; }
+    if (groupBaseSha && headIsCheckout) {
+      try {
+        ctx.changedFiles = changedFilesForRange(groupBaseSha);
+        ctx.rangeIdentities = rangeCommitIdentities(groupBaseSha);
+        for (const id of ctx.rangeIdentities) { try { ctx.messageBySha[id.sha] = commitMessage(id.sha); } catch { /* skip */ } }
+        ctx.parentSuiteFile = jsonFileAtRef(groupBaseSha, ".github/gate-suite.json");
+      } catch { /* leave the empty, fail-closed defaults */ }
+    }
+    if (!client) {
+      apiSkippedReason = `no API context (--repo / GITHUB_REPOSITORY) — the queue membership could not be resolved; failing closed`;
+    } else {
+      try {
+        ctx.membership = resolveQueuedPr({
+          groupHeadSha,
+          parents: parentsOf(groupHeadSha),
+          queuePulls: client.pullsForCommit(groupHeadSha),
+        });
+      } catch (e) {
+        apiSkippedReason = `GitHub API unavailable (${e.message}) — the queue membership could not be resolved; failing closed`;
+      }
+    }
+    if (client && ctx.membership.status === "resolved") {
+      try {
+        const prNumber = ctx.membership.number;
+        const pr = client.pr(prNumber);
+        ctx.prAuthorLogin = pr.user?.login;
+        // The head AT ENQUEUE (the group head's own parent), never the live PR
+        // head — a head that moved after the approval must surface as exactly
+        // that, not be quietly adopted as the reviewed head.
+        ctx.reviewedHeadSha = ctx.membership.headAtEnqueue;
+        ctx.reviews = client.listReviews(prNumber);
+        ctx.approverLogins = [...new Set(ctx.reviews.filter((r) => r.state === "APPROVED").map((r) => r.user?.login).filter(Boolean))];
+        // The verification-boundary record is read off the pull request body by
+        // the SAME parser the pre-merge arm uses.
+        const declared = parseTrailers(pr.body || "");
+        if (declared.reviewed.length) ctx.declaredReviewedBy = declared.reviewed;
+        if (declared.hasGateArm) ctx.declaredGateArm = declared;
+        ctx.permissionByLogin = {};
+        for (const login of [...ctx.approverLogins, ...(ctx.declaredReviewedBy || []).map((r) => r.login)]) {
+          if (!login || ctx.permissionByLogin[login] !== undefined) continue;
+          try { ctx.permissionByLogin[login] = client.permissionOf(login).permission; } catch { /* unknown */ }
+        }
+        ctx.contentBinds = makeContentBinds({ anchor: groupBaseSha });
+        ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha);
+        ctx.verifyGateArm = settlingVerifier(ctx.reviewedHeadSha);
+        ctx.runWorkflow = makeRunWorkflowResolver(client);
+        ctx.selfRunId = selfRunId;
+        ctx.suiteFile = repoSuite;
+        ctx.approvedHeadCheck = verifyQueuedApprovedHead({
+          headAtEnqueue: ctx.membership.headAtEnqueue,
+          reviews: ctx.reviews,
+          prAuthorLogin: ctx.prAuthorLogin,
+          permissionByLogin: ctx.permissionByLogin,
+        });
+        ctx.queueCandidate = resolveQueueCandidate({
+          groupHeadSha, baseSha: groupBaseSha, prHeadSha: ctx.membership.headAtEnqueue,
+        });
+        ctx.apiBound = true;
+      } catch (e) {
+        apiSkippedReason = `GitHub API unavailable (${e.message}) — the queued pull request could not be verified; failing closed`;
+        ctx.apiBound = false;
+      }
+    }
+    result = analyzeMergeGroup(ctx);
   } else {
     // post-merge: validate the squash record on the given commit (default HEAD).
     const commit = args.commit || "HEAD";
