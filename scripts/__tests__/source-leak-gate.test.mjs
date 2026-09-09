@@ -1371,6 +1371,39 @@ test("probe deadline: an IN-FLIGHT request is cut at the deadline, not at its ow
   }
 });
 
+test("probe deadline: the cut is classified by WHOSE budget it was, not by re-reading the clock", async () => {
+  // The defect this locks: whether an in-flight cut counted as the LANE's
+  // deadline or as the request's OWN timeout was decided after the fact, by
+  // comparing the cut timer's firing against the wall clock. A timer may fire a
+  // whisker BEFORE the clock reaches the instant it was scheduled for, and that
+  // one millisecond turned the lane's own cut into an ordinary network timeout:
+  // a MEMOISED unresolved-error finding instead of the unmemoised fail-closed
+  // budget one, on a runner slow enough for the two to disagree.
+  //
+  // The clock is injected here, so the classification is asserted rather than
+  // raced: this clock never says the deadline arrived, and the verdict must
+  // still be the deadline's, because the budget this request ran on was cut
+  // FROM what was left of the lane deadline.
+  stubFetch((url, init) => new Promise((_, reject) => {
+    const stuck = setTimeout(() => reject(new Error("the stub was never aborted")), 30_000);
+    init.signal.addEventListener("abort", () => {
+      clearTimeout(stuck);
+      reject(init.signal.reason ?? new Error("aborted"));
+    });
+  }));
+  const ctx = probeCtx({ deadlineMs: 5000, timeoutMs: 4000 });
+  ctx.deadlineAt = Date.now() + 5000;
+  // Frozen 30ms short of the deadline: the request's budget is the 30ms the
+  // lane has left (not its own 4000ms timeout), and no read of this clock ever
+  // reports the deadline as passed.
+  ctx.now = () => ctx.deadlineAt - 30;
+  const v = await resolveRepoVisibility("stuck-name", ctx);
+  assert.equal(v.state, "deadline",
+    "a request cut by what was LEFT of the lane deadline is the lane's cut, never its own timeout");
+  assert.match(v.reason, /deadline/);
+  assert.equal(ctx.cache.has("stuck-name"), false, "and it is not memoised — the name was never answered");
+});
+
 test("probe deadline: a body read the deadline cuts is the BUDGET finding, unmemoised", async () => {
   // The defect this locks: the deadline can fire during the SECOND half of a
   // request — the body read — as readily as during the first. That rejection was
