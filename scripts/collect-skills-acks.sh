@@ -38,16 +38,18 @@
 #   unavailable  the live read failed in a non-gating run: the staged file is
 #                empty and the payload copy is still NOT used, so the run reports
 #                the commit range only.
-#   (unset)      no live read was wired by the caller — read the payload copy,
-#                the long-standing behaviour. This keeps a caller whose workflow
-#                pin predates the live read working unchanged instead of losing
-#                every description marker.
+#   (unset)      no source was named by the caller — read the staged file if one
+#                is there, and nothing otherwise. The payload copy is never an
+#                input: it used to be handed to this script in the step's
+#                environment as well, and a long description then exceeded the
+#                argument-length limit the environment shares, so the step's
+#                shell could not start at all. The description travels by FILE,
+#                at any length.
 #
 # Inputs (all via env; branch names, PR bodies, and SHAs are
 # attacker-influenceable, so every value is passed via env and never
 # interpolated into a shell line — no command injection via a crafted ref):
 #   EVENT_NAME    github.event_name ("pull_request" or "push")
-#   PR_BODY       github.event.pull_request.body          (pull_request arm)
 #   BASE_REF      github.event.pull_request.base.ref      (pull_request arm)
 #   EVENT_BEFORE  github.event.before                     (push arm)
 #   PR_BODY_FILE  path to the staged PR description       (both arms; optional)
@@ -57,7 +59,6 @@
 set -euo pipefail
 
 EVENT_NAME="${EVENT_NAME:-}"
-PR_BODY="${PR_BODY:-}"
 BASE_REF="${BASE_REF:-}"
 EVENT_BEFORE="${EVENT_BEFORE:-}"
 PR_BODY_FILE="${PR_BODY_FILE:-}"
@@ -93,8 +94,13 @@ if [ "$EVENT_NAME" = "pull_request" ]; then
       fi
       ;;
     *)
-      # No live read wired by the caller — the payload copy is all there is.
-      printf '%s\n' "$PR_BODY"
+      # No source named by the caller: read the staged description if one is
+      # there. There is no inline copy to fall back to — an absent or empty file
+      # simply means no description acknowledgement, as an empty one always did.
+      if readable_body_file; then
+        cat -- "$PR_BODY_FILE"
+        printf '\n'
+      fi
       ;;
   esac
   git log --format='%B' "origin/$BASE_REF...HEAD" 2>/dev/null || true

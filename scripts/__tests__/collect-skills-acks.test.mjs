@@ -452,20 +452,71 @@ test("RE-RUN TRAP: ACK_SOURCE=unavailable reads the (empty) staged file, never t
   } finally { rm(dir); }
 });
 
-test("COMPAT: with no ACK_SOURCE the payload copy is still read — a caller pinned to a pre-live-read workflow keeps working", () => {
-  // The scripts are checked out at the caller's `ref` input while the workflow
-  // comes from its `uses:` pin; if those diverge, a newer collector can be driven
-  // by an older workflow that only sets PR_BODY. Dropping that arm would lose
-  // every description marker and red correctly-acknowledged PRs.
+test("cinatra#3376: with no ACK_SOURCE the payload copy is NOT read — the description travels by FILE only", () => {
+  // The description used to reach the collector twice: staged in a file AND
+  // inline in the step environment. A long description made the step's shell
+  // unable to start at all ("Argument list too long" — the environment counts
+  // toward the same limit), so the gate red on a body it never read. The inline
+  // copy is gone: PR_BODY is no longer an input, and the file is the only road.
+  //
+  // This replaces the earlier COMPAT case, which asserted the opposite (an
+  // inline-only caller still produced an acknowledgement). That arm is exactly
+  // the inline road being removed, so the two cannot both hold; a caller pinned
+  // to a workflow that only sets the inline copy now collects no description
+  // marker and must acknowledge in a commit trailer or move its pin forward.
   const { dir, baseSha } = prRepo();
   try {
-    const out = collectPR(dir, { PR_BODY: EDITED_BODY });
-    assert.equal(out.status, 0);
-    assert.match(out.stdout, /Skills-unaffected: the identifier moved/);
-    const ackFile = path.join(dir, "acks.txt");
-    fs.writeFileSync(ackFile, out.stdout);
-    assert.equal(runGate(dir, baseSha, ackFile).status, 0);
+    const inlineOnly = collectPR(dir, { PR_BODY: EDITED_BODY });
+    assert.equal(inlineOnly.status, 0);
+    assert.doesNotMatch(inlineOnly.stdout, /Skills-unaffected:/,
+      "the inline copy must never be read, with or without ACK_SOURCE");
+    const inlineAcks = path.join(dir, "inline.txt");
+    fs.writeFileSync(inlineAcks, inlineOnly.stdout);
+    assert.equal(runGate(dir, baseSha, inlineAcks).status, 1);
+
+    // The file road with no ACK_SOURCE still reads the staged description.
+    const byFile = collectPR(dir, { PR_BODY_FILE: writePrBodyFile(dir, EDITED_BODY) });
+    assert.equal(byFile.status, 0);
+    assert.match(byFile.stdout, /Skills-unaffected: the identifier moved/);
+    const fileAcks = path.join(dir, "by-file.txt");
+    fs.writeFileSync(fileAcks, byFile.stdout);
+    assert.equal(runGate(dir, baseSha, fileAcks).status, 0);
   } finally { rm(dir); }
+});
+
+test("cinatra#3376: a description far past the argument-length limit is read whole from the file and its marker clears the gate", () => {
+  // The measured failure: a description carrying fifteen proof rounds could not
+  // be handed to the step at all. Read from a file, size is a non-event.
+  const { dir, baseSha } = prRepo();
+  try {
+    const filler = ("x".repeat(120) + "\n").repeat(2400); // ~290 KiB, well past 256 KiB
+    const body = filler + EDITED_BODY + filler;
+    const bodyFile = writePrBodyFile(dir, body);
+    assert.ok(fs.statSync(bodyFile).size > 256 * 1024, "the fixture description must exceed 256 KiB");
+
+    // Every arm the collector can be driven on reads the same file: the live
+    // read, and a caller that stages the file without naming a source.
+    for (const env of [{ ACK_SOURCE: "live" }, {}]) {
+      const out = collectPR(dir, { PR_BODY_FILE: bodyFile, ...env });
+      assert.equal(out.status, 0, `the collector must succeed on a long description; stderr: ${out.stderr}`);
+      assert.match(out.stdout, /Skills-unaffected: the identifier moved/,
+        "the acknowledgement line must be found in a description larger than the argument limit");
+      const ackFile = path.join(dir, "acks.txt");
+      fs.writeFileSync(ackFile, out.stdout);
+      const pass = runGate(dir, baseSha, ackFile);
+      assert.equal(pass.status, 0, `the long description's acknowledgement must clear the gate; stderr: ${pass.stderr}`);
+      assert.equal(JSON.parse(pass.stdout).unacknowledgedWatchFindingCount, 0);
+    }
+  } finally { rm(dir); }
+});
+
+test("cinatra#3376 WORKFLOW LOCK: no step passes the description inline in its environment", () => {
+  const text = fs.readFileSync(WORKFLOW, "utf8");
+  assert.doesNotMatch(text, /^\s*[A-Z_]+:\s*\$\{\{\s*github\.event\.pull_request\.body\s*\}\}/m,
+    "the description must never travel in a step environment — that is what made the shell fail to start");
+  assert.doesNotMatch(acksStepBlock(), /PR_BODY:/,
+    "the acks step must hand the collector the file road only");
+  assert.match(acksStepBlock(), /PR_BODY_FILE:/, "the file road stays");
 });
 
 test("RESOLVER FAIL-CLOSED: an API failure in enforce exits 1 with an error annotation and leaves NO body staged", () => {

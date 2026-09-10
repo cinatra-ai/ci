@@ -310,13 +310,11 @@ jobs:
         id: acks
         env:
           EVENT_NAME: ${{ github.event_name }}
-          # The payload copy of the description — UNUSED by this pin (whenever a
-          # live read is wired, ACK_SOURCE decides and the collector reads the
-          # staged file). It is still passed because the collector's legacy arm
-          # reads this variable, and that arm is what keeps a caller running an
-          # OLDER workflow against a newer gate checkout ('ref' defaults to the
-          # default branch) reading descriptions at all.
-          PR_BODY: ${{ github.event.pull_request.body }}
+          # The description is NOT passed here. It used to be forwarded inline as
+          # well as staged in a file; a long one then pushed the step's
+          # environment past the argument-length limit and the shell could not
+          # start ("Argument list too long"), reddening the gate on a description
+          # it never read. PR_BODY_FILE below is the only road, at any length.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           EVENT_BEFORE: ${{ github.event.before }}
           # Exactly ONE of the two resolve steps runs per event (pull_request vs
