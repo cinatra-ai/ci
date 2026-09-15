@@ -1955,6 +1955,36 @@ rejected. A parse failure of either config => the whole change is treated
 high-risk (fail closed). Removing a default means editing this repo's config —
 itself a high-risk path, so maintainer-reviewed by construction.
 
+### Known-agent identities and content-free merges (§5/§5c)
+
+Check 5 reads a commit whose author or committer matches a known-agent token as
+agent work and demands a named `Assisted-by` on it. The public default tokens are
+the AI-vendor names plus the two org bot **logins** — `cinatra-agent` (the
+dedicated identity that authors agent-opened PRs) and **`groganz-bot`** (the
+loop's own bot, `groganz-bot[bot]`, which authors and opens every lane pull
+request). Both logins are public on every pull request they open, so they belong
+in the public default rather than in a repo's private internal-codename config;
+name and e-mail are matched against the same tokens, so an API committer form
+such as `293224031+groganz-bot[bot]@users.noreply.github.com` is covered by the
+login token itself.
+
+One thing follows from knowing the login. A **bring-up-to-date merge** the bot
+makes through the API (`Merge branch 'main' into …`: two parents, no conflict of
+its own) carries no record and never will — read as agent work it would turn
+every forwarded branch red. Such a merge is **content-free**: its tree is exactly
+what `git merge-tree` produces for its two parents, so nobody wrote a line in it.
+Check 5 — pre-merge on the range and post-merge on the landed commit — therefore
+does not read its identity, demands no record of it, and lets it contribute
+nothing to a squash record's union. The boundary is the **tree**, not the
+message: a merge whose tree differs from the clean merge resolved a conflict or
+carries an edit made in the merge, and keeps the rule untouched — as does any
+merge whose parents, tree or merge-tree the gate could not read (fail closed).
+Post-merge the reading needs the objects: a squash landing leaves the PR's own
+commits (and the branch-side parent of such a merge) outside the default-branch
+checkout, so the gate fetches `refs/pull/N/head` once when a two-parent source
+commit is unreadable there. A fetch that fails changes nothing — the merge stays
+unread, and unread is not content-free.
+
 ### Tool-made dependency bumps (§5b)
 
 Check 5 reads a commit by a known agent or bot identity as agent work and
@@ -1972,10 +2002,17 @@ A commit is in the class only when **all** of this holds:
   API-made commit looks), **and**
 - it has exactly **one parent** (a merge commit is never a bump) and **modifies**
   only dependency files — package manifests, lockfiles, container image
-  references — with nothing added, deleted, renamed, copied or chmod-ed, **and**
+  references (the compose files, the Dockerfiles, and the app's
+  `config/upgrade/upgrade-matrix.json`, whose pinned image digests the dependency
+  tool rewrites in the same commit as the compose files) — with nothing added,
+  deleted, renamed, copied or chmod-ed, **and**
 - outside a lockfile (whose whole diff is accepted as-is, once it has been read)
   every added and removed line carries a **version or an image digest** and pairs
   with the line it replaced **inside the same hunk** once that token is blanked.
+  A pattern may carry more than one capture (the matrix pins the same digest
+  twice on one line); each is blanked **at its own indices**, so everything
+  between them — the matrix's `major` policy field — still has to match, and a
+  major move is never a bump.
   Adding, removing or **moving** a dependency name, or touching a script, a
   stage, a command or a numeric setting, is **not** a bump.
 
