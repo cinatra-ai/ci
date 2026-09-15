@@ -4230,3 +4230,303 @@ test("§5b .github/** is kept OUT of the class by the config, not by hope", () =
   const fileLines = [{ path: ".github/package.json", hunks: BUMP_PKG_FILE.hunks }];
   assert.equal(isBump(files, fileLines), false, "a manifest beside the workflows is never a bump");
 });
+
+// =========================================================================
+// engineering#680 — the loop bot login, CONTENT-FREE CLEAN MERGES (§5c), and
+// the app upgrade matrix in the tool-made bump class (§5b).
+//
+// Fixture style as above: the class is read from the SHIPPED config, the diff
+// evidence is given the way the collectors produce it (per file, grouped by
+// hunk), and the merge facts come from a REAL git fixture through the same git
+// road the gate reads commits with.
+// =========================================================================
+
+const LOOP_BOT_NAME = "groganz-bot[bot]";
+const LOOP_BOT_EMAIL = "293224031+groganz-bot[bot]@users.noreply.github.com";
+// The loop bot as GitHub writes it for an API-made commit (the bot authors,
+// `GitHub <noreply@github.com>` commits).
+const LOOP_BOT_ID = {
+  authorName: LOOP_BOT_NAME, authorEmail: LOOP_BOT_EMAIL,
+  committerName: "GitHub", committerEmail: "noreply@github.com",
+};
+// The tokens a repo has today PLUS the login — so the merge cases below are
+// read as agent work whether or not the public default already carries it:
+// what they prove is the CONTENT-FREE reading, not the login.
+const LOOP_TOKENS = [...DEFAULT_AGENT_NAME_TOKENS, "groganz-bot"];
+
+test("§5 check5: the loop's bot login is a PUBLIC default token, by name and by its noreply e-mail", () => {
+  assert.ok(DEFAULT_AGENT_NAME_TOKENS.includes("groganz-bot"),
+    "the login is public on every pull request the bot opens — the same category as the cinatra-agent token");
+  assert.ok(looksLikeAgent({ name: LOOP_BOT_NAME, email: "x@y.z" }), "the login matches by name");
+  assert.ok(looksLikeAgent({ name: "GitHub", email: LOOP_BOT_EMAIL }),
+    "the noreply e-mail form matches through the SAME token (looksLikeAgent reads name and email alike)");
+  assert.ok(!looksLikeAgent({ name: "Sandro Groganz", email: "sandro@cinatra.ai" }), "a human is still not an agent");
+});
+
+test("§5 check5: a groganz-bot[bot] commit with NO trailer touching a source file is REFUSED", () => {
+  const sha = "1".repeat(40);
+  const r = analyzePreMerge({
+    changedFiles: ["src/index.ts"],
+    rangeIdentities: [{ sha, ...LOOP_BOT_ID }],
+    messageBySha: { [sha]: "feat: the thing" },
+    rangeMessages: ["feat: the thing"],
+    defaults: DEFAULTS_OK, repoSuite: null,
+  });
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"),
+    "the loop's own bot commits must be read as agent work by the PUBLIC default: " + JSON.stringify(r.findings));
+});
+
+// ---- §5c: the bring-up-to-date merge, on a real two-branch git fixture ----
+
+/**
+ * main and feature both move, then the bot merges main into feature.
+ * `shape`: "clean" (an automatic merge — nobody wrote a line),
+ *          "conflict" (both sides touched the same line; resolved by hand),
+ *          "extra" (a clean automatic merge the bot then edited before committing).
+ * Returns { dir, mergeSha, identity }.
+ */
+function loopMergeFixture(shape) {
+  const { dir, g } = tmpGitRepo();
+  const write = (f, s) => fs.writeFileSync(path.join(dir, f), s);
+  write("app.txt", "one\ntwo\nthree\n");
+  write("main.txt", "m1\n");
+  g("add", "-A");
+  g("commit", "-q", "-m", "base commit");
+  g("checkout", "-q", "-b", "feature");
+  write("feat.txt", "f1\n");
+  if (shape === "conflict") write("app.txt", "one\nFEATURE\nthree\n");
+  g("add", "-A");
+  g("commit", "-q", "-m", "feat: branch work\n\nAssisted-by: Claude Code (claude-opus-5)");
+  g("checkout", "-q", "main");
+  write("main.txt", "m2\n");
+  if (shape === "conflict") write("app.txt", "one\nMAIN\nthree\n");
+  g("add", "-A");
+  g("commit", "-q", "-m", "chore: main moves on");
+  g("checkout", "-q", "feature");
+  const asBot = ["-c", `user.name=${LOOP_BOT_NAME}`, "-c", `user.email=${LOOP_BOT_EMAIL}`];
+  const msg = "Merge branch 'main' into feature";
+  if (shape === "clean") {
+    const res = g(...asBot, "merge", "-q", "--no-ff", "main", "-m", msg);
+    assert.equal(res.status, 0, `the fixture merge must be automatic: ${res.stdout}${res.stderr}`);
+  } else {
+    g(...asBot, "merge", "--no-commit", "--no-ff", "main");
+    // the hand at work: a conflict resolved, or an extra edit made in the merge
+    write("app.txt", shape === "conflict" ? "one\nRESOLVED BY HAND\nthree\n" : "one\ntwo\nthree\nAND ONE MORE\n");
+    g("add", "-A");
+    const res = g(...asBot, "commit", "-q", "-m", msg);
+    assert.equal(res.status, 0, `${res.stdout}${res.stderr}`);
+  }
+  const mergeSha = g("rev-parse", "HEAD").stdout.trim();
+  assert.equal(parentsOf(mergeSha, dir).length, 2, "the fixture head is a two-parent merge");
+  return { dir, mergeSha, identity: { sha: mergeSha, ...LOOP_BOT_ID } };
+}
+
+/**
+ * The merge facts by the primitive git road the gate already exports, so the
+ * ctx below is built the same way on either side of this change — what the
+ * cases prove is the READING, not the collector.
+ */
+function rawMergeInfo(dir, sha) {
+  const ps = parentsOf(sha, dir);
+  return { parents: ps, tree: treeOf(sha, dir), cleanTree: ps.length === 2 ? mergedTreeOf(ps[0], ps[1], dir) : null };
+}
+
+/** A pre-merge ctx whose check-5 reading is ONLY this merge commit. */
+function mergeCtx({ dir, mergeSha, identity }) {
+  return {
+    changedFiles: ["app.txt", "main.txt"],
+    rangeIdentities: [identity],
+    messageBySha: { [mergeSha]: "Merge branch 'main' into feature" },
+    rangeMessages: ["Merge branch 'main' into feature"],
+    agentTokens: LOOP_TOKENS,
+    defaults: DEFAULTS_OK, repoSuite: null,
+    mergeInfoBySha: { [mergeSha]: rawMergeInfo(dir, mergeSha) },
+  };
+}
+
+test("§5c a CLEAN bring-up-to-date merge by the bot is CONTENT-FREE: accepted, no record demanded", () => {
+  const fx = loopMergeFixture("clean");
+  const info = rawMergeInfo(fx.dir, fx.mergeSha);
+  assert.equal(info.tree, mergedTreeOf(info.parents[0], info.parents[1], fx.dir),
+    "the fixture merge's tree IS the clean merge of its parents");
+  const r = analyzePreMerge(mergeCtx(fx));
+  assert.deepEqual(r.findings.filter((f) => f.code === "agent-commit-no-assisted"), [],
+    "nobody wrote a line in a clean merge — it demands no record: " + JSON.stringify(r.findings));
+  // ...and post-merge, a squash record over such a range is not made untrue by it
+  const post = analyzePostMerge({
+    message: "chore: forward\n\nAssisted-by: none\nReviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
+    changedFiles: ["app.txt"], defaults: DEFAULTS_OK, repoSuite: null,
+    apiBound: true, treeMatch: true,
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    prAuthorLogin: LOOP_BOT_NAME, reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
+    agentTokens: LOOP_TOKENS,
+    rangeIdentities: [fx.identity],
+    messageBySha: { [fx.mergeSha]: "Merge branch 'main' into feature" },
+    mergeInfoBySha: { [fx.mergeSha]: info },
+  });
+  assert.deepEqual(post.findings.filter((f) => f.code === "agent-commit-no-assisted"), [],
+    "the landed record is not made untrue by a content-free merge: " + JSON.stringify(post.findings));
+  // the collector reads the same facts from the same git road, and the rule
+  // answers on them directly
+  assert.deepEqual(gateExports.mergeInfoOf(fx.mergeSha, { cwd: fx.dir }), info);
+  assert.equal(gateExports.isContentFreeMerge(info), true);
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+test("§5c a merge whose tree is NOT the clean merge keeps today's rule (a hand resolved it) — REFUSED", () => {
+  // (1) a conflict resolved by hand: `git merge-tree` cannot produce a tree at
+  // all, and an unreadable merge-tree is never read as clean (fail closed).
+  const conflict = loopMergeFixture("conflict");
+  const cInfo = rawMergeInfo(conflict.dir, conflict.mergeSha);
+  assert.equal(cInfo.cleanTree, null, "the fixture's parents do not merge cleanly");
+  assert.equal(gateExports.isContentFreeMerge(cInfo), false);
+  const r = analyzePreMerge(mergeCtx(conflict));
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"),
+    "a hand-resolved merge is authored content and still needs a record: " + JSON.stringify(r.findings));
+  fs.rmSync(conflict.dir, { recursive: true, force: true });
+
+  // (2) an automatic merge the bot then EDITED: the merge-tree is readable and
+  // the trees DIFFER — those bytes were chosen, so today's rule applies.
+  const extra = loopMergeFixture("extra");
+  const eInfo = rawMergeInfo(extra.dir, extra.mergeSha);
+  assert.ok(eInfo.cleanTree, "this one merges cleanly");
+  assert.notEqual(eInfo.tree, eInfo.cleanTree, "but the commit's tree is not the clean merge's");
+  assert.equal(gateExports.isContentFreeMerge(eInfo), false);
+  const r2 = analyzePreMerge(mergeCtx(extra));
+  assert.ok(r2.findings.some((f) => f.code === "agent-commit-no-assisted"), JSON.stringify(r2.findings));
+  fs.rmSync(extra.dir, { recursive: true, force: true });
+
+  // (3) fail closed on every unread reading: no info, one parent, an unreadable
+  // tree or an unreadable merge-tree is NOT content-free.
+  assert.equal(gateExports.isContentFreeMerge(null), false);
+  assert.equal(gateExports.isContentFreeMerge({ parents: ["b".repeat(40)], tree: HEAD, cleanTree: HEAD }), false);
+  assert.equal(gateExports.isContentFreeMerge({ parents: [HEAD, "b".repeat(40)], tree: null, cleanTree: HEAD }), false);
+  assert.equal(gateExports.isContentFreeMerge({ parents: [HEAD, "b".repeat(40)], tree: HEAD, cleanTree: null }), false);
+  assert.equal(gateExports.mergeInfoOf(null), null, "a single-parent commit carries no merge facts");
+});
+
+test("§5c the union of a squash range carrying a clean bot merge and a named-agent commit names THE AGENT ONLY", () => {
+  const mergeMsg = "Merge branch 'main' into feature";
+  const agentMsg = "feat: the thing\n\nAssisted-by: Claude Code (claude-opus-5)";
+  assert.deepEqual(aggregateAssisted([mergeMsg, agentMsg], { contentFree: [true, false] }),
+    ["Assisted-by: Claude Code (claude-opus-5)"], "a content-free merge contributes nothing to the union");
+  // an all-clean-merge forward aggregates to the single truthful `none`
+  assert.deepEqual(aggregateAssisted([mergeMsg], { contentFree: [true] }), ["Assisted-by: none"]);
+  // the flag only ever REMOVES an invented agent, never a declared one
+  assert.deepEqual(aggregateAssisted([`${mergeMsg}\n\nAssisted-by: Codex (gpt-5.6-sol)`], { contentFree: [true] }),
+    ["Assisted-by: Codex (gpt-5.6-sol)"]);
+  // ...and the same range post-merge: the agent's own name is the record, and
+  // the clean merge demands nothing of its own.
+  const mergeSha = "2".repeat(40);
+  const agentSha = "3".repeat(40);
+  const treeSha = "d".repeat(40);
+  const r = analyzePostMerge({
+    message: ["chore: the thing", "", "Assisted-by: Claude Code (claude-opus-5)",
+      "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n"),
+    changedFiles: ["src/thing.ts"], defaults: DEFAULTS_OK, repoSuite: null,
+    apiBound: true, treeMatch: true,
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    prAuthorLogin: LOOP_BOT_NAME, reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
+    agentTokens: LOOP_TOKENS,
+    rangeIdentities: [
+      { sha: mergeSha, ...LOOP_BOT_ID },
+      { sha: agentSha, authorName: "Claude Code", authorEmail: "noreply@anthropic.com", committerName: "Claude Code", committerEmail: "noreply@anthropic.com" },
+    ],
+    messageBySha: { [mergeSha]: mergeMsg, [agentSha]: agentMsg },
+    mergeInfoBySha: { [mergeSha]: { parents: [HEAD, "b".repeat(40)], tree: treeSha, cleanTree: treeSha } },
+  });
+  assert.deepEqual(r.findings.filter((f) => f.code === "agent-commit-no-assisted"), [], JSON.stringify(r.findings));
+});
+
+// ---- §5b: the app's upgrade matrix (container image digests) ----
+
+const MATRIX_PATH = "config/upgrade/upgrade-matrix.json";
+// The REAL line shape of the three digest bumps in cinatra-ai/cinatra (#2341,
+// #2622, #2832): one compound object per line, where the sha256 token appears
+// TWICE (the pinned image reference and the `digest` field beside it).
+const matrixPin = (d) => `      "baselinePin": { "image": "postgres:18-alpine@${d}", "major": "18", "digest": "${d}" },`;
+const matrixCoupled = (d) => `        { "image": "nangohq/nango-server:hosted@${d}", "major": "hosted", "digest": "${d}" }`;
+const composeImage = (d) => `    image: postgres:18-alpine@${d}`;
+
+test("§5b a digest bump touching the UPGRADE MATRIX and the compose file is a bump", () => {
+  const files = [MATRIX_PATH, "docker-compose.yml"];
+  const fileLines = [
+    { path: MATRIX_PATH, hunks: [{ added: [matrixPin(DIGEST_NEW)], removed: [matrixPin(DIGEST_OLD)] }] },
+    { path: "docker-compose.yml", hunks: [{ added: [composeImage(DIGEST_NEW)], removed: [composeImage(DIGEST_OLD)] }] },
+  ];
+  assert.equal(isBump(files, fileLines), true, "the tool rewrites the matrix in the SAME commit as the compose file");
+  const r = analyzePreMerge(bumpCtx({ changedFiles: files, fileLines }));
+  assert.deepEqual(r.findings.filter((f) => f.code === "agent-commit-no-assisted"), [], JSON.stringify(r.findings));
+  // the nested coupledAppImages element (cinatra#2341) has the same shape
+  assert.equal(isBump([MATRIX_PATH],
+    [{ path: MATRIX_PATH, hunks: [{ added: [matrixCoupled(DIGEST_NEW)], removed: [matrixCoupled(DIGEST_OLD)] }] }]), true);
+  // WHICH pattern the real lines needed: the compose `image:` line was already
+  // covered by the shipped digest pattern; the matrix's compound line is
+  // covered ONLY by the pattern this change adds.
+  const withoutNew = BUMP_CLASS.value.linePatterns.filter((p) => !p.includes('"digest"'));
+  const pats = gateExports.compileBumpPatterns(withoutNew);
+  assert.ok(gateExports.normalizeBumpLine(composeImage(DIGEST_OLD), pats), "the compose image: line needed no new pattern");
+  assert.equal(gateExports.normalizeBumpLine(matrixPin(DIGEST_OLD), pats), null,
+    "the matrix's compound line matched none of the shipped patterns — that is the one added");
+  // and the class stays narrow: a MAJOR move rewrites the image TAG, which sits
+  // outside the blanked token, so it never pairs as a bump.
+  const majorMove = [{ path: MATRIX_PATH, hunks: [{
+    added: [matrixPin(DIGEST_NEW).replace("18-alpine", "19-alpine")], removed: [matrixPin(DIGEST_OLD)] }] }];
+  assert.equal(isBump([MATRIX_PATH], majorMove), false, "moving the pinned major is a decision, not a bump");
+  // a note line the tool did not write is not a bump either
+  assert.equal(isBump([MATRIX_PATH], [{ path: MATRIX_PATH, hunks: [{
+    added: ['      "notes": "held at 18",'], removed: ['      "notes": "held at 17",'] }] }]), false);
+});
+
+// ---- convergence round (engineering#680): the two findings, pinned ----
+
+test("§5b the matrix line's NON-digest content survives normalization: a `major` move alone is not a bump", () => {
+  // Both digests on the line are blanked at their OWN indices, so everything
+  // between them — the `major` policy field — still has to match for two lines
+  // to pair. (A single capture spanning both would have blanked `major` with
+  // them, and a hand-made major move would have read as a tool-made bump.)
+  const pats = gateExports.compileBumpPatterns(BUMP_CLASS.value.linePatterns);
+  const at18 = (d) => `      "baselinePin": { "image": "postgres:alpine@${d}", "major": "18", "digest": "${d}" },`;
+  const at19 = (d) => `      "baselinePin": { "image": "postgres:alpine@${d}", "major": "19", "digest": "${d}" },`;
+  const nOld = gateExports.normalizeBumpLine(at18(DIGEST_OLD), pats);
+  const nNew = gateExports.normalizeBumpLine(at18(DIGEST_NEW), pats);
+  assert.ok(nOld && nNew, "the matrix's compound line is in the class");
+  assert.equal(nOld, nNew, "only the digest pair may differ for a bump to pair");
+  assert.ok(nOld.includes('"major": "18"'), `the major field must survive normalization: ${JSON.stringify(nOld)}`);
+  assert.notEqual(gateExports.normalizeBumpLine(at19(DIGEST_OLD), pats), nOld,
+    "a major move on an unchanged digest must NOT normalize equal");
+  // ...and end to end: the same tag, the same digests, a moved major is no bump
+  const majorOnly = [{ path: MATRIX_PATH, hunks: [{ added: [at19(DIGEST_OLD)], removed: [at18(DIGEST_OLD)] }] }];
+  assert.equal(isBump([MATRIX_PATH], majorOnly), false, "moving the pinned major is a decision, not a bump");
+});
+
+test("§5c the post-merge arm can READ a squashed PR's merge: refs/pull/N/head brings the parents back", () => {
+  // After a squash landing the source commits are not on the default branch and
+  // the branch is deleted — `git merge-tree` has nothing to read, so without the
+  // pull request's own head ref the clean-merge exemption could never fire where
+  // the bot's bring-up-to-date merges actually surface.
+  const origin = loopMergeFixture("clean");
+  const g = (...a) => spawnSync("git", a, { cwd: origin.dir, encoding: "utf8" });
+  g("update-ref", `refs/pull/7/head`, origin.mergeSha);
+  g("checkout", "-q", "main");
+  g("branch", "-D", "feature");                                  // the branch is gone with the merge
+  const landed = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tag-landed-")));
+  const clone = spawnSync("git", ["clone", "-q", "--no-local", origin.dir, landed], { encoding: "utf8" });
+  assert.equal(clone.status, 0, `${clone.stdout}${clone.stderr}`);
+
+  assert.equal(gateExports.hasCommitLocally(origin.mergeSha, landed), false,
+    "the squashed PR's merge is NOT in the landed checkout");
+  assert.equal(gateExports.isContentFreeMerge(rawMergeInfo(landed, origin.mergeSha)), false,
+    "unread => not content-free (fail closed) — this is the state the fetch repairs");
+
+  assert.equal(gateExports.fetchPrHeadRef(7, { cwd: landed }), true, "the pull request's head ref is fetchable");
+  assert.equal(gateExports.hasCommitLocally(origin.mergeSha, landed), true);
+  const info = gateExports.mergeInfoOf(origin.mergeSha, { cwd: landed });
+  assert.equal(gateExports.isContentFreeMerge(info), true,
+    `the merge reads content-free in the landed checkout: ${JSON.stringify(info)}`);
+  // a pull request number that does not resolve changes nothing (fail closed)
+  assert.equal(gateExports.fetchPrHeadRef(4242, { cwd: landed }), false);
+  assert.equal(gateExports.fetchPrHeadRef(null, { cwd: landed }), false);
+  fs.rmSync(origin.dir, { recursive: true, force: true });
+  fs.rmSync(landed, { recursive: true, force: true });
+});

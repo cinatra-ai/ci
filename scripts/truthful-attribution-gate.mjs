@@ -437,9 +437,17 @@ export function classifyArm(parsed) {
  * aggregates to the single truthful `Assisted-by: none`. The flag only ever
  * REMOVES an invented agent, never a declared one: a flagged commit whose own
  * message NAMES an agent is aggregated exactly as any other commit is.
+ *
+ * §5c (engineering#680): `opts.contentFree` is the same kind of parallel array
+ * for CONTENT-FREE CLEAN MERGES (a bring-up-to-date merge whose tree is the
+ * clean merge of its parents). Nobody wrote a line in one, so it contributes
+ * nothing and counts as `none` — a forward that carries only such merges
+ * aggregates to the single truthful `Assisted-by: none`, and one alongside agent
+ * work leaves the agent named. The same never-erase rule applies.
  */
 export function aggregateAssisted(messages, opts = {}) {
   const bumps = Array.isArray(opts.bumps) ? opts.bumps : [];
+  const contentFree = Array.isArray(opts.contentFree) ? opts.contentFree : [];
   const seen = new Set();
   const lines = [];
   let sawNamed = false;
@@ -447,9 +455,9 @@ export function aggregateAssisted(messages, opts = {}) {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const p = parseTrailers(msg);
-    // A flagged bump contributes `none` — UNLESS its own message names an agent,
-    // which the union never erases (see below).
-    if (bumps[i] && !p.assisted.some((a) => !a.isNone)) { sawNone = true; continue; }
+    // A flagged bump or content-free merge contributes `none` — UNLESS its own
+    // message names an agent, which the union never erases (see below).
+    if ((bumps[i] || contentFree[i]) && !p.assisted.some((a) => !a.isNone)) { sawNone = true; continue; }
     for (const a of p.assisted) {
       if (a.isNone) { sawNone = true; continue; }
       const key = `${a.name} ${a.model || ""}`;
@@ -1507,6 +1515,17 @@ export const DEFAULT_AGENT_NAME_TOKENS = [
   // being specific enough not to false-positive on humans, and covers all org
   // repos automatically during the §7 step 6 rollout (no per-repo config).
   "cinatra-agent",
+  // The LOOP's own bot login (engineering#680). `groganz-bot[bot]` is the
+  // identity that authors and opens every lane pull request; it carries none of
+  // the vendor tokens above, so without this the gate's check 5 never fires for
+  // the loop's own commits and the fence lives in the wrong place. The login is
+  // PUBLIC (visible on every pull request it opens), the same category as the
+  // "cinatra-agent" token above, so it belongs in this public default rather
+  // than in private internalAgentTokens. looksLikeAgent tests name AND email
+  // against the same tokens, so the API committer form
+  // (293224031+groganz-bot[bot]@users.noreply.github.com) matches through this
+  // one token too.
+  "groganz-bot",
 ];
 export const DEFAULT_NONAI_BOT_ALLOW = [
   "dependabot[bot]", "renovate[bot]", "github-actions[bot]",
@@ -1532,6 +1551,103 @@ export function looksLikeAgent({ name, email }, { tokens = DEFAULT_AGENT_NAME_TO
   return false;
 }
 
+
+// ===========================================================================
+// §5c — The CONTENT-FREE CLEAN MERGE (engineering#680)
+//
+// With the loop's bot login a known agent (§5 above), every bring-up-to-date
+// merge the bot makes through the API ("Merge branch 'main' into …": two
+// parents, no conflict of its own, no record and never one) would read as agent
+// work and turn every forwarded branch red. Such a merge CONTRIBUTED NOTHING:
+// its tree is exactly the tree merging its two parents produces, so nobody
+// wrote a line in it. Check 5 (pre-merge on the range, post-merge on the landed
+// commit) therefore reads a two-parent commit whose tree equals `git merge-tree`
+// of its parents as CONTENT-FREE: no identity reading, no record demanded, and
+// nothing contributed to a squash record's union.
+//
+// The boundary is the tree, not the message: a merge whose tree DIFFERS from the
+// clean merge resolved a conflict or carries an edit made in the merge — a hand
+// chose those bytes — and keeps today's rule untouched. Fail closed in every
+// other direction too: a commit that is not a two-parent merge, an unreadable
+// parent list, an unreadable tree and an unreadable merge-tree (a conflict makes
+// `git merge-tree` fail) are NOT content-free, so the unchanged rule applies.
+// The reading goes through the same git road the gate already reads commits with
+// (parentsOf / treeOf / mergedTreeOf).
+// ===========================================================================
+
+/**
+ * The merge facts of ONE commit: its parents, its own tree, and the tree a
+ * clean merge of its two parents produces. `parents` / `tree` may be supplied by
+ * a caller that already read them (the post-merge arm reads both from the PR
+ * commits payload); anything else is read from local git. Returns null for a
+ * commit that is not a two-parent merge; an unreadable tree or merge-tree stays
+ * null INSIDE the record, which isContentFreeMerge fails closed on.
+ */
+export function mergeInfoOf(commit, { cwd = process.cwd(), parents = null, tree = null } = {}) {
+  const given = Array.isArray(parents) && parents.length ? parents : null;
+  const ps = (given || parentsOf(commit, cwd)).map((x) => asFullSha(x && x.sha ? x.sha : x)).filter(Boolean);
+  if (ps.length !== 2) return null;
+  return {
+    parents: ps,
+    tree: asFullSha(tree) || treeOf(commit, cwd),
+    cleanTree: mergedTreeOf(ps[0], ps[1], cwd),
+  };
+}
+
+/**
+ * Is this commit a CONTENT-FREE clean merge — a two-parent commit whose tree is
+ * exactly what merging its two parents produces? Anything the gate could not
+ * read in full (no record, not two parents, an unreadable tree or merge-tree)
+ * is NOT content-free: today's rule applies.
+ */
+export function isContentFreeMerge(info) {
+  if (!info || !Array.isArray(info.parents) || info.parents.length !== 2) return false;
+  const tree = asFullSha(info.tree);
+  const clean = asFullSha(info.cleanTree);
+  if (!tree || !clean) return false;                                  // unreadable => fail closed
+  return tree === clean;
+}
+
+/** Is this commit object present in THIS checkout (the merge-tree read needs it)? */
+export function hasCommitLocally(sha, cwd = process.cwd()) {
+  if (!/^[0-9a-f]{7,40}$/.test(String(sha || "").toLowerCase())) return false;
+  try {
+    const out = execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${sha}^{commit}`], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return /^[0-9a-f]{40}$/.test(out);
+  } catch { return false; }
+}
+
+/**
+ * Fetch a pull request's OWN head ref (`refs/pull/N/head`) into this checkout.
+ *
+ * The post-merge arm runs on the default branch after the landing, where a
+ * SQUASHED pull request's source commits are unreachable — and the branch is
+ * usually deleted with the merge, so no `refs/heads/*` fetch brings them back.
+ * Without those objects `git merge-tree` cannot be run for a bring-up-to-date
+ * merge in the range and the §5c reading is simply never available, which would
+ * leave every forward landing demanding a record for a merge nobody wrote a line
+ * in. GitHub keeps `refs/pull/N/head` after the merge, and it carries the merge
+ * AND both of its parents. A failure returns false and changes nothing: the
+ * reading stays unreadable, which is NOT content-free (fail closed).
+ */
+export function fetchPrHeadRef(prNumber, { cwd = process.cwd(), remote = "origin" } = {}) {
+  const n = Number(prNumber);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    execFileSync("git", ["--literal-pathspecs", "fetch", "--no-tags", "--quiet", remote, `+refs/pull/${n}/head:refs/remotes/pr/${n}/head`], {
+      cwd, stdio: ["ignore", "ignore", "ignore"], timeout: 120000,
+    });
+    return true;
+  } catch { return false; }
+}
+
+/** Is THIS range/landed commit a content-free clean merge, per ctx's readings? */
+function ctxCommitIsCleanMerge(ctx, identity) {
+  if (!ctx || !identity) return false;
+  return isContentFreeMerge((ctx.mergeInfoBySha || {})[identity.sha]);
+}
 
 // ===========================================================================
 // §5b — The TOOL-MADE DEPENDENCY BUMP class (engineering#679)
@@ -1603,7 +1719,13 @@ export function compileBumpPatterns(linePatterns) {
     try { re = new RegExp(String(src), "d"); } catch { return null; }  // unusable pattern => fail closed
     let groups;
     try { groups = new RegExp(`${re.source}|`).exec("").length - 1; } catch { return null; }
-    if (groups !== 1) return null;                                     // the token must be identifiable
+    // At least ONE capture: the token must be identifiable. A pattern may carry
+    // MORE than one (engineering#680) when a single line pins the same version
+    // or digest twice — the app's upgrade matrix writes the pinned image
+    // reference and the `digest` field beside it on one line — and every capture
+    // is blanked separately, so the text BETWEEN them (a `major` policy field)
+    // still has to match for two lines to pair.
+    if (groups < 1) return null;
     out.push(re);
   }
   return out;
@@ -1624,9 +1746,26 @@ export function normalizeBumpLine(line, linePatterns) {
   for (const re of res) {
     const m = re.exec(line);
     if (!m || m[1] === undefined) continue;
-    const at = m.indices && m.indices[1];
-    if (!at) continue;
-    return line.slice(0, at[0]) + "\u0000VERSION\u0000" + line.slice(at[1]);
+    // EVERY participating capture is blanked, each at its own indices (a pattern
+    // may pin the same token twice on one line — engineering#680). Everything
+    // between two captures is left standing, so a line that changes there does
+    // not pair with the line it replaced.
+    const spans = [];
+    let readable = true;
+    for (let g = 1; g < m.length; g++) {
+      if (m[g] === undefined) continue;
+      const at = m.indices && m.indices[g];
+      if (!at) { readable = false; break; }
+      spans.push(at);
+    }
+    if (!readable || spans.length === 0) continue;
+    spans.sort((a, b) => a[0] - b[0]);
+    let sane = true;
+    for (let i = 1; i < spans.length; i++) if (spans[i][0] < spans[i - 1][1]) { sane = false; break; }
+    if (!sane) continue;                                               // overlapping captures prove nothing
+    let out = line;
+    for (let i = spans.length - 1; i >= 0; i--) out = out.slice(0, spans[i][0]) + "\u0000VERSION\u0000" + out.slice(spans[i][1]);
+    return out;
   }
   return null;
 }
@@ -2847,6 +2986,7 @@ function canonicalizeForBump(v) {
  * `ctx` is a plain object of already-collected inputs (so this is unit-testable
  * without git or network):
  *   { changedFiles, rangeIdentities, rangeMessages, agentTokens, agentAllow,
+ *     mergeInfoBySha (§5c: sha -> { parents, tree, cleanTree }),
  *     defaults, repoSuite,
  *     // optional API-derived (when a client + PR are available):
  *     reviews, prAuthorLogin, reviewedHeadSha, permissionByLogin, suiteFile,
@@ -2867,6 +3007,11 @@ export function analyzePreMerge(ctx) {
     // is not read as agent work at all. Every other commit falls through to the
     // rule below, unchanged.
     if (ctxCommitIsBump(ctx, id)) continue;
+    // §5c: a CONTENT-FREE CLEAN MERGE (a bring-up-to-date merge whose tree is
+    // the clean merge of its parents) contributed no line — it is not read as
+    // agent work at all. A merge whose tree differs (a conflict resolved by
+    // hand) and an unreadable one fall through to the rule below, unchanged.
+    if (ctxCommitIsCleanMerge(ctx, id)) continue;
     const agentAuthor = looksLikeAgent({ name: id.authorName, email: id.authorEmail }, { tokens: ctx.agentTokens, allow: ctx.agentAllow });
     const agentCommitter = looksLikeAgent({ name: id.committerName, email: id.committerEmail }, { tokens: ctx.agentTokens, allow: ctx.agentAllow });
     if (agentAuthor || agentCommitter) {
@@ -3421,9 +3566,12 @@ export function analyzePostMerge(ctx) {
   // §5b: tool-made dependency bumps are dropped from the reading first — a bump
   // is not agent work, so it neither demands a named Assisted-by on its own
   // landed record nor makes a squash record's `none` untrue.
+  // §5c: a content-free clean merge is dropped with them — a bring-up-to-date
+  // merge the bot made through the API contributed no line, so it neither
+  // demands a record of its own nor makes a squash record's `none` untrue.
   const check5All = landedSelf ? [landedSelf] : ctx.rangeIdentities;
   const check5Identities = Array.isArray(check5All)
-    ? check5All.filter((id) => !ctxCommitIsBump(ctx, id))
+    ? check5All.filter((id) => !ctxCommitIsBump(ctx, id) && !ctxCommitIsCleanMerge(ctx, id))
     : check5All;
   if (Array.isArray(check5Identities) && check5Identities.length) {
     const anyAgent = check5Identities.some((id) =>
@@ -3660,6 +3808,13 @@ function main() {
       if (!identityInBumpClass(id, ctx.bumpClass)) continue;
       try { ctx.commitDiffBySha[id.sha] = { changedFiles: changedFilesForCommit(id.sha), fileLines: commitDiffLines(id.sha) }; } catch { /* not a bump */ }
     }
+    // §5c: the merge facts of each range commit, read by the SAME git road. A
+    // single-parent commit collects nothing; anything unreadable stays absent,
+    // so the commit is simply not content-free (fail closed).
+    ctx.mergeInfoBySha = {};
+    if (base) for (const id of rangeIdentities) {
+      try { const info = mergeInfoOf(id.sha); if (info) ctx.mergeInfoBySha[id.sha] = info; } catch { /* not content-free */ }
+    }
 
     if (client && args.pr) {
       try {
@@ -3712,7 +3867,7 @@ function main() {
     const ctx = {
       changedFiles: [], rangeIdentities: [], messageBySha: {},
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
-      bumpClass: loadJsonSafe(bumpClassPath()), commitDiffBySha: {},
+      bumpClass: loadJsonSafe(bumpClassPath()), commitDiffBySha: {}, mergeInfoBySha: {},
       defaults, repoSuite, apiBound: false,
       membership: { status: "unresolved", number: null, candidates: [] },
       parentSuiteFile: { ok: false, reason: "no merge-group base" },
@@ -3732,6 +3887,10 @@ function main() {
         for (const id of ctx.rangeIdentities) {
           if (!identityInBumpClass(id, ctx.bumpClass)) continue;
           try { ctx.commitDiffBySha[id.sha] = { changedFiles: changedFilesForCommit(id.sha), fileLines: commitDiffLines(id.sha) }; } catch { /* not a bump */ }
+        }
+        // §5c: the candidate's own merge facts, same git road (see the pre-merge arm).
+        for (const id of ctx.rangeIdentities) {
+          try { const info = mergeInfoOf(id.sha); if (info) ctx.mergeInfoBySha[id.sha] = info; } catch { /* not content-free */ }
         }
         ctx.parentSuiteFile = jsonFileAtRef(groupBaseSha, ".github/gate-suite.json");
       } catch { /* leave the empty, fail-closed defaults */ }
@@ -3920,6 +4079,11 @@ function main() {
           // also consider the GitHub-resolved login (a bot/app identity)
           ghAuthorLogin: c.author?.login,
           ghCommitterLogin: c.committer?.login,
+          // §5c: the merge facts this payload already carries — a source commit
+          // is not in this checkout after a squash, but its PARENTS (the branch
+          // commit and the default-branch commit it merged) are.
+          parents: (c.parents || []).map((p) => p && p.sha).filter(Boolean),
+          tree: c.commit?.tree?.sha,
         }));
         // §7 MULTI-COMMIT REBASE LANDING (ci#94). A rebase merge lands the PR's
         // commits INDIVIDUALLY and reports the LAST of them as merge_commit_sha,
@@ -3947,6 +4111,29 @@ function main() {
             fileLines: bumpLinesFromApiFiles(files),
           };
         }
+        // §5c: the clean-merge reading for each source commit that IS a merge —
+        // the parents and tree from the payload above, the merge-tree from local
+        // git. An object this checkout cannot read leaves the record unreadable,
+        // which is not content-free (fail closed).
+        ctx.mergeInfoBySha = ctx.mergeInfoBySha || {};
+        // A squash landing leaves the source commits — and the branch-side parent
+        // of a bring-up-to-date merge — outside this checkout, and the branch is
+        // usually deleted with the merge. The pull request's own head ref still
+        // carries them, so it is fetched ONCE, and only when a two-parent source
+        // commit is actually unreadable here. A failed fetch changes nothing: the
+        // merge-tree read fails and the merge is not content-free (fail closed).
+        let prHeadFetched = false;
+        for (const id of ctx.rangeIdentities) {
+          try {
+            const ps = (Array.isArray(id.parents) ? id.parents : []).filter(Boolean);
+            if (ps.length === 2 && !ps.every((sha) => hasCommitLocally(sha)) && !prHeadFetched) {
+              prHeadFetched = true;
+              fetchPrHeadRef(prNumber);
+            }
+            const info = mergeInfoOf(id.sha, { parents: id.parents, tree: id.tree });
+            if (info) ctx.mergeInfoBySha[id.sha] = info;
+          } catch { /* not content-free */ }
+        }
         const prCommitMessages = (prCommits || []).map((c) => c.commit?.message ?? "");
         const landing = classifyLandedShape({
           mergedSha,
@@ -3969,6 +4156,10 @@ function main() {
             if (c && c.sha && typeof c.message === "string") { (ctx.messageBySha = ctx.messageBySha || {})[c.sha] = c.message; }
             if (!identityInBumpClass(c, ctx.bumpClass)) continue;
             try { ctx.commitDiffBySha[c.sha] = { changedFiles: c.changedFiles, fileLines: commitDiffLines(c.sha) }; } catch { /* not a bump */ }
+          }
+          // §5c: and each landed commit's own merge facts, for the per-commit check 5.
+          for (const c of ctx.landedRange.commits) {
+            try { const info = mergeInfoOf(c.sha); if (info) ctx.mergeInfoBySha[c.sha] = info; } catch { /* not content-free */ }
           }
           ctx.contentMatch = resolveContentMatch({ commit: mergedSha, reviewedHeadSha: ctx.reviewedHeadSha, rangeBase: landing.base });
           // The staleness anchor moves with the binding: the on-main commit the
