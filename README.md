@@ -1955,6 +1955,46 @@ rejected. A parse failure of either config => the whole change is treated
 high-risk (fail closed). Removing a default means editing this repo's config —
 itself a high-risk path, so maintainer-reviewed by construction.
 
+### Tool-made dependency bumps (§5b)
+
+Check 5 reads a commit by a known agent or bot identity as agent work and
+demands a named `Assisted-by` on it. **One** narrow class is exempt: the
+**tool-made dependency bump**. Nobody changed the code there — a tool rewrote a
+version line and a lockfile — so the truthful record is `Assisted-by: none` (or
+no `Assisted-by` line at all, which normalizes to `none`), and such a commit
+contributes no named assistant to a squash record's union.
+
+A commit is in the class only when **all** of this holds:
+
+- its **author and committer** are class identities (the org's agent bot,
+  `dependabot[bot]`, `renovate[bot]`, `github-actions[bot]`; the committer
+  `GitHub <noreply@github.com>` counts as the author's identity — that is how an
+  API-made commit looks), **and**
+- it has exactly **one parent** (a merge commit is never a bump) and **modifies**
+  only dependency files — package manifests, lockfiles, container image
+  references — with nothing added, deleted, renamed, copied or chmod-ed, **and**
+- outside a lockfile (whose whole diff is accepted as-is, once it has been read)
+  every added and removed line carries a **version or an image digest** and pairs
+  with the line it replaced **inside the same hunk** once that token is blanked.
+  Adding, removing or **moving** a dependency name, or touching a script, a
+  stage, a command or a numeric setting, is **not** a bump.
+
+The class is **data**: `config/tool-made-bump-class.json` (`identities`,
+`excludeGlobs`, `fileGlobs`, `lockfileGlobs`, `linePatterns`), so the merge
+road's preflight can read the same definition at the engine's ref. Everything
+outside the class keeps today's rule unchanged — a bot-identity commit that
+touches anything else still needs a named agent — and `.github/**` is kept out of
+the class by `excludeGlobs`, so a manifest that lives beside the workflows is
+never a bump. The exemption only ever spares a record from naming an agent that
+never existed: a commit whose own message **names** an agent is not exempt, and
+the squash union never drops a name a commit declares. Fail closed throughout: an
+unparseable config, a line pattern that will not compile or does not capture its
+token, an unreadable diff, a merge commit, a rename, a copy, a binary file, an
+added or deleted file, a mode change, a changed path the read diff does not
+cover, an API file list at GitHub's 300-entry cap or one without its patch, and
+any line the class does not recognize all mean **not a bump**, and the unchanged
+rule applies.
+
 ### Gate suite — registry, versioning, audit (§4)
 
 The named, versioned set of required checks that constitutes machine verification

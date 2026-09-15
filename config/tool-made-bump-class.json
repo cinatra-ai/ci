@@ -1,0 +1,58 @@
+{
+  "$comment": "The TOOL-MADE DEPENDENCY BUMP class for the truthful-attribution-gate (engineering#679). BOUNDARY: a commit belongs to this class ONLY when its author AND its committer are one of the `identities` below (the committer `apiCommitter` — GitHub / noreply@github.com — counts as the same identity when the author is one of them, which is how an API-made commit looks), it has exactly ONE parent, its diff MODIFIES only files matching `fileGlobs` and none matching `excludeGlobs`, and — outside `lockfileGlobs`, whose whole diff is accepted as-is once it has been READ — every added and removed line WITHIN EACH HUNK matches one of `linePatterns` AND pairs with an identical line on the other side of that same hunk once its captured version/digest token is blanked (so a bump CHANGES a version where it stands, while adding, removing or MOVING a dependency name, or touching a script, a stage, a command or a numeric setting, is not a bump). A commit in this class may carry `Assisted-by: none` or no Assisted-by line (normalizing to none) and contributes no named assistant to a squash record's union; a commit whose own message NAMES an agent is never exempted, and EVERY other commit keeps the gate's rule unchanged — a bot-identity commit that touches anything outside the class still needs a named agent. `linePatterns` are JavaScript regular-expression sources matched against a hunk line's content (without its leading +/-); each MUST carry exactly one capture group, the version or digest token that a bump is allowed to change, and the version token must carry at least two numeric components or a range operator so that a bare numeric setting (a uid, a replica count) is not a version. Fail closed: a parse failure of this file, a pattern that does not compile or does not capture exactly one group, a merge commit, a rename, a copy, a binary file, an added or deleted file, a mode change, a changed path the read diff does not cover, or a diff the gate could not read in full => no commit is classified as a bump (today's rule applies).",
+  "version": "2026.09",
+  "identities": [
+    "groganz-bot[bot]",
+    "*+groganz-bot[bot]@users.noreply.github.com",
+    "dependabot[bot]",
+    "*+dependabot[bot]@users.noreply.github.com",
+    "renovate[bot]",
+    "*+renovate[bot]@users.noreply.github.com",
+    "github-actions[bot]",
+    "*+github-actions[bot]@users.noreply.github.com"
+  ],
+  "apiCommitter": { "name": "GitHub", "email": "noreply@github.com" },
+  "excludeGlobs": [
+    ".github/**",
+    "**/.github/**"
+  ],
+  "fileGlobs": [
+    "package.json",
+    "**/package.json",
+    "pnpm-workspace.yaml",
+    "**/pnpm-workspace.yaml",
+    "package-lock.json",
+    "**/package-lock.json",
+    "pnpm-lock.yaml",
+    "**/pnpm-lock.yaml",
+    "yarn.lock",
+    "**/yarn.lock",
+    "*.lock",
+    "**/*.lock",
+    "Dockerfile*",
+    "**/Dockerfile*",
+    "docker-compose*.yml",
+    "**/docker-compose*.yml",
+    "compose*.yml",
+    "**/compose*.yml"
+  ],
+  "lockfileGlobs": [
+    "package-lock.json",
+    "**/package-lock.json",
+    "pnpm-lock.yaml",
+    "**/pnpm-lock.yaml",
+    "yarn.lock",
+    "**/yarn.lock",
+    "*.lock",
+    "**/*.lock"
+  ],
+  "linePatterns": [
+    "^\\s*\"[^\"]+\"\\s*:\\s*\"((?:(?:[\\^~]|>=?|<=?|=)v?\\d+(?:\\.\\d+)*|v?\\d+(?:\\.\\d+)+)(?:[-+][0-9A-Za-z.\\-]+)?)\"\\s*,?\\s*$",
+    "^\\s*\"[^\"]+\"\\s*:\\s*\"[\\w.\\-@/]+@(\\d[\\w.\\-+]*)\"\\s*,?\\s*$",
+    "^\\s*['\"]?[@\\w][\\w.\\-/@]*['\"]?\\s*:\\s*['\"]?((?:(?:[\\^~]|>=?|<=?|=)v?\\d+(?:\\.\\d+)*|v?\\d+(?:\\.\\d+)+)(?:[-+][0-9A-Za-z.\\-]+)?)['\"]?\\s*$",
+    "^\\s*image:\\s*['\"]?[^\\s'\"@]+@(sha256:[0-9a-f]{7,64})['\"]?\\s*$",
+    "^\\s*image:\\s*['\"]?[^\\s'\"@:]+:([\\w][\\w.\\-]*)['\"]?\\s*$",
+    "^\\s*FROM\\s+[^\\s@]+@(sha256:[0-9a-f]{7,64})(?:\\s+[Aa][Ss]\\s+[\\w.\\-]+)?\\s*$",
+    "^\\s*FROM\\s+[^\\s@:]+:([\\w][\\w.\\-]*)(?:\\s+[Aa][Ss]\\s+[\\w.\\-]+)?\\s*$"
+  ]
+}

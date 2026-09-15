@@ -9,6 +9,7 @@ import {
   classifyArm,
   aggregateAssisted,
   globToRegExp,
+  loadJsonSafe,
   classifyHighRisk,
   permissionMeetsTier,
   verifyReviewedLine,
@@ -57,6 +58,10 @@ import {
   resolveQueueCandidate,
   analyzeMergeGroup,
 } from "../truthful-attribution-gate.mjs";
+// §5b (engineering#679) reads its new exports through the namespace so the file
+// still LINKS against a build that does not have them (the five bump tests then
+// fail on their own, which is what red-first needs).
+import * as gateExports from "../truthful-attribution-gate.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
 
@@ -3992,4 +3997,236 @@ test("QUEUE ARM CLI: --arm merge-group runs and fails closed with no API context
   assert.ok(report.apiSkippedReason, "no API context must be reported, not silently passed");
   assert.ok(report.findings.some((f) => f.code === "queue-membership-unresolved"), JSON.stringify(report.findings));
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+
+// =========================================================================
+// §5b — the TOOL-MADE DEPENDENCY BUMP class (engineering#679)
+//
+// The class is DATA: these tests read the SHIPPED config the gate reads, so a
+// change to the class definition is exercised here too. Diff evidence is given
+// the way the collectors produce it: per FILE, grouped BY HUNK.
+// =========================================================================
+
+const BUMP_CLASS = loadJsonSafe(path.join(import.meta.dirname, "..", "..", "config", "tool-made-bump-class.json"));
+// The org's agent bot as GitHub writes it for an API-made commit: the bot
+// authors, `GitHub <noreply@github.com>` commits.
+const BUMP_BOT = {
+  authorName: "groganz-bot[bot]",
+  authorEmail: "293224031+groganz-bot[bot]@users.noreply.github.com",
+  committerName: "GitHub",
+  committerEmail: "noreply@github.com",
+};
+// A repo whose private config names the loop's bot as an agent identity — the
+// exact situation the exemption is for (without the token check 5 never reads
+// these commits at all, and there would be nothing to exempt).
+const BUMP_TOKENS = [...DEFAULT_AGENT_NAME_TOKENS, "groganz-bot"];
+const BUMP_SHA = "b".repeat(40);
+const BUMP_MSG = "chore(deps): bump eslint from 9.12.0 to 9.13.0";
+const BUMP_PKG_FILE = {
+  path: "package.json",
+  hunks: [{ added: ['    "eslint": "^9.13.0",'], removed: ['    "eslint": "^9.12.0",'] }],
+};
+const BUMP_LOCK_FILE = {
+  path: "package-lock.json",
+  hunks: [{
+    added: ['      "version": "9.13.0",', '      "resolved": "https://registry.npmjs.org/eslint/-/eslint-9.13.0.tgz",'],
+    removed: ['      "version": "9.12.0",', '      "resolved": "https://registry.npmjs.org/eslint/-/eslint-9.12.0.tgz",'],
+  }],
+};
+const DIGEST_OLD = "sha256:" + "a".repeat(64);
+const DIGEST_NEW = "sha256:" + "c".repeat(64);
+const bumpIdentity = { sha: BUMP_SHA, ...BUMP_BOT };
+
+function bumpCtx({ changedFiles, commitFiles, fileLines, identities, messageBySha, rangeMessages } = {}) {
+  const files = changedFiles || ["package.json", "package-lock.json"];
+  // The BUMP COMMIT's own changed set (the range's set can be wider — other
+  // commits in the range touch other files).
+  const own = commitFiles || files;
+  return {
+    changedFiles: files,
+    rangeIdentities: identities || [bumpIdentity],
+    messageBySha: messageBySha || { [BUMP_SHA]: BUMP_MSG },
+    rangeMessages: rangeMessages || [BUMP_MSG],
+    agentTokens: BUMP_TOKENS,
+    defaults: DEFAULTS_OK,
+    repoSuite: null,
+    bumpClass: BUMP_CLASS,
+    commitDiffBySha: {
+      [BUMP_SHA]: { changedFiles: own, fileLines: fileLines || [BUMP_PKG_FILE, BUMP_LOCK_FILE] },
+    },
+  };
+}
+const isBump = (changedFiles, fileLines, identity = bumpIdentity) =>
+  gateExports.isToolMadeBump({ identity, changedFiles, fileLines }, BUMP_CLASS);
+
+test("§5b a bot-identity version bump (package.json + its lockfile, no trailer) is ACCEPTED, record 'Assisted-by: none'", () => {
+  assert.ok(BUMP_CLASS.ok, `config/tool-made-bump-class.json must parse: ${BUMP_CLASS.reason || ""}`);
+  assert.ok(Array.isArray(BUMP_CLASS.value.identities), "the class declares its identities in the config file");
+  assert.ok(Array.isArray(BUMP_CLASS.value.fileGlobs), "the class declares its fileGlobs in the config file");
+  assert.ok(Array.isArray(BUMP_CLASS.value.linePatterns), "the class declares its linePatterns in the config file");
+
+  const r = analyzePreMerge(bumpCtx());
+  assert.deepEqual(r.findings.filter((f) => f.code === "agent-commit-no-assisted"), [],
+    "a tool-made dependency bump carries no agent — it must not demand a named Assisted-by: " + JSON.stringify(r.findings));
+  // ...and the record such a commit aggregates to is the truthful "none".
+  assert.deepEqual(aggregateAssisted([BUMP_MSG], { bumps: [true] }), ["Assisted-by: none"]);
+});
+
+test("§5b the SAME identity with a diff that also touches a source file is refused exactly as today", () => {
+  const files = ["package.json", "src/index.ts"];
+  const fileLines = [BUMP_PKG_FILE, { path: "src/index.ts", hunks: [{ added: ["  return 2;"], removed: ["  return 1;"] }] }];
+  const r = analyzePreMerge(bumpCtx({ changedFiles: files, fileLines }));
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"),
+    "anything outside the class still needs a named agent: " + JSON.stringify(r.findings));
+  assert.equal(isBump(files, fileLines), false, "a source file is not a dependency file — not a bump");
+});
+
+test("§5b a bot-identity commit changing an image DIGEST line in a compose file is ACCEPTED", () => {
+  const files = ["docker-compose.yml"];
+  const fileLines = [{
+    path: "docker-compose.yml",
+    hunks: [{
+      added: [`    image: ghcr.io/cinatra/app@${DIGEST_NEW}`],
+      removed: [`    image: ghcr.io/cinatra/app@${DIGEST_OLD}`],
+    }],
+  }];
+  const r = analyzePreMerge(bumpCtx({ changedFiles: files, fileLines }));
+  assert.deepEqual(r.findings.filter((f) => f.code === "agent-commit-no-assisted"), [],
+    "an image digest is a version — the tool wrote it: " + JSON.stringify(r.findings));
+  assert.equal(isBump(files, fileLines), true);
+});
+
+test("§5b a bot-identity commit that ADDS a dependency name is refused (a new dependency is a decision, not a bump)", () => {
+  const files = ["package.json", "package-lock.json"];
+  const fileLines = [
+    { path: "package.json", hunks: [{ added: ['    "left-pad": "^1.3.0",'], removed: [] }] },
+    BUMP_LOCK_FILE,
+  ];
+  const r = analyzePreMerge(bumpCtx({ changedFiles: files, fileLines }));
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"),
+    "an added dependency name is not a version change: " + JSON.stringify(r.findings));
+  assert.equal(isBump(files, fileLines), false);
+  // ...and the same holds for a REMOVED dependency name.
+  assert.equal(isBump(files, [{ path: "package.json", hunks: [{ added: [], removed: ['    "left-pad": "^1.3.0",'] }] }, BUMP_LOCK_FILE]), false);
+});
+
+test("§5b a bump commit and a named-agent commit in ONE squash range: the union names the agent and stays valid", () => {
+  const agentSha = "f".repeat(40);
+  const agentMsg = "feat: the thing\n\nAssisted-by: Claude Code (claude-opus-5)";
+  const r = analyzePreMerge(bumpCtx({
+    changedFiles: ["package.json", "package-lock.json", "src/thing.ts"],
+    commitFiles: ["package.json", "package-lock.json"],
+    identities: [
+      bumpIdentity,
+      { sha: agentSha, authorName: "Claude Code", authorEmail: "noreply@anthropic.com", committerName: "Claude Code", committerEmail: "noreply@anthropic.com" },
+    ],
+    messageBySha: { [BUMP_SHA]: BUMP_MSG, [agentSha]: agentMsg },
+    rangeMessages: [BUMP_MSG, agentMsg],
+  }));
+  assert.deepEqual(r.findings.filter((f) => f.code === "agent-commit-no-assisted"), [],
+    "the bump is exempt and the agent commit names its agent: " + JSON.stringify(r.findings));
+  const union = aggregateAssisted([BUMP_MSG, agentMsg], { bumps: [true, false] });
+  assert.deepEqual(union, ["Assisted-by: Claude Code (claude-opus-5)"]);
+  assert.deepEqual(parseTrailers(["chore: release", "", ...union, "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n")).errors, [],
+    "the aggregated record is a valid §1 record");
+});
+
+// ---- convergence round (codex, 2026-09-15): the class must not be a door ----
+
+test("§5b a NUMERIC SETTING that merely looks version-shaped is not a version (compose `user: 1000` -> `0`)", () => {
+  const files = ["docker-compose.yml"];
+  const fileLines = [{ path: "docker-compose.yml", hunks: [{ added: ['    user: "0"'], removed: ['    user: "1000"'] }] }];
+  assert.equal(isBump(files, fileLines), false, "running the container as root is not a dependency bump");
+  const r = analyzePreMerge(bumpCtx({ changedFiles: files, fileLines }));
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"), JSON.stringify(r.findings));
+  // a replica count and a port are equally not versions
+  assert.equal(isBump(files, [{ path: "docker-compose.yml", hunks: [{ added: ["    replicas: 9"], removed: ["    replicas: 2"] }] }]), false);
+});
+
+test("§5b a dependency line MOVED between sections is not a bump (the pairing is PER HUNK)", () => {
+  const line = '    "eslint": "^9.12.0",';
+  const files = ["package.json"];
+  // removed from `dependencies` in one hunk, added to `devDependencies` in another
+  const moved = [{ path: "package.json", hunks: [{ added: [], removed: [line] }, { added: [line], removed: [] }] }];
+  assert.equal(isBump(files, moved), false, "moving a dependency between sections changes membership, not a version");
+  const r = analyzePreMerge(bumpCtx({ changedFiles: files, fileLines: moved }));
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"), JSON.stringify(r.findings));
+  // ...while the same two lines inside ONE hunk with a changed token still bump
+  assert.equal(isBump(files, [BUMP_PKG_FILE]), true);
+});
+
+test("§5b a changed path the read diff does not cover is not a bump (a mode change, a partial payload)", () => {
+  // `Dockerfile` is a class file, but nothing was read about what changed in it
+  assert.equal(isBump(["package.json", "Dockerfile"], [BUMP_PKG_FILE]), false);
+  // an empty hunk proves nothing either
+  assert.equal(isBump(["package.json"], [{ path: "package.json", hunks: [{ added: [], removed: [] }] }]), false);
+  // and a file the diff reports that the commit's changed set does not
+  assert.equal(isBump(["package.json"], [BUMP_PKG_FILE, BUMP_LOCK_FILE]), false);
+  // the git collector refuses a mode change, an added file, a deleted file and a rename outright
+  const modeOnly = "diff --git a/Dockerfile b/Dockerfile\nold mode 100644\nnew mode 100755\n";
+  assert.equal(gateExports.parseUnifiedDiffLines(modeOnly), null);
+  assert.equal(gateExports.parseUnifiedDiffLines("diff --git a/x.lock b/x.lock\nnew file mode 100644\n--- /dev/null\n+++ b/x.lock\n@@ -0,0 +1 @@\n+anything\n"), null);
+  assert.equal(gateExports.parseUnifiedDiffLines("diff --git a/x.lock b/x.lock\n--- a/x.lock\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"), null);
+  assert.equal(gateExports.parseUnifiedDiffLines("diff --git a/a.lock b/b.lock\nrename from a.lock\nrename to b.lock\n"), null);
+  // a real one-hunk modification parses into hunks
+  const ok = gateExports.parseUnifiedDiffLines('diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n@@ -3 +3 @@\n-    "eslint": "^9.12.0",\n+    "eslint": "^9.13.0",\n');
+  assert.deepEqual(ok, [{ path: "package.json", hunks: [{ added: ['    "eslint": "^9.13.0",'], removed: ['    "eslint": "^9.12.0",'] }] }]);
+});
+
+test("§5b the REST reading refuses evidence it did not fully read (no patch, an added file, a capped file list)", () => {
+  const patch = '@@ -3 +3 @@\n-    "eslint": "^9.12.0",\n+    "eslint": "^9.13.0",';
+  assert.deepEqual(gateExports.bumpLinesFromApiFiles([{ filename: "package.json", status: "modified", patch }]),
+    [{ path: "package.json", hunks: [{ added: ['    "eslint": "^9.13.0",'], removed: ['    "eslint": "^9.12.0",'] }] }]);
+  // a lockfile whose patch GitHub omitted: "the whole diff is accepted" means the whole diff was READ
+  assert.equal(gateExports.bumpLinesFromApiFiles([{ filename: "yarn.lock", status: "modified" }]), null);
+  assert.equal(gateExports.bumpLinesFromApiFiles([{ filename: "yarn.lock", status: "added", patch: "@@ -0,0 +1 @@\n+whatever" }]), null);
+  assert.equal(gateExports.bumpLinesFromApiFiles([{ filename: "package.json", status: "modified", patch: "not a diff at all" }]), null);
+  // a file list at GitHub's cap may be truncated — it cannot be shown to hold only class files
+  const capped = Array.from({ length: gateExports.API_COMMIT_FILES_CAP }, (_, i) => ({ filename: `p${i}/package.json`, status: "modified", patch }));
+  assert.equal(gateExports.bumpLinesFromApiFiles(capped), null);
+});
+
+test("§5b the exemption never ERASES a named agent a bump commit declares", () => {
+  const declared = `${BUMP_MSG}\n\nAssisted-by: Codex (gpt-5.6-sol)`;
+  // the union keeps the declared name even when the commit is flagged as a bump
+  assert.deepEqual(aggregateAssisted([declared], { bumps: [true] }), ["Assisted-by: Codex (gpt-5.6-sol)"]);
+  // ...and post-merge, a squash record claiming `none` over such a commit still reds
+  const r = analyzePostMerge({
+    message: "chore: deps\n\nAssisted-by: none\nReviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
+    changedFiles: ["package.json"], defaults: DEFAULTS_OK, repoSuite: null,
+    apiBound: true, treeMatch: true,
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
+    agentTokens: BUMP_TOKENS,
+    rangeIdentities: [bumpIdentity],
+    messageBySha: { [BUMP_SHA]: declared },
+    bumpClass: BUMP_CLASS,
+    commitDiffBySha: { [BUMP_SHA]: { changedFiles: ["package.json"], fileLines: [BUMP_PKG_FILE] } },
+  });
+  assert.ok(r.findings.some((f) => f.code === "agent-commit-no-assisted"),
+    "a commit that names an agent is not exempt — the record may not say none: " + JSON.stringify(r.findings));
+});
+
+test("§5b a class definition the gate cannot read IN FULL exempts nothing, and the token is located by its capture", () => {
+  const broken = { ok: true, value: { ...BUMP_CLASS.value, linePatterns: [...BUMP_CLASS.value.linePatterns, "["] } };
+  assert.equal(gateExports.isToolMadeBump({ identity: bumpIdentity, changedFiles: ["package.json"], fileLines: [BUMP_PKG_FILE] }, broken), false,
+    "one unusable pattern disables the whole class");
+  const noCapture = { ok: true, value: { ...BUMP_CLASS.value, linePatterns: ["^\\s*\"[^\"]+\": \"\\d+\\.\\d+\\.\\d+\",?$"] } };
+  assert.equal(gateExports.isToolMadeBump({ identity: bumpIdentity, changedFiles: ["package.json"], fileLines: [BUMP_PKG_FILE] }, noCapture), false,
+    "a pattern that does not capture its token cannot prove a bump");
+  assert.equal(gateExports.compileBumpPatterns([]), null);
+  // the capture's own indices are blanked, never an earlier identical run of characters
+  const pats = gateExports.compileBumpPatterns(BUMP_CLASS.value.linePatterns);
+  const a = gateExports.normalizeBumpLine('    "pkg-1.2": "1.2.3",', pats);
+  const b = gateExports.normalizeBumpLine('    "pkg-1.2": "1.2.4",', pats);
+  assert.ok(a && b && a === b, `the dependency name must survive normalization: ${JSON.stringify([a, b])}`);
+  assert.ok(a.includes("pkg-1.2"), a);
+});
+
+test("§5b .github/** is kept OUT of the class by the config, not by hope", () => {
+  assert.ok(Array.isArray(BUMP_CLASS.value.excludeGlobs), "the class declares its excludeGlobs in the config file");
+  const files = [".github/package.json"];
+  const fileLines = [{ path: ".github/package.json", hunks: BUMP_PKG_FILE.hunks }];
+  assert.equal(isBump(files, fileLines), false, "a manifest beside the workflows is never a bump");
 });
