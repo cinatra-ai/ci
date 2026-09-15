@@ -79,6 +79,36 @@
  * "single" and binds exactly as before (fail closed), and a tampered rebased
  * range still has to re-derive the reviewed fingerprint over the whole range.
  *
+ * ============ §5b — THE TOOL-MADE DEPENDENCY BUMP (engineering#679) ========
+ * Check 5 reads a commit by a known agent or bot identity as agent work and
+ * demands a named `Assisted-by` on it. ONE narrow class is exempt: the
+ * tool-made dependency bump — a commit whose author AND committer are class
+ * identities (the org's agent bot, dependabot, renovate, github-actions; the
+ * committer `GitHub <noreply@github.com>` counts as the author's identity,
+ * which is how an API-made commit looks), whose diff touches ONLY dependency
+ * files (manifests, lockfiles, container image references) and which, outside a
+ * lockfile (whose whole diff is accepted as-is), changes ONLY lines carrying a
+ * version or an image digest — each changed line pairing with the line it
+ * replaced once that token is blanked, so adding or removing a dependency name,
+ * a script, a stage or a command is NOT a bump. Nobody changed the code there:
+ * the tool rewrote a version line, so the truthful record is
+ * `Assisted-by: none` (or no line, normalizing to none), and such a commit
+ * contributes no named assistant to a squash record's union. Everything else
+ * keeps the rule unchanged — a bot-identity commit touching anything outside
+ * the class still needs a named agent, and workflow files, gate suites and
+ * every other high-risk path stay outside the class by construction. The class
+ * is DATA: config/tool-made-bump-class.json (`excludeGlobs` keeps .github/**
+ * out of the class explicitly, so a manifest that lives beside the workflows is
+ * never a bump). The pairing is PER HUNK — a dependency line moved from one
+ * section to another is a membership change, not a bump — and a commit whose own
+ * message NAMES an agent is never exempted (the exemption spares a record from
+ * inventing an agent; it never erases a declared one). Fail closed throughout:
+ * an unparseable config, a pattern that will not compile or does not capture its
+ * token, an unreadable diff, a merge commit, a rename, a copy, a binary file, an
+ * added or deleted file, a mode change, a changed path the read diff does not
+ * cover, a REST payload at the API's 300-file cap or without its patch, and any
+ * unrecognized line => not a bump, and today's rule applies.
+ *
  * Zero runtime dependencies (node builtins only). GitHub API access is via an
  * injectable client (default: `gh api` through execFileSync), so the entire
  * analysis is unit-testable offline with a stub client.
@@ -398,14 +428,28 @@ export function classifyArm(parsed) {
  * mixes human-only commits with agent commits is agent-assisted overall).
  * Input: array of commit messages (branch commits). Output: array of canonical
  * "Assisted-by: ..." lines for the squash record.
+ *
+ * §5b (engineering#679): `opts.bumps` is an optional array of booleans parallel
+ * to `messages` flagging the TOOL-MADE DEPENDENCY BUMP commits. A flagged commit
+ * contributes NOTHING to the union and counts as `none` (its own record may be
+ * `Assisted-by: none` or no line at all, normalizing to none) — so a squash that
+ * mixes a bump with agent work still names the agent, and an all-bump squash
+ * aggregates to the single truthful `Assisted-by: none`. The flag only ever
+ * REMOVES an invented agent, never a declared one: a flagged commit whose own
+ * message NAMES an agent is aggregated exactly as any other commit is.
  */
-export function aggregateAssisted(messages) {
+export function aggregateAssisted(messages, opts = {}) {
+  const bumps = Array.isArray(opts.bumps) ? opts.bumps : [];
   const seen = new Set();
   const lines = [];
   let sawNamed = false;
   let sawNone = false;
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
     const p = parseTrailers(msg);
+    // A flagged bump contributes `none` — UNLESS its own message names an agent,
+    // which the union never erases (see below).
+    if (bumps[i] && !p.assisted.some((a) => !a.isNone)) { sawNone = true; continue; }
     for (const a of p.assisted) {
       if (a.isNone) { sawNone = true; continue; }
       const key = `${a.name} ${a.model || ""}`;
@@ -1488,6 +1532,294 @@ export function looksLikeAgent({ name, email }, { tokens = DEFAULT_AGENT_NAME_TO
   return false;
 }
 
+
+// ===========================================================================
+// §5b — The TOOL-MADE DEPENDENCY BUMP class (engineering#679)
+//
+// The ONE narrow exemption from check 5. The class is DATA — the identities,
+// the file globs and the line patterns live in config/tool-made-bump-class.json
+// (so the merge road's preflight can read the SAME definition at the engine's
+// ref); this is the one rule that reads it. A commit is a bump when:
+//   - its author AND its committer are class identities (the API committer
+//     `GitHub <noreply@github.com>` counts as the author's identity), and
+//   - its diff touches ONLY class files, and
+//   - outside a lockfile (whose whole diff is accepted as-is) every added and
+//     removed line matches a class line pattern AND pairs with the line it
+//     replaced once the captured version/digest token is blanked.
+// Fail closed everywhere: an unparseable config, an unreadable diff, a rename,
+// a binary file, a deleted file or an unrecognized line => NOT a bump, and
+// today's rule applies untouched.
+// ===========================================================================
+
+/** Does a path match any of these minimatch-style globs (§3 dialect)? */
+function matchesAnyGlob(p, globs) {
+  return (globs || []).some((g) => globToRegExp(String(g)).test(p));
+}
+
+/** Unwrap a loadJsonSafe envelope ({ok,value}); a plain object is taken as-is. */
+function bumpClassValue(cls) {
+  if (!cls || typeof cls !== "object") return null;
+  if (Object.prototype.hasOwnProperty.call(cls, "ok")) return cls.ok ? (cls.value || null) : null;
+  return cls;
+}
+
+/** Case-insensitive identity match; a pattern containing `*` is a glob. */
+function identityPatternMatches(pattern, value) {
+  const pat = String(pattern || "").toLowerCase();
+  const val = String(value || "").toLowerCase();
+  if (!pat || !val) return false;
+  if (pat.includes("*")) return globToRegExp(pat).test(val);
+  return pat === val;
+}
+
+/**
+ * Are BOTH the author and the committer of this commit class identities? The
+ * committer `GitHub <noreply@github.com>` (how an API-made commit looks) counts
+ * as the same identity when the AUTHOR is one of them.
+ */
+export function identityInBumpClass(identity, bumpClass) {
+  const cls = bumpClassValue(bumpClass);
+  if (!cls || !Array.isArray(cls.identities) || !identity) return false;
+  const anyPattern = (...values) => values.some((v) => cls.identities.some((pat) => identityPatternMatches(pat, v)));
+  if (!anyPattern(identity.authorName, identity.authorEmail, identity.ghAuthorLogin)) return false;
+  const api = cls.apiCommitter || null;
+  const committerIsApi = Boolean(api)
+    && identityPatternMatches(api.name, identity.committerName)
+    && identityPatternMatches(api.email, identity.committerEmail);
+  return committerIsApi || anyPattern(identity.committerName, identity.committerEmail, identity.ghCommitterLogin);
+}
+
+/**
+ * Compile the class's line patterns ONCE, atomically: every pattern must compile
+ * AND carry exactly one capture group (the version/digest token). A single
+ * unusable pattern disables the WHOLE class (null) — a class definition the gate
+ * cannot read in full never exempts anything.
+ */
+export function compileBumpPatterns(linePatterns) {
+  if (!Array.isArray(linePatterns) || linePatterns.length === 0) return null;
+  const out = [];
+  for (const src of linePatterns) {
+    let re;
+    try { re = new RegExp(String(src), "d"); } catch { return null; }  // unusable pattern => fail closed
+    let groups;
+    try { groups = new RegExp(`${re.source}|`).exec("").length - 1; } catch { return null; }
+    if (groups !== 1) return null;                                     // the token must be identifiable
+    out.push(re);
+  }
+  return out;
+}
+
+/**
+ * The line with its version/digest token blanked, or null when the line matches
+ * no class pattern. Two lines that normalize EQUAL differ only in that token —
+ * which is exactly what a bump is allowed to change. The token is located by the
+ * capture's own INDICES (never by searching its text, which would blank an
+ * earlier identical run of characters in the dependency name instead).
+ */
+export function normalizeBumpLine(line, linePatterns) {
+  const res = Array.isArray(linePatterns) && linePatterns.length && linePatterns.every((r) => r instanceof RegExp)
+    ? linePatterns
+    : compileBumpPatterns(linePatterns);
+  if (!res) return null;
+  for (const re of res) {
+    const m = re.exec(line);
+    if (!m || m[1] === undefined) continue;
+    const at = m.indices && m.indices[1];
+    if (!at) continue;
+    return line.slice(0, at[0]) + "\u0000VERSION\u0000" + line.slice(at[1]);
+  }
+  return null;
+}
+
+/** The hunks of ONE file entry, or null when the diff evidence is missing. */
+function hunksOfEntry(file) {
+  return file && Array.isArray(file.hunks) ? file.hunks : null;
+}
+
+/**
+ * Is this commit a tool-made dependency bump?
+ *
+ * @param identity     { authorName, authorEmail, committerName, committerEmail, ... }
+ * @param changedFiles the commit's changed-path list (the authoritative set)
+ * @param fileLines    [{ path, hunks: [{ added:[line], removed:[line] }] }] — the
+ *                     hunk line CONTENT without the leading +/-, GROUPED BY HUNK
+ *                     (a version bump replaces a line where it stands; a line
+ *                     moved from one hunk to another is a section change, not a
+ *                     bump). Every changed path must appear here with at least
+ *                     one hunk: missing evidence (a mode change, a truncated or
+ *                     patch-less payload) => NOT a bump.
+ */
+export function isToolMadeBump({ identity, changedFiles, fileLines }, bumpClass) {
+  const cls = bumpClassValue(bumpClass);
+  if (!cls || !Array.isArray(cls.fileGlobs) || !Array.isArray(cls.linePatterns)) return false;
+  const patterns = compileBumpPatterns(cls.linePatterns);
+  if (!patterns) return false;                                        // unusable class definition => fail closed
+  if (!identityInBumpClass(identity, cls)) return false;
+  if (!Array.isArray(changedFiles) || changedFiles.length === 0) return false;
+  if (!Array.isArray(fileLines) || fileLines.length === 0) return false;   // unreadable diff => fail closed
+  const excluded = cls.excludeGlobs || [];
+  const inClassFile = (p) => !matchesAnyGlob(p, excluded) && matchesAnyGlob(p, cls.fileGlobs);
+  const wanted = new Set((changedFiles || []).map((f) => String(f)));
+  for (const f of wanted) if (!inClassFile(f)) return false;
+  const covered = new Set();
+  for (const file of fileLines) {
+    const p = String((file && file.path) || "");
+    if (!p || covered.has(p) || !wanted.has(p)) return false;         // an unexpected or repeated path => fail closed
+    covered.add(p);
+    if (!inClassFile(p)) return false;
+    const hunks = hunksOfEntry(file);
+    if (!Array.isArray(hunks) || hunks.length === 0) return false;    // no readable evidence => fail closed
+    if (matchesAnyGlob(p, cls.lockfileGlobs || [])) continue;         // the tool's own lockfile write
+    const norm = (lines) => {
+      if (!Array.isArray(lines)) return null;
+      const out = [];
+      for (const l of lines) {
+        const n = normalizeBumpLine(l, patterns);
+        if (n === null) return null;                                  // a script / stage / command / setting line
+        out.push(n);
+      }
+      return out.sort();
+    };
+    for (const h of hunks) {
+      const added = norm(h && h.added);
+      const removed = norm(h && h.removed);
+      if (added === null || removed === null) return false;
+      if (added.length === 0 && removed.length === 0) return false;   // an empty hunk proves nothing
+      if (added.length !== removed.length) return false;              // an ADDED or REMOVED dependency name
+      for (let i = 0; i < added.length; i++) if (added[i] !== removed[i]) return false;
+    }
+  }
+  if (covered.size !== wanted.size) return false;                     // a changed path the diff did not cover
+  return true;
+}
+
+/** Is THIS range/landed commit a bump, given the diffs collected into ctx? */
+function ctxCommitIsBump(ctx, identity) {
+  if (!ctx || !ctx.bumpClass || !identity) return false;
+  const d = (ctx.commitDiffBySha || {})[identity.sha];
+  if (!d) return false;
+  // A commit whose OWN message NAMES an agent is never exempt. The exemption
+  // exists so a record need not invent an agent that never existed — never to
+  // erase one the commit itself declares (that would make the record untrue in
+  // the other direction).
+  const msg = (ctx.messageBySha && ctx.messageBySha[identity.sha]) || identity.message || "";
+  if (msg && parseTrailers(msg).assisted.some((a) => !a.isNone)) return false;
+  return isToolMadeBump({ identity, changedFiles: d.changedFiles, fileLines: d.fileLines }, ctx.bumpClass);
+}
+
+/**
+ * Added/removed line content of a unified diff body, GROUPED BY HUNK (no file
+ * header). null when the text carries no hunk header at all — text that is not a
+ * diff proves nothing and must not read as an empty, and therefore clean, change.
+ */
+function hunkLinesOf(patch) {
+  const hunks = [];
+  let cur = null;
+  for (const raw of String(patch).split("\n")) {
+    if (raw.startsWith("@@")) { cur = { added: [], removed: [] }; hunks.push(cur); continue; }
+    if (raw.startsWith("+++") || raw.startsWith("---")) continue;
+    if (raw.startsWith("+")) { if (!cur) return null; cur.added.push(raw.slice(1)); continue; }
+    if (raw.startsWith("-")) { if (!cur) return null; cur.removed.push(raw.slice(1)); continue; }
+  }
+  return hunks.length ? hunks : null;
+}
+
+/**
+ * Parse a unified diff into [{path, hunks:[{added,removed}]}] — or null (FAIL
+ * CLOSED) on a rename/copy, a binary file, a MODE change, a deleted file, an
+ * ADDED file or an unexpected header shape. Only a modification of an existing
+ * class file, read line by line, can establish a bump.
+ */
+export function parseUnifiedDiffLines(diffText) {
+  const files = [];
+  let cur = null;
+  let hunk = null;
+  for (const raw of String(diffText == null ? "" : diffText).split("\n")) {
+    if (raw.startsWith("diff --git ")) { cur = null; hunk = null; continue; }
+    if (raw.startsWith("rename from ") || raw.startsWith("rename to ")) return null;
+    if (raw.startsWith("copy from ") || raw.startsWith("copy to ")) return null;
+    if (raw.startsWith("Binary files ") || raw.startsWith("GIT binary patch")) return null;
+    if (raw.startsWith("old mode ") || raw.startsWith("new mode ")) return null;   // a mode change is not a bump
+    if (raw.startsWith("--- ")) {
+      if (raw.slice(4) === "/dev/null") return null;                  // an ADDED file is not a bump
+      continue;
+    }
+    if (raw.startsWith("+++ ")) {
+      const p = raw.slice(4);
+      if (p === "/dev/null") return null;                             // a deleted file is not a bump
+      if (!p.startsWith("b/")) return null;                           // unexpected header => fail closed
+      cur = { path: p.slice(2), hunks: [] };
+      hunk = null;
+      files.push(cur);
+      continue;
+    }
+    if (raw.startsWith("@@")) {
+      if (!cur) return null;
+      hunk = { added: [], removed: [] };
+      cur.hunks.push(hunk);
+      continue;
+    }
+    if (raw.startsWith("+")) { if (!hunk) return null; hunk.added.push(raw.slice(1)); continue; }
+    if (raw.startsWith("-")) { if (!hunk) return null; hunk.removed.push(raw.slice(1)); continue; }
+  }
+  return files;
+}
+
+/**
+ * ONE commit's own hunk lines (`<sha>^!`), read by the SAME git road the range's
+ * commits are read by (and the same -U0 no-textconv diff the content
+ * fingerprint uses). null on any git error => not a bump.
+ */
+export function commitDiffLines(commit, cwd = process.cwd()) {
+  // A MERGE (or a root) commit is never a bump: `<sha>^!` against several parents
+  // is not one commit's own change. Prove exactly one parent first.
+  try {
+    const parents = execFileSync(
+      "git",
+      ["rev-list", "--parents", "-n", "1", "--end-of-options", commit],
+      { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"] },
+    ).trim().split(/\s+/).filter(Boolean);
+    if (parents.length !== 2) return null;
+  } catch { return null; }
+  let out;
+  try {
+    out = execFileSync(
+      "git",
+      ["--literal-pathspecs", "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "-U0", "--end-of-options", `${commit}^!`, "--"],
+      { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 },
+    );
+  } catch { return null; }
+  return parseUnifiedDiffLines(out);
+}
+
+/**
+ * The same reading from the REST commit-files payload — the road the post-merge
+ * arm reads a SQUASHED PR's source-commit identities by (those commits are not
+ * in the default-branch checkout). FAIL CLOSED on everything that is not a plain
+ * modification with a readable patch: a rename/copy/removal/addition, an unknown
+ * status, a `patch` GitHub omitted (too large or binary — a lockfile included:
+ * "the whole diff is accepted" means the whole diff was READ), or a file list at
+ * the API's 300-entry cap, which may be truncated and so cannot be shown to
+ * contain only class files. null => not a bump.
+ */
+export const API_COMMIT_FILES_CAP = 300;
+export function bumpLinesFromApiFiles(files) {
+  if (!Array.isArray(files)) return null;
+  if (files.length >= API_COMMIT_FILES_CAP) return null;              // possibly truncated => fail closed
+  const out = [];
+  for (const f of files) {
+    const p = f && f.filename;
+    if (typeof p !== "string" || !p) return null;
+    if (f.previous_filename) return null;
+    if (f.status !== "modified" && f.status !== "changed") return null;
+    if (typeof f.patch !== "string") return null;                     // no readable evidence => fail closed
+    const hunks = hunkLinesOf(f.patch);
+    if (!hunks) return null;
+    out.push({ path: p, hunks });
+  }
+  return out;
+}
+
 // ===========================================================================
 // GitHub API client (injectable; default uses `gh api`). Anti-fabrication
 // (§5 checks 2 & 3) needs: PR reviews, the actor's repo permission, and the
@@ -1657,6 +1989,18 @@ export function makeGhClient({ repo } = {}) {
     // authoritative input for check 5 on a squash merge, where the merge
     // commit's own first-parent diff is NOT the branch commits.
     prCommits(pr) { return ghApi(`/repos/${repo}/pulls/${pr}/commits`, { shape: "array" }); },
+    // §5b: ONE commit's file list + patches — the same REST road prCommits reads
+    // the range's identities by, so the bump reading sits beside the identity
+    // reading rather than opening a second one. null on ANY miss => fail closed
+    // (the commit is simply not classified as a bump).
+    commitFiles(sha) {
+      try {
+        const c = ghApi(`/repos/${repo}/commits/${sha}`);
+        if (!c || !Array.isArray(c.files)) return null;
+        if (!Array.isArray(c.parents) || c.parents.length !== 1) return null;  // a merge commit is not a bump
+        return c.files;
+      } catch { return null; }
+    },
     // Tree object sha of a commit via the API. The BASE repo can resolve a FORK
     // head commit's tree (the local checkout cannot — fork heads aren't fetched),
     // closing the post-merge fork-PR false negative. Bound to THIS gate's
@@ -2518,6 +2862,11 @@ export function analyzePreMerge(ctx) {
   // check 5: any range commit authored/committed by a known agent must carry a
   // matching Assisted-by in its OWN message (branch-commit attribution).
   for (const id of ctx.rangeIdentities || []) {
+    // §5b: a TOOL-MADE DEPENDENCY BUMP is not agent work — no agent produced it,
+    // so `Assisted-by: none` (or no line) is the truthful record and this commit
+    // is not read as agent work at all. Every other commit falls through to the
+    // rule below, unchanged.
+    if (ctxCommitIsBump(ctx, id)) continue;
     const agentAuthor = looksLikeAgent({ name: id.authorName, email: id.authorEmail }, { tokens: ctx.agentTokens, allow: ctx.agentAllow });
     const agentCommitter = looksLikeAgent({ name: id.committerName, email: id.committerEmail }, { tokens: ctx.agentTokens, allow: ctx.agentAllow });
     if (agentAuthor || agentCommitter) {
@@ -3069,7 +3418,13 @@ export function analyzePostMerge(ctx) {
   // commit was agent-made. Nothing escapes: every landed commit is judged, each
   // against its own record (the loop below), which is also exactly what the §6
   // re-verify path will conclude for each of them individually.
-  const check5Identities = landedSelf ? [landedSelf] : ctx.rangeIdentities;
+  // §5b: tool-made dependency bumps are dropped from the reading first — a bump
+  // is not agent work, so it neither demands a named Assisted-by on its own
+  // landed record nor makes a squash record's `none` untrue.
+  const check5All = landedSelf ? [landedSelf] : ctx.rangeIdentities;
+  const check5Identities = Array.isArray(check5All)
+    ? check5All.filter((id) => !ctxCommitIsBump(ctx, id))
+    : check5All;
   if (Array.isArray(check5Identities) && check5Identities.length) {
     const anyAgent = check5Identities.some((id) =>
       looksLikeAgent({ name: id.authorName, email: id.authorEmail }, { tokens: ctx.agentTokens, allow: ctx.agentAllow }) ||
@@ -3217,6 +3572,15 @@ function defaultsPath(args) {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "config", "high-risk-defaults.json");
 }
 
+/**
+ * §5b: the tool-made-dependency-bump class definition. Co-located with the
+ * high-risk defaults (<ci>/config) and read the same fail-closed way — there is
+ * no CLI flag for it, so the reusable workflow's interface is unchanged.
+ */
+function bumpClassPath() {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "config", "tool-made-bump-class.json");
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const arm = args.arm || "pre-merge";
@@ -3286,6 +3650,16 @@ function main() {
     // Per-commit message lookup by SHA (so check 5 reads the right commit body).
     ctx.messageBySha = {};
     if (base) for (const id of rangeIdentities) { try { ctx.messageBySha[id.sha] = commitMessage(id.sha); } catch { /* skip */ } }
+    // §5b: the class definition, plus — for the range commits whose identity is
+    // IN the class — that commit's own changed files and hunk lines, read by the
+    // SAME git road as the identities above. Anything unreadable stays absent,
+    // so the commit is simply not a bump (fail closed).
+    ctx.bumpClass = loadJsonSafe(bumpClassPath());
+    ctx.commitDiffBySha = {};
+    if (base) for (const id of rangeIdentities) {
+      if (!identityInBumpClass(id, ctx.bumpClass)) continue;
+      try { ctx.commitDiffBySha[id.sha] = { changedFiles: changedFilesForCommit(id.sha), fileLines: commitDiffLines(id.sha) }; } catch { /* not a bump */ }
+    }
 
     if (client && args.pr) {
       try {
@@ -3338,6 +3712,7 @@ function main() {
     const ctx = {
       changedFiles: [], rangeIdentities: [], messageBySha: {},
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
+      bumpClass: loadJsonSafe(bumpClassPath()), commitDiffBySha: {},
       defaults, repoSuite, apiBound: false,
       membership: { status: "unresolved", number: null, candidates: [] },
       parentSuiteFile: { ok: false, reason: "no merge-group base" },
@@ -3353,6 +3728,11 @@ function main() {
         ctx.changedFiles = changedFilesForRange(groupBaseSha);
         ctx.rangeIdentities = rangeCommitIdentities(groupBaseSha);
         for (const id of ctx.rangeIdentities) { try { ctx.messageBySha[id.sha] = commitMessage(id.sha); } catch { /* skip */ } }
+        // §5b: the candidate's own bump diffs, same git road (see the pre-merge arm).
+        for (const id of ctx.rangeIdentities) {
+          if (!identityInBumpClass(id, ctx.bumpClass)) continue;
+          try { ctx.commitDiffBySha[id.sha] = { changedFiles: changedFilesForCommit(id.sha), fileLines: commitDiffLines(id.sha) }; } catch { /* not a bump */ }
+        }
         ctx.parentSuiteFile = jsonFileAtRef(groupBaseSha, ".github/gate-suite.json");
       } catch { /* leave the empty, fail-closed defaults */ }
     }
@@ -3420,6 +3800,7 @@ function main() {
     const ctx = {
       message, changedFiles, defaults, repoSuite,
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
+      bumpClass: loadJsonSafe(bumpClassPath()), commitDiffBySha: {},
     };
     // Range identities for check 5 (the squash's source commits): the merge
     // commit is a squash, so its first parent is the base it landed on; the
@@ -3551,6 +3932,21 @@ function main() {
         // per-commit inside analyzePostMerge. Anything unproven leaves the
         // single-commit binding exactly as it was (fail closed): the classifier
         // returns "single" and nothing below runs.
+        // §5b: each class-identity source commit's own files + hunk lines, read
+        // by the SAME REST road these identities came from (after a squash the
+        // branch commits are not in this checkout at all).
+        // The source commits' OWN messages, from the SAME payload: a commit that
+        // names an agent is never exempted (see ctxCommitIsBump).
+        ctx.messageBySha = ctx.messageBySha || {};
+        for (const c of prCommits || []) { if (c && c.sha) ctx.messageBySha[c.sha] = c.commit?.message ?? ""; }
+        for (const id of ctx.rangeIdentities) {
+          if (!identityInBumpClass(id, ctx.bumpClass)) continue;
+          const files = client.commitFiles(id.sha);
+          ctx.commitDiffBySha[id.sha] = {
+            changedFiles: (files || []).map((f) => f && f.filename).filter(Boolean),
+            fileLines: bumpLinesFromApiFiles(files),
+          };
+        }
         const prCommitMessages = (prCommits || []).map((c) => c.commit?.message ?? "");
         const landing = classifyLandedShape({
           mergedSha,
@@ -3567,6 +3963,13 @@ function main() {
             // changed path unjudged.
             commits: landing.commits.map((c) => ({ ...c, changedFiles: changedFilesForCommit(c.sha) })),
           };
+          // §5b: each landed commit's own bump diff (local git — a rebase landing
+          // put these commits on the default branch), for the per-commit check 5.
+          for (const c of ctx.landedRange.commits) {
+            if (c && c.sha && typeof c.message === "string") { (ctx.messageBySha = ctx.messageBySha || {})[c.sha] = c.message; }
+            if (!identityInBumpClass(c, ctx.bumpClass)) continue;
+            try { ctx.commitDiffBySha[c.sha] = { changedFiles: c.changedFiles, fileLines: commitDiffLines(c.sha) }; } catch { /* not a bump */ }
+          }
           ctx.contentMatch = resolveContentMatch({ commit: mergedSha, reviewedHeadSha: ctx.reviewedHeadSha, rangeBase: landing.base });
           // The staleness anchor moves with the binding: the on-main commit the
           // RANGE landed on, not the tip's own parent (which is itself a landed
