@@ -1,0 +1,17 @@
+{
+  "schema": "cinatra.delegated-merge-trust/v1",
+  "authority": {
+    "id": "grant-8e65116e40c6d1fb440753a9d0c93909ae7e25dff6b5ce74f08ce2ae283d3bbe",
+    "revision": 1,
+    "digest": "c4695a5ec66d98d78799b596154f700ab95709601fc3670a5633affb6d828fe9"
+  },
+  "ownerUserId": 8213731,
+  "bot": {
+    "login": "groganz-bot[bot]",
+    "userId": 293224031,
+    "appId": 4040322,
+    "organizationId": 271621020
+  },
+  "organization": "cinatra-ai",
+  "maximumReceiptSeconds": 86400
+}
