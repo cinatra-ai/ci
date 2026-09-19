@@ -1,7 +1,7 @@
 {
   "$comment": "The docs#156 AC1 inventory — the closure set the meta-commentary sweep and gate rollout are measured against. 'Published surface' = a page a non-contributor is expected to read: a public repo's root README.md / CHANGELOG.md, any docs/ tree, copy staged for an external listing (.wordpress-org/, .drupalorg/), and (docs#160) published HTML reference pages. Contributor-, maintainer-, and engineering-internal documentation is exempt by design; every exemption is RECORDED here per surface with a rationale, never implied. class values: 'published' (in scope; a caller of the reusable meta-commentary-gate should cover it), 'exempt-engineering-internal' (recorded exemption), 'staged-listing' (copy staged for an external directory listing; the docs#156 AC5 ruling makes it a PUBLISHED surface — asset-production notes are removed, not exempted, and its repo's caller scans the path). An optional 'coverage' field records that something OTHER than a pinned caller enforces the gate on that surface ('repo-local' = the repo runs its own blocking check); scripts/meta-commentary-surface-coverage.mjs (docs#160 AC11) reads it and treats an ABSENT coverage as 'a caller is required' — the escape is recorded, never inferred. Recorded from each PUBLIC, non-archived org repo's default branch as of recordedAt (enumerated via the GitHub API). Archived public repos are excluded (read-only; no callers can be added) and listed in excludedArchivedRepos. Private repos publish nothing and are out of scope by definition. Regenerate by running scripts/meta-commentary-surface-coverage.mjs --live and recording what it reports; update recordedAt when doing so.",
   "schemaVersion": 1,
-  "recordedAt": "2026-08-09",
+  "recordedAt": "2026-09-19",
   "issue": "cinatra-ai/docs#156 · cinatra-ai/docs#160",
   "surfacePatterns": [
     "README.md",
@@ -20,7 +20,7 @@
     "cinatra-ai/skill-recommender-agent",
     "cinatra-ai/trigger-agent"
   ],
-  "repoCount": 133,
+  "repoCount": 138,
   "repos": [
     {
       "repo": "cinatra-ai/.github",
@@ -155,6 +155,16 @@
       ]
     },
     {
+      "repo": "cinatra-ai/binary-artifact",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
       "repo": "cinatra-ai/blog-connector",
       "defaultBranch": "main",
       "surfaces": [
@@ -236,6 +246,16 @@
           "path": "CHANGELOG.md",
           "class": "published"
         },
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/blog-image-generator-agent",
+      "defaultBranch": "main",
+      "surfaces": [
         {
           "path": "README.md",
           "class": "published"
@@ -401,6 +421,20 @@
           "class": "published"
         },
         {
+          "path": "README.md",
+          "class": "published"
+        },
+        {
+          "path": "docs/README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
           "path": "docs/internals/architecture/skills-lifecycle.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
@@ -409,6 +443,11 @@
           "path": "docs/internals/architecture/stateful-service-inventory.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/attribution-corrections.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Maintainer mirror of commit attribution corrections and verification-record history."
         },
         {
           "path": "docs/internals/contracts/artifact-renderer-rsc-contract.md",
@@ -421,9 +460,24 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
+          "path": "docs/internals/contracts/core-extension-border.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor contract for enforcing the host/extension source boundary and its internal audit gates."
+        },
+        {
           "path": "docs/internals/contracts/default-off-flags.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/design-conformance-pin-drift.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Maintainer procedure for the conformance pin-drift CI check and adopting updated manifests."
+        },
+        {
+          "path": "docs/internals/contracts/design-pin-freshness-and-anchors.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor contract for pin freshness, anchor resolution and verification-record grammar gates."
         },
         {
           "path": "docs/internals/contracts/extension-clone-pinning.md",
@@ -441,6 +495,11 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
+          "path": "docs/internals/contracts/host-shared-primitives-contract.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor ABI and migration contract for sharing host design primitives with extension bundles."
+        },
+        {
           "path": "docs/internals/contracts/llm-provider-dependency-vocabulary.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
@@ -454,6 +513,16 @@
           "path": "docs/internals/contracts/mcp-supported-revisions.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/contracts/no-provider-key-at-rest.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor container credential handling invariant and the CI checks enforcing it."
+        },
+        {
+          "path": "docs/internals/contracts/product-tree-hygiene.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor tracked-tree hygiene contract and implementation of its CI guard."
         },
         {
           "path": "docs/internals/contracts/schema-migrations-and-org-write-policy.md",
@@ -526,9 +595,9 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
-          "path": "docs/internals/README.md",
+          "path": "docs/internals/records/2026-09-11-bridge-output-member-declarations.md",
           "class": "exempt-engineering-internal",
-          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+          "rationale": "Engineering measurement of output-schema declarations across a pinned extension set."
         },
         {
           "path": "docs/internals/records/attribution/attr-correction-05ed5e5b.md",
@@ -544,6 +613,11 @@
           "path": "docs/internals/records/attribution/attr-correction-13c12abe.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-1a143160.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Maintainer correction of a historical merge attribution record."
         },
         {
           "path": "docs/internals/records/attribution/attr-correction-2efb4f63.md",
@@ -601,6 +675,11 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
+          "path": "docs/internals/records/attribution/attr-correction-97e94d4c.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Maintainer correction of a historical gate-suite verification record."
+        },
+        {
           "path": "docs/internals/records/attribution/attr-correction-a01adbd5.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
@@ -639,6 +718,11 @@
           "path": "docs/internals/records/attribution/attr-correction-d76ae1b2.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/records/attribution/attr-correction-dd736768.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Maintainer correction of a historical merge verification record."
         },
         {
           "path": "docs/internals/records/attribution/attr-correction-de45a1f4.md",
@@ -741,6 +825,11 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
+          "path": "docs/internals/records/attribution/cinatra2584-reviewed-by-without-approval.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Maintainer audit of an unsupported review-attribution claim and its correction."
+        },
+        {
           "path": "docs/internals/records/attribution/cinatra346-attribution-correction.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
@@ -841,6 +930,11 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
+          "path": "docs/internals/records/audits/2951-blog-repair-new-run-road.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Engineering audit of the implemented lifecycle repair dispatch path."
+        },
+        {
           "path": "docs/internals/records/audits/v0.1.5-release-record.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
@@ -856,9 +950,29 @@
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
         },
         {
+          "path": "docs/internals/workflows/constrained-host-builds.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor build-memory measurements and local builder configuration guidance."
+        },
+        {
+          "path": "docs/internals/workflows/memory-conventions.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Coding-agent memory maintenance rules for contributors, not application user guidance."
+        },
+        {
+          "path": "docs/internals/workflows/provision-a-development-instance.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Explicitly developer-only fixture provisioning procedure for verification instances."
+        },
+        {
           "path": "docs/internals/workflows/upgrade-track.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
+        },
+        {
+          "path": "docs/internals/workflows/verification-record-3504.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Engineering candidate verification record with measured local checks and CI-deferred boundaries."
         },
         {
           "path": "docs/internals/workflows/webhooks/authoring-inbound-webhooks.md",
@@ -869,15 +983,6 @@
           "path": "docs/internals/workflows/webhooks/outbound-delivery.md",
           "class": "exempt-engineering-internal",
           "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
-        },
-        {
-          "path": "docs/README.md",
-          "class": "exempt-engineering-internal",
-          "rationale": "cinatra's docs/ is the engineering-internal tree by design (enforced by the repo docs-tree guard); it serves implementers, not product users."
-        },
-        {
-          "path": "README.md",
-          "class": "published"
         }
       ]
     },
@@ -1328,6 +1433,17 @@
       ]
     },
     {
+      "repo": "cinatra-ai/engineering-proofs",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "exempt-engineering-internal",
+          "rationale": "Contributor instructions for storing and linking pull-request verification media; not product or end-user documentation."
+        }
+      ]
+    },
+    {
       "repo": "cinatra-ai/extension-authoring-skill",
       "defaultBranch": "main",
       "surfaces": [
@@ -1551,6 +1667,16 @@
     },
     {
       "repo": "cinatra-ai/list-curator-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/markdown-artifact",
       "defaultBranch": "main",
       "surfaces": [
         {
@@ -1793,6 +1919,16 @@
     },
     {
       "repo": "cinatra-ai/planner-agent",
+      "defaultBranch": "main",
+      "surfaces": [
+        {
+          "path": "README.md",
+          "class": "published"
+        }
+      ]
+    },
+    {
+      "repo": "cinatra-ai/podcast-artifacts",
       "defaultBranch": "main",
       "surfaces": [
         {
