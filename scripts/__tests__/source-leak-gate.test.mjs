@@ -852,13 +852,22 @@ test("a FIXTURE basename exemption exists only while a pin-keyed expiry justifie
     `${entry.untilPin.file} no longer pins ${entry.untilPin.uses} at the sha the exemption is keyed to — delete the basename AND the expiry entry`);
 });
 
-test("the committed public-repos cache parses and holds only confirmed-public names", () => {
-  const loaded = loadKnownPublicRepos(path.join(import.meta.dirname, "..", "..", "config", "public-repos.json"));
-  assert.ok(loaded.names.size >= 1, "the cache must load");
-  // It is a latency cache, never an authority for "private": nothing the offline
-  // list calls private, and nothing the probe exempts, may sit in it.
-  for (const n of loaded.names) {
-    assert.equal(PROBE_EXEMPT_NAMES.has(n), false, `${n} cannot be both cached-public and privately owned`);
+test("the committed public-repos cache has valid metadata and only non-exempt names", () => {
+  const cachePath = path.join(import.meta.dirname, "..", "..", "config", "public-repos.json");
+  const snapshot = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+  assert.ok(Array.isArray(snapshot.public) && snapshot.public.length > 0, "the committed cache contains entries");
+  // This is a structural check of a committed snapshot, not a live freshness
+  // promise. Expired entries correctly fall back to the API; the independent
+  // TTL/expiry/probe tests below verify that behavior with explicit clocks.
+  const recordedAt = snapshot.public.map((entry) => entry.verifiedAt).sort().at(-1);
+  const loaded = loadKnownPublicRepos(cachePath, { now: `${recordedAt}T00:00:00.000Z` });
+  assert.equal(loaded.ttlValid, true);
+  assert.deepEqual(loaded.warnings, [], "committed metadata must be valid at its recorded epoch");
+  assert.equal(loaded.entries.length, snapshot.public.length);
+  assert.ok(loaded.names.size >= 1, "the newest confirmed entry loads at its recorded epoch");
+  // Check every declared name, including entries older than the latest stamp.
+  for (const { name } of loaded.entries) {
+    assert.equal(PROBE_EXEMPT_NAMES.has(name), false, `${name} cannot be both cached-public and privately owned`);
   }
 });
 
