@@ -957,7 +957,7 @@
         {
           "path": "docs/internals/workflows/memory-conventions.md",
           "class": "exempt-engineering-internal",
-          "rationale": "Coding-agent memory maintenance rules for contributors, not application user guidance."
+          "rationale": "Repository maintenance conventions for durable contributor notes and their ownership."
         },
         {
           "path": "docs/internals/workflows/provision-a-development-instance.md",
