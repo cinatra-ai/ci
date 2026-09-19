@@ -233,6 +233,10 @@
       "defaultBranch": "main",
       "surfaces": [
         {
+          "path": "CHANGELOG.md",
+          "class": "published"
+        },
+        {
           "path": "README.md",
           "class": "published"
         }
