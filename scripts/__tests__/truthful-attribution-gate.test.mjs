@@ -62,8 +62,53 @@ import {
 // still LINKS against a build that does not have them (the five bump tests then
 // fail on their own, which is what red-first needs).
 import * as gateExports from "../truthful-attribution-gate.mjs";
+// The maintained hosted job names this test file explicitly; importing the
+// receipt fixture also runs its strict protocol cases in that existing job.
+import { fixture as delegatedFixture } from "./delegated-merge-receipt.test.mjs";
+import { pointer as authorizationPointer, digest as authorizationDigest, normalizeFiles as authorizationFiles } from "../delegated-merge-receipt.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
+
+test("scoped delegation is a strict distinct trailer arm", () => {
+  const f = delegatedFixture(), ref = authorizationPointer(f.pr.body);
+  const trailer = `Merge-authorization: delegated-v1 ${ref.url} sha256:${ref.digest}`;
+  const parsed = parseTrailers("change\n\nAssisted-by: Codex (gpt-6)\n" + trailer);
+  assert.deepEqual(parsed.errors, []);
+  assert.equal(parsed.hasDelegatedArm, true);
+  assert.equal(parsed.hasHumanArm, false);
+  assert.deepEqual(classifyArm(parsed).errors, []);
+  for (const bad of [trailer.replace("delegated-v1", "delegated-v2"), trailer + " ", trailer + "\n" + trailer]) {
+    assert.ok(parseTrailers("change\n\nAssisted-by: none\n" + bad).errors.length);
+  }
+});
+test("actual verified receipt permits scoped high-risk premerge while preserving other findings", () => {
+  const f = delegatedFixture(), verified = f.check();
+  assert.equal(verified.ok, true);
+  const ctx = { changedFiles: [".github/workflows/check.yml"], defaults: DEFAULTS_OK, repoSuite: null,
+    apiBound: true, reviews: [], declaredAuthorization: verified.reference, delegation: verified };
+  assert.deepEqual(analyzePreMerge(ctx).findings, []);
+  assert.ok(analyzePreMerge({ ...ctx, delegation: undefined }).findings.some(row => row.code === "merge-authorization-unverifiable"));
+  assert.ok(analyzePreMerge({ ...ctx, delegationRequested: false, declaredAuthorization: null }).findings.some(row => row.code === "high-risk-without-maintainer"));
+  assert.ok(analyzePreMerge({ ...ctx, declaredReviewedBy: [{ login: "invented-review", tier: "maintainer" }] }).findings.some(row => row.code === "reviewed-by-fabricated"));
+  assert.ok(analyzePreMerge({ ...ctx, declaredGateArm: gateParsed() }).findings.some(row => row.code === "gate-suite-unverifiable"));
+});
+test("postmerge requires exact authenticated receipt and preserves landed content checks", () => {
+  const f = delegatedFixture(); f.post();
+  const verified = f.check({ arm: "post-merge", mergedSha: f.pr.merge_commit_sha });
+  assert.equal(verified.ok, true);
+  const ref = verified.reference;
+  const message = `change\n\nAssisted-by: Codex (gpt-6)\nMerge-authorization: delegated-v1 ${ref.url} sha256:${ref.digest}`;
+  const ctx = { message, changedFiles: [".github/workflows/check.yml"], defaults: DEFAULTS_OK, repoSuite: null,
+    apiBound: true, reviews: [], delegation: verified, treeMatch: true };
+  assert.deepEqual(analyzePostMerge(ctx).findings, []);
+  for (const delegation of [undefined, { ok: false, reasons: ["revoked"] }, { ...verified, reference: { ...ref, commentId: 100 } }]) {
+    assert.ok(analyzePostMerge({ ...ctx, delegation }).findings.some(row => row.code === "merge-authorization-unverifiable"));
+  }
+  assert.ok(analyzePostMerge({ ...ctx, apiBound: false }).findings.some(row => row.code === "merge-authorization-unverifiable"));
+  assert.ok(analyzePostMerge({ ...ctx, treeMatch: false, contentMatch: false }).findings.some(row => row.code === "content-mismatch"));
+  assert.ok(analyzePostMerge({ ...ctx, treeMatch: undefined }).findings.some(row => row.code === "tree-unverifiable"));
+  assert.ok(analyzePostMerge({ ...ctx, message: message + "\nReviewed-by: Invented Person <review@example.invalid> (@invented-review, tier=maintainer)" }).findings.some(row => row.code === "reviewed-by-fabricated"));
+});
 
 // =========================================================================
 // §1 — Trailer grammar: parseTrailers
@@ -4529,4 +4574,89 @@ test("§5c the post-merge arm can READ a squashed PR's merge: refs/pull/N/head b
   assert.equal(gateExports.fetchPrHeadRef(null, { cwd: landed }), false);
   fs.rmSync(origin.dir, { recursive: true, force: true });
   fs.rmSync(landed, { recursive: true, force: true });
+});
+
+test("delegated actual CLI uses immutable engine authority and real pre/post squash trees", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "delegated-git-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const git = (...args) => {
+    const r = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr); return r.stdout.trim();
+  };
+  git("init", "-b", "main"); git("config", "user.name", "Fixture Contributor"); git("config", "user.email", "fixture@example.invalid");
+  fs.mkdirSync(path.join(directory, ".github/workflows"), { recursive: true });
+  fs.writeFileSync(path.join(directory, ".github/workflows/check.yml"), "name: original\n");
+  git("add", "."); git("commit", "-m", "initial\n\nAssisted-by: none");
+  const oldBase = git("rev-parse", "HEAD");
+  git("switch", "-c", "feature/work");
+  fs.writeFileSync(path.join(directory, ".github/workflows/check.yml"), "name: changed\n");
+  git("commit", "-am", "change workflow\n\nAssisted-by: Codex (gpt-6)");
+  const head = git("rev-parse", "HEAD"), headTree = git("rev-parse", "HEAD^{tree}");
+  git("switch", "main"); fs.writeFileSync(path.join(directory, "unrelated.txt"), "independent base advance\n");
+  git("add", "."); git("commit", "-m", "base advance\n\nAssisted-by: none");
+  const base = git("rev-parse", "HEAD"), mergeTree = git("merge-tree", "--write-tree", base, head).split("\n")[0];
+  git("switch", "feature/work");
+  const f = delegatedFixture({ trustedPolicy: true }), repo = f.receipt.target.repository;
+  Object.assign(f.receipt.target, { headSha: head, headTree, mergeTree, base: { ref: "main", sha: base }, policy: { ref: "main", sha: base } });
+  const now = Math.floor(Date.now() / 1000) * 1000;
+  const stamp = ms => new Date(ms).toISOString().replace(".000Z", "Z");
+  f.receipt.issuedAt = stamp(now - 60000); f.receipt.validUntil = stamp(now + 3600000);
+  f.comment.created_at = f.comment.updated_at = stamp(now - 59000);
+  f.files[0] = { filename: ".github/workflows/check.yml", status: "modified", sha: git("rev-parse", head + ":.github/workflows/check.yml"), additions: 1, deletions: 1, changes: 2 };
+  f.receipt.scope.fileInventoryDigest = authorizationDigest(authorizationFiles(f.files));
+  f.pr.head.sha = head; f.pr.base.sha = oldBase;
+  f.pr.user = { login: "fixture-contributor" };
+  f.seal();
+  const oldRoot = f.root, api = f.api;
+  for (const key of Object.keys(api)) if (key.includes("/git/")) delete api[key];
+  const commit = sha => ({ sha, commit: { tree: { sha: git("rev-parse", sha + "^{tree}") }, message: git("show", "-s", "--format=%B", sha),
+    author: { name: "Fixture Contributor", email: "fixture@example.invalid" }, committer: { name: "Fixture Contributor", email: "fixture@example.invalid" } },
+    parents: git("show", "-s", "--format=%P", sha).split(" ").filter(Boolean).map(sha => ({ sha })) });
+  for (const sha of [head, base]) {
+    const c = commit(sha); api[oldRoot + "/commits/" + sha] = c;
+    api[oldRoot + "/git/commits/" + sha] = { sha, tree: c.commit.tree, parents: c.parents };
+  }
+  api[oldRoot + "/git/ref/heads/main"] = { ref: "refs/heads/main", object: { type: "commit", sha: base } };
+  api[oldRoot + "/pulls/7/reviews"] = [];
+  api[oldRoot + "/pulls/7/commits"] = [commit(head)];
+  api[oldRoot + "/commits/" + head + "/check-runs?filter=all"] = { total_count: 0, check_runs: [] };
+  const fixtureFile = path.join(directory, "transport.json"), bindir = path.join(directory, "fixture-bin"); fs.mkdirSync(bindir);
+  const gh = path.join(bindir, "gh");
+  fs.writeFileSync(gh, "#!/usr/bin/env node\n" + `
+const fs=require('node:fs'),args=process.argv.slice(2),endpoint=args.at(-1);
+if(args[0]!=='api')throw Error('only read-only API fixture');
+if(args.includes('--method') && args[args.indexOf('--method')+1]!=='GET')throw Error('mutation forbidden');
+const api=JSON.parse(fs.readFileSync(process.env.DELEGATION_FIXTURE));
+if(!(endpoint in api))throw Error('unexpected endpoint '+endpoint);
+const value=api[endpoint];process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value));
+`); fs.chmodSync(gh, 0o700);
+  const env = { ...process.env, PATH: bindir + path.delimiter + process.env.PATH, DELEGATION_FIXTURE: fixtureFile };
+  const run = (...args) => { fs.writeFileSync(fixtureFile, JSON.stringify(api)); return spawnSync(process.execPath,
+    [GATE, "--mode", "enforce", "--format", "json", "--repo", repo, "--gate-arm-wait-ms", "0", ...args],
+    { cwd: directory, env, encoding: "utf8", timeout: 20000 }); };
+  const pre = () => run("--arm", "pre-merge", "--pr", "7", "--head-sha", head, "--diff-base", "main");
+  let r = pre(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(JSON.parse(r.stdout).highRisk, true);
+  const pointerBody = f.pr.body;
+  f.pr.body += "\n\nAssisted-by: Codex (gpt-6)\nReviewed-by: Invented Person <review@example.invalid> (@invented-review, tier=maintainer)";
+  api[oldRoot + "/collaborators/invented-review/permission"] = { permission: "admin" };
+  r = pre(); assert.notEqual(r.status, 0); assert.match(r.stdout, /reviewed-by-fabricated/);
+  f.pr.body = pointerBody;
+  // Candidate-owned config cannot widen the pinned engine's authority.
+  fs.mkdirSync(path.join(directory, "config")); fs.writeFileSync(path.join(directory, "config/delegated-merge-authorities.json"), JSON.stringify({ allowAll: true }));
+  const digestBefore = f.receipt.authority.digest; f.receipt.authority.digest = "0".repeat(64); f.seal();
+  r = pre(); assert.notEqual(r.status, 0); assert.match(r.stdout, /merge-authorization-unverifiable/);
+  f.receipt.authority.digest = digestBefore; f.seal();
+  const ref = authorizationPointer(f.pr.body);
+  git("switch", "main"); git("merge", "--squash", "feature/work");
+  git("commit", "-m", `change workflow (#7)\n\nAssisted-by: Codex (gpt-6)\nMerge-authorization: delegated-v1 ${ref.url} sha256:${ref.digest}`);
+  const landed = git("rev-parse", "HEAD"), landedCommit = commit(landed);
+  f.pr.state = "closed"; f.pr.merged = true; f.pr.merge_commit_sha = landed; f.pr.merged_at = stamp(now - 58000);
+  api[oldRoot + "/commits/" + landed + "/pulls"] = [f.pr];
+  api[oldRoot + "/git/commits/" + landed] = { sha: landed, tree: landedCommit.commit.tree, parents: landedCommit.parents };
+  api[oldRoot + "/commits/" + landed] = landedCommit;
+  const post = () => run("--arm", "post-merge", "--commit", landed);
+  r = post(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  api[oldRoot + "/git/commits/" + landed].parents = [{ sha: oldBase }];
+  r = post(); assert.notEqual(r.status, 0); assert.match(r.stdout, /merge-authorization-unverifiable/);
 });

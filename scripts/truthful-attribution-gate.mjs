@@ -118,6 +118,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { canonical as canonicalAuthorization, parseAuthorization, verifyDelegatedReceipt } from "./delegated-merge-receipt.mjs";
 
 export const GATE_VERSION = "0.3.0";
 
@@ -184,7 +185,7 @@ const CORRECTION_RE = /^Correction-for:[ \t]+(?<sha>[0-9a-fA-F]{40})[ \t]*$/;
 
 // Lines we own (any malformed instance of one of these keys is an error, not an
 // "unknown trailer"). Unknown keys (ticket refs etc.) are ignored, not errors.
-const OWNED_KEY_RE = /^(Assisted-by|Reviewed-by|Gate-suite|Accountable|Correction-for):/;
+const OWNED_KEY_RE = /^(Assisted-by|Reviewed-by|Gate-suite|Accountable|Correction-for|Merge-authorization):/;
 
 // Git-standard auto-generated IDENTITY trailers. On `gh pr merge
 // --squash`, GitHub auto-appends a `Co-authored-by:` line as its OWN trailer
@@ -281,6 +282,8 @@ export function parseTrailers(message) {
   let gateSuite = null; // { suite, version, raw } | null
   let accountable = null; // { name, email, login, raw } | null
   let correctionFor = null; // sha | null
+  let authorization = null;
+  let authorizationCount = 0;
   let gateSuiteCount = 0;
   let accountableCount = 0;
   let correctionCount = 0;
@@ -356,6 +359,11 @@ export function parseTrailers(message) {
       correctionFor = m.groups.sha.toLowerCase();
       continue;
     }
+    if ((m = parseAuthorization(raw))) {
+      authorizationCount++;
+      authorization = m;
+      continue;
+    }
     // A line that uses an OWNED key but did not match its strict grammar is an
     // error (malformed owned trailer), not an ignorable unknown trailer.
     if (OWNED_KEY_RE.test(raw)) {
@@ -384,6 +392,7 @@ export function parseTrailers(message) {
   if (gateSuiteCount > 1) errors.push(`duplicate Gate-suite trailer (only one allowed)`);
   if (accountableCount > 1) errors.push(`duplicate Accountable trailer (only one allowed)`);
   if (correctionCount > 1) errors.push(`duplicate Correction-for trailer (only one allowed)`);
+  if (authorizationCount > 1) errors.push(`duplicate Merge-authorization trailer (only one allowed)`);
   // Gate arm: Gate-suite and Accountable must both appear, and Accountable must
   // immediately follow Gate-suite.
   if (gateSuite && !accountable) errors.push(`Gate-suite present without Accountable (gate arm requires both)`);
@@ -401,8 +410,10 @@ export function parseTrailers(message) {
     gateSuite,
     accountable,
     correctionFor,
+    authorization,
     hasHumanArm: reviewed.length > 0,
     hasGateArm: Boolean(gateSuite && accountable),
+    hasDelegatedArm: Boolean(authorization),
   };
 }
 
@@ -415,8 +426,8 @@ export function parseTrailers(message) {
  */
 export function classifyArm(parsed) {
   const errors = [];
-  if (!parsed.hasHumanArm && !parsed.hasGateArm) {
-    errors.push(`no verification arm — need a Reviewed-by (human arm) or a Gate-suite+Accountable (gate arm)`);
+  if (!parsed.hasHumanArm && !parsed.hasGateArm && !parsed.hasDelegatedArm) {
+    errors.push(`no verification arm — need a Reviewed-by (human arm), a Gate-suite+Accountable (gate arm), or a verified Merge-authorization`);
   }
   return { errors, hasHumanArm: parsed.hasHumanArm, hasGateArm: parsed.hasGateArm };
 }
@@ -2994,6 +3005,10 @@ function canonicalizeForBump(v) {
  */
 export function analyzePreMerge(ctx) {
   const findings = [];
+  const delegationRequested = Boolean(ctx.delegationRequested || ctx.declaredAuthorization);
+  const delegated = delegationRequested && ctx.apiBound === true && ctx.delegation?.ok === true;
+  if (delegationRequested && !delegated) findings.push({ code: "merge-authorization-unverifiable", severity: "error",
+    message: "scoped merge authorization failed: " + (ctx.delegation?.reasons || ["authenticated receipt unavailable"]).join("; ") });
 
   // check 4 + §3: high-risk mapping (always computable from the diff + config).
   const hr = classifyHighRisk(ctx.changedFiles || [], ctx.defaults, ctx.repoSuite);
@@ -3035,7 +3050,7 @@ export function analyzePreMerge(ctx) {
   // can evaluate this when the API gave us the declared Reviewed-by claim +
   // reviews. (The squash record's Reviewed-by is post-merge; here the gate uses
   // the PR's actual approvals as the proxy for what the record will assert.)
-  if (hr.highRisk) {
+  if (hr.highRisk && !delegated) {
     if (!ctx.apiBound || !ctx.reviews) {
       // High-risk change but no API to verify a maintainer approval — cannot
       // pass it (fail closed). The PR carries a high-risk surface; without the
@@ -3413,6 +3428,10 @@ export function analyzePostMerge(ctx) {
   // pass it — that is the fail-open hole. We emit an "unverifiable-claim"
   // finding so the record is never blessed without its claims being checked.
   const apiBound = Boolean(ctx.apiBound);
+  const delegated = parsed.hasDelegatedArm && apiBound && ctx.delegation?.ok === true
+    && canonicalAuthorization(parsed.authorization) === canonicalAuthorization(ctx.delegation.reference);
+  if (parsed.hasDelegatedArm && !delegated) findings.push({ code: "merge-authorization-unverifiable", severity: "error",
+    message: "scoped merge authorization failed: " + (ctx.delegation?.reasons?.length ? ctx.delegation.reasons : ["authenticated exact receipt unavailable"]).join("; ") });
 
   // §6 SCOPE GUARD. Correction discovery runs ONLY when main() explicitly opted
   // this analysis in — i.e. the re-verify path, where a specific commit was named
@@ -3495,7 +3514,7 @@ export function analyzePostMerge(ctx) {
       // Tree resolved and differs, and content could NOT be re-derived on both
       // sides to prove equivalence — preserve the tree-mismatch signal (fail closed).
       findings.push({ code: "tree-mismatch", severity: "error", message: `tree(merged) != tree(reviewed head) — the landed tree is not what was reviewed; approvals/contexts do not bind` });
-    } else if (apiBound && (parsed.hasHumanArm || parsed.hasGateArm)) {
+    } else if (apiBound && (parsed.hasHumanArm || parsed.hasGateArm || parsed.hasDelegatedArm)) {
       // API bound but NEITHER tree NOR content could be resolved on both sides —
       // cannot confirm what landed == what was reviewed. Fail closed.
       findings.push({ code: "tree-unverifiable", severity: "error", message: `cannot resolve tree(merged) and tree(reviewed head), nor re-derive the content fingerprint on both sides, to confirm the landed change was the reviewed one — failing closed` });
@@ -3527,7 +3546,7 @@ export function analyzePostMerge(ctx) {
       }
     }
   }
-  if (hr.highRisk && passingMaintainer.length === 0) {
+  if (hr.highRisk && passingMaintainer.length === 0 && !delegated) {
     findings.push({ code: "high-risk-without-maintainer", severity: "error", message: `high-risk change but no passing tier=maintainer Reviewed-by in the record (high-risk requires the human arm; the gate arm alone is rejected)` });
   }
 
@@ -3819,6 +3838,7 @@ function main() {
     if (client && args.pr) {
       try {
         const pr = client.pr(args.pr);
+        ctx.delegationRequested = /^Merge authorization:|^Merge-authorization:/im.test(pr.body || "");
         ctx.prAuthorLogin = pr.user?.login;
         ctx.reviewedHeadSha = args["head-sha"] || pr.head?.sha;
         ctx.reviews = client.listReviews(args.pr);
@@ -3832,6 +3852,14 @@ function main() {
         // declared-arm fail-closed checks reachable. Absent a body record, the
         // gate still truth-checks the actual approvals via approverLogins (above).
         const declared = parseTrailers(pr.body || "");
+        ctx.declaredAuthorization = declared.authorization;
+        if (ctx.delegationRequested) {
+          const hasTrailer = /^Merge-authorization:/im.test(pr.body || "");
+          ctx.delegation = hasTrailer && (!declared.authorization || declared.errors.length)
+            ? { ok: false, reasons: ["declared authorization record is malformed"] }
+            : verifyDelegatedReceipt({ repository: repo, pullRequest: Number(args.pr), expectedHead: ctx.reviewedHeadSha,
+              arm: "pre-merge", record: declared.authorization, mergeTree: mergedTreeOf });
+        }
         if (declared.reviewed.length) ctx.declaredReviewedBy = declared.reviewed;
         if (declared.hasGateArm) ctx.declaredGateArm = declared;
 
@@ -4034,6 +4062,14 @@ function main() {
           permissionByLogin: ctx.permissionByLogin,
         });
         ctx.reviewedHeadSha = rh.headSha;
+        const authorization = parseTrailers(message).authorization;
+        if (authorization) {
+          // A deleted branch may require the immutable pull head ref for the
+          // mechanical tree proof. This fetch cannot grant authorization.
+          if (!hasCommitLocally(ctx.reviewedHeadSha)) fetchPrHeadRef(prNumber);
+          ctx.delegation = verifyDelegatedReceipt({ repository: repo, pullRequest: prNumber, expectedHead: ctx.reviewedHeadSha,
+            arm: "post-merge", record: authorization, mergedSha, mergeTree: mergedTreeOf });
+        }
         ctx.approvedHeads = rh.approvedHeads;
         ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha);
         ctx.runWorkflow = makeRunWorkflowResolver(client);
