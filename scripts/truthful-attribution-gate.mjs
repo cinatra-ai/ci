@@ -3186,6 +3186,33 @@ function queuePrIdentity(pr) {
     head: { sha: pr.head?.sha, ref: pr.head?.ref, repository: pr.head?.repo?.full_name, repositoryId: pr.head?.repo?.id },
     base: { ref: pr.base?.ref, repository: pr.base?.repo?.full_name, repositoryId: pr.base?.repo?.id } };
 }
+// A current API-bound result for callers, never an alternate authority input.
+// The review path permits a fork head; the delegated predicate already requires
+// both repositories to be the receipt's exact repository.
+function verifiedQueueBinding(ctx, groupHeadSha) {
+  const q = ctx.queueBinding, m = ctx.membership, candidate = ctx.queueCandidate;
+  const delegated = Boolean(ctx.delegationRequested || ctx.declaredAuthorization);
+  const authority = delegated ? queuedDelegation(ctx) : ctx.approvedHeadCheck;
+  const full = value => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+  const positive = value => Number.isSafeInteger(value) && value > 0;
+  if (!(ctx.apiBound === true && authority?.ok === true && candidate?.ok === true
+    && m?.status === "resolved" && m.candidates?.length === 1 && positive(m.number)
+    && q?.headIsCheckout === true && q.pulls?.length === 1
+    && q.pulls[0].number === m.number && q.pulls[0].head?.sha === m.headAtEnqueue
+    && full(groupHeadSha) && full(q.baseSha) && full(m.headAtEnqueue)
+    && q.parents?.length === 2 && q.parents[0] === q.baseSha && q.parents[1] === m.headAtEnqueue
+    && full(candidate.groupTree) && candidate.groupTree === candidate.expectedTree
+    && q.pr?.number === m.number && q.pr.state === "open" && q.pr.merged === false && q.pr.draft === false
+    && q.pr.head?.sha === m.headAtEnqueue && typeof q.pr.head?.ref === "string" && q.pr.head.ref.length > 0
+    && positive(q.pr.head?.repo?.id) && typeof q.pr.head.repo.full_name === "string"
+    && positive(q.pr.base?.repo?.id) && q.pr.base.repo.full_name === q.repository
+    && typeof q.pr.base?.ref === "string" && q.pr.base.ref.length > 0
+    && canonicalAuthorization(queuePrIdentity(q.pr)) === canonicalAuthorization(queuePrIdentity(q.finalPr)))) return null;
+  return { schema: "cinatra.queue-binding/v1", repository: q.repository, repositoryId: q.pr.base.repo.id,
+    pullRequest: m.number, headSha: m.headAtEnqueue, headRepositoryId: q.pr.head.repo.id,
+    baseRef: q.pr.base.ref, baseSha: q.baseSha, groupHeadSha, parents: [...q.parents],
+    groupTree: candidate.groupTree, authority: delegated ? "delegated-v1" : "review" };
+}
 export function analyzeMergeGroup(ctx) {
   const findings = [];
   const delegationRequested = Boolean(ctx.delegationRequested || ctx.declaredAuthorization);
@@ -3762,7 +3789,7 @@ function parseArgs(argv) {
 }
 
 const GH = process.env.GITHUB_ACTIONS === "true";
-function annotate(level, msg) { if (GH) process.stdout.write(`::${level}::${msg.replace(/\n/g, " ")}\n`); }
+function annotate(level, msg, stream = process.stdout) { if (GH) stream.write(`::${level}::${msg.replace(/\n/g, " ")}\n`); }
 function emitStepSummary(lines) {
   const f = process.env.GITHUB_STEP_SUMMARY;
   if (!f) return;
@@ -3809,6 +3836,7 @@ function main() {
   }
 
   let result;
+  let queueBinding = null;
   let apiSkippedReason = null;
 
   // This gate's own Actions run id — the self-reference exclusion key (§5 check3).
@@ -4018,9 +4046,9 @@ function main() {
             ? { ok: false, reasons: ["declared authorization record is malformed"] }
             : verifyDelegatedReceipt({ repository: repo, pullRequest: prNumber, expectedHead: ctx.reviewedHeadSha,
               arm: "pre-merge", record: declared.authorization, mergeTree: mergedTreeOf });
-          ctx.queueBinding.pr = pr;
-          ctx.queueBinding.finalPr = client.pr(prNumber);
         }
+        ctx.queueBinding.pr = pr;
+        ctx.queueBinding.finalPr = client.pr(prNumber);
         ctx.apiBound = true;
       } catch (e) {
         apiSkippedReason = `GitHub API unavailable (${e.message}) — the queued pull request could not be verified; failing closed`;
@@ -4028,6 +4056,11 @@ function main() {
       }
     }
     result = analyzeMergeGroup(ctx);
+    if (mode === "enforce" && !apiSkippedReason && result.findings.length === 0) {
+      queueBinding = verifiedQueueBinding(ctx, groupHeadSha);
+      if (!queueBinding) result.findings.push({ code: "queue-binding-unverifiable", severity: "error",
+        message: "a complete current pull-request identity and ordered group tree could not be bound" });
+    }
   } else {
     // post-merge: validate the squash record on the given commit (default HEAD).
     const commit = args.commit || "HEAD";
@@ -4269,6 +4302,7 @@ function main() {
     repo: repo || null,
     highRisk: Boolean(result.highRisk),
     apiSkippedReason,
+    queueBinding,
     // §6: the landed correction whose record governed this verdict (re-verify
     // path only; null when the commit's own record was the record of truth).
     governedBy: result.governedBy || null,
@@ -4292,8 +4326,10 @@ function main() {
   }
 
   // GitHub annotations + step summary. WARN keeps the check green regardless.
-  for (const f of findings) annotate(f.severity === "error" ? "warning" : "notice", `truthful-attribution [${f.code}] ${f.message}`);
-  if (apiSkippedReason) annotate("notice", `truthful-attribution: ${apiSkippedReason}`);
+  // Machine-readable stdout stays one JSON document under Actions as well.
+  const annotationStream = format === "json" ? process.stderr : process.stdout;
+  for (const f of findings) annotate(f.severity === "error" ? "warning" : "notice", `truthful-attribution [${f.code}] ${f.message}`, annotationStream);
+  if (apiSkippedReason) annotate("notice", `truthful-attribution: ${apiSkippedReason}`, annotationStream);
   const summary = [`## truthful-attribution-gate (${mode.toUpperCase()})`, "", `Arm: \`${arm}\`${result.highRisk ? " · **high-risk path touched**" : ""}`, ""];
   if (apiSkippedReason) summary.push(`> ${apiSkippedReason}`, "");
   if (findings.length === 0) summary.push("Clean — a truthful verification record is present and no fabrication was detected.");
