@@ -82,7 +82,7 @@ test("candidate cwd/env cannot replace source-owned principal or add mutation co
   const f = fixture(t); f.add(); fs.mkdirSync(path.join(f.dir, "config"));
   fs.writeFileSync(path.join(f.dir, "config/delegated-merge-authorities.json"), JSON.stringify({ bot: { userId: 1 } }));
   assert.equal(f.run([], { DEVOPS_OPERATOR_CONFIG: "/missing", BOUNDARY_BOT_ID: "1" }).status, 0);
-  for (const args of [["--repo", "foreign/ci"], ["--repo", "cinatra-ai/product.."], ["--head", HEAD.slice(0, 12)], ["--pr", "0"], ["--publish"], ["--trust", "/tmp/policy"]]) {
+  for (const args of [["--repo", "foreign/ci"], ["--repo", "cinatra-ai/ci.."], ["--head", HEAD.slice(0, 12)], ["--pr", "0"], ["--publish"], ["--trust", "/tmp/policy"]]) {
     refused(f.run(args)); assert.equal(fs.existsSync(f.trace), false);
   }
 });
@@ -148,7 +148,7 @@ test("direct/list security parity and repeated-read movement refuse", t => {
 });
 
 test("canonical producer receipts still require exact live repository/PR/schema scope", t => {
-  for (const changes of [{ repository: "cinatra-ai/other" }, { repositoryId: 11 }, { pullRequest: 8 }, { schema: "other/v1" }]) {
+  for (const changes of [{ repository: "cinatra-ai/cinatra" }, { repositoryId: 11 }, { pullRequest: 8 }, { schema: "other/v1" }]) {
     const f = fixture(t); f.add("candidate", HEAD, ["unit"], changes); refused(f.run());
   }
 });

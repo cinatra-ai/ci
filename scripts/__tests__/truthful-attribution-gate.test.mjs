@@ -4714,7 +4714,9 @@ const version=args.includes('X-GitHub-Api-Version: 2022-11-28');
 process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   (key,value)=>key==='merge_commit_sha'&&!version?undefined:value));
 `); fs.chmodSync(gh, 0o700);
-  const env = { ...process.env, PATH: bindir + path.delimiter + process.env.PATH, DELEGATION_FIXTURE: fixtureFile };
+  // Keep the real hosted annotation path active, including negative verdicts.
+  const env = { ...process.env, GITHUB_ACTIONS: "true", GITHUB_STEP_SUMMARY: path.join(directory, "step-summary.md"),
+    PATH: bindir + path.delimiter + process.env.PATH, DELEGATION_FIXTURE: fixtureFile };
   const run = (...args) => { fs.writeFileSync(fixtureFile, JSON.stringify(api)); fs.rmSync(fixtureFile + ".profile-reads", { force: true }); fs.rmSync(fixtureFile + ".pr-reads", { force: true }); return spawnSync(process.execPath,
     [GATE, "--mode", "enforce", "--format", "json", "--repo", repo, "--gate-arm-wait-ms", "0", ...args],
     { cwd: directory, env, encoding: "utf8", timeout: 20000 }); };
@@ -4765,6 +4767,7 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   api[associated] = [f.pr];
   const queue = (candidate = group, candidateBase = base) => run("--arm", "merge-group", "--merge-group-head", candidate, "--merge-group-base", candidateBase);
   r = queue(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /::(?:notice|warning)::/);
   assert.equal(JSON.parse(r.stdout).highRisk, true);
   const binding = { schema: "cinatra.queue-binding/v1", repository: repo, repositoryId: f.receipt.target.repositoryId,
     pullRequest: 7, headSha: head, headRepositoryId: f.receipt.target.repositoryId, baseRef: "main", baseSha: base,
@@ -4776,6 +4779,9 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   assert.equal(r.status, 0); assert.equal(JSON.parse(r.stdout).queueBinding, null);
   delete api[associated]; r = queue(); assert.notEqual(r.status, 0);
   assert.match(JSON.parse(r.stdout).apiSkippedReason, /API unavailable/); assert.equal(JSON.parse(r.stdout).queueBinding, null);
+  assert.doesNotMatch(r.stdout, /::(?:notice|warning)::/);
+  assert.match(r.stderr, /::notice::truthful-attribution: GitHub API unavailable/);
+  assert.match(r.stderr, /::warning::truthful-attribution/);
   api[associated] = [f.pr];
   // Same authorized tree with different parents is still not the frozen group.
   const olderGroup = git("commit-tree", mergeTree, "-p", oldBase, "-p", head, "-m", "older group");

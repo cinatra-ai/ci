@@ -3789,7 +3789,7 @@ function parseArgs(argv) {
 }
 
 const GH = process.env.GITHUB_ACTIONS === "true";
-function annotate(level, msg) { if (GH) process.stdout.write(`::${level}::${msg.replace(/\n/g, " ")}\n`); }
+function annotate(level, msg, stream = process.stdout) { if (GH) stream.write(`::${level}::${msg.replace(/\n/g, " ")}\n`); }
 function emitStepSummary(lines) {
   const f = process.env.GITHUB_STEP_SUMMARY;
   if (!f) return;
@@ -4326,8 +4326,10 @@ function main() {
   }
 
   // GitHub annotations + step summary. WARN keeps the check green regardless.
-  for (const f of findings) annotate(f.severity === "error" ? "warning" : "notice", `truthful-attribution [${f.code}] ${f.message}`);
-  if (apiSkippedReason) annotate("notice", `truthful-attribution: ${apiSkippedReason}`);
+  // Machine-readable stdout stays one JSON document under Actions as well.
+  const annotationStream = format === "json" ? process.stderr : process.stdout;
+  for (const f of findings) annotate(f.severity === "error" ? "warning" : "notice", `truthful-attribution [${f.code}] ${f.message}`, annotationStream);
+  if (apiSkippedReason) annotate("notice", `truthful-attribution: ${apiSkippedReason}`, annotationStream);
   const summary = [`## truthful-attribution-gate (${mode.toUpperCase()})`, "", `Arm: \`${arm}\`${result.highRisk ? " · **high-risk path touched**" : ""}`, ""];
   if (apiSkippedReason) summary.push(`> ${apiSkippedReason}`, "");
   if (findings.length === 0) summary.push("Clean — a truthful verification record is present and no fabrication was detected.");
