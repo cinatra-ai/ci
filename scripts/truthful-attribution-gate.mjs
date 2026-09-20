@@ -2040,7 +2040,9 @@ export function makeGhClient({ repo } = {}) {
   //                    we must merge that field across pages.
   function ghApi(endpoint, { shape = "object", arrayField = null } = {}) {
     const paginated = shape === "array" || Boolean(arrayField);
-    const args = ["api"];
+    // The merged-PR binding below needs merge_commit_sha, removed in API2026.
+    // Explicitly retain the supported response contract previously supplied by default.
+    const args = ["api", "-H", "X-GitHub-Api-Version: 2022-11-28"];
     // `--paginate --slurp`: gh follows every Link `next` and emits ONE valid JSON
     // document — a top-level array whose elements are the per-page response
     // bodies (an array of the page-arrays for array endpoints; an array of the

@@ -81,23 +81,22 @@ function validatePolicy(policy) {
     && positive(policy.bot.userId) && positive(policy.bot.appId) && positive(policy.bot.organizationId), "trusted publisher malformed");
   return { ...a, organization: policy.organization, publisher: policy.bot };
 }
-function trusted(comment, authority) {
+function publisher(comment, authority) {
   const p = authority.publisher;
-  return comment?.user?.id === p.userId && comment.user.login === p.login && comment.user.type === "Bot"
-    && comment.performed_via_github_app?.id === p.appId;
+  return comment?.user?.id === p.userId && comment.user.login === p.login && comment.user.type === "Bot";
 }
-function commentBinding(comment) {
+function commentBinding(comment, authority) {
   return { id: comment.id, url: comment.html_url, issue: comment.issue_url, body: comment.body,
     user: { id: comment.user?.id, login: comment.user?.login, type: comment.user?.type },
-    app: comment.performed_via_github_app?.id, created: comment.created_at, updated: comment.updated_at };
+    app: comment.performed_via_github_app?.id ?? authority.publisher.appId, created: comment.created_at, updated: comment.updated_at };
 }
 export function frame(receipt) {
   return MARKER + "\n```json\n" + canonical(receipt) + "\n```\nReceipt-SHA256: " + digest(receipt);
 }
-function decode(comment, ref, authority) {
+function decode(comment, ref, authenticate) {
   requireThat(comment.id === ref.commentId && comment.html_url === ref.url
     && comment.issue_url === "https://api.github.com/repos/" + ref.repository + "/issues/" + ref.pullRequest
-    && trusted(comment, authority), "receipt publisher or identity is untrusted");
+    && authenticate(comment), "receipt publisher or identity is untrusted");
   requireThat(comment.created_at === comment.updated_at, "receipt comment was edited");
   time(comment.created_at);
   requireThat(typeof comment.body === "string" && comment.body.length <= 32768, "receipt content unavailable or too large");
@@ -131,8 +130,9 @@ function payload(receipt, authority) {
   return t;
 }
 export function readGithub(endpoint) {
-  requireThat(typeof endpoint === "string" && endpoint.startsWith("/repos/") && !/[\x00-\x20\x7f]/.test(endpoint), "invalid receipt API endpoint");
-  return JSON.parse(execFileSync("gh", ["api", "--hostname", "github.com", "--method", "GET", "-H", "Accept: application/vnd.github+json", endpoint],
+  requireThat(typeof endpoint === "string" && (endpoint.startsWith("/repos/") || /^\/users\/[A-Za-z0-9-]+%5Bbot%5D$/.test(endpoint)) && !/[\x00-\x20\x7f]/.test(endpoint), "invalid receipt API endpoint");
+  return JSON.parse(execFileSync("gh", ["api", "--hostname", "github.com", "--method", "GET", "-H", "Accept: application/vnd.github+json",
+    "-H", "X-GitHub-Api-Version: 2022-11-28", endpoint],
     { encoding: "utf8", timeout: 15000, maxBuffer: 8 * 1024 * 1024 }));
 }
 
@@ -145,6 +145,24 @@ export function verifyDelegatedReceipt({ repository, pullRequest, expectedHead, 
       && ["pre-merge", "post-merge"].includes(arm), "delegation request identity malformed or unsupported");
     const root = "/repos/" + repository, number = Number(pullRequest), deadline = Date.now() + 90000;
     const read = endpoint => { requireThat(Date.now() < deadline, "receipt read deadline exceeded"); return get(endpoint); };
+    // GitHub may redact a private App object while preserving its immutable Bot author.
+    // The trusted engine policy owns the numeric Bot/App association. A redacted object
+    // additionally requires GitHub's live Bot profile to link that same author to the App.
+    const profileEndpoint = "/users/" + encodeURIComponent(authority.publisher.login);
+    let profileBefore = null;
+    const publisherProfile = () => {
+      const profile = read(profileEndpoint), p = authority.publisher;
+      requireThat(profile?.id === p.userId && profile.login === p.login && profile.type === "Bot"
+        && profile.html_url === "https://github.com/apps/" + p.login.slice(0, -5), "publisher App profile linkage unavailable or untrusted");
+      return { id: profile.id, login: profile.login, type: profile.type, url: profile.html_url };
+    };
+    const authenticate = comment => {
+      if (!publisher(comment, authority)) return false;
+      const app = comment.performed_via_github_app;
+      if (app !== null && app !== undefined) return plain(app) && app.id === authority.publisher.appId;
+      profileBefore ??= publisherProfile();
+      return true;
+    };
     const list = endpoint => {
       const rows = [];
       for (let page = 1; page <= 31; page++) {
@@ -171,7 +189,7 @@ export function verifyDelegatedReceipt({ repository, pullRequest, expectedHead, 
     requireThat(ref && ref.repository === repository && ref.pullRequest === number, "receipt pointer missing or bound to another PR");
     if (record !== null) requireThat(canonical(record) === canonical(ref), "record does not match the exact receipt pointer");
     const comment = read(root + "/issues/comments/" + ref.commentId);
-    const receipt = decode(comment, ref, authority), target = payload(receipt, authority);
+    const receipt = decode(comment, ref, authenticate), target = payload(receipt, authority);
     requireThat(target.repository === repository && target.pullRequest === number && target.headSha === expectedHead
       && before.headSha === expectedHead && before.headRef === target.headRef && before.baseRef === target.base.ref
       && before.baseRepositoryId === target.repositoryId, "receipt does not match the candidate head/base/repository");
@@ -190,9 +208,10 @@ export function verifyDelegatedReceipt({ repository, pullRequest, expectedHead, 
       const comments = list(root + "/issues/" + number + "/comments");
       requireThat(comments.length === before.comments && comments.every(row => positive(row.id))
         && new Set(comments.map(row => row.id)).size === comments.length, "comment inventory incomplete or duplicated");
-      const candidates = comments.filter(row => trusted(row, authority) && typeof row.body === "string" && row.body.includes(MARKER))
+      const candidates = comments.filter(row => publisher(row, authority) && typeof row.body === "string" && row.body.includes(MARKER))
         .sort((a, b) => b.id - a.id);
-      requireThat(candidates[0]?.id === ref.commentId && canonical(commentBinding(candidates[0])) === canonical(commentBinding(comment)),
+      requireThat(candidates[0]?.id === ref.commentId && authenticate(candidates[0])
+        && canonical(commentBinding(candidates[0], authority)) === canonical(commentBinding(comment, authority)),
         "receipt superseded or comment inventory changed");
     };
     verifyComments();
@@ -216,7 +235,8 @@ export function verifyDelegatedReceipt({ repository, pullRequest, expectedHead, 
       requireThat(governance?.sha === target.policy.sha && (target.policy.ref !== target.base.ref || target.policy.sha === target.base.sha), "historical governance binding differs");
     }
     requireThat(digest(normalizeFiles(list(root + "/pulls/" + number + "/files"))) === receipt.scope.fileInventoryDigest, "file inventory changed during verification");
-    requireThat(canonical(commentBinding(read(root + "/issues/comments/" + ref.commentId))) === canonical(commentBinding(comment)), "receipt changed during verification");
+    const finalComment = read(root + "/issues/comments/" + ref.commentId);
+    requireThat(authenticate(finalComment) && canonical(commentBinding(finalComment, authority)) === canonical(commentBinding(comment, authority)), "receipt changed during verification");
     verifyComments();
     const finalMeta = read(root);
     requireThat(finalMeta?.id === meta.id && finalMeta.full_name === meta.full_name && finalMeta.default_branch === meta.default_branch
@@ -225,6 +245,7 @@ export function verifyDelegatedReceipt({ repository, pullRequest, expectedHead, 
     if (arm === "pre-merge") requireThat(liveRef(target.base.ref) === target.base.sha && liveRef(target.policy.ref) === target.policy.sha,
       "actual target or governance ref changed during verification");
     requireThat(canonical(snapshot(read(root + "/pulls/" + number))) === canonical(before), "PR changed during receipt verification");
+    if (profileBefore !== null) requireThat(canonical(publisherProfile()) === canonical(profileBefore), "publisher App profile changed during verification");
     return { ok: true, reference: ref, receipt, reasons: [] };
   } catch (error) { return { ok: false, reasons: [error.message] }; }
 }

@@ -21,7 +21,8 @@ export function fixture({ trustedPolicy = false } = {}) {
   const pr = { number: 7, state: "open", merged: false, draft: false, comments: 1, changed_files: 1,
     head: { sha: HEAD, ref: "feature/work", repo: { id: 123, full_name: repo } },
     base: { sha: "0".repeat(40), ref: "main", repo: { id: 123, full_name: repo } } };
-  const api = { [root]: { id: 123, full_name: repo, default_branch: "main", archived: false, disabled: false,
+  const profileEndpoint = "/users/" + encodeURIComponent(policy.bot.login);
+  const api = { [profileEndpoint]: { id: policy.bot.userId, login: policy.bot.login, type: "Bot", html_url: "https://github.com/apps/" + policy.bot.login.slice(0, -5) }, [root]: { id: 123, full_name: repo, default_branch: "main", archived: false, disabled: false,
     owner: { id: policy.bot.organizationId, type: "Organization" } },
     [root + "/pulls/7"]: pr, [root + "/issues/comments/99"]: comment,
     [root + "/pulls/7/files?per_page=100&page=1"]: files,
@@ -31,7 +32,7 @@ export function fixture({ trustedPolicy = false } = {}) {
     [root + "/git/commits/" + BASE]: { sha: BASE, tree: { sha: "9".repeat(40) } },
     [root + "/git/commits/" + LANDED]: { sha: LANDED, tree: { sha: MERGE }, parents: [{ sha: BASE }] } };
   const calls = [];
-  const f = { policy, receipt, api, root, pr, comment, files, calls,
+  const f = { policy, receipt, api, root, pr, comment, files, calls, profileEndpoint,
     get(endpoint) { calls.push(endpoint); assert.ok(endpoint in api, "unexpected API " + endpoint); return structuredClone(api[endpoint]); },
     seal() { comment.body = frame(receipt); pr.body = "Merge authorization: " + url + " SHA256:" + digest(receipt); },
     check(options = {}) { return verifyDelegatedReceipt({ repository: repo, pullRequest: 7, expectedHead: HEAD, arm: "pre-merge",
@@ -46,6 +47,93 @@ test("valid scoped receipt binds live base despite lagging PR base payload", () 
   const f = fixture(); assert.equal(f.check().ok, true);
   assert.equal(f.calls.filter(p => p.endsWith("/files?per_page=100&page=1")).length, 2);
   assert.equal(f.calls.filter(p => p.endsWith("/comments?per_page=100&page=1")).length, 2);
+});
+test("comment authentication tolerates unrelated list/direct API metadata differences", () => {
+  for (const arm of ["pre-merge", "post-merge"]) {
+    const f = fixture(), original = f.get;
+    if (arm === "post-merge") f.post();
+    f.get = endpoint => {
+      const result = original(endpoint);
+      if (endpoint === f.root + "/issues/comments/99") result.pin = null;
+      if (endpoint === f.root + "/issues/7/comments?per_page=100&page=1") {
+        result[0].performed_via_github_app.client_id = "fixture-client";
+        result[0].user.avatar_url = "https://example.test/avatar.png";
+      }
+      return result;
+    };
+    assert.equal(f.check({ arm, mergedSha: arm === "post-merge" ? LANDED : null }).ok, true, arm);
+  }
+});
+const commentSecurityMutations = {
+  id: row => row.id++,
+  body: row => row.body += " changed",
+  "user.id": row => row.user.id++,
+  "user.login": row => row.user.login = "other[bot]",
+  "user.type": row => row.user.type = "User",
+  "app.id": row => row.performed_via_github_app.id++,
+  html_url: row => row.html_url += "0",
+  issue_url: row => row.issue_url += "0",
+  created_at: row => row.created_at = "2026-09-19T10:00:02Z",
+  updated_at: row => row.updated_at = "2026-09-19T10:00:02Z",
+};
+for (const boundary of ["direct", "list", "direct-readback", "list-readback"]) {
+  test("every authenticated comment field is bound at " + boundary, () => {
+    for (const [field, mutate] of Object.entries(commentSecurityMutations)) {
+      const f = fixture(), original = f.get;
+      const isList = boundary.startsWith("list"), targetRead = boundary.endsWith("readback") ? 2 : 1;
+      const endpoint = f.root + (isList ? "/issues/7/comments?per_page=100&page=1" : "/issues/comments/99");
+      let reads = 0;
+      f.get = path => {
+        const result = original(path);
+        if (path === endpoint && ++reads === targetRead) mutate(isList ? result[0] : result);
+        return result;
+      };
+      assert.equal(f.check().ok, false, boundary + ": " + field);
+    }
+  });
+}
+test("redacted App metadata requires exact live Bot profile linkage and final readback", () => {
+  for (const value of [null, undefined]) {
+    const f = fixture();
+    if (value === undefined) delete f.comment.performed_via_github_app;
+    else f.comment.performed_via_github_app = value;
+    assert.equal(f.check().ok, true);
+    assert.equal(f.calls.filter(p => p === f.profileEndpoint).length, 2);
+  }
+  const f = fixture(); assert.equal(f.check().ok, true);
+  assert.equal(f.calls.includes(f.profileEndpoint), false);
+});
+test("redacted direct App and visible list App can authenticate the same immutable publisher", () => {
+  const f = fixture(), original = f.get;
+  f.get = endpoint => { const value = original(endpoint); if (endpoint.endsWith("/issues/comments/99")) value.performed_via_github_app = null; return value; };
+  assert.equal(f.check().ok, true);
+});
+test("present conflicting or malformed App objects never fall back to a profile", () => {
+  for (const app of [{ id: 1 }, {}, { id: "4040322" }, [], false, "redacted"]) {
+    const f = fixture(); f.comment.performed_via_github_app = app; refuses(f, /publisher/);
+    assert.equal(f.calls.includes(f.profileEndpoint), false);
+  }
+});
+test("missing or forged Bot profiles and changed final linkage refuse", () => {
+  for (const readback of [false, true]) {
+    for (const change of [p => p.id++, p => p.login = "other[bot]", p => p.type = "User",
+      p => p.html_url = "https://github.com/apps/other", p => p.html_url += "/", p => p.id = String(p.id)]) {
+      const f = fixture(), original = f.get; f.comment.performed_via_github_app = null; let reads = 0;
+      f.get = endpoint => { const value = original(endpoint); if (endpoint === f.profileEndpoint && ++reads === (readback ? 2 : 1)) change(value); return value; };
+      refuses(f, /profile/);
+    }
+  }
+  for (const value of [null, {}, undefined]) {
+    const f = fixture(); f.comment.performed_via_github_app = null;
+    if (value === undefined) delete f.api[f.profileEndpoint]; else f.api[f.profileEndpoint] = value;
+    refuses(f);
+  }
+});
+test("newer same-Bot outcomes cannot hide behind redacted or conflicting App metadata", () => {
+  for (const app of [null, { id: 1 }]) {
+    const f = fixture(); f.api[f.root + "/issues/7/comments?per_page=100&page=1"].push({ ...f.comment, id: 100, performed_via_github_app: app });
+    f.pr.comments++; refuses(f, /superseded/);
+  }
 });
 test("receipt and trailer framing are exact and duplicate pointers refuse", () => {
   const f = fixture(), ref = pointer(f.pr.body);
@@ -109,6 +197,7 @@ test("postmerge binds historical expiry, sole base parent and actual landed tree
   assert.equal(f.check(options).ok, true);
   assert.equal(f.calls.some(p => p.includes("/git/ref/")), false);
   for (const change of [g => g.pr.merged_at = "2026-09-20T10:00:01Z", g => g.pr.merge_commit_sha = HEAD,
+    g => delete g.pr.merge_commit_sha, g => g.pr.merge_commit_sha = "malformed",
     g => g.api[g.root + "/git/commits/" + LANDED].parents.push({ sha: HEAD }),
     g => g.api[g.root + "/git/commits/" + LANDED].parents[0].sha = HEAD,
     g => g.api[g.root + "/git/commits/" + LANDED].tree.sha = TREE]) { const g = fixture(); g.post(); change(g); refuses(g, undefined, options); }

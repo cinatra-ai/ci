@@ -4628,15 +4628,51 @@ if(args[0]!=='api')throw Error('only read-only API fixture');
 if(args.includes('--method') && args[args.indexOf('--method')+1]!=='GET')throw Error('mutation forbidden');
 const api=JSON.parse(fs.readFileSync(process.env.DELEGATION_FIXTURE));
 if(!(endpoint in api))throw Error('unexpected endpoint '+endpoint);
-const value=api[endpoint];process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value));
+// API2026 deliberately omits merge_commit_sha on both direct and associated PR objects.
+// Emulate that response unless the real read transport explicitly requests the supported contract.
+let value=api[endpoint];
+if(endpoint.startsWith('/users/')) {
+ const counter=process.env.DELEGATION_FIXTURE+'.profile-reads';
+ const n=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;
+ fs.writeFileSync(counter,String(n+1));
+ if(n>0 && endpoint+'#readback' in api)value=api[endpoint+'#readback'];
+}
+const version=args.includes('X-GitHub-Api-Version: 2022-11-28');
+process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
+  (key,value)=>key==='merge_commit_sha'&&!version?undefined:value));
 `); fs.chmodSync(gh, 0o700);
   const env = { ...process.env, PATH: bindir + path.delimiter + process.env.PATH, DELEGATION_FIXTURE: fixtureFile };
-  const run = (...args) => { fs.writeFileSync(fixtureFile, JSON.stringify(api)); return spawnSync(process.execPath,
+  const run = (...args) => { fs.writeFileSync(fixtureFile, JSON.stringify(api)); fs.rmSync(fixtureFile + ".profile-reads", { force: true }); return spawnSync(process.execPath,
     [GATE, "--mode", "enforce", "--format", "json", "--repo", repo, "--gate-arm-wait-ms", "0", ...args],
     { cwd: directory, env, encoding: "utf8", timeout: 20000 }); };
   const pre = () => run("--arm", "pre-merge", "--pr", "7", "--head-sha", head, "--diff-base", "main");
   let r = pre(); assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.equal(JSON.parse(r.stdout).highRisk, true);
+  // The actual child transport must support private-App redaction without accepting
+  // conflicting App metadata or a forged/missing/finally-changed GitHub Bot profile.
+  const originalApp = f.comment.performed_via_github_app, profile = structuredClone(api[f.profileEndpoint]);
+  for (const value of [null, undefined]) {
+    if (value === undefined) delete f.comment.performed_via_github_app; else f.comment.performed_via_github_app = value;
+    r = pre(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  }
+  for (const app of [{ id: 1 }, {}, false]) {
+    f.comment.performed_via_github_app = app; r = pre(); assert.notEqual(r.status, 0); assert.match(r.stdout, /merge-authorization-unverifiable/);
+  }
+  f.comment.performed_via_github_app = null;
+  for (const field of ["id", "login", "type", "html_url"]) {
+    api[f.profileEndpoint] = { ...profile, [field]: field === "id" ? profile.id + 1 : "forged" };
+    r = pre(); assert.notEqual(r.status, 0); assert.match(r.stdout, /profile linkage/);
+  }
+  delete api[f.profileEndpoint]; r = pre(); assert.notEqual(r.status, 0);
+  api[f.profileEndpoint] = null; r = pre(); assert.notEqual(r.status, 0);
+  api[f.profileEndpoint] = profile; api[f.profileEndpoint + "#readback"] = { ...profile, html_url: "https://github.com/apps/other" };
+  r = pre(); assert.notEqual(r.status, 0); assert.match(r.stdout, /profile linkage/);
+  delete api[f.profileEndpoint + "#readback"];
+  for (const field of ["id", "login", "type"]) {
+    const saved = f.comment.user[field]; f.comment.user[field] = field === "id" ? saved + 1 : "forged";
+    r = pre(); assert.notEqual(r.status, 0); f.comment.user[field] = saved;
+  }
+  f.comment.performed_via_github_app = originalApp;
   const pointerBody = f.pr.body;
   f.pr.body += "\n\nAssisted-by: Codex (gpt-6)\nReviewed-by: Invented Person <review@example.invalid> (@invented-review, tier=maintainer)";
   api[oldRoot + "/collaborators/invented-review/permission"] = { permission: "admin" };
@@ -4657,6 +4693,9 @@ const value=api[endpoint];process.stdout.write(JSON.stringify(args.includes('--s
   api[oldRoot + "/commits/" + landed] = landedCommit;
   const post = () => run("--arm", "post-merge", "--commit", landed);
   r = post(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  f.comment.performed_via_github_app = null;
+  r = post(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  f.comment.performed_via_github_app = originalApp;
   api[oldRoot + "/git/commits/" + landed].parents = [{ sha: oldBase }];
   r = post(); assert.notEqual(r.status, 0); assert.match(r.stdout, /merge-authorization-unverifiable/);
 });
