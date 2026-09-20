@@ -3157,8 +3157,39 @@ export function analyzePreMerge(ctx) {
  *   queueCandidate    — resolveQueueCandidate's verdict.
  * A missing verdict is a FAILED verdict: this arm never passes on absence.
  */
+// An authenticated v1 receipt authorizes one frozen queue candidate. It does
+// not authorize rebasing onto a later queue base or adding another pull request.
+function queuedDelegation(ctx) {
+  const t = ctx.delegation?.receipt?.target, q = ctx.queueBinding, m = ctx.membership;
+  const bound = ctx.apiBound === true && ctx.delegation?.ok === true && t && q
+    && m?.status === "resolved" && m.candidates?.length === 1
+    && q.pulls?.length === 1 && q.pulls[0].number === m.number
+    && q.pulls[0].head?.sha === m.headAtEnqueue
+    && t.repository === q.repository && t.pullRequest === m.number
+    && t.headSha === m.headAtEnqueue && t.headSha === ctx.reviewedHeadSha
+    && q.pr?.number === t.pullRequest && q.pr.head?.sha === t.headSha
+    && q.pr.head?.ref === t.headRef && q.pr.head?.repo?.full_name === t.repository
+    && Number.isSafeInteger(t.repositoryId) && t.repositoryId > 0
+    && q.pr.head?.repo?.id === t.repositoryId && q.pr.base?.repo?.id === t.repositoryId
+    && q.pr.base?.ref === t.base.ref && q.pr.base?.repo?.full_name === t.repository
+    && q.baseSha === t.base.sha && q.headIsCheckout === true
+    && q.parents?.length === 2 && q.parents[0] === t.base.sha && q.parents[1] === t.headSha
+    && ctx.queueCandidate?.ok === true && ctx.queueCandidate.groupTree === t.mergeTree
+    && ctx.queueCandidate.expectedTree === t.mergeTree
+    && canonicalAuthorization(queuePrIdentity(q.pr)) === canonicalAuthorization(queuePrIdentity(q.finalPr));
+  return { ok: Boolean(bound), reason: bound ? null : "authenticated delegation does not bind exactly this pull request, current head, frozen base and queue tree" };
+}
+function queuePrIdentity(pr) {
+  if (!pr) return null;
+  return { number: pr.number, body: pr.body, state: pr.state, merged: pr.merged,
+    comments: pr.comments, changedFiles: pr.changed_files, draft: pr.draft,
+    head: { sha: pr.head?.sha, ref: pr.head?.ref, repository: pr.head?.repo?.full_name, repositoryId: pr.head?.repo?.id },
+    base: { ref: pr.base?.ref, repository: pr.base?.repo?.full_name, repositoryId: pr.base?.repo?.id } };
+}
 export function analyzeMergeGroup(ctx) {
   const findings = [];
+  const delegationRequested = Boolean(ctx.delegationRequested || ctx.declaredAuthorization);
+  const authority = delegationRequested ? queuedDelegation(ctx) : ctx.approvedHeadCheck;
   const membership = ctx.membership || { status: "unresolved", number: null, candidates: [] };
 
   if (membership.status === "ambiguous") {
@@ -3175,7 +3206,7 @@ export function analyzeMergeGroup(ctx) {
       message: `no pull request could be bound to this merge group from the group head's parents and the queue's pull-request list — failing closed`,
     });
   } else {
-    const ah = ctx.approvedHeadCheck;
+    const ah = authority;
     if (!ah || ah.ok !== true) {
       findings.push({
         code: "queue-approved-head",
@@ -3195,7 +3226,10 @@ export function analyzeMergeGroup(ctx) {
     }
   }
 
-  const record = analyzePreMerge(ctx);
+  // A valid receipt for a different group must not satisfy the delegated
+  // high-risk alternative; invalid declared authority never falls back to review.
+  const record = analyzePreMerge(delegationRequested && !authority?.ok
+    ? { ...ctx, delegation: { ok: false, reasons: [authority?.reason || "queue authority unavailable"] } } : ctx);
   return {
     findings: [...findings, ...record.findings],
     highRisk: record.highRisk,
@@ -3929,10 +3963,12 @@ function main() {
       apiSkippedReason = `no API context (--repo / GITHUB_REPOSITORY) — the queue membership could not be resolved; failing closed`;
     } else {
       try {
+        ctx.queueBinding = { repository: repo, baseSha: groupBaseSha, headIsCheckout,
+          parents: parentsOf(groupHeadSha), pulls: client.pullsForCommit(groupHeadSha) };
         ctx.membership = resolveQueuedPr({
           groupHeadSha,
-          parents: parentsOf(groupHeadSha),
-          queuePulls: client.pullsForCommit(groupHeadSha),
+          parents: ctx.queueBinding.parents,
+          queuePulls: ctx.queueBinding.pulls,
         });
       } catch (e) {
         apiSkippedReason = `GitHub API unavailable (${e.message}) — the queue membership could not be resolved; failing closed`;
@@ -3952,6 +3988,8 @@ function main() {
         // The verification-boundary record is read off the pull request body by
         // the SAME parser the pre-merge arm uses.
         const declared = parseTrailers(pr.body || "");
+        ctx.delegationRequested = /^Merge authorization:|^Merge-authorization:/im.test(pr.body || "");
+        ctx.declaredAuthorization = declared.authorization;
         if (declared.reviewed.length) ctx.declaredReviewedBy = declared.reviewed;
         if (declared.hasGateArm) ctx.declaredGateArm = declared;
         ctx.permissionByLogin = {};
@@ -3974,6 +4012,15 @@ function main() {
         ctx.queueCandidate = resolveQueueCandidate({
           groupHeadSha, baseSha: groupBaseSha, prHeadSha: ctx.membership.headAtEnqueue,
         });
+        if (ctx.delegationRequested) {
+          const hasTrailer = /^Merge-authorization:/im.test(pr.body || "");
+          ctx.delegation = hasTrailer && (!declared.authorization || declared.errors.length)
+            ? { ok: false, reasons: ["declared authorization record is malformed"] }
+            : verifyDelegatedReceipt({ repository: repo, pullRequest: prNumber, expectedHead: ctx.reviewedHeadSha,
+              arm: "pre-merge", record: declared.authorization, mergeTree: mergedTreeOf });
+          ctx.queueBinding.pr = pr;
+          ctx.queueBinding.finalPr = client.pr(prNumber);
+        }
         ctx.apiBound = true;
       } catch (e) {
         apiSkippedReason = `GitHub API unavailable (${e.message}) — the queued pull request could not be verified; failing closed`;

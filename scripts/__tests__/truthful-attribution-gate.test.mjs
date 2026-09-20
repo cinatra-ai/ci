@@ -3843,6 +3843,71 @@ function qBaseCtx(over = {}) {
   };
 }
 
+function qDelegatedCtx() {
+  const f = delegatedFixture(), delegation = f.check(), t = f.receipt.target;
+  assert.equal(delegation.ok, true);
+  return qBaseCtx({
+    changedFiles: [".github/workflows/check.yml"], reviews: [], approverLogins: [],
+    reviewedHeadSha: t.headSha, delegationRequested: true, delegation,
+    membership: resolveQueuedPr({ groupHeadSha: Q_GROUP, parents: [t.base.sha, t.headSha], queuePulls: [f.pr] }),
+    queueCandidate: { ok: true, groupTree: t.mergeTree, expectedTree: t.mergeTree },
+    queueBinding: { repository: t.repository, baseSha: t.base.sha, parents: [t.base.sha, t.headSha],
+      headIsCheckout: true, pulls: [structuredClone(f.pr)], pr: structuredClone(f.pr), finalPr: structuredClone(f.pr) },
+  });
+}
+test("QUEUE delegated authority accepts the authenticated exact frozen candidate without inventing a review", () => {
+  const ctx = qDelegatedCtx();
+  assert.deepEqual(analyzeMergeGroup(ctx).findings, []);
+  assert.deepEqual(ctx.reviews, []);
+  assert.equal(ctx.approvedHeadCheck, undefined);
+});
+test("QUEUE delegated authority refuses unrelated or incomplete group binding even with a real review", () => {
+  const changes = {
+    unauthenticated: c => { c.delegation = { ok: false, reasons: ["untrusted"] }; },
+    offline: c => { c.apiBound = false; },
+    missing: c => { delete c.queueBinding; },
+    repository: c => { c.queueBinding.repository = "other/repository"; },
+    number: c => { c.queueBinding.pr.number++; },
+    head: c => { c.queueBinding.pr.head.sha = Q_OLD; },
+    branch: c => { c.queueBinding.pr.head.ref = "other"; },
+    baseRef: c => { c.queueBinding.pr.base.ref = "release/other"; },
+    baseSha: c => { c.queueBinding.baseSha = Q_OLD; },
+    oldParents: c => { c.queueBinding.parents[0] = Q_OLD; },
+    extraParent: c => { c.queueBinding.parents.push(Q_OLD); },
+    otherCheckout: c => { c.queueBinding.headIsCheckout = false; },
+    hiddenPull: c => { c.queueBinding.pulls.push({ number: 8, head: { sha: Q_OLD } }); },
+    multipleCandidates: c => { c.membership.candidates.push({ number: 8 }); },
+    groupTree: c => { c.queueCandidate.groupTree = Q_OLD; },
+    expectedTree: c => { c.queueCandidate.expectedTree = Q_OLD; },
+    headRace: c => { c.queueBinding.finalPr.head.sha = Q_OLD; },
+    bodyRace: c => { c.queueBinding.finalPr.body += " changed"; },
+    commentsRace: c => { c.queueBinding.finalPr.comments++; },
+  };
+  for (const [name, change] of Object.entries(changes)) {
+    const ctx = qDelegatedCtx(); change(ctx); ctx.approvedHeadCheck = { ok: true };
+    const result = analyzeMergeGroup(ctx);
+    assert.ok(result.findings.some(f => f.code === "queue-approved-head"), name);
+    assert.ok(result.findings.some(f => f.code === "merge-authorization-unverifiable"), name);
+  }
+});
+test("QUEUE delegated authority binds positive numeric repository IDs on initial and final PR reads", () => {
+  for (const read of ["pr", "finalPr"]) {
+    for (const side of ["head", "base"]) {
+      for (const id of [124, "123", 0, -1, null, undefined, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        const ctx = qDelegatedCtx(); ctx.queueBinding[read][side].repo.id = id;
+        assert.ok(analyzeMergeGroup(ctx).findings.some(f => f.code === "queue-approved-head"), `${read}.${side}: ${id}`);
+      }
+    }
+  }
+});
+test("QUEUE delegated authority preserves claimed gate failures and fabricated-review refusals", () => {
+  const ctx = qDelegatedCtx();
+  assert.ok(analyzeMergeGroup({ ...ctx, declaredGateArm: gateParsed(), suiteFile: SUITE_FILE,
+    checkRuns: [{ name: "ci / build-test", status: "completed", conclusion: "failure" }] }).findings.some(f => f.code === "gate-suite-fabricated"));
+  assert.ok(analyzeMergeGroup({ ...ctx, declaredReviewedBy: [{ login: "invented", tier: "maintainer" }] })
+    .findings.some(f => f.code === "reviewed-by-fabricated"));
+});
+
 test("QUEUE ARM: a group with exactly ONE queued pull request whose approved head, approval and record hold is CLEAN", () => {
   const membership = resolveQueuedPr({
     groupHeadSha: Q_GROUP,
@@ -4576,7 +4641,7 @@ test("§5c the post-merge arm can READ a squashed PR's merge: refs/pull/N/head b
   fs.rmSync(landed, { recursive: true, force: true });
 });
 
-test("delegated actual CLI uses immutable engine authority and real pre/post squash trees", t => {
+test("delegated actual CLI uses immutable engine authority and real pre/queue/post trees", t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "delegated-git-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const git = (...args) => {
@@ -4631,6 +4696,12 @@ if(!(endpoint in api))throw Error('unexpected endpoint '+endpoint);
 // API2026 deliberately omits merge_commit_sha on both direct and associated PR objects.
 // Emulate that response unless the real read transport explicitly requests the supported contract.
 let value=api[endpoint];
+if(endpoint.endsWith('/pulls/7') && endpoint+'#queue-readback' in api) {
+ const counter=process.env.DELEGATION_FIXTURE+'.pr-reads';
+ const n=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;
+ fs.writeFileSync(counter,String(n+1));
+ if(n===3)value=api[endpoint+'#queue-readback'];
+}
 if(endpoint.startsWith('/users/')) {
  const counter=process.env.DELEGATION_FIXTURE+'.profile-reads';
  const n=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;
@@ -4642,7 +4713,7 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   (key,value)=>key==='merge_commit_sha'&&!version?undefined:value));
 `); fs.chmodSync(gh, 0o700);
   const env = { ...process.env, PATH: bindir + path.delimiter + process.env.PATH, DELEGATION_FIXTURE: fixtureFile };
-  const run = (...args) => { fs.writeFileSync(fixtureFile, JSON.stringify(api)); fs.rmSync(fixtureFile + ".profile-reads", { force: true }); return spawnSync(process.execPath,
+  const run = (...args) => { fs.writeFileSync(fixtureFile, JSON.stringify(api)); fs.rmSync(fixtureFile + ".profile-reads", { force: true }); fs.rmSync(fixtureFile + ".pr-reads", { force: true }); return spawnSync(process.execPath,
     [GATE, "--mode", "enforce", "--format", "json", "--repo", repo, "--gate-arm-wait-ms", "0", ...args],
     { cwd: directory, env, encoding: "utf8", timeout: 20000 }); };
   const pre = () => run("--arm", "pre-merge", "--pr", "7", "--head-sha", head, "--diff-base", "main");
@@ -4683,6 +4754,57 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   const digestBefore = f.receipt.authority.digest; f.receipt.authority.digest = "0".repeat(64); f.seal();
   r = pre(); assert.notEqual(r.status, 0); assert.match(r.stdout, /merge-authorization-unverifiable/);
   f.receipt.authority.digest = digestBefore; f.seal();
+  // Exercise the actual merge-group CLI with the same authenticated v1 bytes,
+  // real Git trees and no APPROVED review; only the GitHub transport is mocked.
+  const group = git("commit-tree", mergeTree, "-p", base, "-p", head, "-m", "queue candidate");
+  git("checkout", "--detach", group);
+  const associated = oldRoot + "/commits/" + group + "/pulls";
+  api[associated] = [f.pr];
+  const queue = (candidate = group, candidateBase = base) => run("--arm", "merge-group", "--merge-group-head", candidate, "--merge-group-base", candidateBase);
+  r = queue(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(JSON.parse(r.stdout).highRisk, true);
+  assert.deepEqual(api[oldRoot + "/pulls/7/reviews"], []);
+  // Same authorized tree with different parents is still not the frozen group.
+  const olderGroup = git("commit-tree", mergeTree, "-p", oldBase, "-p", head, "-m", "older group");
+  api[oldRoot + "/commits/" + olderGroup + "/pulls"] = [f.pr];
+  git("checkout", "--detach", olderGroup);
+  r = queue(olderGroup); assert.notEqual(r.status, 0); assert.match(r.stdout, /queue-approved-head/);
+  git("checkout", "--detach", group);
+  r = queue(group, oldBase); assert.notEqual(r.status, 0); assert.match(r.stdout, /queue-approved-head/);
+  const altered = git("commit-tree", headTree, "-p", base, "-p", head, "-m", "different tree");
+  api[oldRoot + "/commits/" + altered + "/pulls"] = [f.pr]; git("checkout", "--detach", altered);
+  r = queue(altered); assert.notEqual(r.status, 0); assert.match(r.stdout, /queue-candidate-mismatch/);
+  git("checkout", "--detach", group);
+  api[associated] = [f.pr, { ...f.pr, number: 8 }];
+  r = queue(); assert.notEqual(r.status, 0); assert.match(r.stdout, /queue-membership-ambiguous/);
+  api[associated] = [f.pr];
+  const queueBody = f.pr.body;
+  for (const mutate of [
+    () => { f.comment.updated_at = stamp(now - 58000); },
+    () => { f.pr.body += "\n" + queueBody; },
+    () => { api[oldRoot + "/git/ref/heads/main"].object.sha = oldBase; },
+    () => { f.pr.head.sha = base; },
+  ]) {
+    mutate(); r = queue(); assert.notEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /merge-authorization-unverifiable/);
+    f.comment.updated_at = f.comment.created_at; f.pr.body = queueBody;
+    api[oldRoot + "/git/ref/heads/main"].object.sha = base; f.pr.head.sha = head;
+  }
+  for (const change of [pr => { pr.head.sha = base; }, pr => { pr.body += " changed during final read"; }, pr => { pr.comments++; }]) {
+    const finalPr = structuredClone(f.pr); change(finalPr); api[oldRoot + "/pulls/7#queue-readback"] = finalPr;
+    r = queue(); assert.notEqual(r.status, 0); assert.match(r.stdout, /queue-approved-head/);
+  }
+  for (const side of ["head", "base"]) {
+    for (const id of [f.receipt.target.repositoryId + 1, String(f.receipt.target.repositoryId), null]) {
+      const finalPr = structuredClone(f.pr); finalPr[side].repo.id = id;
+      api[oldRoot + "/pulls/7#queue-readback"] = finalPr;
+      r = queue(); assert.notEqual(r.status, 0); assert.match(r.stdout, /queue-approved-head/);
+    }
+  }
+  delete api[oldRoot + "/pulls/7#queue-readback"];
+  f.pr.body += "\n\nAssisted-by: Codex (gpt-6)\nReviewed-by: Invented Person <review@example.invalid> (@invented-review, tier=maintainer)";
+  r = queue(); assert.notEqual(r.status, 0); assert.match(r.stdout, /reviewed-by-fabricated/); f.pr.body = queueBody;
+  r = queue(); assert.equal(r.status, 0, r.stdout + r.stderr);
   const ref = authorizationPointer(f.pr.body);
   git("switch", "main"); git("merge", "--squash", "feature/work");
   git("commit", "-m", `change workflow (#7)\n\nAssisted-by: Codex (gpt-6)\nMerge-authorization: delegated-v1 ${ref.url} sha256:${ref.digest}`);
