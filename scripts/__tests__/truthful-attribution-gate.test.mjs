@@ -65,6 +65,8 @@ import * as gateExports from "../truthful-attribution-gate.mjs";
 // The maintained hosted job names this test file explicitly; importing the
 // receipt fixture also runs its strict protocol cases in that existing job.
 import { fixture as delegatedFixture } from "./delegated-merge-receipt.test.mjs";
+// The maintained self-check explicitly selects this entrypoint.
+import "./verification-boundary.test.mjs";
 import { pointer as authorizationPointer, digest as authorizationDigest, normalizeFiles as authorizationFiles } from "../delegated-merge-receipt.mjs";
 
 const GATE = path.join(import.meta.dirname, "..", "truthful-attribution-gate.mjs");
@@ -4700,7 +4702,7 @@ if(endpoint.endsWith('/pulls/7') && endpoint+'#queue-readback' in api) {
  const counter=process.env.DELEGATION_FIXTURE+'.pr-reads';
  const n=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;
  fs.writeFileSync(counter,String(n+1));
- if(n===3)value=api[endpoint+'#queue-readback'];
+ if(n===(api[endpoint+'#queue-read-index']??3))value=api[endpoint+'#queue-readback'];
 }
 if(endpoint.startsWith('/users/')) {
  const counter=process.env.DELEGATION_FIXTURE+'.profile-reads';
@@ -4719,6 +4721,7 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   const pre = () => run("--arm", "pre-merge", "--pr", "7", "--head-sha", head, "--diff-base", "main");
   let r = pre(); assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.equal(JSON.parse(r.stdout).highRisk, true);
+  assert.equal(JSON.parse(r.stdout).queueBinding, null);
   // The actual child transport must support private-App redaction without accepting
   // conflicting App metadata or a forged/missing/finally-changed GitHub Bot profile.
   const originalApp = f.comment.performed_via_github_app, profile = structuredClone(api[f.profileEndpoint]);
@@ -4763,7 +4766,17 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   const queue = (candidate = group, candidateBase = base) => run("--arm", "merge-group", "--merge-group-head", candidate, "--merge-group-base", candidateBase);
   r = queue(); assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.equal(JSON.parse(r.stdout).highRisk, true);
+  const binding = { schema: "cinatra.queue-binding/v1", repository: repo, repositoryId: f.receipt.target.repositoryId,
+    pullRequest: 7, headSha: head, headRepositoryId: f.receipt.target.repositoryId, baseRef: "main", baseSha: base,
+    groupHeadSha: group, parents: [base, head], groupTree: mergeTree, authority: "delegated-v1" };
+  assert.deepEqual(JSON.parse(r.stdout).queueBinding, binding);
   assert.deepEqual(api[oldRoot + "/pulls/7/reviews"], []);
+  // Advisory/offline reports never expose a consumable authorization binding.
+  r = run("--arm", "merge-group", "--merge-group-head", group, "--merge-group-base", base, "--mode", "warn");
+  assert.equal(r.status, 0); assert.equal(JSON.parse(r.stdout).queueBinding, null);
+  delete api[associated]; r = queue(); assert.notEqual(r.status, 0);
+  assert.match(JSON.parse(r.stdout).apiSkippedReason, /API unavailable/); assert.equal(JSON.parse(r.stdout).queueBinding, null);
+  api[associated] = [f.pr];
   // Same authorized tree with different parents is still not the frozen group.
   const olderGroup = git("commit-tree", mergeTree, "-p", oldBase, "-p", head, "-m", "older group");
   api[oldRoot + "/commits/" + olderGroup + "/pulls"] = [f.pr];
@@ -4805,6 +4818,31 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   f.pr.body += "\n\nAssisted-by: Codex (gpt-6)\nReviewed-by: Invented Person <review@example.invalid> (@invented-review, tier=maintainer)";
   r = queue(); assert.notEqual(r.status, 0); assert.match(r.stdout, /reviewed-by-fabricated/); f.pr.body = queueBody;
   r = queue(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  // A real qualified review still authorizes unrelated work; it receives the
+  // same exact current identity projection, without a fabricated delegation.
+  const reviewEndpoint = oldRoot + "/pulls/7/reviews";
+  f.pr.body = "Assisted-by: Codex (gpt-6)\nReviewed-by: Fixture Reviewer <review@example.invalid> (@fixture-reviewer, tier=maintainer)";
+  api[reviewEndpoint] = [{ state: "APPROVED", user: { login: "fixture-reviewer" }, commit_id: head, submitted_at: stamp(now - 1000) }];
+  api[oldRoot + "/collaborators/fixture-reviewer/permission"] = { permission: "maintain" };
+  r = queue(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout).queueBinding, { ...binding, authority: "review" });
+  for (const change of [pr => { pr.head.sha = base; }, pr => { pr.base.ref = "release"; },
+    pr => { pr.head.repo.id++; }, pr => { pr.base.repo.id++; }, pr => { pr.draft = true; }]) {
+    const finalPr = structuredClone(f.pr); change(finalPr);
+    api[oldRoot + "/pulls/7#queue-read-index"] = 1;
+    api[oldRoot + "/pulls/7#queue-readback"] = finalPr;
+    r = queue(); assert.notEqual(r.status, 0); assert.equal(JSON.parse(r.stdout).queueBinding, null);
+    assert.match(r.stdout, /queue-binding-unverifiable/);
+  }
+  delete api[oldRoot + "/pulls/7#queue-read-index"]; delete api[oldRoot + "/pulls/7#queue-readback"];
+  for (const side of ["head", "base"]) {
+    const id = f.pr[side].repo.id; f.pr[side].repo.id = String(id);
+    r = queue(); assert.notEqual(r.status, 0); assert.equal(JSON.parse(r.stdout).queueBinding, null); f.pr[side].repo.id = id;
+  }
+  // Declaring bad delegated authority cannot use this otherwise valid review.
+  f.pr.body += "\nMerge authorization: invalid";
+  r = queue(); assert.notEqual(r.status, 0); assert.equal(JSON.parse(r.stdout).queueBinding, null);
+  f.pr.body = queueBody; api[reviewEndpoint] = [];
   const ref = authorizationPointer(f.pr.body);
   git("switch", "main"); git("merge", "--squash", "feature/work");
   git("commit", "-m", `change workflow (#7)\n\nAssisted-by: Codex (gpt-6)\nMerge-authorization: delegated-v1 ${ref.url} sha256:${ref.digest}`);
@@ -4815,6 +4853,7 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   api[oldRoot + "/commits/" + landed] = landedCommit;
   const post = () => run("--arm", "post-merge", "--commit", landed);
   r = post(); assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(JSON.parse(r.stdout).queueBinding, null);
   f.comment.performed_via_github_app = null;
   r = post(); assert.equal(r.status, 0, r.stdout + r.stderr);
   f.comment.performed_via_github_app = originalApp;
