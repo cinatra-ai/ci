@@ -4866,3 +4866,257 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   api[oldRoot + "/git/commits/" + landed].parents = [{ sha: oldBase }];
   r = post(); assert.notEqual(r.status, 0); assert.match(r.stdout, /merge-authorization-unverifiable/);
 });
+
+// =========================================================================
+// §6b — the IN-BRANCH CORRECTION COVER (pre-merge check 5).
+//
+// A historical bot-identity commit that landed with no named `Assisted-by`
+// cannot be given one: its message is fixed. Check 5 read each range commit's
+// OWN message only, so such a commit could never go green without rewriting the
+// branch's history — on a long-lived PR that discards every review and every
+// green check (cinatra#3079 sat blocked on exactly two such commits).
+//
+// The coordinator's merge road has accepted an IN-BRANCH correction record
+// since 2026-09-14 (its check `4-assisted-union`): a later commit
+// in the same PR range naming the commit's FULL sha and carrying its own named
+// Assisted-by covers it. These tests hold the engine to the SAME rule — and to
+// every refusal that rule does not relax.
+//
+// The new export is reached through the namespace so this file still LINKS
+// against a build without it (the §6b tests then fail on their own — red-first).
+// =========================================================================
+
+const CC_ASSISTED = "Assisted-by: Claude Code (claude-opus-5)";
+const CC_BOT = {
+  authorName: "groganz-bot[bot]",
+  authorEmail: "293224031+groganz-bot[bot]@users.noreply.github.com",
+  committerName: "groganz-bot[bot]",
+  committerEmail: "293224031+groganz-bot[bot]@users.noreply.github.com",
+};
+const CC_HUMAN = {
+  authorName: "Sandro Groganz", authorEmail: "sandro@cinatra.ai",
+  committerName: "Sandro Groganz", committerEmail: "sandro@cinatra.ai",
+};
+// The real records (cinatra#3079): the two historical commits and the two
+// empty correction commits that name them.
+const CC_T1 = "37191425e50161fb1ed4e691f06c677f6a612b7d";
+const CC_T2 = "b66f514dadd79ac9bf99c2139f209747bc623c30";
+const CC_C1 = "9cee349b1c88f0cc95a00f483a816026ef69e51a";
+const CC_C2 = "9d1b85746454466f43ed0c03dd78e11ee9ffc076";
+
+/**
+ * A pre-merge ctx from commits given NEWEST FIRST — the order the arm itself
+ * sees, because it builds rangeIdentities with `git log <base>..HEAD`
+ * (rangeCommitIdentities), which is newest-first. A LATER commit therefore sits
+ * at a LOWER index, and the order contract is pinned by its own test below.
+ */
+function ccCtx(commits, extra = {}) {
+  return {
+    changedFiles: ["src/x.ts"],
+    rangeIdentities: commits.map((c) => ({ sha: c.sha, ...(c.identity || CC_BOT) })),
+    messageBySha: Object.fromEntries(commits.map((c) => [c.sha, c.message])),
+    rangeMessages: commits.map((c) => c.message),
+    defaults: DEFAULTS_OK, repoSuite: null,
+    ...extra,
+  };
+}
+const ccNoAssisted = (what) => `fix(agents): ${what}\n\nA real change with no record of its own.`;
+const ccNoneAssisted = (what) => `fix(agents): ${what}\n\nA real change.\n\nAssisted-by: none`;
+// The REAL correction shape: the pointer is the SUBJECT line, the record's own
+// named Assisted-by sits in the trailer block.
+const ccSubjectCorrection = (target, assisted = CC_ASSISTED) =>
+  [`Correction-for: ${target}`, "", "An empty correction record for the commit above. The branch content is unchanged.", "", assisted].join("\n");
+// The earlier example's shape: the pointer sits IN the trailer block.
+const ccTrailerCorrection = (target, assisted = CC_ASSISTED) =>
+  ["record: restate the record for the commit above", "", assisted, `Correction-for: ${target}`].join("\n");
+const ccFlagged = (r) => r.findings.filter((f) => f.code === "agent-commit-no-assisted");
+
+test("§6b an in-branch Correction-for record naming the commit IN FULL covers check 5 for it", () => {
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T1) },   // later (newest-first => index 0)
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.deepEqual(ccFlagged(r), [],
+    "a later in-range correction naming the full sha and naming its agent IS the record: " + JSON.stringify(r.findings));
+  const disclosed = r.findings.find((f) => f.code === "agent-commit-corrected");
+  assert.ok(disclosed, "the cover is DISCLOSED, never silent: " + JSON.stringify(r.findings));
+  assert.equal(disclosed.severity, "notice", "a disclosure never fails the gate");
+  assert.match(disclosed.message, /9cee349b/, "the notice names the correction that covers it");
+  // The same holds when the corrected commit's own record is the untrue
+  // `Assisted-by: none` (cinatra#3079's first commit), not merely absent.
+  const none = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T1) },
+    { sha: CC_T1, message: ccNoneAssisted("the historical commit") },
+  ]));
+  assert.deepEqual(ccFlagged(none), [], JSON.stringify(none.findings));
+});
+
+test("§6b the pointer may sit in the TRAILER BLOCK as well as in the subject line", () => {
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: ccTrailerCorrection(CC_T1) },
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.deepEqual(ccFlagged(r), [], JSON.stringify(r.findings));
+});
+
+test("§6b the correction commit is itself a bot-identity commit and passes check 5 on its OWN named Assisted-by", () => {
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T1) },
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.ok(looksLikeAgent({ name: CC_BOT.authorName, email: CC_BOT.authorEmail }, {}),
+    "the fixture identity must really be a known agent, or this proves nothing");
+  assert.deepEqual(r.findings.filter((f) => /9cee349b/.test(f.message) && f.code === "agent-commit-no-assisted"), [],
+    "the correction names its agent, so check 5 is satisfied on the correction itself");
+  // ...and a correction that names NO agent trips check 5 on its own account.
+  const bare = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: [`Correction-for: ${CC_T1}`, "", "An empty correction record with no record of its own."].join("\n") },
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.equal(ccFlagged(bare).length, 2, "neither the correction nor its target has a record: " + JSON.stringify(bare.findings));
+});
+
+test("§6b a later commit that only MENTIONS the sha in prose covers nothing", () => {
+  const prose = [
+    "chore: follow-up work",
+    "",
+    `Re-does what ${CC_T1} did (Correction-for that commit, morally), and`,
+    `mentions Correction-for: ${CC_T1} inside a sentence rather than on its own line.`,
+    "",
+    CC_ASSISTED,
+  ].join("\n");
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: prose },
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.equal(ccFlagged(r).length, 1, "a body mention is not a record — only the structured line counts: " + JSON.stringify(r.findings));
+  assert.match(ccFlagged(r)[0].message, /37191425/);
+});
+
+test("§6b an ABBREVIATED sha — or a pointer that breaks the grammar — covers nothing", () => {
+  for (const pointer of [
+    `Correction-for: ${CC_T1.slice(0, 12)}`,          // abbreviated
+    `Correction-for: ${CC_T1.slice(0, 39)}`,          // one hex short of full
+    `Correction-for:${CC_T1}`,                        // no separating space
+    `Correction-for: ${CC_T1} (the test-tier fix)`,   // trailing prose on the line
+    `correction-for: ${CC_T1}`,                       // wrong case on the key
+    `# Correction-for: ${CC_T1}`,                     // not line-anchored
+  ]) {
+    const r = analyzePreMerge(ccCtx([
+      { sha: CC_C1, message: [pointer, "", "An empty correction record.", "", CC_ASSISTED].join("\n") },
+      { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+    ]));
+    assert.equal(ccFlagged(r).length, 1, `"${pointer}" must not cover anything: ` + JSON.stringify(r.findings));
+  }
+});
+
+test("§6b a correction whose own Assisted-by is `none` — or absent — covers nothing", () => {
+  const none = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T1, "Assisted-by: none") },
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.ok(ccFlagged(none).some((f) => /37191425/.test(f.message)),
+    "a correction that names no agent replaces one missing record with another: " + JSON.stringify(none.findings));
+  const absent = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: [`Correction-for: ${CC_T1}`, "", "An empty correction record with no Assisted-by at all."].join("\n") },
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+  ]));
+  assert.ok(ccFlagged(absent).some((f) => /37191425/.test(f.message)), JSON.stringify(absent.findings));
+});
+
+test("§6b a correction EARLIER in the range than the commit it names covers nothing", () => {
+  // NEWEST FIRST: the target at index 0 is LATER than the correction at index 1.
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_T1, message: ccNoAssisted("the historical commit") },
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T1) },
+  ]));
+  assert.equal(ccFlagged(r).length, 1,
+    "only a LATER commit can supply the record (the merge road's rule sentence): " + JSON.stringify(r.findings));
+  assert.match(ccFlagged(r)[0].message, /37191425/);
+});
+
+test("§6b a correction naming a DIFFERENT commit covers only that commit", () => {
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T2) },   // names T2, not T1
+    { sha: CC_T2, message: ccNoAssisted("the second historical commit") },
+    { sha: CC_T1, message: ccNoAssisted("the first historical commit") },
+  ]));
+  const flagged = ccFlagged(r);
+  assert.equal(flagged.length, 1, JSON.stringify(r.findings));
+  assert.match(flagged[0].message, /37191425/, "T1 is still uncovered; only T2 was named");
+});
+
+test("§6b a correction OUTSIDE the PR range covers nothing", () => {
+  // The correction exists (its message is even in the range's message list) but
+  // it is not a commit of this range — exactly as the merge road reads only the
+  // pull request's own commits.
+  const r = analyzePreMerge({
+    ...ccCtx([{ sha: CC_T1, message: ccNoAssisted("the historical commit") }]),
+    rangeMessages: [ccNoAssisted("the historical commit"), ccSubjectCorrection(CC_T1)],
+  });
+  assert.equal(ccFlagged(r).length, 1, "the cover is IN-BRANCH: " + JSON.stringify(r.findings));
+});
+
+test("§6b a commit cannot correct ITSELF", () => {
+  const selfCorrecting = [`Correction-for: ${CC_T1}`, "", "A commit pointing at its own sha.", "", "Assisted-by: none"].join("\n");
+  const r = analyzePreMerge(ccCtx([{ sha: CC_T1, message: selfCorrecting }]));
+  assert.equal(ccFlagged(r).length, 1, "a record cannot correct itself (§6): " + JSON.stringify(r.findings));
+});
+
+test("§6b cinatra#3079's real shape — two historical bot commits, two later correction records — goes green", () => {
+  const r = analyzePreMerge(ccCtx([
+    { sha: CC_C2, message: ccSubjectCorrection(CC_T2) },                       // PR head
+    { sha: CC_C1, message: ccSubjectCorrection(CC_T1) },
+    { sha: "c".repeat(40), message: `feat: ordinary work\n\n${CC_ASSISTED}`, identity: CC_BOT },
+    { sha: CC_T2, message: ccNoAssisted("fix leg 8, which reached the branch without a record") },
+    { sha: CC_T1, message: ccNoneAssisted("the settled-skills-step integration tier") },
+    { sha: "d".repeat(40), message: "docs: a human note\n\nAssisted-by: none", identity: CC_HUMAN },
+  ]));
+  assert.deepEqual(ccFlagged(r), [],
+    "the branch carries the record for both historical commits: " + JSON.stringify(r.findings));
+  assert.equal(r.findings.filter((f) => f.code === "agent-commit-corrected").length, 2,
+    "both covers are disclosed: " + JSON.stringify(r.findings));
+});
+
+test("§6b inBranchCorrectionCover: pure, case-insensitive on the named sha, empty on nothing to read", () => {
+  const cover = gateExports.inBranchCorrectionCover({
+    rangeIdentities: [{ sha: CC_C1, ...CC_BOT }, { sha: CC_T1, ...CC_BOT }],
+    messageBySha: { [CC_C1]: ccSubjectCorrection(CC_T1.toUpperCase()), [CC_T1]: ccNoAssisted("x") },
+  });
+  assert.equal(cover.get(CC_T1), CC_C1, "an upper-case hex pointer names the same commit");
+  assert.equal(gateExports.inBranchCorrectionCover({}).size, 0, "no range, no cover");
+  // The TARGET must be in the range too: a pointer at a commit this range does
+  // not contain covers nothing and leaves no entry behind.
+  assert.equal(gateExports.inBranchCorrectionCover({
+    rangeIdentities: [{ sha: CC_C1, ...CC_BOT }],
+    messageBySha: { [CC_C1]: ccSubjectCorrection(CC_T2) },
+  }).size, 0, "a correction naming a commit outside this range covers nothing");
+  assert.equal(gateExports.inBranchCorrectionCover({ rangeIdentities: [{ sha: CC_C1, ...CC_BOT }] }).size, 0,
+    "a range with no messages reads no correction (fail closed)");
+});
+
+test("§6b the order contract: rangeCommitIdentities emits NEWEST FIRST, so a LATER commit sits at a LOWER index", () => {
+  const { dir, g } = tmpGitRepo();
+  fs.writeFileSync(path.join(dir, "base.txt"), "base");
+  g("add", "-A"); g("commit", "-q", "-m", "base commit");
+  const base = g("rev-parse", "HEAD").stdout.trim();
+  fs.writeFileSync(path.join(dir, "older.txt"), "older");
+  g("add", "-A"); g("commit", "-q", "-m", "the OLDER branch commit");
+  const older = g("rev-parse", "HEAD").stdout.trim();
+  fs.writeFileSync(path.join(dir, "newer.txt"), "newer");
+  g("add", "-A"); g("commit", "-q", "-m", `Correction-for: ${older}\n\nAn empty correction record.\n\n${CC_ASSISTED}`);
+  const newer = g("rev-parse", "HEAD").stdout.trim();
+
+  const ids = rangeCommitIdentities(base, dir);
+  assert.deepEqual(ids.map((i) => i.sha), [newer, older],
+    "the pre-merge range array is git-log order — newest first; §6b's 'later' reading depends on it");
+  assert.equal(rangeCommitMessages(base, dir)[0].split("\n")[0], `Correction-for: ${older}`);
+
+  // ...and the cover computed over that REAL array covers the older commit.
+  const cover = gateExports.inBranchCorrectionCover({
+    rangeIdentities: ids,
+    messageBySha: Object.fromEntries(ids.map((i) => [i.sha, rangeCommitMessages(base, dir)[ids.indexOf(i)]])),
+  });
+  assert.equal(cover.get(older), newer, "the later commit covers the older one");
+  fs.rmSync(dir, { recursive: true, force: true });
+});

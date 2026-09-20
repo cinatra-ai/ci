@@ -61,6 +61,8 @@
  * path does not opt in and is unchanged. Fail-closed throughout: a correction can
  * only move a verdict by being a fully VALID record whose own claims verify
  * against X's context. See the §6 sections below for the rule and its edges.
+ * That discovery is the LANDED path — records already on the default branch.
+ * The same repair read IN A BRANCH, before merge, is §6b below.
  *
  * ==================== §7 — MULTI-COMMIT REBASE LANDING =====================
  * A REBASE merge lands the PR's commits INDIVIDUALLY and reports the LAST of
@@ -109,6 +111,27 @@
  * cover, a REST payload at the API's 300-file cap or without its patch, and any
  * unrecognized line => not a bump, and today's rule applies.
  *
+ * ========= §6b — THE IN-BRANCH CORRECTION COVER (pre-merge check 5) ========
+ * A commit's message is fixed the moment the commit exists, so a historical
+ * bot-identity commit that landed with no named `Assisted-by` could never
+ * satisfy check 5 — the missing record cannot be written into it, and rewriting
+ * the branch's history to fix it discards every review and every green check a
+ * long-lived pull request already earned. The pre-merge arm therefore reads the
+ * record where it CAN be supplied: in the branch. A flagged commit is covered —
+ * no finding, an `agent-commit-corrected` NOTICE instead — when a LATER commit
+ * of the SAME range carries a well-formed `Correction-for:` line (CORRECTION_RE,
+ * on a line of its own, in the subject or the trailer block) naming that
+ * commit's FULL 40-hex sha AND carries a named, non-`none` `Assisted-by` of its
+ * own. This MIRRORS the coordinator's merge road (its `4-assisted-union`
+ * check), which has accepted exactly this since 2026-09-14, so the
+ * CI engine and the merge road now agree on the same branch. Nothing else is
+ * relaxed: a prose mention of the sha, an abbreviated sha, a correction whose
+ * own record names no agent, one earlier in the range than the commit it names,
+ * one naming a different commit, and one outside the range all leave check 5
+ * exactly as it was. A correction need not be an empty commit (the merge road
+ * reads identities and message lines, never the correction's tree). See the §6b
+ * section below for the rule, its order contract and its edges.
+ *
  * Zero runtime dependencies (node builtins only). GitHub API access is via an
  * injectable client (default: `gh api` through execFileSync), so the entire
  * analysis is unit-testable offline with a stub client.
@@ -120,7 +143,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonical as canonicalAuthorization, parseAuthorization, verifyDelegatedReceipt } from "./delegated-merge-receipt.mjs";
 
-export const GATE_VERSION = "0.3.0";
+export const GATE_VERSION = "0.4.0";
 
 const VALID_MODES = ["warn", "enforce"];
 const VALID_ARMS = ["pre-merge", "post-merge", "merge-group"];
@@ -2985,6 +3008,101 @@ function canonicalizeForBump(v) {
 }
 
 // ===========================================================================
+// §6b — the IN-BRANCH CORRECTION COVER (pre-merge check 5).
+//
+// THE GAP. Check 5 reads each range commit's OWN message, and a message is
+// fixed the moment the commit exists: a historical bot-identity commit that
+// landed without a named `Assisted-by` could therefore NEVER go green, because
+// the record it is missing cannot be written into it. The only escape the
+// engine left was rewriting the branch's history — which on a long-lived pull
+// request discards every review and every green check it already earned.
+//
+// THE RULE, mirrored from the coordinator's merge road (its `4-assisted-union`
+// check, rule "a Correction-for record (2026-09-14)"), which has accepted
+// exactly this since that date: a flagged commit is COVERED when a
+// LATER commit in the SAME pull-request range carries a well-formed
+// `Correction-for:` line naming that commit's FULL 40-hex sha AND carries a
+// named (non-`none`) `Assisted-by` of its own. The record is then IN THE
+// BRANCH, where a reviewer reads it before approving, and check 5 stops
+// demanding the one thing that cannot be supplied.
+//
+// WHAT IT DOES NOT RELAX — every one of these still raises the finding, each
+// with its own test:
+//   - a PROSE mention of the sha counts for nothing. The pointer must be a
+//     LINE matching CORRECTION_RE — the same §1 grammar the trailer parser
+//     uses — so a body that merely talks about the commit is not a record;
+//   - an ABBREVIATED sha counts for nothing (full 40 hex, as the merge road
+//     requires a 40-character token or nothing);
+//   - a correction whose OWN `Assisted-by` is `none` or absent covers nothing:
+//     it would replace one missing record with another;
+//   - a correction EARLIER in the range than the commit it names covers
+//     nothing (see ORDER);
+//   - a correction naming a DIFFERENT commit covers only that commit;
+//   - a correction OUTSIDE the range is not read at all. The cover is
+//     IN-BRANCH, exactly like the merge road's, whose rows are the pull
+//     request's own commits and nothing else.
+//
+// WHERE THE POINTER MAY SIT: anywhere in the message. The real correction
+// records carry `Correction-for: <sha>` as the SUBJECT line (both of
+// cinatra#3079's), and an earlier example carried it in the trailer block; the
+// merge road reads any line of the message that starts with the key, so this
+// reads any line too. `parseTrailers().correctionFor` alone would see only the
+// trailer block and miss the subject — it is deliberately not the reader here.
+//
+// ORDER. The pre-merge range array is `git log <base>..HEAD` order — NEWEST
+// FIRST (rangeCommitIdentities) — so a LATER commit sits at a LOWER index. The
+// merge road's own rule sentence says "a later commit" while its python builds
+// the corrected set over every row without testing order; this mirrors the
+// SENTENCE, which can never refuse a real record: a commit's sha is fixed by its
+// whole history, so no commit can name a sha that does not exist yet, and every
+// real correction is later than what it corrects. Strictly-later also means a
+// commit can never correct ITSELF, which is §6's rule for the landed path.
+//
+// EMPTINESS. A correction is NOT required to be a content-free (empty) commit:
+// the merge road reads identities and message lines only, never the
+// correction's tree, and this mirrors it. (The real records happen to be empty.)
+//
+// FAIL-CLOSED DIRECTION. The cover can only ever REMOVE check 5's finding for a
+// commit that a valid, named, in-range, later correction claims — and it is
+// DISCLOSED as an `agent-commit-corrected` notice, never silent. No other check
+// reads it and nothing else is relaxed.
+// ===========================================================================
+
+/**
+ * Map each range commit that a LATER in-range correction covers to that
+ * correction's sha. Pure: `{ rangeIdentities, messageBySha }` in, Map out
+ * (lower-cased full shas both sides). An unreadable message reads as no
+ * correction, which leaves check 5 exactly as it was (fail closed).
+ */
+export function inBranchCorrectionCover({ rangeIdentities = [], messageBySha = {} } = {}) {
+  const cover = new Map();
+  const ids = Array.isArray(rangeIdentities) ? rangeIdentities : [];
+  const positionOf = new Map();
+  ids.forEach((id, i) => {
+    const sha = asFullSha(id && id.sha);
+    if (sha && !positionOf.has(sha)) positionOf.set(sha, i);
+  });
+  ids.forEach((id, i) => {
+    const msg = (messageBySha && messageBySha[id && id.sha]) || "";
+    if (!msg) return;
+    // The correction's OWN record must name an agent — read exactly the way
+    // check 5 reads every other commit's (the trailer block's Assisted-by).
+    if (!parseTrailers(msg).assisted.some((a) => !a.isNone)) return;
+    for (const line of String(msg).split(/\r?\n/)) {
+      const m = line.match(CORRECTION_RE);
+      if (!m) continue;
+      const target = asFullSha(m.groups.sha);
+      if (!target) continue;
+      const at = positionOf.get(target);
+      if (at === undefined) continue;   // names a commit outside this range
+      if (!(at > i)) continue;          // newest-first: the correction must be LATER (self excluded)
+      if (!cover.has(target)) cover.set(target, asFullSha(id && id.sha) || String(id && id.sha));
+    }
+  });
+  return cover;
+}
+
+// ===========================================================================
 // Analysis orchestration (per-arm). Network calls go through the injected
 // client; all decision logic is pure and reachable from tests.
 // ===========================================================================
@@ -3017,7 +3135,10 @@ export function analyzePreMerge(ctx) {
   for (const e of hr.errors) findings.push({ code: "high-risk-config", severity: "error", message: e });
 
   // check 5: any range commit authored/committed by a known agent must carry a
-  // matching Assisted-by in its OWN message (branch-commit attribution).
+  // matching Assisted-by in its OWN message (branch-commit attribution) — or,
+  // §6b, be covered by a LATER in-branch `Correction-for` record that names it
+  // in full and names its own agent (the merge road's rule since 2026-09-14).
+  const correctionCover = inBranchCorrectionCover(ctx);
   for (const id of ctx.rangeIdentities || []) {
     // §5b: a TOOL-MADE DEPENDENCY BUMP is not agent work — no agent produced it,
     // so `Assisted-by: none` (or no line) is the truthful record and this commit
@@ -3039,6 +3160,18 @@ export function analyzePreMerge(ctx) {
       const p = parseTrailers(msg);
       const named = p.assisted.some((a) => !a.isNone);
       if (!named) {
+        // §6b: the record may instead be in the BRANCH — a later commit of this
+        // same range whose `Correction-for:` line names this commit in full and
+        // which names its own agent. Disclosed, never silent.
+        const coveredBy = correctionCover.get(asFullSha(id.sha));
+        if (coveredBy) {
+          findings.push({
+            code: "agent-commit-corrected",
+            severity: "notice",
+            message: `commit ${shortSha(id.sha)} carries no named Assisted-by of its own, but the LATER in-range commit ${shortSha(coveredBy)} is a Correction-for record naming it in full and naming its agent — the record is in the branch (§6b; the merge road has accepted this since 2026-09-14)`,
+          });
+          continue;
+        }
         findings.push({
           code: "agent-commit-no-assisted",
           severity: "error",
