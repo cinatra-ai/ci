@@ -1955,6 +1955,65 @@ rejected. A parse failure of either config => the whole change is treated
 high-risk (fail closed). Removing a default means editing this repo's config —
 itself a high-risk path, so maintainer-reviewed by construction.
 
+### Manifest content rules (§3b)
+
+A glob in `highRiskPaths` makes **every** change to a file high-risk. For a pack's
+`package.json` that is too coarse. The owner's decision of 2026-09-24: a pack
+manifest change is high-risk only when it **adds** a display or a renderer
+export, or **changes** dependencies. A change that drops a display, claims a
+representation, bumps the version or reorders the file is not high-risk.
+
+A suite states this rule with the optional `highRiskManifestRules` key:
+
+```json
+"highRiskManifestRules": [
+  {
+    "path": "package.json",
+    "addedUnder": ["cinatra.displays", "cinatra.renderers", "exports"],
+    "changedKeys": ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]
+  }
+]
+```
+
+When a change touches the `path` of a rule (one repository-relative file, not a
+glob), the gate reads the JSON of that file at the base and at the head of the
+change. On a pull request and in the merge queue, these are the merge base and
+the head that the changed files are measured between. After the merge, they are
+the first parent of each landed commit and the commit itself.
+
+- **`addedUnder`** — dotted paths of object keys. The change is high-risk when
+  the head has an entry under one of these subtrees that the base does not have.
+  The entries of an object are its keys. The entries of an array are its
+  elements, compared by their full value, so a changed element counts as an
+  added one. A plain value is one entry.
+- **`changedKeys`** — dotted paths of object keys. The change is high-risk when
+  the value at one of these paths is different at the base and at the head. The
+  order of object keys and of array elements is not a change. A key that appears
+  or disappears is a change.
+- All other changes to the file are classed **not high-risk by rule**.
+
+The JSON report gives one verdict for each changed rule file in `manifestRules`:
+the rule that fired (for example `package.json: added entry under
+cinatra.displays ("summary")` or `package.json: changed dependencies`), or the
+statement that the rule classed the change as not high-risk. A high-risk finding
+names the rule that fired.
+
+The gate removes a rule path from the repository's own `highRiskPaths` globs, so
+a suite does not have to list the file there. The central defaults still apply
+to that path and to all other paths: a rule never removes a default. The rule
+fails closed:
+
+- A malformed rule list makes the whole change high-risk. Malformed means: not an
+  array, a rule that is not an object, an unknown key, a glob or `..` path, a
+  missing or malformed `addedUnder` or `changedKeys`, a rule that names no
+  change, or two rules for one path.
+- A rule file that is not valid JSON, or not a JSON object, at the base or at the
+  head is refused by name and is high-risk.
+- A file that the change adds or deletes is read as an empty object on the side
+  where it does not exist, so all of its content counts as added or changed.
+
+A suite without the key classifies exactly as before.
+
 ### Known-agent identities and content-free merges (§5/§5c)
 
 Check 5 reads a commit whose author or committer matches a known-agent token as
@@ -2042,7 +2101,8 @@ for one repo. Hybrid storage:
   registry). Shape: `suiteId`, CalVer `version` (`YYYY.MM[.N]`),
   `accountable{github,name,email}` (all three required), non-empty
   `requiredContexts[{context, workflow?, pinned?, appSlug?}]`, `highRiskPaths`
-  (superset of the central defaults), `lastAuditedAt`, `auditEvidence`.
+  (superset of the central defaults), the optional `highRiskManifestRules`
+  (§3b), `lastAuditedAt`, `auditEvidence`.
 - **`config/gate-suite-index.json`** in this repo is a **generated, read-only**
   org-wide audit index — *nothing reads it at merge time*, so it can never weaken
   enforcement. It is regenerated from the **explicit** `config/gate-suite-inventory.json`
@@ -2053,10 +2113,10 @@ for one repo. Hybrid storage:
   exactly the inventoried repos (`scripts/gate-suite-index-selfcheck.mjs`).
 
 **Version-bump rule (gate-checked):** on a PR that changes
-`.github/gate-suite.json`, if `requiredContexts`, a context `pinned` SHA, or
-`highRiskPaths` changed versus the base and `version` did **not** bump, that is a
-finding — a material suite change must bump CalVer so the audit can tell which
-suite applied.
+`.github/gate-suite.json`, if `requiredContexts`, a context `pinned` SHA,
+`highRiskPaths` or `highRiskManifestRules` changed versus the base and `version`
+did **not** bump, that is a finding — a material suite change must bump CalVer so
+the audit can tell which suite applied.
 
 **Continuous-audit + staleness (gate-checked):** monthly, the `Accountable`
 engineer reviews the suite + a 10% sample of gate-arm merges (min 5), records
