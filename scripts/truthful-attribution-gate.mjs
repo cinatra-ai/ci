@@ -132,6 +132,25 @@
  * reads identities and message lines, never the correction's tree). See the §6b
  * section below for the rule, its order contract and its edges.
  *
+ * ============ §3b — MANIFEST CONTENT RULES (devops#271) ====================
+ * A glob in `highRiskPaths` makes EVERY change to a file high-risk. For a pack's
+ * manifest that is too coarse: the owner's decision of 2026-09-24 is that a
+ * pack's package.json is high-risk only when the change ADDS a display or a
+ * renderer export or CHANGES dependencies — dropping a display, claiming a
+ * representation, bumping the version or reordering is not. A suite may name
+ * such a file in the optional `highRiskManifestRules` list instead:
+ * `{ path, addedUnder: [dotted JSON paths], changedKeys: [dotted JSON paths] }`.
+ * The file's JSON is read at the base and at the head of the change; an entry
+ * ADDED under an `addedUnder` subtree, or a CHANGED value at a `changedKeys`
+ * path, makes the change high-risk and the report names the rule that fired;
+ * anything else is classed not high-risk BY RULE, and the report says so. The
+ * rule path leaves the repository's own `highRiskPaths` globs; the central
+ * defaults still apply to it and to every other path (a rule never removes a
+ * default). Fail closed: a malformed rule list makes the whole change
+ * high-risk, and a rule file that is not valid JSON at either end — or whose
+ * content was not read — is refused by name and treated as high-risk. A suite
+ * without the key classifies exactly as before. See the §3b section below.
+ *
  * Zero runtime dependencies (node builtins only). GitHub API access is via an
  * injectable client (default: `gh api` through execFileSync), so the entire
  * analysis is unit-testable offline with a stub client.
@@ -512,7 +531,9 @@ export function aggregateAssisted(messages, opts = {}) {
 // high-risk-defaults.json (exact globs) plus the repo's .github/gate-suite.json
 // highRiskPaths, which may EXTEND but never remove defaults (gate verifies the
 // effective set is a superset of defaults). Parse failure of either config =>
-// the entire change is treated high-risk (fail closed).
+// the entire change is treated high-risk (fail closed). A suite's optional
+// highRiskManifestRules (§3b) classifies a named manifest file by the CONTENT
+// of its change instead of by the repo's globs — and never removes a default.
 // ===========================================================================
 
 /**
@@ -561,29 +582,42 @@ export function loadJsonSafe(p) {
  *
  * @param changedFiles list of paths (both old+new for renames; §3 mechanics)
  * @param defaults     { ok, value:{ highRiskGlobs:[...] } } from high-risk-defaults.json
- * @param repoSuite    { ok, value:{ highRiskPaths:[...] } } from .github/gate-suite.json (optional)
+ * @param repoSuite    { ok, value:{ highRiskPaths:[...], highRiskManifestRules?:[...] } }
+ *                     from .github/gate-suite.json (optional)
+ * @param opts.manifestFiles §3b: { [rule path]: { base, head } } — a changed rule
+ *                     file's JSON at both ends of the change (jsonFileAtRef-shaped),
+ *                     as collectManifestFiles reads it.
  *
  * Fail-closed rules (§3):
  *  - defaults parse failure => high-risk (and a hardError).
  *  - repoSuite present but parse failure => high-risk.
  *  - repoSuite highRiskPaths NOT a superset of defaults => high-risk + error
  *    (a repo may extend, never remove defaults).
+ *  - §3b: a malformed highRiskManifestRules => high-risk + error; a changed rule
+ *    file that is not valid JSON at either end, or was not read => that file is
+ *    high-risk + an error naming it.
+ *
+ * `manifest` carries one verdict per changed rule file ({ path, highRisk,
+ * verdict, detail }): the rule that fired, the refusal, or that the change was
+ * classed not high-risk by rule. A `matched` entry names its `glob`, or — for a
+ * fired manifest rule — the `rule` that fired.
  */
-export function classifyHighRisk(changedFiles, defaults, repoSuite) {
+export function classifyHighRisk(changedFiles, defaults, repoSuite, { manifestFiles = null } = {}) {
   const errors = [];
   if (!defaults || !defaults.ok || !Array.isArray(defaults.value?.highRiskGlobs)) {
     errors.push(`high-risk-defaults config unparseable (${defaults?.reason || "missing highRiskGlobs"}) — failing CLOSED, treating change as high-risk`);
-    return { highRisk: true, errors, effectiveGlobs: [], matched: [], failClosed: true };
+    return { highRisk: true, errors, effectiveGlobs: [], matched: [], failClosed: true, manifest: [] };
   }
   const defaultGlobs = defaults.value.highRiskGlobs.map(String);
 
   let repoGlobs = [];
+  let manifestRules = [];
   if (repoSuite && repoSuite.ok) {
     const hr = repoSuite.value?.highRiskPaths;
     if (hr !== undefined) {
       if (!Array.isArray(hr)) {
         errors.push(`gate-suite.json highRiskPaths is not an array — failing CLOSED`);
-        return { highRisk: true, errors, effectiveGlobs: defaultGlobs, matched: [], failClosed: true };
+        return { highRisk: true, errors, effectiveGlobs: defaultGlobs, matched: [], failClosed: true, manifest: [] };
       }
       repoGlobs = hr.map(String);
       // Superset check: every default must be present in the repo set (extend-only).
@@ -591,23 +625,285 @@ export function classifyHighRisk(changedFiles, defaults, repoSuite) {
       const missing = defaultGlobs.filter((g) => !repoSet.has(g));
       if (missing.length) {
         errors.push(`gate-suite.json highRiskPaths must be a SUPERSET of central defaults; missing: ${missing.join(", ")} — failing CLOSED`);
-        return { highRisk: true, errors, effectiveGlobs: defaultGlobs, matched: [], failClosed: true };
+        return { highRisk: true, errors, effectiveGlobs: defaultGlobs, matched: [], failClosed: true, manifest: [] };
       }
     }
+    // §3b: the manifest content rules, validated in full before any is applied.
+    // A malformed list fails the WHOLE change closed, like a malformed highRiskPaths.
+    const mr = parseManifestRules(repoSuite.value?.highRiskManifestRules);
+    if (!mr.ok) {
+      errors.push(...mr.errors);
+      return { highRisk: true, errors, effectiveGlobs: [...new Set([...defaultGlobs, ...repoGlobs])], matched: [], failClosed: true, manifest: [] };
+    }
+    manifestRules = mr.rules;
   } else if (repoSuite && !repoSuite.ok) {
     errors.push(`gate-suite.json present but unparseable (${repoSuite.reason}) — failing CLOSED`);
-    return { highRisk: true, errors, effectiveGlobs: defaultGlobs, matched: [], failClosed: true };
+    return { highRisk: true, errors, effectiveGlobs: defaultGlobs, matched: [], failClosed: true, manifest: [] };
   }
 
   const effectiveGlobs = [...new Set([...defaultGlobs, ...repoGlobs])];
   const compiled = effectiveGlobs.map((g) => ({ glob: g, re: globToRegExp(g) }));
+  const compiledDefaults = defaultGlobs.map((g) => ({ glob: g, re: globToRegExp(g) }));
+  const ruleByPath = new Map(manifestRules.map((r) => [r.path, r]));
+  const contents = manifestFiles && typeof manifestFiles === "object" ? manifestFiles : {};
   const matched = [];
+  const manifest = [];
+  let failClosed = false;
   for (const f of changedFiles) {
-    for (const { glob, re } of compiled) {
-      if (re.test(f)) { matched.push({ file: f, glob }); break; }
+    const rule = ruleByPath.get(f);
+    if (!rule) {
+      for (const { glob, re } of compiled) {
+        if (re.test(f)) { matched.push({ file: f, glob }); break; }
+      }
+      continue;
+    }
+    // §3b: a rule path leaves the repository's own globs — never the central
+    // defaults, which a suite may extend and never remove.
+    const central = compiledDefaults.find(({ re }) => re.test(f));
+    if (central) {
+      matched.push({ file: f, glob: central.glob });
+      manifest.push({ path: f, highRisk: true, verdict: "central-default", detail: `${f}: high-risk through the central default ${central.glob} — a manifest rule never removes a central default` });
+      continue;
+    }
+    const verdict = evaluateManifestRule(rule, Object.prototype.hasOwnProperty.call(contents, f) ? contents[f] : null);
+    manifest.push(verdict);
+    if (verdict.verdict === "refused") { errors.push(verdict.detail); failClosed = true; }
+    if (verdict.highRisk) matched.push({ file: f, rule: verdict.detail });
+  }
+  return { highRisk: matched.length > 0, errors, effectiveGlobs, matched, failClosed, manifest };
+}
+
+/** What a high-risk finding names: each matching glob, or the manifest rule that fired (§3b). */
+function highRiskSurface(hr) {
+  const items = (hr && Array.isArray(hr.matched) ? hr.matched : []).map((m) => m.rule || m.glob);
+  return `${items.slice(0, 3).join(", ")}${items.length > 3 ? ", …" : ""}`;
+}
+
+// ===========================================================================
+// §3b — MANIFEST CONTENT RULES (devops#271)
+//
+// A glob makes EVERY change to a file high-risk. The owner's decision of
+// 2026-09-24 draws the line inside a pack's package.json instead: the change is
+// high-risk only when it ADDS a display or a renderer export or CHANGES
+// dependencies; dropping a display, claiming a representation, bumping the
+// version and reordering are not. A suite expresses that as data:
+//
+//   "highRiskManifestRules": [{
+//     "path": "package.json",
+//     "addedUnder": ["cinatra.displays", "cinatra.renderers", "exports"],
+//     "changedKeys": ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]
+//   }]
+//
+// For a change that touches a rule's `path` (one repository-relative file, never
+// a glob) the file's JSON is read at the base and at the head of the change:
+//   - addedUnder (dotted paths of object keys): an ENTRY present under that
+//     subtree at the head and not at the base fires the rule. An object's
+//     entries are its keys; an array's entries are its elements, each compared
+//     by its whole canonical value (so a changed element reads as an added one —
+//     fail closed); a plain value is a single entry.
+//   - changedKeys (dotted paths of object keys): a value that differs between
+//     base and head fires the rule. Object key order and array order are not
+//     changes (the §4 canonical form); a key that appears or disappears is.
+//   - nothing fired => the change to that file is classed NOT high-risk by the
+//     rule, and the report says so.
+// A rule path leaves the repository's own highRiskPaths globs (a suite may keep
+// the file out of the list, or list it — the rule governs either way), but never
+// the central defaults: a default glob that matches it still classifies it.
+//
+// Fail closed, by name: a malformed rule list (not an array, a rule that is not
+// an object, an unknown key, a glob or traversing path, a missing or malformed
+// addedUnder/changedKeys, a rule naming nothing, a path two rules name) makes the
+// WHOLE change high-risk, exactly like a malformed highRiskPaths. A changed rule
+// file that is not valid JSON, or not a JSON object, at either end — or whose
+// content was not read at all — is refused and high-risk. A file absent at one
+// end (the change creates or deletes it) reads as an empty object there, so
+// everything it carries counts as added or changed.
+// ===========================================================================
+
+const MANIFEST_RULE_KEYS = ["path", "addedUnder", "changedKeys"];
+
+/** Why a rule path is unusable, or null. One repository-relative file: no glob, no traversal. */
+function manifestRulePathProblem(p) {
+  if (typeof p !== "string" || p === "") return "path must be a non-empty string";
+  if (p.trim() !== p || p.startsWith("/") || p.includes("\\")) return "path must be repository-relative, with forward slashes and no surrounding whitespace";
+  if (/[*?[\]{}]/.test(p)) return "path must name one file, not a glob";
+  if (p.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) return "path must not contain empty, '.' or '..' segments";
+  return null;
+}
+
+/** Why a dotted JSON path is unusable, or null. */
+function dottedPathProblem(s) {
+  if (typeof s !== "string" || s === "") return "is not a non-empty string";
+  if (/\s/.test(s)) return "contains whitespace";
+  if (s.split(".").some((seg) => seg === "")) return "has an empty segment";
+  return null;
+}
+
+/**
+ * Validate a suite's optional `highRiskManifestRules`. Pure. Returns
+ * { ok, rules, errors }: an absent key (or an empty list) is no rule at all; ANY
+ * malformed rule refuses the whole list (ok:false, rules:[]), each problem named.
+ * Repeated entries inside one list collapse (first occurrence kept).
+ */
+export function parseManifestRules(value) {
+  if (value === undefined) return { ok: true, rules: [], errors: [] };
+  const errors = [];
+  const refuse = (what) => errors.push(`gate-suite.json highRiskManifestRules${what} — failing CLOSED`);
+  if (!Array.isArray(value)) {
+    refuse(" is not an array");
+    return { ok: false, rules: [], errors };
+  }
+  const rules = [];
+  const seen = new Set();
+  value.forEach((rule, i) => {
+    if (!rule || typeof rule !== "object" || Array.isArray(rule)) { refuse(`[${i}] is not an object`); return; }
+    const name = typeof rule.path === "string" && rule.path !== "" ? `[${i}] (${rule.path})` : `[${i}]`;
+    const unknown = Object.keys(rule).filter((k) => !MANIFEST_RULE_KEYS.includes(k));
+    if (unknown.length) { refuse(`${name} carries unknown key(s) ${unknown.join(", ")}`); return; }
+    const pathProblem = manifestRulePathProblem(rule.path);
+    if (pathProblem) { refuse(`${name}: ${pathProblem}`); return; }
+    const lists = {};
+    for (const key of ["addedUnder", "changedKeys"]) {
+      if (!Array.isArray(rule[key])) { refuse(`${name}: ${key} must be an array of dotted JSON paths`); return; }
+      for (const entry of rule[key]) {
+        const problem = dottedPathProblem(entry);
+        if (problem) { refuse(`${name}: ${key} entry ${JSON.stringify(entry)} ${problem}`); return; }
+      }
+      lists[key] = [...new Set(rule[key])];
+    }
+    if (lists.addedUnder.length === 0 && lists.changedKeys.length === 0) {
+      refuse(`${name} names no high-risk change (addedUnder and changedKeys are both empty)`);
+      return;
+    }
+    if (seen.has(rule.path)) { refuse(`${name} names a path another rule already names`); return; }
+    seen.add(rule.path);
+    rules.push({ path: rule.path, addedUnder: lists.addedUnder, changedKeys: lists.changedKeys });
+  });
+  return errors.length ? { ok: false, rules: [], errors } : { ok: true, rules, errors };
+}
+
+/** The value at a dotted path of object keys: { present, value }. An array or a plain value on the way ends the walk. */
+function manifestValueAt(doc, dotted) {
+  let node = doc;
+  for (const seg of String(dotted).split(".")) {
+    if (!node || typeof node !== "object" || Array.isArray(node) || !Object.prototype.hasOwnProperty.call(node, seg)) {
+      return { present: false, value: undefined };
+    }
+    node = node[seg];
+  }
+  return { present: true, value: node };
+}
+
+/** Canonical JSON text: object key order and array order do not count (the §4 canonical form). */
+function manifestCanonical(v) {
+  return JSON.stringify(canonicalizeForBump(v));
+}
+
+/** The entries of a subtree: an object's keys, an array's elements (by canonical value), or one plain value. */
+function manifestEntries(at) {
+  if (!at.present) return [];
+  const v = at.value;
+  if (Array.isArray(v)) return v.map((x) => { const c = manifestCanonical(x); return { id: `item:${c}`, label: c }; });
+  if (v && typeof v === "object") return Object.keys(v).map((k) => ({ id: `key:${k}`, label: JSON.stringify(k) }));
+  const c = manifestCanonical(v);
+  return [{ id: `value:${c}`, label: c }];
+}
+
+/** The entries present under a subtree at the head and not at the base (a multiset difference). */
+function manifestAddedEntries(baseAt, headAt) {
+  const left = new Map();
+  for (const e of manifestEntries(baseAt)) left.set(e.id, (left.get(e.id) || 0) + 1);
+  const added = [];
+  for (const e of manifestEntries(headAt)) {
+    const n = left.get(e.id) || 0;
+    if (n > 0) left.set(e.id, n - 1);
+    else added.push(e.label);
+  }
+  return added;
+}
+
+/** One end of a rule file as a document, or the reason it cannot be one. An absent file is an empty object. */
+function manifestSide(side, end, file) {
+  if (side && side.ok === true) {
+    const v = side.value;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return { doc: null, problem: `${file} is not a JSON object at the ${end}` };
+    return { doc: v, problem: null };
+  }
+  if (side && side.absent === true) return { doc: {}, problem: null };
+  const reason = side && side.reason ? String(side.reason) : "not read";
+  return {
+    doc: null,
+    problem: /^invalid JSON/.test(reason) ? `${file} is not valid JSON at the ${end} (${reason})` : `${file} could not be read at the ${end} (${reason})`,
+  };
+}
+
+function clipManifestLabel(s) {
+  return s.length > 60 ? `${s.slice(0, 57)}...` : s;
+}
+
+/**
+ * Apply ONE validated rule to its file's JSON at both ends of the change. Pure.
+ *
+ * @param rule      { path, addedUnder, changedKeys } from parseManifestRules
+ * @param snapshot  { base, head } — each a jsonFileAtRef-shaped result — or null
+ *                  when the content was not read (refused: never "unchanged").
+ * Returns { path, highRisk, verdict: "rule-fired" | "not-high-risk" | "refused", detail }.
+ */
+export function evaluateManifestRule(rule, snapshot) {
+  const file = rule.path;
+  const refused = (why) => ({
+    path: file, highRisk: true, verdict: "refused",
+    detail: `${why} — the manifest rule cannot be applied; refused, failing CLOSED (treated as high-risk)`,
+  });
+  if (!snapshot || typeof snapshot !== "object") return refused(`${file}: the file's content at the base and the head was not read`);
+  const base = manifestSide(snapshot.base, "base", file);
+  const head = manifestSide(snapshot.head, "head", file);
+  const problems = [base.problem, head.problem].filter(Boolean);
+  if (problems.length) return refused(problems.join("; "));
+  const reasons = [];
+  for (const sub of rule.addedUnder) {
+    const added = manifestAddedEntries(manifestValueAt(base.doc, sub), manifestValueAt(head.doc, sub));
+    if (added.length) {
+      reasons.push(`${file}: added entry under ${sub} (${added.slice(0, 3).map(clipManifestLabel).join(", ")}${added.length > 3 ? ", …" : ""})`);
     }
   }
-  return { highRisk: matched.length > 0, errors, effectiveGlobs, matched, failClosed: false };
+  for (const key of rule.changedKeys) {
+    const a = manifestValueAt(base.doc, key);
+    const b = manifestValueAt(head.doc, key);
+    if (a.present !== b.present || (a.present && manifestCanonical(a.value) !== manifestCanonical(b.value))) {
+      reasons.push(`${file}: changed ${key}`);
+    }
+  }
+  if (reasons.length) return { path: file, highRisk: true, verdict: "rule-fired", detail: reasons.join("; ") };
+  const addedPart = rule.addedUnder.length ? `no entry added under ${rule.addedUnder.join(", ")}` : "no subtree named";
+  const keyPart = rule.changedKeys.length ? `${rule.changedKeys.join(", ")} unchanged` : "no key named";
+  return {
+    path: file, highRisk: false, verdict: "not-high-risk",
+    detail: `${file}: changed, classed not high-risk by the suite's highRiskManifestRules (${addedPart}; ${keyPart})`,
+  };
+}
+
+/**
+ * Read each CHANGED rule file's JSON at both ends of the change, by the same git
+ * road the parent suite is read by (jsonFileAtRef keeps an absent file apart
+ * from an unreadable one). Returns { [rule path]: { base, head } } for the rule
+ * paths in `changedFiles` only. A missing ref reads as an operational gap —
+ * refused by the rule, never an absent file. Never throws.
+ */
+export function collectManifestFiles({ suite, changedFiles, baseRef, headRef, cwd = process.cwd() } = {}) {
+  const out = {};
+  if (!suite || suite.ok !== true) return out;
+  const parsed = parseManifestRules(suite.value?.highRiskManifestRules);
+  if (!parsed.ok) return out;                       // classifyHighRisk refuses the malformed list itself
+  const changed = new Set((Array.isArray(changedFiles) ? changedFiles : []).map(String));
+  const read = (ref, file, end) => (ref
+    ? jsonFileAtRef(ref, file, cwd)
+    : { ok: false, reason: `no ${end} commit to read ${file} at`, operational: true });
+  for (const rule of parsed.rules) {
+    if (!changed.has(rule.path)) continue;
+    out[rule.path] = { base: read(baseRef, rule.path, "base"), head: read(headRef, rule.path, "head") };
+  }
+  return out;
 }
 
 // ===========================================================================
@@ -954,7 +1250,8 @@ export function collectLandedChain({ commit, depth, cwd = process.cwd() } = {}) 
  * Read a file's contents at a git ref as a loadJsonSafe-shaped result. Used by
  * the §4 version-bump rule to obtain the PARENT gate-suite.json (the suite as it
  * stood on the base the PR's changed-file range was computed against — NOT a
- * remote registry, so no TOCTOU).
+ * remote registry, so no TOCTOU), and by §3b to read a manifest-rule file at
+ * both ends of the change (collectManifestFiles).
  *
  * It DISTINGUISHES (codex round-2 HIGH — must not collapse to "absent" and fail
  * open):
@@ -971,7 +1268,7 @@ export function jsonFileAtRef(ref, filePath, cwd = process.cwd()) {
   // 1. Does the ref resolve at all? An unresolvable ref is operational, not absence.
   try {
     execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], { stdio: "ignore", cwd });
-  } catch { return { ok: false, reason: `base ref '${ref}' does not resolve (not fetched?) — cannot read the parent suite`, operational: true }; }
+  } catch { return { ok: false, reason: `base ref '${ref}' does not resolve (not fetched?) — cannot read ${filePath} there`, operational: true }; }
   // 2. Is the path present in that ref's tree? If not, it is genuinely a NEW file.
   try {
     execFileSync("git", ["--literal-pathspecs", "cat-file", "-e", "--end-of-options", `${ref}:${filePath}`], { stdio: "ignore", cwd });
@@ -2939,9 +3236,10 @@ export function checkAuditStaleness(lastAuditedAt, now = Date.now()) {
 /**
  * §4 version-bump + audit-coupling rule (gate-checked). On any PR that changes
  * `.github/gate-suite.json`:
- *  - if `requiredContexts` (incl. any context `pinned` SHA) or `highRiskPaths`
- *    changed against the PARENT (base-ref) suite and `version` did NOT bump =>
- *    finding (defeats the "which suite version applied" audit);
+ *  - if `requiredContexts` (incl. any context `pinned` SHA), `highRiskPaths` or
+ *    `highRiskManifestRules` (§3b) changed against the PARENT (base-ref) suite
+ *    and `version` did NOT bump => finding (defeats the "which suite version
+ *    applied" audit);
  *  - if `lastAuditedAt` changed but `auditEvidence` did NOT change => finding
  *    (§4: lastAuditedAt and auditEvidence are bumped IN THE SAME COMMIT — a new
  *    audit date with stale evidence is the half-fabrication the coupling exists
@@ -2975,9 +3273,11 @@ export function checkSuiteVersionBump(parentSuite, headSuite) {
   const norm = (v) => JSON.stringify(canonicalizeForBump(v));
   const materialChanged =
     norm(a.requiredContexts) !== norm(b.requiredContexts) ||
-    norm(a.highRiskPaths) !== norm(b.highRiskPaths);
+    norm(a.highRiskPaths) !== norm(b.highRiskPaths) ||
+    // §3b: what counts as a high-risk manifest change is classification, too.
+    norm(a.highRiskManifestRules) !== norm(b.highRiskManifestRules);
   if (materialChanged && a.version === b.version) {
-    return { ok: false, reason: `gate-suite.json requiredContexts/pinned/highRiskPaths changed but version did not bump (still '${b.version}') — a material suite change must bump version (CalVer YYYY.MM[.N]) so the audit can tell which suite applied (§4)` };
+    return { ok: false, reason: `gate-suite.json requiredContexts/pinned/highRiskPaths/highRiskManifestRules changed but version did not bump (still '${b.version}') — a material suite change must bump version (CalVer YYYY.MM[.N]) so the audit can tell which suite applied (§4)` };
   }
   // §4 audit coupling: a changed lastAuditedAt with unchanged auditEvidence is
   // an uncoupled audit-date bump. Compare by canonical VALUE (not `===`, which
@@ -2989,7 +3289,8 @@ export function checkSuiteVersionBump(parentSuite, headSuite) {
   return { ok: true, reason: null };
 }
 
-// Canonicalize a requiredContexts/highRiskPaths value for order-insensitive,
+// Canonicalize a requiredContexts/highRiskPaths/highRiskManifestRules value (and,
+// for §3b, a manifest's JSON values) for order-insensitive,
 // whitespace-insensitive comparison: sort arrays of strings; sort arrays of
 // context objects by a stable key (context+workflow+pinned+appSlug); recurse.
 function canonicalizeForBump(v) {
@@ -3119,6 +3420,7 @@ export function inBranchCorrectionCover({ rangeIdentities = [], messageBySha = {
  *   { changedFiles, rangeIdentities, rangeMessages, agentTokens, agentAllow,
  *     mergeInfoBySha (§5c: sha -> { parents, tree, cleanTree }),
  *     defaults, repoSuite,
+ *     manifestFiles (§3b: rule path -> { base, head }, collectManifestFiles),
  *     // optional API-derived (when a client + PR are available):
  *     reviews, prAuthorLogin, reviewedHeadSha, permissionByLogin, suiteFile,
  *     checkRuns, declaredReviewedBy }
@@ -3130,8 +3432,9 @@ export function analyzePreMerge(ctx) {
   if (delegationRequested && !delegated) findings.push({ code: "merge-authorization-unverifiable", severity: "error",
     message: "scoped merge authorization failed: " + (ctx.delegation?.reasons || ["authenticated receipt unavailable"]).join("; ") });
 
-  // check 4 + §3: high-risk mapping (always computable from the diff + config).
-  const hr = classifyHighRisk(ctx.changedFiles || [], ctx.defaults, ctx.repoSuite);
+  // check 4 + §3: high-risk mapping (always computable from the diff + config;
+  // §3b reads a changed manifest-rule file's content from ctx.manifestFiles).
+  const hr = classifyHighRisk(ctx.changedFiles || [], ctx.defaults, ctx.repoSuite, { manifestFiles: ctx.manifestFiles });
   for (const e of hr.errors) findings.push({ code: "high-risk-config", severity: "error", message: e });
 
   // check 5: any range commit authored/committed by a known agent must carry a
@@ -3193,7 +3496,7 @@ export function analyzePreMerge(ctx) {
       findings.push({
         code: "high-risk-unverifiable",
         severity: "error",
-        message: `change touches a high-risk path (${hr.matched.slice(0, 3).map((m) => m.glob).join(", ")}${hr.matched.length > 3 ? ", …" : ""}) but the PR approvals could not be fetched to confirm a maintainer review — failing closed`,
+        message: `change touches a high-risk path (${highRiskSurface(hr)}) but the PR approvals could not be fetched to confirm a maintainer review — failing closed`,
       });
     } else {
       const maintainerOk = (ctx.declaredReviewedBy || [])
@@ -3218,7 +3521,7 @@ export function analyzePreMerge(ctx) {
         findings.push({
           code: "high-risk-without-maintainer",
           severity: "error",
-          message: `change touches a high-risk path (${hr.matched.slice(0, 3).map((m) => m.glob).join(", ")}${hr.matched.length > 3 ? ", …" : ""}) — requires a non-self maintainer-tier approval at the reviewed head; none found`,
+          message: `change touches a high-risk path (${highRiskSurface(hr)}) — requires a non-self maintainer-tier approval at the reviewed head; none found`,
         });
       }
     }
@@ -3270,7 +3573,7 @@ export function analyzePreMerge(ctx) {
     if (!vb.ok) findings.push({ code: "gate-suite-version-not-bumped", severity: "error", message: vb.reason });
   }
 
-  return { findings, highRisk: hr.highRisk, highRiskMatched: hr.matched };
+  return { findings, highRisk: hr.highRisk, highRiskMatched: hr.matched, highRiskManifest: hr.manifest };
 }
 
 
@@ -3394,6 +3697,7 @@ export function analyzeMergeGroup(ctx) {
     findings: [...findings, ...record.findings],
     highRisk: record.highRisk,
     highRiskMatched: record.highRiskMatched,
+    highRiskManifest: record.highRiskManifest,
     membership,
   };
 }
@@ -3604,7 +3908,8 @@ export function classifyLandedShape({ mergedSha, prMergeCommitSha, prCommitMessa
  * itself. §5 checks 1–4 on the merge commit. The tree-identity bridge (§5) and
  * the live API checks are passed in via ctx (collected by main()).
  *
- * ctx: { message, changedFiles, defaults, repoSuite, treeMatch, approvedTreeMatch,
+ * ctx: { message, changedFiles, defaults, repoSuite, manifestFiles (§3b),
+ *        treeMatch, approvedTreeMatch,
  *        reviews, prAuthorLogin, reviewedHeadSha, permissionByLogin,
  *        suiteFile, checkRuns, selfRunId, verifyGateArm,
  *        // §6 correction discovery (re-verify path ONLY — see the scope guard):
@@ -3718,7 +4023,8 @@ export function analyzePostMerge(ctx) {
   }
 
   // check 4 + §3: high-risk requires a passing tier=maintainer Reviewed-by.
-  const hr = classifyHighRisk(ctx.changedFiles || [], ctx.defaults, ctx.repoSuite);
+  // (§3b: a changed manifest-rule file is classed by ctx.manifestFiles' content.)
+  const hr = classifyHighRisk(ctx.changedFiles || [], ctx.defaults, ctx.repoSuite, { manifestFiles: ctx.manifestFiles });
   for (const e of hr.errors) findings.push({ code: "high-risk-config", severity: "error", message: e });
 
   // check 2: each Reviewed-by in the RECORD must verify against the PR approvals.
@@ -3743,7 +4049,8 @@ export function analyzePostMerge(ctx) {
     }
   }
   if (hr.highRisk && passingMaintainer.length === 0 && !delegated) {
-    findings.push({ code: "high-risk-without-maintainer", severity: "error", message: `high-risk change but no passing tier=maintainer Reviewed-by in the record (high-risk requires the human arm; the gate arm alone is rejected)` });
+    const surface = highRiskSurface(hr);
+    findings.push({ code: "high-risk-without-maintainer", severity: "error", message: `high-risk change${surface ? ` (${surface})` : ""} but no passing tier=maintainer Reviewed-by in the record (high-risk requires the human arm; the gate arm alone is rejected)` });
   }
 
   // check 3: gate arm in the record must verify. A declared gate arm we cannot
@@ -3819,10 +4126,15 @@ export function analyzePostMerge(ctx) {
       // a per-commit set is missing the pass falls back to this pass's own set
       // rather than to an empty one, so an unknown surface is never "not
       // high-risk".)
+      const ownFiles = Array.isArray(c.changedFiles);
       const sibling = analyzePostMerge({
         ...ctx,
         message: c.message,
-        changedFiles: Array.isArray(c.changedFiles) ? c.changedFiles : (ctx.changedFiles || []),
+        changedFiles: ownFiles ? c.changedFiles : (ctx.changedFiles || []),
+        // §3b: a manifest-rule file is classed on THIS commit's own content, read
+        // with its own changed files. A per-commit set without its own reading is
+        // refused by the rule (fail closed) — never judged on another commit's.
+        manifestFiles: ownFiles ? (c.manifestFiles || null) : ctx.manifestFiles,
         rangeIdentities: null,
         landedRange: { ...landing, head: c.sha },
         landedSiblingPass: true,
@@ -3837,7 +4149,7 @@ export function analyzePostMerge(ctx) {
     }
   }
 
-  if (!discoveryInScope) return { findings, parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched, landing: landingSummary };
+  if (!discoveryInScope) return { findings, parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched, highRiskManifest: hr.manifest, landing: landingSummary };
 
   // ---- §6 correction discovery: applied AFTER X's own verdict is computed ----
   const discoveryFindings = [...discovery.findings];
@@ -3858,7 +4170,7 @@ export function analyzePostMerge(ctx) {
 
   if (!discovery.governing) {
     // Nothing governs: X's own verdict stands, plus any refusal warnings.
-    return { findings: [...findings, ...discoveryFindings], parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched, governedBy: null, supersededCorrections: [], landing: landingSummary };
+    return { findings: [...findings, ...discoveryFindings], parsed, highRisk: hr.highRisk, highRiskMatched: hr.matched, highRiskManifest: hr.manifest, governedBy: null, supersededCorrections: [], landing: landingSummary };
   }
 
   // The correction's record is validated IN X's STEAD but IN X's CONTEXT: the
@@ -3889,6 +4201,7 @@ export function analyzePostMerge(ctx) {
     parsed: governed.parsed,
     highRisk: governed.highRisk,
     highRiskMatched: governed.highRiskMatched,
+    highRiskManifest: governed.highRiskManifest,
     governedBy: discovery.governing.sha,
     supersededCorrections: discovery.superseded,
     landing: landingSummary,
@@ -4000,6 +4313,9 @@ function main() {
       changedFiles, rangeIdentities, rangeMessages: messages,
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
       defaults, repoSuite,
+      // §3b: each changed manifest-rule file's JSON at both ends of the range the
+      // changed-file set was measured over (base...HEAD: the merge base to HEAD).
+      manifestFiles: collectManifestFiles({ suite: repoSuite, changedFiles, baseRef: base ? mergeBaseOf(base, "HEAD") : null, headRef: "HEAD" }),
     };
     // §5 content binding (engineering#483): the staleness resolver injected into
     // every verifyReviewedLine below. anchor = the on-main diff base; an approval
@@ -4093,7 +4409,7 @@ function main() {
       changedFiles: [], rangeIdentities: [], messageBySha: {},
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
       bumpClass: loadJsonSafe(bumpClassPath()), commitDiffBySha: {}, mergeInfoBySha: {},
-      defaults, repoSuite, apiBound: false,
+      defaults, repoSuite, manifestFiles: {}, apiBound: false,
       membership: { status: "unresolved", number: null, candidates: [] },
       parentSuiteFile: { ok: false, reason: "no merge-group base" },
     };
@@ -4106,6 +4422,8 @@ function main() {
     if (groupBaseSha && headIsCheckout) {
       try {
         ctx.changedFiles = changedFilesForRange(groupBaseSha);
+        // §3b: the candidate's manifest-rule files, over the same range as its changed files.
+        ctx.manifestFiles = collectManifestFiles({ suite: repoSuite, changedFiles: ctx.changedFiles, baseRef: mergeBaseOf(groupBaseSha, "HEAD"), headRef: "HEAD" });
         ctx.rangeIdentities = rangeCommitIdentities(groupBaseSha);
         for (const id of ctx.rangeIdentities) { try { ctx.messageBySha[id.sha] = commitMessage(id.sha); } catch { /* skip */ } }
         // §5b: the candidate's own bump diffs, same git road (see the pre-merge arm).
@@ -4201,6 +4519,9 @@ function main() {
     const changedFiles = changedFilesForCommit(commit);
     const ctx = {
       message, changedFiles, defaults, repoSuite,
+      // §3b: the landed commit's manifest-rule files, first parent to commit —
+      // the same first-parent diff its changed files were read from.
+      manifestFiles: collectManifestFiles({ suite: repoSuite, changedFiles, baseRef: firstParentOf(commit), headRef: commit }),
       agentTokens: loadAgentTokens(args), agentAllow: DEFAULT_NONAI_BOT_ALLOW,
       bumpClass: loadJsonSafe(bumpClassPath()), commitDiffBySha: {},
     };
@@ -4399,7 +4720,12 @@ function main() {
             // what that commit's record covers (the same set the §6 re-verify path
             // would compute for it), and the union across the landed set leaves no
             // changed path unjudged.
-            commits: landing.commits.map((c) => ({ ...c, changedFiles: changedFilesForCommit(c.sha) })),
+            // §3b: and each landed commit's OWN manifest-rule content, first parent
+            // to commit, read beside its own changed files.
+            commits: landing.commits.map((c) => {
+              const changed = changedFilesForCommit(c.sha);
+              return { ...c, changedFiles: changed, manifestFiles: collectManifestFiles({ suite: repoSuite, changedFiles: changed, baseRef: firstParentOf(c.sha), headRef: c.sha }) };
+            }),
           };
           // §5b: each landed commit's own bump diff (local git — a rebase landing
           // put these commits on the default branch), for the per-commit check 5.
@@ -4428,12 +4754,17 @@ function main() {
   }
 
   const findings = result.findings;
+  const manifestRules = Array.isArray(result.highRiskManifest) ? result.highRiskManifest : [];
   const report = {
     gateVersion: GATE_VERSION,
     arm,
     mode,
     repo: repo || null,
     highRisk: Boolean(result.highRisk),
+    // §3b: one verdict per changed manifest-rule file ({ path, highRisk, verdict,
+    // detail }) — the rule that fired, the refusal, or "classed not high-risk by
+    // rule". Empty for a suite without highRiskManifestRules.
+    manifestRules,
     apiSkippedReason,
     queueBinding,
     // §6: the landed correction whose record governed this verdict (re-verify
@@ -4456,6 +4787,7 @@ function main() {
       process.stderr.write(`truthful-attribution-gate [${arm}/${mode}]: ${findings.length} finding(s):\n`);
       for (const f of findings) process.stderr.write(`  [${f.severity}] ${f.code}: ${f.message}\n`);
     }
+    for (const m of manifestRules) process.stderr.write(`truthful-attribution-gate [${arm}/${mode}]: manifest rule — ${m.detail}\n`);
   }
 
   // GitHub annotations + step summary. WARN keeps the check green regardless.
@@ -4464,6 +4796,7 @@ function main() {
   for (const f of findings) annotate(f.severity === "error" ? "warning" : "notice", `truthful-attribution [${f.code}] ${f.message}`, annotationStream);
   if (apiSkippedReason) annotate("notice", `truthful-attribution: ${apiSkippedReason}`, annotationStream);
   const summary = [`## truthful-attribution-gate (${mode.toUpperCase()})`, "", `Arm: \`${arm}\`${result.highRisk ? " · **high-risk path touched**" : ""}`, ""];
+  if (manifestRules.length) summary.push(...manifestRules.map((m) => `- Manifest rule: ${m.detail}`), "");
   if (apiSkippedReason) summary.push(`> ${apiSkippedReason}`, "");
   if (findings.length === 0) summary.push("Clean — a truthful verification record is present and no fabrication was detected.");
   else {

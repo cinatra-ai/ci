@@ -5120,3 +5120,407 @@ test("§6b the order contract: rangeCommitIdentities emits NEWEST FIRST, so a LA
   assert.equal(cover.get(older), newer, "the later commit covers the older one");
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// =========================================================================
+// §3b — MANIFEST CONTENT RULES (devops#271). A suite may name a JSON manifest
+// whose changes are high-risk only for the CONTENT changes it lists (the
+// owner's decision of 2026-09-24): an entry ADDED under a named subtree (a
+// display, a renderer, an export) or a CHANGED value at a named key (the
+// dependency sets). Every other change to that file — a removed entry, a
+// changed representation claim, a version bump, a reorder — is not high-risk,
+// and the report says so. The rule path leaves the repository's own
+// highRiskPaths globs; the central defaults still apply everywhere. A malformed
+// rule, and a rule file that is not valid JSON at either end, are refused by
+// name (fail closed = high-risk).
+// =========================================================================
+
+const MR_DEFAULTS_PATH = path.join(import.meta.dirname, "..", "..", "config", "high-risk-defaults.json");
+const MR_DEFAULTS = loadJsonSafe(MR_DEFAULTS_PATH);
+const MR_RULE = {
+  path: "package.json",
+  addedUnder: ["cinatra.displays", "cinatra.renderers", "exports"],
+  changedKeys: ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"],
+};
+
+/** A pack suite shaped like the live ones: the central defaults, the pack's own paths, and the rule (null = no key). */
+function mrSuite({ rules = [MR_RULE], extraPaths = ["package.json", "extension-kind-gate.mjs"] } = {}) {
+  const value = {
+    suiteId: "example-artifact-core",
+    version: "2026.09.2",
+    highRiskPaths: [...MR_DEFAULTS.value.highRiskGlobs, ...extraPaths],
+  };
+  if (rules !== null) value.highRiskManifestRules = rules;
+  return { ok: true, value };
+}
+
+/** The pack manifest at the base of every case. */
+function mrManifest() {
+  return {
+    name: "@cinatra-ai/example-artifact",
+    version: "0.1.0",
+    type: "module",
+    peerDependencies: { react: "^19.0.0", "react-dom": "^19.0.0" },
+    devDependencies: { typescript: "^5.6.3", vitest: "^2.1.8" },
+    cinatra: {
+      kind: "artifact",
+      displays: { detail: { entry: "./src/displays/detail.tsx", representations: ["text/plain"] } },
+      renderers: { detail: { entry: "./src/renderers/detail.tsx", representations: ["text/plain"] } },
+    },
+    exports: { ".": "./src/index.ts", "./src/renderers/detail": "./src/renderers/detail.tsx" },
+  };
+}
+
+/** The file's JSON at both ends, in the jsonFileAtRef shape main() collects (undefined = absent). */
+function mrFiles(base, head, file = "package.json") {
+  const side = (v) => (v === undefined ? { ok: false, reason: "absent-at-ref", absent: true } : { ok: true, value: v });
+  return { [file]: { base: side(base), head: side(head) } };
+}
+
+function mrClassify(head, { base = mrManifest(), files = ["package.json"], suite = mrSuite() } = {}) {
+  return classifyHighRisk(files, MR_DEFAULTS, suite, { manifestFiles: mrFiles(base, head) });
+}
+
+test("§3b an ADDED display is high-risk, and the report names the subtree", () => {
+  const head = mrManifest();
+  head.cinatra.displays.summary = { entry: "./src/displays/summary.tsx", representations: ["text/plain"] };
+  const r = mrClassify(head);
+  assert.equal(r.highRisk, true);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.matched.length, 1, JSON.stringify(r.matched));
+  assert.match(String(r.matched[0].rule), /^package\.json: added entry under cinatra\.displays \("summary"\)$/);
+  assert.equal(r.manifest[0].verdict, "rule-fired");
+  // an added renderer export fires on its own subtree
+  const exp = mrManifest();
+  exp.exports["./src/renderers/preview"] = "./src/renderers/preview.tsx";
+  const e = mrClassify(exp);
+  assert.equal(e.highRisk, true);
+  assert.match(String(e.matched[0].rule), /^package\.json: added entry under exports \("\.\/src\/renderers\/preview"\)$/);
+  // a manifest the change creates (absent at the base): everything under a named subtree is added
+  const created = classifyHighRisk(["package.json"], MR_DEFAULTS, mrSuite(), { manifestFiles: mrFiles(undefined, mrManifest()) });
+  assert.equal(created.highRisk, true);
+  assert.match(String(created.matched[0].rule), /added entry under cinatra\.displays/);
+});
+
+test("§3b a REMOVED display is not high-risk — classed so by the rule, and the report says it", () => {
+  const head = mrManifest();
+  delete head.cinatra.displays.detail;
+  const r = mrClassify(head);
+  assert.equal(r.highRisk, false, JSON.stringify(r.matched));
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.matched, []);
+  assert.equal(r.manifest[0].verdict, "not-high-risk");
+  assert.match(r.manifest[0].detail, /^package\.json: changed, classed not high-risk by the suite's highRiskManifestRules/);
+});
+
+test("§3b a VERSION BUMP is not high-risk", () => {
+  const head = mrManifest();
+  head.version = "0.2.0";
+  const r = mrClassify(head);
+  assert.equal(r.highRisk, false, JSON.stringify(r.matched));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.manifest[0].verdict, "not-high-risk");
+});
+
+test("§3b a changed REPRESENTATION claim and a REORDER are not high-risk", () => {
+  const claim = mrManifest();
+  claim.cinatra.renderers.detail.representations.push("text/csv");
+  claim.cinatra.displays.detail.representations = ["text/markdown"];
+  const c = mrClassify(claim);
+  assert.equal(c.highRisk, false, JSON.stringify(c.matched));
+  assert.equal(c.manifest[0].verdict, "not-high-risk");
+  // the same content with every object's keys, the dependency maps and the
+  // exports in another order
+  const base = mrManifest();
+  const reordered = {
+    exports: { "./src/renderers/detail": base.exports["./src/renderers/detail"], ".": base.exports["."] },
+    cinatra: { renderers: base.cinatra.renderers, displays: base.cinatra.displays, kind: base.cinatra.kind },
+    devDependencies: { vitest: "^2.1.8", typescript: "^5.6.3" },
+    peerDependencies: { "react-dom": "^19.0.0", react: "^19.0.0" },
+    type: base.type, version: base.version, name: base.name,
+  };
+  const r = mrClassify(reordered);
+  assert.equal(r.highRisk, false, JSON.stringify(r.matched));
+  assert.equal(r.manifest[0].verdict, "not-high-risk");
+});
+
+test("§3b a DEPENDENCY change is high-risk, and the report names the key", () => {
+  const dev = mrManifest();
+  dev.devDependencies.jsdom = "^25.0.1";
+  const r = mrClassify(dev);
+  assert.equal(r.highRisk, true);
+  assert.match(String(r.matched[0].rule), /^package\.json: changed devDependencies$/);
+  // a moved version range is a change too, and every changed key is named
+  const both = mrManifest();
+  both.peerDependencies.react = "^20.0.0";
+  both.dependencies = { "left-pad": "^1.3.0" };
+  const b = mrClassify(both);
+  assert.equal(b.highRisk, true);
+  assert.match(String(b.matched[0].rule), /package\.json: changed dependencies/);
+  assert.match(String(b.matched[0].rule), /package\.json: changed peerDependencies/);
+  assert.equal(b.manifest[0].verdict, "rule-fired");
+});
+
+test("§3b a manifest that is NOT JSON at the base or the head is refused by name (fail closed = high-risk)", () => {
+  const cases = [
+    { base: { ok: true, value: mrManifest() }, head: { ok: false, reason: "invalid JSON at HEAD: Unexpected token", operational: true }, want: /package\.json is not valid JSON at the head/ },
+    { base: { ok: false, reason: "invalid JSON at base: Unexpected end of JSON input", operational: true }, head: { ok: true, value: mrManifest() }, want: /package\.json is not valid JSON at the base/ },
+    { base: { ok: true, value: mrManifest() }, head: { ok: true, value: ["not", "an", "object"] }, want: /package\.json is not a JSON object at the head/ },
+  ];
+  for (const c of cases) {
+    const r = classifyHighRisk(["package.json"], MR_DEFAULTS, mrSuite(), { manifestFiles: { "package.json": { base: c.base, head: c.head } } });
+    assert.equal(r.highRisk, true);
+    assert.equal(r.failClosed, true, JSON.stringify(r));
+    assert.ok(r.errors.some((e) => c.want.test(e) && /failing CLOSED/.test(e)), JSON.stringify(r.errors));
+    assert.equal(r.manifest[0].verdict, "refused");
+  }
+  // content that was never read is refused the same way — never judged "unchanged"
+  const unread = classifyHighRisk(["package.json"], MR_DEFAULTS, mrSuite(), { manifestFiles: {} });
+  assert.equal(unread.highRisk, true);
+  assert.ok(unread.errors.some((e) => /^package\.json: the file's content at the base and the head was not read/.test(e)), JSON.stringify(unread.errors));
+});
+
+test("§3b a MALFORMED rule is refused by name, and the whole change is high-risk (fail closed)", () => {
+  const malformed = [
+    [{ path: "package.json" }, /highRiskManifestRules is not an array/],
+    [["package.json"], /highRiskManifestRules\[0\] is not an object/],
+    [[{ ...MR_RULE, addedUndr: ["x"] }], /highRiskManifestRules\[0\] \(package\.json\) carries unknown key\(s\) addedUndr/],
+    [[{ ...MR_RULE, path: "**/package.json" }], /highRiskManifestRules\[0\] \(\*\*\/package\.json\): path must name one file, not a glob/],
+    [[{ ...MR_RULE, path: "../package.json" }], /path must not contain empty, '\.' or '\.\.' segments/],
+    [[{ path: "package.json", changedKeys: ["dependencies"] }], /addedUnder must be an array of dotted JSON paths/],
+    [[{ ...MR_RULE, addedUnder: "cinatra.displays" }], /addedUnder must be an array of dotted JSON paths/],
+    [[{ ...MR_RULE, changedKeys: ["dependencies", "cinatra..deps"] }], /changedKeys entry "cinatra\.\.deps"/],
+    [[{ ...MR_RULE, addedUnder: [], changedKeys: [] }], /names no high-risk change/],
+    [[MR_RULE, { ...MR_RULE }], /highRiskManifestRules\[1\] \(package\.json\) names a path another rule already names/],
+  ];
+  for (const [rules, want] of malformed) {
+    // the change does not even touch the manifest: a malformed list fails the whole change closed
+    const r = classifyHighRisk(["src/index.ts"], MR_DEFAULTS, mrSuite({ rules }), { manifestFiles: {} });
+    assert.equal(r.highRisk, true, `expected fail-closed for ${JSON.stringify(rules)}`);
+    assert.equal(r.failClosed, true);
+    assert.ok(r.errors.some((e) => want.test(e) && /failing CLOSED/.test(e)), `${want} not in ${JSON.stringify(r.errors)}`);
+  }
+});
+
+test("§3b a suite WITHOUT the key classifies exactly as before (package.json stays a plain glob)", () => {
+  const suite = mrSuite({ rules: null });
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  const pick = (r) => ({ highRisk: r.highRisk, errors: r.errors, matched: r.matched, effectiveGlobs: r.effectiveGlobs, failClosed: r.failClosed });
+  for (const files of [["package.json"], ["src/index.ts"], ["package.json", "src/index.ts"], [".github/workflows/ci.yml"]]) {
+    const plain = classifyHighRisk(files, MR_DEFAULTS, suite);
+    const withContent = classifyHighRisk(files, MR_DEFAULTS, suite, { manifestFiles: mrFiles(mrManifest(), bumped) });
+    assert.deepEqual(pick(withContent), pick(plain), "file content changes nothing without a rule");
+  }
+  const r = classifyHighRisk(["package.json"], MR_DEFAULTS, suite, { manifestFiles: mrFiles(mrManifest(), bumped) });
+  assert.equal(r.highRisk, true, "without a rule, package.json is high-risk through its glob, whatever changed in it");
+  assert.deepEqual(r.matched, [{ file: "package.json", glob: "package.json" }]);
+  assert.equal(classifyHighRisk(["package.json"], MR_DEFAULTS, null).highRisk, false, "and with no suite it is not high-risk at all");
+  assert.deepEqual(r.manifest, [], "the report carries no manifest verdict");
+});
+
+test("§3b the 35 central defaults still apply — to every other path, and to the rule path itself", () => {
+  assert.equal(MR_DEFAULTS.value.highRiskGlobs.length, 35, "the committed central defaults");
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  // a not-high-risk manifest change beside a workflow and an auth change: those still decide
+  const r = classifyHighRisk(["package.json", ".github/workflows/ci.yml", "src/auth/session.ts"], MR_DEFAULTS, mrSuite(), { manifestFiles: mrFiles(mrManifest(), bumped) });
+  assert.equal(r.highRisk, true);
+  assert.deepEqual(r.matched, [{ file: ".github/workflows/ci.yml", glob: ".github/**" }, { file: "src/auth/session.ts", glob: "**/auth/**" }]);
+  assert.equal(r.manifest[0].verdict, "not-high-risk");
+  // a rule can never remove a default: a manifest under a default glob stays high-risk
+  const sdk = "packages/sdk-extensions/package.json";
+  const s = classifyHighRisk([sdk], MR_DEFAULTS, mrSuite({ rules: [{ ...MR_RULE, path: sdk }] }), { manifestFiles: mrFiles(mrManifest(), bumped, sdk) });
+  assert.equal(s.highRisk, true);
+  assert.deepEqual(s.matched, [{ file: sdk, glob: "packages/sdk-extensions/**" }]);
+  assert.equal(s.manifest[0].verdict, "central-default");
+  assert.match(s.manifest[0].detail, /a manifest rule never removes a central default/);
+});
+
+test("§3b pre-merge: a rule that fires is named in the high-risk finding; a change classed not high-risk raises none", () => {
+  const added = mrManifest();
+  added.cinatra.displays.summary = { entry: "./src/displays/summary.tsx" };
+  const ctx = { changedFiles: ["package.json"], defaults: MR_DEFAULTS, repoSuite: mrSuite(), manifestFiles: mrFiles(mrManifest(), added), apiBound: false };
+  const r = analyzePreMerge(ctx);
+  const f = r.findings.find((x) => x.code === "high-risk-unverifiable");
+  assert.ok(f, JSON.stringify(r.findings));
+  assert.match(f.message, /package\.json: added entry under cinatra\.displays \("summary"\)/);
+  assert.equal(r.highRiskManifest[0].verdict, "rule-fired");
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  const q = analyzePreMerge({ ...ctx, manifestFiles: mrFiles(mrManifest(), bumped) });
+  assert.deepEqual(q.findings, [], JSON.stringify(q.findings));
+  assert.equal(q.highRisk, false);
+  assert.equal(q.highRiskManifest[0].verdict, "not-high-risk");
+  const broken = analyzePreMerge({ ...ctx, manifestFiles: { "package.json": { base: { ok: true, value: mrManifest() }, head: { ok: false, reason: "invalid JSON at HEAD: Unexpected token", operational: true } } } });
+  assert.ok(broken.findings.some((x) => x.code === "high-risk-config" && /package\.json is not valid JSON at the head/.test(x.message)), JSON.stringify(broken.findings));
+});
+
+test("§3b post-merge: the gate arm alone may carry a change the rule classes not high-risk, never one it fires on", () => {
+  const message = ["chore: bump the pack version", "", "Assisted-by: none", "Gate-suite: example-artifact-core@2026.09.2", "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)"].join("\n");
+  const ctx = { message, changedFiles: ["package.json"], defaults: MR_DEFAULTS, repoSuite: mrSuite(), apiBound: false };
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  const ok = analyzePostMerge({ ...ctx, manifestFiles: mrFiles(mrManifest(), bumped) });
+  assert.ok(!ok.findings.some((f) => f.code === "high-risk-without-maintainer"), JSON.stringify(ok.findings));
+  assert.equal(ok.highRisk, false);
+  assert.equal(ok.highRiskManifest[0].verdict, "not-high-risk");
+  const dep = mrManifest();
+  dep.dependencies = { "left-pad": "^1.3.0" };
+  const bad = analyzePostMerge({ ...ctx, manifestFiles: mrFiles(mrManifest(), dep) });
+  const f = bad.findings.find((x) => x.code === "high-risk-without-maintainer");
+  assert.ok(f, JSON.stringify(bad.findings));
+  assert.match(f.message, /^high-risk change \(package\.json: changed dependencies\) but no passing tier=maintainer Reviewed-by/);
+});
+
+test("§3b a rebase landing reads each landed commit's OWN manifest content, and refuses one whose content was not read", () => {
+  const gateOnly = (subject) => [subject, "", "Assisted-by: Claude Code (claude-opus-5)", "Gate-suite: example-artifact-core@2026.09.2", "Accountable: Sandro Groganz <sandro@cinatra.ai> (@groganz)"].join("\n");
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  const added = mrManifest();
+  added.cinatra.renderers.preview = { entry: "./src/renderers/preview.tsx" };
+  const landed = (c5Files) => [1, 2, 3, 4, 5, 6].map((i) => ({
+    sha: i === 6 ? RL_TIP : rlSha(`c${i}`),
+    message: i === 5 ? gateOnly("chore: bump the pack version") : rlRepairMsg(i),
+    changedFiles: i === 5 ? ["package.json"] : ["src/repair.ts"],
+    ...(i === 5 && c5Files !== undefined ? { manifestFiles: c5Files } : {}),
+    ...RL_AGENT,
+  }));
+  const run = (c5Files) => analyzePostMerge({ ...rlCtx({ commits: landed(c5Files) }), defaults: MR_DEFAULTS, repoSuite: mrSuite() })
+    .findings.filter((f) => f.code === "high-risk-without-maintainer" || f.code === "high-risk-config");
+  const c5 = rlSha("c5").slice(0, 8);
+  assert.deepEqual(run(mrFiles(mrManifest(), bumped)), [], "commit 5's own change is a version bump — not high-risk");
+  const fired = run(mrFiles(mrManifest(), added));
+  assert.equal(fired.length, 1, JSON.stringify(fired));
+  assert.match(fired[0].message, new RegExp(`^landed commit ${c5}: high-risk change \\(package\\.json: added entry under cinatra\\.renderers \\("preview"\\)\\)`));
+  const unread = run(undefined);
+  assert.ok(unread.some((f) => f.code === "high-risk-config" && new RegExp(`^landed commit ${c5}: package\\.json: the file's content`).test(f.message)), JSON.stringify(unread));
+  assert.ok(unread.some((f) => f.code === "high-risk-without-maintainer"), JSON.stringify(unread));
+});
+
+test("§3b §4: a changed highRiskManifestRules is a material suite change — it must bump the version", () => {
+  const suite = (rules, version = "2026.09.1") => ({ ok: true, value: { version, requiredContexts: [{ context: "a" }], highRiskPaths: ["package.json"], ...(rules ? { highRiskManifestRules: rules } : {}) } });
+  const r = checkSuiteVersionBump(suite(null), suite([MR_RULE]));
+  assert.equal(r.ok, false);
+  assert.match(String(r.reason), /highRiskManifestRules/);
+  assert.match(String(r.reason), /did not bump/);
+  assert.ok(checkSuiteVersionBump(suite(null), suite([MR_RULE], "2026.09.2")).ok, "the same change WITH a bump is fine");
+  const reordered = { ...MR_RULE, addedUnder: [...MR_RULE.addedUnder].reverse(), changedKeys: [...MR_RULE.changedKeys].reverse() };
+  assert.ok(checkSuiteVersionBump(suite([MR_RULE]), suite([reordered])).ok, "a pure reorder is not material");
+});
+
+test("§3b parseManifestRules: absent or empty is no rule; the owner's rule parses; a repeated entry collapses", () => {
+  assert.deepEqual(gateExports.parseManifestRules(undefined), { ok: true, rules: [], errors: [] });
+  assert.deepEqual(gateExports.parseManifestRules([]), { ok: true, rules: [], errors: [] });
+  const p = gateExports.parseManifestRules([{ ...MR_RULE, changedKeys: [...MR_RULE.changedKeys, "dependencies"] }]);
+  assert.equal(p.ok, true, JSON.stringify(p.errors));
+  assert.deepEqual(p.rules, [MR_RULE]);
+});
+
+test("§3b collectManifestFiles reads a changed rule file at both ends from git — absent and invalid kept apart", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(mrManifest()));
+  fs.writeFileSync(path.join(dir, "other.json"), "{}");
+  g("add", "-A"); g("commit", "-q", "-m", "base");
+  const base = g("rev-parse", "HEAD").stdout.trim();
+  fs.writeFileSync(path.join(dir, "package.json"), "{ not json");
+  g("add", "-A"); g("commit", "-q", "-m", "break it");
+  const suite = mrSuite({ rules: [MR_RULE, { ...MR_RULE, path: "sub/package.json" }] });
+  const got = gateExports.collectManifestFiles({ suite, changedFiles: ["package.json", "sub/package.json", "other.json"], baseRef: base, headRef: "HEAD", cwd: dir });
+  assert.deepEqual(Object.keys(got).sort(), ["package.json", "sub/package.json"], "only the changed rule paths are read");
+  assert.equal(got["package.json"].base.ok, true);
+  assert.equal(got["package.json"].base.value.version, "0.1.0");
+  assert.equal(got["package.json"].head.ok, false);
+  assert.match(got["package.json"].head.reason, /invalid JSON/);
+  assert.equal(got["sub/package.json"].base.absent, true, "a file absent at a ref reads as absent, not as unreadable");
+  assert.deepEqual(gateExports.collectManifestFiles({ suite: mrSuite({ rules: null }), changedFiles: ["package.json"], baseRef: base, headRef: "HEAD", cwd: dir }), {}, "no rule, nothing read");
+  const noBase = gateExports.collectManifestFiles({ suite, changedFiles: ["package.json"], baseRef: null, headRef: "HEAD", cwd: dir });
+  assert.equal(noBase["package.json"].base.ok, false);
+  assert.equal(noBase["package.json"].base.operational, true, "no base commit is an operational gap (refused), never an absent file");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** A pack repository on disk: the suite and the manifest at a base commit. */
+function mrRepo({ rules = [MR_RULE] } = {}) {
+  const { dir, g } = tmpRepo();
+  fs.mkdirSync(path.join(dir, ".github"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".github", "gate-suite.json"), JSON.stringify(mrSuite({ rules }).value, null, 2) + "\n");
+  fs.writeFileSync(path.join(dir, "package.json"), mrText(mrManifest()));
+  g("add", "-A"); g("commit", "-q", "-m", "chore: the pack at its base\n\nAssisted-by: none");
+  return { dir, g, base: g("rev-parse", "HEAD").stdout.trim() };
+}
+function mrText(manifest) { return JSON.stringify(manifest, null, 2) + "\n"; }
+function mrCommit(dir, g, text, subject) {
+  fs.writeFileSync(path.join(dir, "package.json"), text);
+  g("add", "-A"); g("commit", "-q", "-m", `${subject}\n\nAssisted-by: none`);
+  return g("rev-parse", "HEAD").stdout.trim();
+}
+function mrGate(dir, args, { format = "json" } = {}) {
+  const env = { ...process.env, GITHUB_ACTIONS: "", GITHUB_REPOSITORY: "" };
+  delete env.TRUTHFUL_ATTR_DIFF_BASE;
+  const res = spawnSync("node", [GATE, ...args, "--mode", "warn", "--format", format, "--high-risk-defaults", MR_DEFAULTS_PATH], { cwd: dir, encoding: "utf8", env });
+  assert.equal(res.status, 0, res.stderr);
+  return format === "json" ? JSON.parse(res.stdout) : res;
+}
+
+test("§3b CLI post-merge: a version bump is classed not high-risk by the rule; an added display is high-risk, named in the report", () => {
+  const { dir, g } = mrRepo();
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  mrCommit(dir, g, mrText(bumped), "chore: bump the pack version");
+  const quiet = mrGate(dir, ["--arm", "post-merge"]);
+  assert.equal(quiet.highRisk, false, JSON.stringify(quiet));
+  assert.deepEqual(quiet.manifestRules.map((m) => m.verdict), ["not-high-risk"]);
+  assert.ok(!quiet.findings.some((f) => f.code === "high-risk-without-maintainer"), JSON.stringify(quiet.findings));
+  const text = mrGate(dir, ["--arm", "post-merge"], { format: "text" });
+  assert.match(text.stderr, /manifest rule — package\.json: changed, classed not high-risk by the suite's highRiskManifestRules/);
+  const added = mrManifest();
+  added.version = "0.2.0";
+  added.cinatra.displays.summary = { entry: "./src/displays/summary.tsx" };
+  const sha = mrCommit(dir, g, mrText(added), "feat: add the summary display");
+  const loud = mrGate(dir, ["--arm", "post-merge", "--commit", sha]);
+  assert.equal(loud.highRisk, true);
+  assert.match(loud.manifestRules[0].detail, /^package\.json: added entry under cinatra\.displays \("summary"\)$/);
+  assert.ok(loud.findings.some((f) => f.code === "high-risk-without-maintainer" && /package\.json: added entry under cinatra\.displays/.test(f.message)), JSON.stringify(loud.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§3b CLI pre-merge: the rule judges the pull request's own change — merge base to head — never main's later edits", () => {
+  const { dir, g } = mrRepo();
+  g("checkout", "-q", "-b", "feature");
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  mrCommit(dir, g, mrText(bumped), "chore: bump the pack version");
+  // main moves on and drops the detail display: measured from main's tip, the
+  // branch would seem to ADD it — measured from the merge base, it changed nothing there
+  g("checkout", "-q", "main");
+  const dropped = mrManifest();
+  delete dropped.cinatra.displays.detail;
+  mrCommit(dir, g, mrText(dropped), "chore: main drops the detail display");
+  g("checkout", "-q", "feature");
+  const quiet = mrGate(dir, ["--arm", "pre-merge", "--diff-base", "main"]);
+  assert.equal(quiet.highRisk, false, JSON.stringify(quiet.manifestRules));
+  assert.deepEqual(quiet.manifestRules.map((m) => m.verdict), ["not-high-risk"]);
+  const dep = mrManifest();
+  dep.version = "0.2.0";
+  dep.devDependencies.jsdom = "^25.0.1";
+  mrCommit(dir, g, mrText(dep), "chore: add a test dependency");
+  const loud = mrGate(dir, ["--arm", "pre-merge", "--diff-base", "main"]);
+  assert.equal(loud.highRisk, true);
+  assert.ok(loud.findings.some((f) => f.code === "high-risk-unverifiable" && /package\.json: changed devDependencies/.test(f.message)), JSON.stringify(loud.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§3b CLI merge-group: the queue candidate's manifest change is classed by the same rule, and a broken manifest is refused", () => {
+  const { dir, g, base } = mrRepo();
+  const bumped = mrManifest();
+  bumped.version = "0.2.0";
+  const head = mrCommit(dir, g, mrText(bumped), "chore: bump the pack version");
+  const quiet = mrGate(dir, ["--arm", "merge-group", "--merge-group-head", head, "--merge-group-base", base]);
+  assert.equal(quiet.highRisk, false, JSON.stringify(quiet));
+  assert.deepEqual(quiet.manifestRules.map((m) => m.verdict), ["not-high-risk"]);
+  const brokenHead = mrCommit(dir, g, "{ not json\n", "chore: break the manifest");
+  const broken = mrGate(dir, ["--arm", "merge-group", "--merge-group-head", brokenHead, "--merge-group-base", base]);
+  assert.equal(broken.highRisk, true);
+  assert.ok(broken.findings.some((f) => f.code === "high-risk-config" && /package\.json is not valid JSON at the head/.test(f.message)), JSON.stringify(broken.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
