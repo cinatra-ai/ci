@@ -2478,6 +2478,164 @@ test("§5 resolveContentMatch + makeContentBinds (real git): reviewed head vs sq
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// ---- the content bridge reads a change above 1 MiB ---------------------------
+// A child-process read without its own output limit stops at 1 MiB, so a
+// larger change used to leave the fingerprint uncomputed and the post-merge arm
+// fell to `tree-mismatch` for a change it never compared. The fixtures are
+// generated here: one text file whose added lines make the -U0 diff larger than
+// 1 MiB, reviewed on a branch and landed on a main that is one disjoint commit
+// ahead of the branch's base.
+
+const LC_MIB = 1024 * 1024;
+const lcText = () => Array.from({ length: 30000 }, (_, i) => `added line ${i + 1} of a change above one mebibyte`).join("\n") + "\n";
+const lcDiffBytes = (dir, a, b) => spawnSync("git", ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-algorithm=histogram", "--find-renames", "-U0", a, b, "--"],
+  { cwd: dir, maxBuffer: 64 * LC_MIB }).stdout.length;
+
+function lcRepo({ files }) {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "README.txt"), "base\n");
+  const main0 = cbCommit(g, "main0");
+  g("checkout", "-q", "-b", "pr", main0);
+  for (const [name, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), content);
+  const reviewedHead = cbCommit(g, "pr: the change");
+  g("checkout", "-q", "main");
+  fs.writeFileSync(path.join(dir, "other.test.txt"), "one disjoint commit on main\n");
+  const main1 = cbCommit(g, "main1: one disjoint commit");
+  // GitHub's squash of the reviewed change onto main1, with a given content.
+  const land = (landedFiles, message = "squash land") => {
+    g("checkout", "-q", "-B", "landing", main1);
+    for (const [name, content] of Object.entries(landedFiles)) fs.writeFileSync(path.join(dir, name), content);
+    return cbCommit(g, message);
+  };
+  return { dir, g, main0, reviewedHead, main1, land };
+}
+
+test("§5 large change: a diff above 1 MiB that landed one disjoint commit behind its reviewed head binds; no finding", () => {
+  const { dir, main0, reviewedHead, main1, land } = lcRepo({ files: { "large.txt": lcText() } });
+  const landed = land({ "large.txt": lcText() });
+  const treeMatch = treeOf(landed, dir) === treeOf(reviewedHead, dir);
+  const contentMatch = resolveContentMatch({ commit: landed, reviewedHeadSha: reviewedHead, cwd: dir });
+  assert.deepEqual(analyzePostMerge(cbPostCtx({ treeMatch, contentMatch })).findings, [],
+    "the landed change IS the reviewed change; the trees differ only by main's disjoint commit");
+  assert.equal(contentMatch, true, "the content bridge must read a diff above 1 MiB and bind");
+  assert.equal(treeMatch, false, "the landing is behind its head, so the trees differ");
+  assert.ok(lcDiffBytes(dir, main0, reviewedHead) > LC_MIB, "the reviewed diff must be above 1 MiB");
+  assert.ok(lcDiffBytes(dir, main1, landed) > LC_MIB, "the landed diff must be above 1 MiB");
+  assert.equal(makeContentBinds({ anchor: firstParentOf(landed, dir), cwd: dir })(reviewedHead, landed), true,
+    "the staleness resolver reads the same large change");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 large change: the same landing with ONE line of the landed change different => content-mismatch", () => {
+  const { dir, reviewedHead, land } = lcRepo({ files: { "large.txt": lcText() } });
+  const landedBad = land({ "large.txt": lcText().replace("added line 15000 of", "added line 15000 CHANGED of") });
+  const treeMatch = treeOf(landedBad, dir) === treeOf(reviewedHead, dir);
+  const contentMatch = resolveContentMatch({ commit: landedBad, reviewedHeadSha: reviewedHead, cwd: dir });
+  const r = analyzePostMerge(cbPostCtx({ treeMatch, contentMatch }));
+  assert.ok(r.findings.some((f) => f.code === "content-mismatch" && f.severity === "error"), JSON.stringify(r.findings));
+  assert.ok(!r.findings.some((f) => f.code === "tree-mismatch"), JSON.stringify(r.findings));
+  assert.equal(contentMatch, false, "one line nobody reviewed changes the fingerprint of a large change too");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 large change: a read above the limit => content-unverifiable naming the limit (an error), NOT tree-mismatch", () => {
+  // A small change and a small injected limit stand in for a change above the
+  // real limit; the answer of the bridge itself stays undefined, as before.
+  const { dir, reviewedHead, land } = lcRepo({ files: { "f.txt": cbLines(1000) } });
+  const landed = land({ "f.txt": cbLines(1000) });
+  let reported = null;
+  const contentMatch = resolveContentMatch({ commit: landed, reviewedHeadSha: reviewedHead, cwd: dir, maxBuffer: 4096, onReadLimit: (n) => { reported = n; } });
+  const r = analyzePostMerge(cbPostCtx({ treeMatch: false, contentMatch, contentReadLimit: reported }));
+  const f = r.findings.find((x) => x.code === "content-unverifiable");
+  assert.ok(f, JSON.stringify(r.findings));
+  assert.equal(f.severity, "error");
+  assert.match(f.message, /read limit of 4096 bytes/);
+  assert.ok(!r.findings.some((x) => x.code === "tree-mismatch"), JSON.stringify(r.findings));
+  assert.equal(contentMatch, undefined, "the bridge's own answer is unchanged: undecided");
+  assert.equal(reported, 4096);
+  // The same change under the default limit binds; the limit alone decided above.
+  assert.equal(resolveContentMatch({ commit: landed, reviewedHeadSha: reviewedHead, cwd: dir }), true);
+  // The real limit is named in MiB as well.
+  const real = analyzePostMerge(cbPostCtx({ treeMatch: false, contentMatch: undefined, contentReadLimit: 64 * LC_MIB }));
+  assert.ok(real.findings.some((x) => x.code === "content-unverifiable" && /67108864 bytes \(64 MiB\)/.test(x.message)), JSON.stringify(real.findings));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 large change: a binary file above 1 MiB binds when it landed behind its head; a different binary of that size does not", () => {
+  const blob = (seed) => { const b = Buffer.alloc(LC_MIB + LC_MIB / 2); for (let i = 0; i < b.length; i += 1) b[i] = (i * 31 + seed) & 0xff; return b; };
+  const { dir, reviewedHead, land } = lcRepo({ files: { "large.bin": blob(7), "notes.txt": "a small text change\n" } });
+  const landed = land({ "large.bin": blob(7), "notes.txt": "a small text change\n" });
+  assert.ok(binaryPathsOf(firstParentOf(landed, dir), landed, dir).has("large.bin"), "the numstat read must see the binary path");
+  assert.equal(resolveContentMatch({ commit: landed, reviewedHeadSha: reviewedHead, cwd: dir }), true);
+  const landedBad = land({ "large.bin": blob(8), "notes.txt": "a small text change\n" });
+  assert.equal(resolveContentMatch({ commit: landedBad, reviewedHeadSha: reviewedHead, cwd: dir }), false,
+    "a different binary post-image is bound through its blob sha, whatever its size");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 contentFingerprint / binaryPathsOf: a read above an injected limit returns null and reports the limit; any other failure reports nothing", () => {
+  const { dir, g } = tmpRepo();
+  fs.writeFileSync(path.join(dir, "f.txt"), cbLines(10));
+  const b = cbCommit(g, "base");
+  fs.writeFileSync(path.join(dir, "f.txt"), cbLines(200));
+  const h = cbCommit(g, "change");
+  const calls = [];
+  assert.equal(contentFingerprint(b, h, dir, { maxBuffer: 64, onReadLimit: (n) => calls.push(n) }), null);
+  assert.deepEqual(calls, [64], "the -U0 read passed the limit");
+  const numstatCalls = [];
+  assert.equal(binaryPathsOf(b, h, dir, { maxBuffer: 4, onReadLimit: (n) => numstatCalls.push(n) }), null,
+    "a numstat read above the limit fails closed to null, never an empty Set");
+  assert.deepEqual(numstatCalls, [4]);
+  const none = [];
+  assert.equal(contentFingerprint("dead".repeat(10), h, dir, { maxBuffer: 64, onReadLimit: (n) => none.push(n) }), null);
+  assert.equal(contentFingerprint(b, "dead".repeat(10), dir, { onReadLimit: (n) => none.push(n) }), null);
+  assert.equal(binaryPathsOf("dead".repeat(10), h, dir, { onReadLimit: (n) => none.push(n) }), null);
+  assert.deepEqual(none, [], "an unresolvable ref is not a size failure");
+  assert.ok(contentFingerprint(b, h, dir), "under the default limit the same change has a fingerprint");
+  assert.ok(binaryPathsOf(b, h, dir) instanceof Set);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 resolveContentMatch: the limit is reported only when every side that failed failed on it alone", () => {
+  const sized = (sides) => (base, head, cwd, opts = {}) => {
+    const side = base === "base-m" ? "M" : "H";
+    if (sides[side] === "size") { if (opts.onReadLimit) opts.onReadLimit(4096); return null; }
+    return sides[side] === "other" ? null : "FP";
+  };
+  const run = (sides, mergeBase = () => "base-h") => {
+    const calls = [];
+    const v = resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => "base-m", mergeBase,
+      fingerprint: sized(sides), onReadLimit: (n) => calls.push(n) });
+    return { v, calls };
+  };
+  assert.deepEqual(run({ M: "size", H: "size" }), { v: undefined, calls: [4096] });
+  assert.deepEqual(run({ M: "size", H: "ok" }), { v: undefined, calls: [4096] });
+  assert.deepEqual(run({ M: "ok", H: "size" }), { v: undefined, calls: [4096] });
+  assert.deepEqual(run({ M: "size", H: "other" }), { v: undefined, calls: [] }, "a size failure beside any other failure keeps today's undefined");
+  assert.deepEqual(run({ M: "other", H: "size" }), { v: undefined, calls: [] });
+  assert.deepEqual(run({ M: "size", H: "ok" }, () => null), { v: undefined, calls: [] }, "an unresolvable merge-base is not a size failure");
+  assert.deepEqual(run({ M: "ok", H: "ok" }), { v: true, calls: [] });
+  // A fingerprint that knows no options (the injected form of before) reports nothing.
+  const calls = [];
+  assert.equal(resolveContentMatch({ commit: SHA_MERGED, reviewedHeadSha: SHA_REVIEWED, firstParent: () => "base-m", mergeBase: () => "base-h",
+    fingerprint: () => null, onReadLimit: (n) => calls.push(n) }), undefined);
+  assert.deepEqual(calls, []);
+});
+
+test("§5 analyzePostMerge: a read-limit failure changes only the tree-mismatch slot; every other outcome is today's", () => {
+  const codes = (extra) => analyzePostMerge(cbPostCtx({ contentReadLimit: 4096, ...extra })).findings.map((f) => f.code);
+  assert.deepEqual(codes({ treeMatch: true, contentMatch: undefined }), [], "a byte-identical tree still passes first");
+  assert.deepEqual(codes({ treeMatch: false, contentMatch: true }), []);
+  assert.deepEqual(codes({ treeMatch: false, contentMatch: false }), ["content-mismatch"], "a proven divergence is never softened");
+  assert.deepEqual(codes({ treeMatch: false, contentMatch: undefined, approvedTreeMatch: true }), [], "the approved-tree rule is unchanged");
+  assert.deepEqual(codes({ treeMatch: undefined, contentMatch: undefined }), ["tree-unverifiable"], "an unresolvable tree keeps its finding");
+  assert.deepEqual(codes({ treeMatch: false, contentMatch: undefined }), ["content-unverifiable"]);
+  // Without a numeric limit the result is exactly today's.
+  for (const contentReadLimit of [undefined, null, 0, "4096", Number.NaN]) {
+    assert.deepEqual(analyzePostMerge(cbPostCtx({ treeMatch: false, contentMatch: undefined, contentReadLimit })).findings.map((f) => f.code), ["tree-mismatch"]);
+  }
+});
+
 // =========================================================================
 // FALSE-RED CLASSES — evaluation timing, self-reference, reviewed-head
 // resolution. Every case here is a record that was TRUTHFUL and was red-flagged
@@ -3809,6 +3967,36 @@ test("§7 PUSH ARM: a SQUASH landing of the same PR is bound exactly as before (
   assert.ok(!report.findings.some((f) => f.code === "rebase-landing"));
   assert.deepEqual(report.findings.filter((f) => f.severity === "error"), [], JSON.stringify(report.findings));
   assert.ok(forkPoint);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---- the push arm END-TO-END on a squash of a change above 1 MiB ----------------
+
+function lcRunSquash(landedText) {
+  const { dir, reviewedHead, land } = lcRepo({ files: { "large.txt": lcText() } });
+  const squash = land({ "large.txt": landedText }, ["feat: a large change (#1)", "", "Assisted-by: none", RL_MAINTAINER].join("\n"));
+  const author = { name: "Sandro Groganz", email: "sandro@cinatra.ai" };
+  const bin = rlStubGh(dir, {
+    pr: { number: 1, merged: true, merge_commit_sha: squash, head: { sha: reviewedHead }, user: { login: "cinatra-agent-bot" }, body: "" },
+    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: reviewedHead, submitted_at: "2026-10-01T10:00:00Z" }],
+    prCommits: [{ sha: "0".repeat(40), commit: { message: "pr: the change", author, committer: author } }],
+  });
+  return { dir, ...rlRunPushArm(dir, bin, squash) };
+}
+
+test("§5 PUSH ARM: a squash of a change above 1 MiB, landed one disjoint commit behind its reviewed head, concludes GREEN in ENFORCE", () => {
+  const { dir, res, report } = lcRunSquash(lcText());
+  assert.deepEqual(report.findings.filter((f) => f.severity === "error"), [], JSON.stringify(report.findings));
+  assert.equal(res.status, 0, `expected GREEN; stderr=${res.stderr}\n${res.stdout}`);
+  assert.equal(report.apiSkippedReason, null, res.stderr);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("§5 PUSH ARM FAIL-CLOSED: the same squash with one line of the large change different reds with content-mismatch", () => {
+  const { dir, res, report } = lcRunSquash(lcText().replace("added line 15000 of", "added line 15000 CHANGED of"));
+  assert.ok(report.findings.some((f) => f.code === "content-mismatch"), JSON.stringify(report.findings));
+  assert.ok(!report.findings.some((f) => f.code === "tree-mismatch"), JSON.stringify(report.findings));
+  assert.equal(res.status, 1, `expected a RED enforce verdict; stdout=${res.stdout}`);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

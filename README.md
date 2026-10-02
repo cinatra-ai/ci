@@ -1944,6 +1944,11 @@ closed), and a tampered rebased range still has to re-derive the reviewed
 fingerprint over the whole range, so any altered commit still reds. The JSON
 report names the shape it bound over in `landing`.
 
+The content binding reads each diff with the output limit of the engine's other
+large reads, 64 MiB. When a diff is larger, the change is not compared: the
+post-merge arm reports `content-unverifiable`, an error that names the limit,
+in place of a `tree-mismatch` it did not measure.
+
 ### High-risk classification (§3)
 
 A change whose files match **any** glob in `config/high-risk-defaults.json` (the
