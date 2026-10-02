@@ -162,7 +162,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonical as canonicalAuthorization, parseAuthorization, verifyDelegatedReceipt } from "./delegated-merge-receipt.mjs";
 
-export const GATE_VERSION = "0.4.0";
+export const GATE_VERSION = "0.5.0";
 
 const VALID_MODES = ["warn", "enforce"];
 const VALID_ARMS = ["pre-merge", "post-merge", "merge-group"];
@@ -1647,7 +1647,18 @@ export function resolveQueueCandidate({
 // parity; a fork/merge_group head must be locally resolvable (ci#55 refetch)
 // else the fingerprint is null => content-unverifiable (same fail-closed
 // posture as today's tree-unverifiable).
+//
+// Every read below carries the output limit of the engine's other large reads
+// (64 MiB). A read whose output passes the limit still yields null, but the
+// limit is reported through `onReadLimit`, so the post-merge arm can say
+// `content-unverifiable` (and name the limit) instead of falling to a
+// `tree-mismatch` it never measured. Every other failure reports nothing.
 // ===========================================================================
+
+/** spawnSync's own signal that a read's output passed its `maxBuffer`. */
+function passedReadLimit(e) {
+  return Boolean(e && e.code === "ENOBUFS");
+}
 
 /** First parent (M^1) of a commit — the base tip a squash/merge landed on. */
 export function firstParentOf(commit, cwd = process.cwd()) {
@@ -1674,16 +1685,20 @@ export function mergeBaseOf(a, b, cwd = process.cwd()) {
  * the content path is the DESTINATION (the binary sha must attach to the raw
  * destination path/status, never the old path). Returns null (FAIL CLOSED) on a
  * git error or a malformed/truncated walk — the caller then returns null so a
- * binary post-image is never silently dropped from the fingerprint.
+ * binary post-image is never silently dropped from the fingerprint. A read
+ * whose output passes `maxBuffer` also returns null, and calls `onReadLimit`.
  */
-export function binaryPathsOf(base, head, cwd = process.cwd()) {
+export function binaryPathsOf(base, head, cwd = process.cwd(), { maxBuffer = 64 * 1024 * 1024, onReadLimit = null } = {}) {
   const set = new Set();
   let out;
   try {
     out = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--find-renames", "--numstat", "-z", "--end-of-options", base, head, "--"], {
-      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer,
     });
-  } catch { return null; }                          // fail closed
+  } catch (e) {                                     // fail closed
+    if (onReadLimit && passedReadLimit(e)) onReadLimit(maxBuffer);
+    return null;
+  }
   const toks = out.split("\0");
   let i = 0;
   while (i < toks.length) {
@@ -1707,22 +1722,27 @@ export function binaryPathsOf(base, head, cwd = process.cwd()) {
 
 /**
  * Canonical content fingerprint of the change base..head, or null (fail closed)
- * when base/head is unresolvable or any git error occurs.
+ * when base/head is unresolvable or any git error occurs. A read whose output
+ * passes `maxBuffer` also returns null, and calls `onReadLimit(maxBuffer)`.
  */
-export function contentFingerprint(base, head, cwd = process.cwd()) {
+export function contentFingerprint(base, head, cwd = process.cwd(), { maxBuffer = 64 * 1024 * 1024, onReadLimit = null } = {}) {
   if (!base || !head) return null;
   for (const ref of [base, head]) {                 // both endpoints must resolve locally
     try {
       execFileSync("git", ["--literal-pathspecs", "rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], { stdio: "ignore", cwd });
     } catch { return null; }
   }
+  const readFailed = (e) => {
+    if (onReadLimit && passedReadLimit(e)) onReadLimit(maxBuffer);
+    return null;
+  };
   // T — verbatim, base-move-invariant text-patch hash.
   let diffOut;
   try {
     diffOut = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-algorithm=histogram", "--find-renames", "-U0", "--end-of-options", base, head, "--"], {
-      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer,
     });
-  } catch { return null; }
+  } catch (e) { return readFailed(e); }
   const canonical = diffOut.split("\n").filter((l) => {
     if (l.startsWith("index ")) return false;              // oldsha..newsha — base-move volatile
     if (l.startsWith("similarity index ")) return false;   // rename heuristic, mildly base-dependent
@@ -1734,10 +1754,10 @@ export function contentFingerprint(base, head, cwd = process.cwd()) {
   let rawOut;
   try {
     rawOut = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--find-renames", "--raw", "--abbrev=40", "-z", "--end-of-options", base, head, "--"], {
-      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer,
     });
-  } catch { return null; }
-  const binarySet = binaryPathsOf(base, head, cwd);
+  } catch (e) { return readFailed(e); }
+  const binarySet = binaryPathsOf(base, head, cwd, { maxBuffer, onReadLimit });
   if (binarySet === null) return null;              // numstat failed — cannot prove binary binding => fail closed
   const toks = rawOut.split("\0");
   const rows = [];
@@ -1785,16 +1805,26 @@ export function contentFingerprint(base, head, cwd = process.cwd()) {
  * can never equal a multi-commit reviewed change — a mismatch by construction).
  * Absent it, this is byte-for-byte the squash/single-commit bridge it has always
  * been.
+ *
+ * `maxBuffer` is handed to both fingerprints (absent: their own default). When
+ * the answer is undefined ONLY because a read passed that limit (every side
+ * that failed failed on the limit alone), `onReadLimit(limit)` is called; any
+ * other failure on either side calls nothing. The return value is unchanged.
  */
 export function resolveContentMatch({ commit, reviewedHeadSha, rangeBase = null, cwd = process.cwd(),
-  fingerprint = contentFingerprint, firstParent = firstParentOf, mergeBase = mergeBaseOf } = {}) {
+  fingerprint = contentFingerprint, firstParent = firstParentOf, mergeBase = mergeBaseOf,
+  maxBuffer, onReadLimit = null } = {}) {
   if (!commit || !reviewedHeadSha) return undefined;
   const baseM = rangeBase || firstParent(commit, cwd);
   if (!baseM) return undefined;
-  const fpM = fingerprint(baseM, commit, cwd);
+  let limitM = null;
+  let limitH = null;
+  const fpM = fingerprint(baseM, commit, cwd, { maxBuffer, onReadLimit: (n) => { limitM = n; } });
   const baseH = mergeBase(baseM, reviewedHeadSha, cwd);
-  const fpH = baseH ? fingerprint(baseH, reviewedHeadSha, cwd) : null;
-  return (fpM && fpH) ? (fpM === fpH) : undefined;
+  const fpH = baseH ? fingerprint(baseH, reviewedHeadSha, cwd, { maxBuffer, onReadLimit: (n) => { limitH = n; } }) : null;
+  if (fpM && fpH) return fpM === fpH;
+  if (onReadLimit && (fpM || limitM !== null) && (fpH || limitH !== null)) onReadLimit(limitM ?? limitH);
+  return undefined;
 }
 
 /**
@@ -4011,6 +4041,11 @@ export function analyzePostMerge(ctx) {
       // landed bytes ARE bytes a reviewer vouched for, whatever the branch's
       // intermediate commit ids were. Used only where the alternative is
       // "cannot tell" — never to overrule a proven mismatch above.
+    } else if (ctx.treeMatch === false && Number.isFinite(ctx.contentReadLimit) && ctx.contentReadLimit > 0) {
+      // Tree differs and the content fingerprint was not computed ONLY because a
+      // diff passed the read limit. The engine measured no difference, so it says
+      // what it could not read — still an error, never a pass.
+      findings.push({ code: "content-unverifiable", severity: "error", message: `the content fingerprint could not be computed: a diff of the landed or the reviewed change is larger than the read limit of ${ctx.contentReadLimit} bytes${ctx.contentReadLimit % (1024 * 1024) === 0 ? ` (${ctx.contentReadLimit / (1024 * 1024)} MiB)` : ""} — the landed change was not compared with the reviewed one; approvals/contexts do not bind — failing closed` });
     } else if (ctx.treeMatch === false) {
       // Tree resolved and differs, and content could NOT be re-derived on both
       // sides to prove equivalence — preserve the tree-mismatch signal (fail closed).
@@ -4634,7 +4669,9 @@ function main() {
         // head); a differing change => content-mismatch. Fork / merge_group heads
         // need the ci#55 refetch to resolve locally, else undefined => fail closed
         // (the same posture as tree-unverifiable).
-        ctx.contentMatch = resolveContentMatch({ commit, reviewedHeadSha: ctx.reviewedHeadSha });
+        // A diff above the read limit is recorded apart (content-unverifiable).
+        ctx.contentReadLimit = null;
+        ctx.contentMatch = resolveContentMatch({ commit, reviewedHeadSha: ctx.reviewedHeadSha, onReadLimit: (n) => { ctx.contentReadLimit = n; } });
         ctx.contentBinds = makeContentBinds({ anchor: firstParentOf(commit) });
         // check 5 (squash-correct): the PR's SOURCE commits via the API — NOT
         // the squash commit's first-parent diff (which is base→squash, not the
@@ -4738,7 +4775,8 @@ function main() {
           for (const c of ctx.landedRange.commits) {
             try { const info = mergeInfoOf(c.sha); if (info) ctx.mergeInfoBySha[c.sha] = info; } catch { /* not content-free */ }
           }
-          ctx.contentMatch = resolveContentMatch({ commit: mergedSha, reviewedHeadSha: ctx.reviewedHeadSha, rangeBase: landing.base });
+          ctx.contentReadLimit = null;
+          ctx.contentMatch = resolveContentMatch({ commit: mergedSha, reviewedHeadSha: ctx.reviewedHeadSha, rangeBase: landing.base, onReadLimit: (n) => { ctx.contentReadLimit = n; } });
           // The staleness anchor moves with the binding: the on-main commit the
           // RANGE landed on, not the tip's own parent (which is itself a landed
           // commit of this very range).
