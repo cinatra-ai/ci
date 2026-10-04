@@ -11,6 +11,10 @@ name: source-leak-gate
 on:
   workflow_call:
     inputs:
+      use_slim:
+        description: "Run this lightweight gate on ubuntu-slim; opt in after validating the caller. Standard runners remain the default."
+        type: boolean
+        default: false
       profile:
         description: "Rule profile (default | ts-monorepo | php-wp-plugin | drupal-module | ops-docs)."
         type: string
@@ -49,7 +53,7 @@ permissions:
 
 jobs:
   source-leak-gate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.use_slim && 'ubuntu-slim' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout caller repository

@@ -9,6 +9,10 @@ name: gitignore-gate
 on:
   workflow_call:
     inputs:
+      use_slim:
+        description: "Run this lightweight gate on ubuntu-slim; opt in after validating the caller. Standard runners remain the default."
+        type: boolean
+        default: false
       ref:
         description: "Git ref of this gate repo to check out (pin to a SHA in production)."
         type: string
@@ -19,7 +23,7 @@ permissions:
 
 jobs:
   gitignore-gate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.use_slim && 'ubuntu-slim' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout caller repository

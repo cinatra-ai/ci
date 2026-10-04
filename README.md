@@ -10,6 +10,24 @@ repos add a thin caller workflow that pins both the workflow ref and the inner
 `secret-scan-gate`) wrap an upstream action directly and do not use an inner
 `ref`.
 
+## Lightweight runners
+
+The `actions-pinned-gate`, `gitignore-gate`, and `source-leak-gate` workflows
+accept `use_slim: true` to select `ubuntu-slim`. The default remains
+`ubuntu-latest`. Runner selection does not change the gate commands, their
+permissions, or their status names. Pin the workflow and inner `ref` together
+when adopting this input.
+
+GitHub bills a reusable workflow to its caller. Public workflow definitions do
+not make a private caller free. The single-CPU runner is suitable for these
+short Node checks; container-based secret scans and jobs needing more than its
+15-minute limit should retain a compatible standard runner.
+
+Cancel outdated pull-request runs in the caller, using a group containing the
+workflow name and pull-request number. Give other events a unique run ID so
+successive pushes retain their verification runs. Keep this concurrency group
+out of the reusable workflow to avoid a caller cancelling its own called job.
+
 ## What belongs in this repo
 
 - **Reusable gate workflows** (`.github/workflows/*.yml`) — org-wide quality
