@@ -218,6 +218,8 @@ jobs:
             scripts/__tests__/doc-code-value-gate.test.mjs \
             scripts/__tests__/extension-ioc-gate.test.mjs \
             scripts/__tests__/secrets-required-gate.test.mjs \
+            scripts/__tests__/secret-scan-engine-pin.test.mjs \
+            scripts/__tests__/secret-scan-scan-errors.test.mjs \
             scripts/__tests__/governance-drift-gate.test.mjs \
             scripts/__tests__/release-workflow-pin-drift-gate.test.mjs \
             scripts/__tests__/check-meta-commentary.test.mjs \
