@@ -1525,7 +1525,9 @@ unverifiable secret is introduced into the diff. The engine is
 [TruffleHog OSS](https://github.com/trufflesecurity/trufflehog), run with
 `--results=verified,unknown` (verified leaks and verification-error results
 both fail; unverified results are excluded to limit false positives). The
-engine version is pinned to match the companion scheduled sweep.
+engine version (3.97.9) is pinned to match the companion scheduled sweep. It
+must stay at 3.97.7 or later: older engines skip PR commits on a branch that
+merged its base branch (trufflesecurity/trufflehog#5325) and still pass.
 
 This gate is the **preventive** control; the companion `secret-scan-sweep`
 workflow (scheduled, org-wide) is the **detective** control that covers the
