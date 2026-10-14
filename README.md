@@ -1551,15 +1551,25 @@ jobs:
       head_sha: ${{ github.event.pull_request.head.sha }}
 ```
 
-When `base_sha` is empty (push events, or not provided), TruffleHog performs
-a full working-tree scan rather than a diff scan.
+The gate passes `--fail-on-scan-errors`: a scan error (for example a base or
+head commit that does not resolve) fails the check. Without it, TruffleHog
+logs the error, scans nothing and exits 0.
+
+A "Resolve scan range" step decides the range per event before the scan, and
+logs an annotation for every fallback:
+
+| Event | Range scanned |
+|-------|---------------|
+| `pull_request`, `pull_request_target`, `merge_group` | `base..head` (from the inputs, else from the event). A commit missing from the clone is fetched once by SHA. A base or head that still does not resolve fails the check. |
+| `push` | `before..after` (`base_sha` and `head_sha`, else the event's `before` and `after`). An empty or all-zero `before` (the first push of a ref) scans the full history of `after`. After a force-push, `before` is fetched by SHA and the scan starts at the merge base of `before` and `after`; if `before` cannot be fetched, the full history of `after` is scanned. A push that only moves the ref back to an ancestor, or deletes it, adds no commits: a notice, and no scan. |
+| any other event | `base..head` when `base_sha` is set, else the full history of the head. |
 
 ### Inputs
 
 | Input | Default | Meaning |
 |-------|---------|---------|
-| `base_sha` | _(none)_ | Diff base commit SHA (PR: `pull_request.base.sha`). Empty triggers a full tree scan. |
-| `head_sha` | _(none)_ | Diff head commit SHA (PR: `pull_request.head.sha`). Empty defaults to `HEAD`. |
+| `base_sha` | _(none)_ | Diff base commit SHA (PR: `pull_request.base.sha`). Empty: the event's base (see the table above). |
+| `head_sha` | _(none)_ | Diff head commit SHA (PR: `pull_request.head.sha`). Empty: the event's head, else `HEAD`. |
 | `extra_args` | _(none)_ | Optional extra TruffleHog CLI args appended after the gate defaults (e.g. `--exclude-paths=.trufflehog-exclude`). |
 
 ### Required-check context
