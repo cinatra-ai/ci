@@ -56,7 +56,8 @@ case holds private data.
   An endpoint that is not in the map is a read that fails. The runner raises the reader's own "cannot be read" error for it.
 - **`platform.links`** (optional) maps an endpoint of a cursor-paged list to the endpoint of its next page, as GitHub's Link header
   names it (rel="next"). The repository activity pages by cursor: a merged pull request's history is read back through these
-  links until the merge is covered. An endpoint without an entry is the last page.
+  links until the merge is covered. An endpoint without an entry is the last page. Every `direction=desc` activity page lists
+  rows newest-first by timestamp; rows from the same second may appear in either order.
 - **`platform.diffs`** maps a compare endpoint (`repos/<org>/<repo>/compare/<base>...<sha>`, the diff media type) to its diff
   text. The patch id is computed from it with `git patch-id --stable`.
 - **`platform.mergeTrees`** maps two parents, `"<p1> <p2>"`, to the tree of their automatic clean merge (what

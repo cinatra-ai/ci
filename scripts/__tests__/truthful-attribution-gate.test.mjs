@@ -3879,7 +3879,8 @@ const send = (v) => { process.stdout.write((process.argv.includes("-i") ? "HTTP/
 // §5d: the head-arrival reading of the approval. The pull request names its head branch and
 // head repository, and the head was pushed (its only reading) before every fixture review.
 const pushed = "2026-07-01T00:00:00Z", headRef = "feature/repair";
-const withHead = { merged_at: null, ...pr, head: { ref: headRef, repo: { full_name: "cinatra-ai/cinatra" }, ...pr.head } };
+const withHead = { merged_at: null, ...pr, head: { ref: headRef, repo: { full_name: "cinatra-ai/cinatra" }, ...pr.head },
+  base: { ref: "main", repo: { full_name: "cinatra-ai/cinatra" } } };
 if (/\\/git\\/commits\\/[0-9a-f]{40}$/.test(endpoint)) send({ sha: endpoint.split("/").pop(), committer: { date: pushed } });
 if (/\\/commits\\/[0-9a-f]{40}\\/check-suites\\?/.test(endpoint)) send({ total_count: 0, check_suites: [] });
 if (/\\/issues\\/\\d+\\/timeline\\?per_page=100$/.test(endpoint)) send([]);
@@ -5798,17 +5799,22 @@ function d5Forward(r) {
  * `ref: undefined` keeps it missing). The returned `read` answers one REST read;
  * `read.page` answers one page of a link-paged list as { body, next }.
  */
-function d5Read({ A, H, committed = D5_H_AT, suiteAt = "2026-10-14T14:22:41Z", history = null, events = [], fail = null, malformed = null, reads = null,
-  suites = null, activityPages = null, timelinePages = null, headSlug = D5_SLUG, baseSuites = { total_count: 0, check_suites: [] } } = {}) {
+function d5Read({ A, H, committed = D5_H_AT, suiteAt = "2026-10-14T14:22:41Z", history = null, baseHistory = null, events = [], fail = null,
+  malformed = null, reads = null, suites = null, activityPages = null, timelinePages = null, headSlug = D5_SLUG,
+  baseSuites = { total_count: 0, check_suites: [] } } = {}) {
   // headSlug: the pull request's head repository (a fork when it is not D5_SLUG). The head branch's check suites are
   // answered there; the base repository answers `baseSuites` (by default none of the head branch).
-  const pull = { number: D5_PR, merged_at: null, head: { sha: H, ref: D5_REF, repo: { full_name: headSlug } } };
+  const pull = { number: D5_PR, merged_at: null, head: { sha: H, ref: D5_REF, repo: { full_name: headSlug } },
+    base: { ref: "main", repo: { full_name: D5_SLUG } } };
   const withRef = (rows) => rows.map((row) => ("ref" in row ? row : { ...row, ref: `refs/heads/${D5_REF}` }));
   const activity = activityPages || [history || [
     { activity_type: "push", timestamp: D5_H_AT, before: A, after: H },
     { activity_type: "branch_creation", timestamp: D5_A_AT, before: "0".repeat(40), after: A },
   ]];
   const timeline = timelinePages || [[{ event: "committed", sha: A }, { event: "reviewed", commit_id: H, state: "approved" }, { event: "committed", sha: H }, ...events]];
+  let defaultBaseTip = null;
+  const baseActivity = () => baseHistory || [{ activity_type: "push", ref: "refs/heads/main", timestamp: "2026-10-14T14:00:00Z",
+    before: "e".repeat(40), after: defaultBaseTip }];
   const answers = {
     pull: () => pull,
     commit: () => ({ sha: H, committer: { date: committed } }),
@@ -5819,7 +5825,7 @@ function d5Read({ A, H, committed = D5_H_AT, suiteAt = "2026-10-14T14:22:41Z", h
       { head_sha: H, head_branch: `refs/pull/${D5_PR}/head`, repository: { full_name: D5_SLUG }, created_at: "2026-10-14T14:22:43Z" },
     ] }),
     timeline: (i) => timeline[i],
-    activity: (i) => withRef(activity[i]),
+    activity: (i, endpoint) => String(endpoint).includes("ref=refs/heads/main") ? baseActivity() : withRef(activity[i]),
   };
   const pagesOf = { timeline: timeline.length, activity: activity.length };
   const kindOf = (endpoint) => {
@@ -5839,19 +5845,20 @@ function d5Read({ A, H, committed = D5_H_AT, suiteAt = "2026-10-14T14:22:41Z", h
     if (kind === malformed) return { message: "an error page" };
     if (kind === "suites" && headSlug !== D5_SLUG && !String(endpoint).startsWith(`/repos/${headSlug}/`)) return JSON.parse(JSON.stringify(baseSuites));
     if (!paged) {
-      const value = kind === "timeline" || kind === "activity" ? answers[kind](0) : answers[kind]();
+      const value = kind === "timeline" || kind === "activity" ? answers[kind](0, endpoint) : answers[kind]();
       if (typeof value === "function") return value();
       return JSON.parse(JSON.stringify(value));
     }
     const at = /[?&]pageno=([0-9]+)/.exec(endpoint);
     const i = at ? Number(at[1]) : 0;
-    const page = answers[kind](i);
+    const page = answers[kind](i, endpoint);
     if (typeof page === "function") return page();
     const next = i + 1 < pagesOf[kind] ? `${String(endpoint).replace(/&pageno=[0-9]+$/, "")}&pageno=${i + 1}` : null;
     return { body: JSON.parse(JSON.stringify(page)), next };
   };
   const read = (endpoint) => answer(endpoint, false);
   read.page = (endpoint) => answer(endpoint, true);
+  read.setDefaultBaseTip = (sha) => { defaultBaseTip = sha; };
   return read;
 }
 
@@ -5862,6 +5869,7 @@ function d5Review(commitId, submittedAt = D5_APPROVED_AT, id = d5ReviewIds++) {
 
 /** The resolver the gate hands verifyReviewedLine, or undefined on a build that has none. */
 function d5ApprovalAt({ read, anchor, cwd }) {
+  if (typeof read?.setDefaultBaseTip === "function") read.setDefaultBaseTip(anchor);
   return typeof gateExports.makeApprovalAt === "function"
     ? gateExports.makeApprovalAt({ read, readPage: read.page, slug: D5_SLUG, pr: D5_PR, anchor, cwd })
     : undefined;
@@ -6080,11 +6088,14 @@ test("§5d (b): an equal patch-id is not enough when the own change's bytes diff
   const H = d5Forward(r);
   const plainForwardOf = gateExports.plainForwardOf;
   assert.equal(typeof plainForwardOf, "function", "the gate exports no plain-forward reading");
-  assert.equal(plainForwardOf({ anchor: r.main1, approvedHead: r.A, head: H, cwd: r.dir }).ok, true);
-  const bytes = plainForwardOf({ anchor: r.main1, approvedHead: r.A, head: H, cwd: r.dir, fingerprint: (base, head) => `fp-${head}` });
+  const platform = { baseRef: "main",
+    headHistory: [{ kind: "push", at: Date.parse(D5_H_AT), after: H }, { kind: "branch_creation", at: Date.parse(D5_A_AT), after: r.A }],
+    baseHistory: [{ kind: "push", at: Date.parse("2026-10-14T14:00:00Z"), after: r.main1 }], baseHistoryComplete: true };
+  assert.equal(plainForwardOf({ anchor: r.main1, approvedHead: r.A, head: H, cwd: r.dir, ...platform }).ok, true);
+  const bytes = plainForwardOf({ anchor: r.main1, approvedHead: r.A, head: H, cwd: r.dir, ...platform, fingerprint: (base, head) => `fp-${head}` });
   assert.equal(bytes.ok, false);
   assert.match(bytes.reason, /patch-id does not read/);
-  const unreadable = plainForwardOf({ anchor: r.main1, approvedHead: r.A, head: H, cwd: r.dir, patchId: () => null });
+  const unreadable = plainForwardOf({ anchor: r.main1, approvedHead: r.A, head: H, cwd: r.dir, ...platform, patchId: () => null });
   assert.equal(unreadable.ok, undefined);
   assert.equal(plainForwardOf({ anchor: null, approvedHead: r.A, head: H, cwd: r.dir }).ok, undefined);
   fs.rmSync(r.dir, { recursive: true, force: true });
@@ -6203,6 +6214,7 @@ test("§5d: the check suites are complete only at exactly their total, the same 
   const base = d5Read({ A: r.A, H });
   const read = (endpoint) => (/\/check-suites\?/.test(endpoint) ? pages[page++] : base(endpoint));
   read.page = base.page;
+  read.setDefaultBaseTip = base.setDefaultBaseTip;
   const v = d5Verify({ review: d5Review(H, D5_FRESH), head: H, approvalAt: d5ApprovalAt({ read, anchor: r.main1, cwd: r.dir }) });
   assert.equal(v.ok, false, "a suites total that changed between pages counted");
   fs.rmSync(r.dir, { recursive: true, force: true });
@@ -6226,6 +6238,28 @@ test("§5d: the head branch's activity is read through its next links until the 
   assert.equal(d5Verify({ review: d5Review(H), head: H, approvalAt: broken }).ok, false);
   const unordered = d5ApprovalAt({ read: d5Read({ A: r.A, H, activityPages: [[pushH, createA], [{ ...pushH, timestamp: "2026-10-14T15:00:00Z" }]] }), anchor: r.main1, cwd: r.dir });
   assert.equal(d5Verify({ review: d5Review(H), head: H, approvalAt: unordered }).ok, false);
+  fs.rmSync(r.dir, { recursive: true, force: true });
+});
+
+test("§5d (b): the plain forward validates the base branch activity and uses its tip at the merge's platform time", () => {
+  const r = d5Repo({ mainEdit: "other-file" });
+  const H = d5Forward(r);
+  const row = (patch = {}) => ({ activity_type: "push", ref: "refs/heads/main", timestamp: "2026-10-14T14:00:00Z",
+    before: r.base, after: r.main1, ...patch });
+  const refused = [
+    [row({ ref: "refs/heads/elsewhere" })],
+    [row({ timestamp: "2026-10-14T13:00:00Z" }), row({ timestamp: "2026-10-14T14:00:00Z" })],
+  ];
+  for (const baseHistory of refused) {
+    const result = d5ApprovalAt({ read: d5Read({ A: r.A, H, baseHistory }), anchor: r.main1, cwd: r.dir })(d5Review(H), H);
+    assert.equal(result.ok, false, `invalid base activity counted: ${JSON.stringify(baseHistory)}`);
+    assert.equal(result.unreadable, true, result.reason);
+  }
+  // Equal seconds are valid ordering. When every row identifies the same tip, that tip is unambiguous and the forward counts.
+  const tied = [row(), row({ before: "d".repeat(40) })];
+  const result = d5ApprovalAt({ read: d5Read({ A: r.A, H, baseHistory: tied }), anchor: r.main1, cwd: r.dir })(d5Review(H), H);
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.via, "plain-forward");
   fs.rmSync(r.dir, { recursive: true, force: true });
 });
 
@@ -6436,7 +6470,7 @@ test("§5d: a check suite whose repository or branch is missing or malformed mak
  * matrix takes its fields and kinds from ARRIVAL_SCHEMAS alone).
  */
 const D5_REQUIRED_PATHS = {
-  pull: ["head.sha", "head.ref", "head.repo.full_name", "merged_at"],
+  pull: ["head.sha", "head.ref", "head.repo.full_name", "base.ref", "merged_at"],
   review: ["id", "state", "user", "user.login", "submitted_at", "commit_id"],
   checkSuite: ["head_sha", "head_branch", "repository.full_name", "created_at"],
   activity: ["activity_type", "ref", "before", "after", "timestamp"],
@@ -6537,6 +6571,7 @@ function d5MutatedRead(base, target) {
   };
   const read = (endpoint) => apply(endpoint, base(endpoint));
   read.page = (endpoint) => apply(endpoint, base.page(endpoint));
+  read.setDefaultBaseTip = base.setDefaultBaseTip;
   return read;
 }
 
@@ -6636,6 +6671,7 @@ test("§5d (KB-239): a parsed row carries only its declared fields, and the read
   const base = d5Read({ A: r.A, H: H2 });
   const read = (endpoint) => { kinds.push(d5KindOf(endpoint)); return base(endpoint); };
   read.page = (endpoint) => { kinds.push(d5KindOf(endpoint)); return base.page(endpoint); };
+  read.setDefaultBaseTip = base.setDefaultBaseTip;
   assert.equal(d5ApprovalAt({ read, anchor: r.main1, cwd: r.dir })(d5Review(H2), H2).ok, true);
   for (const kind of new Set(kinds)) assert.ok(kind && gateExports.ARRIVAL_SCHEMAS[kind], `the reading reads ${kind} without a declaration`);
   fs.rmSync(r.dir, { recursive: true, force: true });
@@ -6733,6 +6769,7 @@ function d5DeclaredRead(base, schemas, log) {
   };
   const read = (endpoint) => wrapAnswer(endpoint, base(endpoint));
   read.page = (endpoint) => wrapAnswer(endpoint, base.page(endpoint));
+  read.setDefaultBaseTip = base.setDefaultBaseTip;
   return read;
 }
 
@@ -6746,7 +6783,9 @@ function d5EndToEnd(gate, r, H, { timeline: given = null } = {}) {
   const schemas = gate.ARRIVAL_SCHEMAS;
   const timeline = given || [{ event: "committed", sha: r.A }, { event: "cross-referenced", created_at: "2026-10-14T14:05:00Z" },
     { event: "head_ref_force_pushed", created_at: "2026-10-14T14:10:00Z", commit_id: r.A }, { event: "commented" }, { event: "committed", sha: H }];
-  const read = d5DeclaredRead(d5Read({ A: r.A, H, timelinePages: [timeline] }), schemas, log);
+  const baseHistory = [{ activity_type: "push", ref: "refs/heads/main", timestamp: "2026-10-14T14:00:00Z",
+    before: r.base, after: r.main1 }];
+  const read = d5DeclaredRead(d5Read({ A: r.A, H, timelinePages: [timeline], baseHistory }), schemas, log);
   const review = (row) => d5Declared(schemas, "review", row, log);
   const fresh = d5Review(H, D5_FRESH);
   const reviews = [review({ ...d5Review(H, "2026-10-14T14:25:00Z"), state: "COMMENTED" }), review(fresh)];

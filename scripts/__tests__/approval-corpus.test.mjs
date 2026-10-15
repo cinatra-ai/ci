@@ -27,24 +27,9 @@ const CASES = fs.readdirSync(CORPUS).filter((name) => name.endsWith(".json")).so
 const SHA = /^[0-9a-f]{40}$/;
 const ZERO_SHA = "0".repeat(40);
 const clone = (value) => structuredClone(value);
-const UNEXPRESSIBLE = Object.freeze({
-  "backdated-merge-of-an-old-base-tip": {
-    actual: 0,
-    reason: "the gate's plain-forward reader compares merge parents with the current base anchor; it does not read the base tip at the platform-recorded merge time",
-  },
-  "foreign-merge": {
-    actual: 0,
-    reason: "the foreign parent became the base tip after the merge, so the gate's current-anchor ancestry model cannot express the authority's at-merge-time refusal",
-  },
-  "merge-re-pushed-after-the-base-moved": {
-    actual: 0,
-    reason: "the gate's current-anchor ancestry model cannot prove that the merge parent was no longer the base tip when the merge was re-pushed",
-  },
-  "merged-pull-request-history-beyond-one-page": {
-    actual: 2,
-    reason: "the corpus's first direction=desc activity page is internally oldest-first; the gate validates newest-first ordering and cannot count it without weakening that invariant",
-  },
-});
+// Only fail-closed differences belong here: the gate may refuse a case the authority counts,
+// but it may never count a case the authority refuses. Keep the reason beside every exception.
+const UNEXPRESSIBLE = Object.freeze({});
 
 class CorpusReadError extends Error {}
 

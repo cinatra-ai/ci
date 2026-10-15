@@ -1934,9 +1934,12 @@ export function makeContentBinds({ anchor, cwd = process.cwd(),
 //       change:
 //         - A is an ancestor of H (a rebase or a force push is no forward);
 //         - every commit H carries beyond A and beyond the base is a two-parent
-//           merge of a base commit whose tree is exactly the clean merge of its
-//           parents (§5c's content-free merge): a new commit refuses, and so
-//           does a merge whose overlap was settled by hand;
+//           merge whose second parent was the base branch's tip when GitHub
+//           recorded that merge's newest arrival on the head branch. The tip is
+//           read from the base branch's own newest-first activity, never inferred
+//           from today's ancestry or a commit date. Its tree must be exactly the
+//           clean merge of its parents (§5c's content-free merge): a new commit,
+//           an old/foreign base parent or a hand-settled overlap refuses;
 //         - the pull request's own diff (merge-base(base, X)..X) has the same
 //           `git patch-id --stable` at A and at H, re-derived here; and
 //         - the §5 content fingerprint of that own diff is equal at A and at H
@@ -2094,7 +2097,7 @@ export const ARRIVAL_FIELD_KINDS = Object.freeze({
  * is no head event is read for its event name only.
  */
 export const ARRIVAL_SCHEMAS = Object.freeze({
-  pull: Object.freeze({ "head.sha": "sha", "head.ref": "branchName", "head.repo.full_name": "repoSlug", merged_at: "timeOrNull" }),
+  pull: Object.freeze({ "head.sha": "sha", "head.ref": "branchName", "head.repo.full_name": "repoSlug", "base.ref": "branchName", merged_at: "timeOrNull" }),
   review: Object.freeze({ id: "reviewId", state: "reviewState", user: "nullUser", "user.login": "login", submitted_at: "time", commit_id: "shaOrNull" }),
   checkSuite: Object.freeze({ head_sha: "sha", head_branch: "branchNameOrNull", "repository.full_name": "repoSlug", created_at: "timeOrNull" }),
   activity: Object.freeze({ activity_type: "activityKind", ref: "branchRef", before: "sha", after: "sha", timestamp: "time" }),
@@ -2278,11 +2281,38 @@ function readPagedList(readPage, first, what) {
   throw new HeadReadingUnreadable(`the ${what} did not reach its end`);
 }
 
-/** One activity entry of the head branch, validated whole; throws on any unrecognised or malformed field. */
-function headActivityRow(row, fullRef) {
-  if (row.ref !== fullRef) throw new HeadReadingUnreadable("an activity entry names another ref than the head branch");
+/** One activity entry of a named branch, validated whole; throws on a wrong ref or impossible head value. */
+function branchActivityRow(row, fullRef, what) {
+  if (row.ref !== fullRef) throw new HeadReadingUnreadable(`the ${what} answered a change of another branch (${row.ref})`);
   if (row.activity_type === "branch_deletion" ? row.after !== ZERO_SHA : row.after === ZERO_SHA) throw new HeadReadingUnreadable(`an activity entry (${row.activity_type}) carries an impossible after commit`);
   return { kind: row.activity_type, at: canonicalTime(row.timestamp), after: row.after };
+}
+
+/**
+ * Validate one direction=desc activity page before a caller relies on its first or last row.
+ * Equal-second rows are valid ordering; a later timestamp after an earlier one is not.
+ */
+function branchActivityPage(raw, ref, what) {
+  if (!Array.isArray(raw)) throw new HeadReadingUnreadable(`the ${what} read is not a list`);
+  const fullRef = `refs/heads/${ref}`;
+  const rows = raw.map((row, i) => branchActivityRow(parseArrivalRow("activity", row, `${what} row ${i}`), fullRef, what));
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].at > rows[i - 1].at) throw new HeadReadingUnreadable(`the ${what} is not newest-first within its page`);
+  }
+  return rows;
+}
+
+/** One non-paged activity read, as used by the owner's plain-forward rule for the base branch. */
+function readBranchActivity(read, slug, ref, perPage, what) {
+  const fullRef = `refs/heads/${ref}`;
+  const endpoint = `/repos/${slug}/activity?ref=${encodeURIComponent(fullRef).replaceAll("%2F", "/")}&direction=desc&per_page=${perPage}`;
+  let answer;
+  try { answer = read(endpoint); }
+  catch (e) {
+    if (e instanceof HeadReadingUnreadable) throw e;
+    throw new HeadReadingUnreadable(`the ${what} cannot be read (${String(e?.message || "failed").slice(0, 160)})`);
+  }
+  return branchActivityPage(answer, ref, what);
 }
 
 /**
@@ -2300,12 +2330,11 @@ function extendHeadHistory(readPage, activity) {
   pagedAnswer(answer, "activity of the head branch");
   // at the bound the next page is read too; only a non-empty page past the bound refuses
   if (activity.pages >= HEAD_READ_MAX_PAGES && answer.body.length) throw new HeadReadingUnreadable(`the activity of the head branch holds more than ${HEAD_READ_MAX_PAGES} pages`);
-  for (const row of answer.body.map((raw) => parseArrivalRow("activity", raw, "an activity entry of the head branch"))) {
-    const item = headActivityRow(row, activity.fullRef);
-    const last = activity.rows[activity.rows.length - 1];
-    if (last && item.at > last.at) throw new HeadReadingUnreadable("the activity of the head branch is not newest-first");
-    activity.rows.push(item);
-  }
+  const ref = activity.fullRef.slice("refs/heads/".length);
+  const page = branchActivityPage(answer.body, ref, "activity of the head branch");
+  const last = activity.rows[activity.rows.length - 1];
+  if (last && page.length && page[0].at > last.at) throw new HeadReadingUnreadable("the activity of the head branch is not newest-first across its pages");
+  activity.rows.push(...page);
   activity.pages += 1;
   activity.next = answer.next;
 }
@@ -2330,9 +2359,9 @@ export function collectHeadArrival(read, { slug, pr, head, readPage }) {
   const pullHead = () => {
     const pull = parseArrivalRow("pull", get(`/repos/${slug}/pulls/${pr}`, "pull request"), "the pull request");
     if (pull.head.sha !== head) throw new HeadReadingUnreadable(`the pull request's head is ${pull.head.sha.slice(0, 12)} now, not ${head.slice(0, 12)}`);
-    return { ref: pull.head.ref, headSlug: pull.head.repo.full_name, mergedAt: pull.merged_at };
+    return { ref: pull.head.ref, headSlug: pull.head.repo.full_name, baseRef: pull.base.ref, mergedAt: pull.merged_at };
   };
-  const { ref, headSlug, mergedAt } = pullHead();
+  const { ref, headSlug, baseRef, mergedAt } = pullHead();
   // the head commit's own dates are never read: its maker sets them (only times GitHub recorded date the arrival)
   const cutoff = mergedAt === null ? null : canonicalTime(mergedAt);   // a merged pull request is read as of its merge
   // Check suites: the read is complete only when it saw exactly total_count suites, the total
@@ -2376,7 +2405,7 @@ export function collectHeadArrival(read, { slug, pr, head, readPage }) {
   // The head is read again before the activity, the last reading; the head branch's newest
   // head-setting change must set it to H.
   const again = pullHead();
-  if (again.ref !== ref || again.headSlug !== headSlug || again.mergedAt !== mergedAt) throw new HeadReadingUnreadable("the pull request's head branch, head repository or merge changed during the reading");
+  if (again.ref !== ref || again.headSlug !== headSlug || again.baseRef !== baseRef || again.mergedAt !== mergedAt) throw new HeadReadingUnreadable("the pull request's head branch, head repository, base branch or merge changed during the reading");
   const fullRef = `refs/heads/${ref}`;
   const activity = { fullRef, rows: [], pages: 0,
     next: `/repos/${headSlug}/activity?ref=${encodeURIComponent(fullRef).replaceAll("%2F", "/")}&direction=desc&per_page=${HEAD_HISTORY_PAGE}` };
@@ -2387,7 +2416,7 @@ export function collectHeadArrival(read, { slug, pr, head, readPage }) {
   const newest = activity.rows.find(setsHead);
   if (!newest) throw new HeadReadingUnreadable(`the activity of the head branch ${ref} has no push`);
   if (newest.after !== head) throw new HeadReadingUnreadable(`the newest change of the head branch ${ref} is no push of ${head.slice(0, 12)}: the branch moved`);
-  return { head, suites, events, commits: [...commits].sort(), newestPush: newest, activity };
+  return { head, ref, headSlug, baseRef, suites, events, commits: [...commits].sort(), newestPush: newest, activity };
 }
 
 /** (a): { ok, line } — was an approval submitted at `submittedAt` given after H arrived? */
@@ -2492,12 +2521,16 @@ export function forwardCommitsOf(approved, head, anchor, cwd = process.cwd()) {
  * pull request's own change? { ok: true|false|undefined, reason, patchId }.
  * false names what refuses; undefined says what could not be read. Both refuse.
  */
-export function plainForwardOf({ anchor, approvedHead, head, cwd = process.cwd(),
+export function plainForwardOf({ anchor, approvedHead, head, baseRef, headHistory, baseHistory, baseHistoryComplete, cwd = process.cwd(),
   isAncestor = isAncestorOf, forwardCommits = forwardCommitsOf, mergeInfo = mergeInfoOf, hasLocal = hasCommitLocally,
   mergeBase = mergeBaseOf, patchId = ownPatchId, fingerprint = contentFingerprint } = {}) {
   const A = asFullSha(approvedHead), H = asFullSha(head);
   if (!anchor) return { ok: undefined, reason: "no base to read the pull request's own change against" };
   if (!A || !H) return { ok: undefined, reason: "the approved head or the head is not a full commit sha" };
+  if (!isBranchName(baseRef)) return { ok: undefined, reason: "the pull request's base branch cannot be read" };
+  if (!Array.isArray(headHistory) || !Array.isArray(baseHistory) || typeof baseHistoryComplete !== "boolean") {
+    return { ok: undefined, reason: "the head or base branch activity cannot be read" };
+  }
   if (A === H) return { ok: false, reason: "the head is the approved head itself, not a forward of it" };
   const ancestor = isAncestor(A, H, cwd);
   if (ancestor === undefined) return { ok: undefined, reason: `whether ${shortSha(H)} contains ${shortSha(A)} cannot be read` };
@@ -2509,9 +2542,21 @@ export function plainForwardOf({ anchor, approvedHead, head, cwd = process.cwd()
     const info = mergeInfo(sha, { cwd });
     if (!info) return { ok: false, reason: `${shortSha(H)} carries a new commit ${shortSha(sha)} after the approved head ${shortSha(A)} (only a merge from the base is a plain forward)` };
     if (!info.parents.every((p) => hasLocal(p, cwd))) return { ok: undefined, reason: `a parent of the merge ${shortSha(sha)} is not in this checkout` };
-    const fromBase = info.parents.map((p) => isAncestor(p, anchor, cwd));
-    if (fromBase.some((x) => x === undefined)) return { ok: undefined, reason: `the parents of the merge ${shortSha(sha)} cannot be placed against the base` };
-    if (!fromBase.some(Boolean)) return { ok: false, reason: `the merge ${shortSha(sha)} merges no commit of the base: it is no forward from the base` };
+    const arrivals = headHistory.filter((item) => item && item.after === sha && Number.isFinite(item.at)).map((item) => item.at);
+    if (!arrivals.length) return { ok: false, reason: `the merge ${shortSha(sha)} never stood as the head of the head branch: its time cannot be read` };
+    // A commit can be pushed away and later restored. The newest platform-recorded arrival decides which base tip it merged.
+    const at = Math.max(...arrivals);
+    const tips = baseHistory.filter((item) => item && Number.isFinite(item.at) && asFullSha(item.after) && item.at <= at);
+    if (!tips.length) {
+      return baseHistoryComplete
+        ? { ok: false, reason: `the base branch ${baseRef} had no tip before the merge ${shortSha(sha)}` }
+        : { ok: undefined, reason: `the base branch's activity does not reach back to the merge ${shortSha(sha)} (${headReadIso(at)})` };
+    }
+    const tipAt = Math.max(...tips.map((item) => item.at));
+    const tipsAt = new Set(tips.filter((item) => item.at === tipAt).map((item) => item.after));
+    if (tipsAt.size !== 1 || !tipsAt.has(info.parents[1])) {
+      return { ok: false, reason: `the merge ${shortSha(sha)} merges ${shortSha(info.parents[1])}, which was not the tip of ${baseRef} at that time (${headReadIso(at)}): no plain forward from the base` };
+    }
     if (!asFullSha(info.tree) || (info.cleanTree !== null && !asFullSha(info.cleanTree))) return { ok: undefined, reason: `the trees of the merge ${shortSha(sha)} cannot be read` };
     if (!isContentFreeMerge(info)) return { ok: false, reason: `the merge ${shortSha(sha)} is not the clean merge of its parents: its overlap was settled by hand (or it carries an edit of its own)` };
   }
@@ -2581,8 +2626,19 @@ export function makeApprovalAt({ read, readPage, slug, pr, anchor, cwd = process
     if (named !== H && named !== original.sha) {
       return refuse(`the approval names ${shortSha(named)}, neither the head it was submitted at (${shortSha(original.sha)}) nor ${H.slice(0, 12)}`, original.sha);
     }
+    // The owner's plain-forward rule places every merge's second parent against the
+    // base branch tip at that merge's newest platform-recorded arrival. One validated
+    // 100-row direction=desc page is the authority's reading; a full page that does not
+    // reach a needed time is incomplete and therefore unreadable.
+    let baseHistory;
+    try { baseHistory = readBranchActivity(read, slug, got.readings.baseRef, HEAD_HISTORY_PAGE, "activity of the base branch"); }
+    catch (e) {
+      if (!(e instanceof HeadReadingUnreadable)) throw e;
+      return refuse(`the approval at ${H.slice(0, 12)} was ${arrival.line}, and the base branch's activity cannot be read (${e.message})`, original.sha, true);
+    }
     if (typeof ensureLocal === "function") { try { ensureLocal(H); } catch { /* the git half then fails closed */ } }
-    const fwd = forward({ anchor, approvedHead: original.sha, head: H, cwd });
+    const fwd = forward({ anchor, approvedHead: original.sha, head: H, baseRef: got.readings.baseRef,
+      headHistory: got.readings.activity.rows, baseHistory, baseHistoryComplete: baseHistory.length < HEAD_HISTORY_PAGE, cwd });
     if (fwd.ok === true) return { ok: true, unreadable: false, via: "plain-forward", reason: null, approvedHead: original.sha, patchId: fwd.patchId };
     return refuse(`the approval was given at ${shortSha(original.sha)} and ${arrival.line}; ${fwd.reason}${fwd.ok === undefined ? " (it cannot be read)" : ""}`, original.sha, fwd.ok === undefined);
   };
