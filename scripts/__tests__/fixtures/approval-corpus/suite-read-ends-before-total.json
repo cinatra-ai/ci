@@ -1,0 +1,304 @@
+{
+ "corpus": 1,
+ "case": "suite-read-ends-before-total",
+ "about": "Page 2 of the suites is empty before total_count is reached.",
+ "origin": "paging: the check suites end exactly at total_count",
+ "ask": {
+  "reading": "owner-approval",
+  "repository": "example-org/example-app",
+  "pull": 7,
+  "head": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+  "owner": "example-owner"
+ },
+ "platform": {
+  "rest": {
+   "repos/example-org/example-app/pulls/7": {
+    "number": 7,
+    "state": "open",
+    "merged_at": null,
+    "head": {
+     "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "feature/example-change",
+     "repo": {
+      "full_name": "example-org/example-app"
+     }
+    },
+    "base": {
+     "ref": "main",
+     "repo": {
+      "full_name": "example-org/example-app"
+     }
+    }
+   },
+   "repos/example-org/example-app/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11/check-suites?per_page=100&page=1": {
+    "total_count": 101,
+    "check_suites": [
+     {"id":4000,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4001,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4002,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4003,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4004,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4005,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4006,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4007,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4008,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4009,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4010,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4011,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4012,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4013,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4014,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4015,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4016,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4017,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4018,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4019,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4020,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4021,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4022,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4023,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4024,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4025,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4026,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4027,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4028,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4029,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4030,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4031,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4032,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4033,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4034,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4035,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4036,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4037,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4038,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4039,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4040,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4041,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4042,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4043,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4044,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4045,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4046,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4047,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4048,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4049,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4050,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4051,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4052,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4053,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4054,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4055,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4056,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4057,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4058,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4059,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4060,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4061,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4062,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4063,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4064,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4065,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4066,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4067,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4068,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4069,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4070,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4071,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4072,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4073,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4074,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4075,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4076,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4077,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4078,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4079,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4080,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4081,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4082,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4083,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4084,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4085,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4086,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4087,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4088,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4089,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4090,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4091,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4092,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4093,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4094,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4095,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4096,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4097,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4098,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}},
+     {"id":4099,"head_sha":"aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11","head_branch":"feature/example-change","status":"completed","conclusion":"success","created_at":"2026-01-15T10:00:02Z","updated_at":"2026-01-15T10:00:02Z","repository":{"full_name":"example-org/example-app"},"app":{"slug":"github-actions"}}
+    ]
+   },
+   "repos/example-org/example-app/issues/7/timeline?per_page=100&page=1": [
+    {
+     "event": "committed",
+     "sha": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "message": "example change",
+     "committer": {
+      "date": "2026-01-15T08:59:00Z"
+     }
+    },
+    {
+     "event": "review_requested",
+     "id": 3001,
+     "created_at": "2026-01-15T09:05:00Z",
+     "commit_id": null
+    },
+    {
+     "event": "committed",
+     "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "message": "example change",
+     "committer": {
+      "date": "2026-01-15T10:00:00Z"
+     }
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=100": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "after": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T10:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "0000000000000000000000000000000000000000",
+     "after": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T09:00:00Z",
+     "activity_type": "branch_creation",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/pulls/7/reviews?per_page=100&page=1": [
+    {
+     "id": 1001,
+     "node_id": "R_example1001",
+     "user": {
+      "login": "example-owner",
+      "id": 6001,
+      "type": "User"
+     },
+     "body": "",
+     "state": "APPROVED",
+     "commit_id": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "author_association": "MEMBER",
+     "submitted_at": "2026-01-15T10:15:00Z"
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/main&direction=desc&per_page=100": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "after": "dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T09:50:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "after": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T08:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/git/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11": {
+    "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+    "tree": {
+     "sha": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    },
+    "parents": [
+     {
+      "sha": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22"
+     }
+    ],
+    "message": "example change",
+    "author": {
+     "name": "Example Author",
+     "date": "2026-01-15T10:00:00Z"
+    },
+    "committer": {
+     "name": "Example Author",
+     "date": "2026-01-15T10:00:00Z"
+    }
+   },
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=10": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "after": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T10:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "0000000000000000000000000000000000000000",
+     "after": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T09:00:00Z",
+     "activity_type": "branch_creation",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11/check-suites?per_page=100&page=2": {
+    "total_count": 101,
+    "check_suites": []
+   }
+  },
+  "diffs": {
+   "repos/example-org/example-app/compare/main...aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11": "diff --git a/src/example.ts b/src/example.ts\nindex 1111111..2222222 100644\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n",
+   "repos/example-org/example-app/compare/main...bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22": "diff --git a/src/example.ts b/src/example.ts\nindex 1111111..2222222 100644\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n"
+  },
+  "mergeTrees": {}
+ },
+ "expect": {
+  "exit": 2,
+  "verdict": "unreadable",
+  "line": "ended at 100 of 101"
+ }
+}

@@ -1979,6 +1979,58 @@ large reads, 64 MiB. When a diff is larger, the change is not compared: the
 post-merge arm reports `content-unverifiable`, an error that names the limit,
 in place of a `tree-mismatch` it did not measure.
 
+### An approval at the head (§5d)
+
+A repository that does not dismiss stale approvals lets GitHub move an earlier
+APPROVED review to a newer head: after a forward from the base branch, the
+review's `commit_id` names the new head although the review was submitted
+before that head existed. The commit id alone is therefore no proof. In every
+arm (the `Reviewed-by` check, the high-risk check, the queue's approved head
+and the live approved heads of the post-merge arm) an approval counts for the
+head H only when one of these is true:
+
+- **It was given after H arrived.** The review names H and was submitted
+  strictly after H's arrival in the pull request: the latest of H's committer
+  date, the earliest check suite of H on the pull request's head branch, the
+  latest force-push or restore event of the pull request's timeline, and the
+  newest change of the head branch's activity. The activity is read last and
+  its newest change must be a push of H; the pull request is read again before
+  it, and a head that moved meanwhile is no reading. A submission in the
+  arrival's own second does not count.
+- **H is a plain forward with the same own change.** The head the review was
+  given at (A) is derived from its submission time against the head branch's
+  activity, never from the `commit_id`. The review names A or H, A is an
+  ancestor of H, every commit H adds beyond A and the base is a merge of a base
+  commit whose tree is exactly the clean merge of its parents, and the pull
+  request's own diff (merge base to head) has the same `git patch-id --stable`
+  and the same content fingerprint at A and at H. A new commit, a merge whose
+  overlap was settled by hand, a rebase, or an own change that differs in any
+  byte (the fingerprint also binds whitespace and binary files, which patch-id
+  does not read) needs a fresh approval.
+
+Otherwise there is no approval at H. A read that fails or answers in a wrong
+shape refuses, and so does a git reading the checkout cannot make. Every read
+is judged whole: one malformed review row makes the whole reviews read
+unreadable; the check suites must add up to their total; every activity entry
+must name the head branch, a known kind and full commits; and the timeline and
+the activity are read page by page through the platform's own next links
+(never ended on a short page), the activity until the head at the review's
+submission is settled. With these readings an approval at an older head stands
+as a live approved head only as H, and only when it counts there.
+
+Each endpoint row the rule reads (the pull request, the head commit, a review,
+a check suite, an activity entry, a timeline row) is parsed once against a
+closed schema, `ARRIVAL_SCHEMAS`. Every field the rule uses is validated before
+any filter runs, including a field used only to exclude a row (another
+repository, another branch). A malformed field makes the whole read unreadable;
+only a valid value excludes a row. A timestamp must be the platform's
+whole-second UTC form `YYYY-MM-DDTHH:MM:SSZ` and round-trip exactly, so a
+calendar-impossible value such as `2026-02-30T00:00:01Z` refuses. The gate's
+tests generate a mutation matrix from the schema: every used field of every
+fixture row, set to missing, a wrong type, empty, an impossible value, or an
+offset or fractional time, must refuse. The readings
+use the workflow token's `contents`, `pull-requests` and `checks` read scopes.
+
 ### High-risk classification (§3)
 
 A change whose files match **any** glob in `config/high-risk-defaults.json` (the

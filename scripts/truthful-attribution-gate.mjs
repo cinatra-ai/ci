@@ -162,7 +162,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonical as canonicalAuthorization, parseAuthorization, verifyDelegatedReceipt } from "./delegated-merge-receipt.mjs";
 
-export const GATE_VERSION = "0.5.0";
+export const GATE_VERSION = "0.6.0";
 
 const VALID_MODES = ["warn", "enforce"];
 const VALID_ARMS = ["pre-merge", "post-merge", "merge-group"];
@@ -1358,32 +1358,68 @@ export function resolveTreeMatch({ client, commit, reviewedHeadSha, treeOf: tree
  *     permission data is available — an unknown permission does NOT qualify
  *     (fail closed).
  * Newest first, de-duplicated.
+ *
+ * §5d: with `approvalAt` and the `head` it may be asked about, a row whose
+ * commit_id IS that head stands there only when the approval counts at the head
+ * by the §5d rule — a review GitHub re-pointed to a forwarded head does not sit
+ * on it. Rows at other commits are read as before.
  */
-export function resolveApprovedHeads(reviews, { prAuthorLogin = null, permissionByLogin = null } = {}) {
+export function resolveApprovedHeads(reviews, { prAuthorLogin = null, permissionByLogin = null, approvalAt = null, head = null } = {}) {
+  if (typeof approvalAt === "function") {
+    // §5d: with the resolver, an approval stands only AT THE HEAD it counts at. A review
+    // still recorded at an older head A (or re-pointed to H) is never a live approved
+    // head of its own: it counts at H only when the resolver proves it (submitted after H
+    // arrived, or H a plain forward of A with the same own change), and then as H. A
+    // malformed reviews read, or no head to judge, stands nowhere (fail closed).
+    const read = projectReviews(reviews);
+    if (!head || read.problem) return [];
+    return qualifiedLatestApprovals(read.rows, { prAuthorLogin, permissionByLogin, strict: true })
+      .some(({ r }) => approvalAt(r, head)?.ok === true) ? [head] : [];
+  }
+  const rows = qualifiedLatestApprovals(reviews, { prAuthorLogin, permissionByLogin })
+    .map(({ r, t }) => ({ sha: r.commit_id, t }));
+  rows.sort((a, b) => b.t - a.t);
+  return [...new Set(rows.map((r) => r.sha))];
+}
+
+/** Each login's latest deciding review when it is a qualified APPROVED one (the rows resolveApprovedHeads reads), as { r, t, login }. */
+function qualifiedLatestApprovals(reviews, { prAuthorLogin = null, permissionByLogin = null, strict = false } = {}) {
+  // `strict` (§5d, the rows a resolver judges; the read must already be well-formed per
+  // reviewRowsProblem): the reader's own PENDING review is no deciding review, and a login
+  // whose latest second holds deciding reviews of different states has no approval.
   const byLogin = new Map();
+  const ambiguous = new Set();
+  const untimed = new Set();   // strict: a login with a deciding review that carries no submitted_at: its order cannot be told
   for (const r of Array.isArray(reviews) ? reviews : []) {
     const login = r?.user?.login;
-    if (!login || !r.state || r.state === "DISMISSED") continue;
+    // strict (§5d, the merge-time reader's rule): a DISMISSED review decides (no approval stands), so it is a candidate
+    if (!login || !r.state || (!strict && r.state === "DISMISSED")) continue;
     // COMMENTED reviews do not change an approval's standing (GitHub keeps the
     // APPROVED row live), so they are not "latest-review" candidates.
     if (r.state === "COMMENTED") continue;
-    const t = new Date(r.submitted_at).getTime();
-    const prev = byLogin.get(login.toLowerCase());
+    if (strict && r.state === "PENDING") continue;
+    const t = strict ? submittedOf(r) : new Date(r.submitted_at).getTime();   // §5d: the one parser on a validated read
+    // strict: ASCII case folding only (a non-ASCII login is its own account, never folded into an ASCII one)
+    const key = strict && !/^[\x00-\x7f]+$/.test(login) ? `\u0000${login}` : login.toLowerCase();
+    if (strict && t === null) { untimed.add(key); continue; }   // no submitted_at: the login's order cannot be told
+    const prev = byLogin.get(key);
     const pt = prev ? prev.t : -Infinity;
-    if (!prev || (Number.isFinite(t) ? t : -Infinity) >= pt) byLogin.set(login.toLowerCase(), { r, t: Number.isFinite(t) ? t : -Infinity, login });
+    if (strict && prev && t === pt && prev.r.state !== r.state) ambiguous.add(key);
+    if (strict && prev && t > pt) ambiguous.delete(key);
+    if (!prev || (Number.isFinite(t) ? t : -Infinity) >= pt) byLogin.set(key, { r, t: Number.isFinite(t) ? t : -Infinity, login });
   }
   const rows = [];
-  for (const { r, t, login } of byLogin.values()) {
+  for (const [key, { r, t, login }] of byLogin.entries()) {
+    if (strict && (ambiguous.has(key) || untimed.has(key))) continue;
     if (r.state !== "APPROVED") continue;
     if (typeof r.commit_id !== "string" || r.commit_id === "") continue;
     if (prAuthorLogin && login.toLowerCase() === String(prAuthorLogin).toLowerCase()) continue;
     if (permissionByLogin) {
       if (!permissionMeetsTier(permissionByLogin[login], "peer")) continue;
     }
-    rows.push({ sha: r.commit_id, t });
+    rows.push({ r, t, login });
   }
-  rows.sort((a, b) => b.t - a.t);
-  return [...new Set(rows.map((r) => r.sha))];
+  return rows;
 }
 
 /**
@@ -1396,8 +1432,8 @@ export function resolveApprovedHeads(reviews, { prAuthorLogin = null, permission
  * fallback below. Only when there is no PR head at all does the latest LIVE
  * approval become the reviewed head — never a dismissed review's commit.
  */
-export function resolveReviewedHead({ prHeadSha, reviews, prAuthorLogin = null, permissionByLogin = null }) {
-  const approvedHeads = resolveApprovedHeads(reviews, { prAuthorLogin, permissionByLogin });
+export function resolveReviewedHead({ prHeadSha, reviews, prAuthorLogin = null, permissionByLogin = null, approvalAt = null }) {
+  const approvedHeads = resolveApprovedHeads(reviews, { prAuthorLogin, permissionByLogin, approvalAt, head: prHeadSha || null });
   if (prHeadSha) return { headSha: prHeadSha, approvedHeads, source: "pr-head" };
   if (approvedHeads.length) return { headSha: approvedHeads[0], approvedHeads, source: "latest-live-approval" };
   return { headSha: null, approvedHeads, source: "none" };
@@ -1571,11 +1607,26 @@ export function resolveQueuedPr({ groupHeadSha = null, parents = [], queuePulls 
  * non-dismissed, not superseded, peer standing at least) must sit on the head
  * the queue enqueued. An approval on an older head means the head moved after
  * the approval, and the queue candidate is not the reviewed change.
+ *
+ * §5d: with `approvalAt` the approval must COUNT at the enqueued head by the
+ * §5d rule (submitted after the head arrived, or the enqueued head a plain
+ * forward of the head it was submitted at with the same own change), whatever
+ * its commit_id reads.
  */
-export function verifyQueuedApprovedHead({ headAtEnqueue, reviews, prAuthorLogin = null, permissionByLogin = null } = {}) {
+export function verifyQueuedApprovedHead({ headAtEnqueue, reviews, prAuthorLogin = null, permissionByLogin = null, approvalAt = null } = {}) {
   const want = typeof headAtEnqueue === "string" && headAtEnqueue !== "" ? headAtEnqueue.toLowerCase() : null;
   if (!want) return { ok: false, approvedHeads: [], reason: `the queued pull request's head at enqueue is unknown — failing closed` };
   if (!Array.isArray(reviews)) return { ok: false, approvedHeads: [], reason: `the queued pull request's reviews could not be read — failing closed` };
+  if (typeof approvalAt === "function") {
+    const read = projectReviews(reviews);
+    if (read.problem) return { ok: false, approvedHeads: [], reason: `the queued pull request's reviews read malformed (${read.problem}) — failing closed` };
+    const rows = qualifiedLatestApprovals(read.rows, { prAuthorLogin, permissionByLogin, strict: true }).sort((a, b) => b.t - a.t);
+    const approvedHeads = [...new Set(rows.map(({ r }) => r.commit_id))];
+    if (rows.length === 0) return { ok: false, approvedHeads, reason: `no live, qualified approval stands on the queued pull request (enqueued head ${want.slice(0, 8)})` };
+    const answers = rows.map(({ r, login }) => ({ login, at: approvalAt(r, want) }));
+    if (answers.some(({ at }) => at && at.ok === true)) return { ok: true, approvedHeads, reason: null };
+    return { ok: false, approvedHeads, reason: `no qualified approval counts at the enqueued head ${want.slice(0, 8)}: ${answers.map(({ login, at }) => `@${login}: ${(at && at.reason) || "it could not be read"}`).join("; ")}` };
+  }
   const approvedHeads = resolveApprovedHeads(reviews, { prAuthorLogin, permissionByLogin });
   if (approvedHeads.length === 0) {
     return { ok: false, approvedHeads, reason: `no live, qualified approval stands on the queued pull request (enqueued head ${want.slice(0, 8)})` };
@@ -1848,6 +1899,756 @@ export function makeContentBinds({ anchor, cwd = process.cwd(),
     const baseR = mergeBase(anchor, reviewedSha, cwd);
     const fpR = baseR ? fingerprint(baseR, reviewedSha, cwd) : null;
     return (fpA && fpR) ? (fpA === fpR) : undefined;
+  };
+}
+
+// ===========================================================================
+// §5d — AN APPROVAL AT THE HEAD. When does an APPROVED review count for the
+// head H the gate judges?
+//
+// The hole this closes: a repository that does not dismiss stale approvals
+// lets GitHub RE-POINT an earlier APPROVED review to a forwarded head — the
+// review's commit_id then reads H although it was submitted before H existed.
+// A reading that compares only commit_id with H takes that for an approval the
+// reviewer never gave at H.
+//
+// The rule. An approval counts for H when EITHER
+//   (a) it was submitted strictly after H's ARRIVAL in the pull request, and its
+//       commit_id is H. Every time compared is a time GitHub recorded; a commit's
+//       author or committer date is set by whoever makes the commit and is never
+//       read. The arrival is the LATEST of: the EARLIEST check suite of H on the
+//       pull request's head branch in its head repository; the latest
+//       head_ref_force_pushed / head_ref_restored event of the pull request's
+//       timeline; the newest change of the head branch's activity. The head
+//       branch's activity is read last, must not be empty, and its newest change
+//       must set the branch to H (a push, a creation, a pull request's merge or a
+//       merge queue's merge into it: a reading that names H, tied to this pull
+//       request); the pull request is read again before it, and a head that moved
+//       during the reading refuses. Equal seconds refuse. A merged pull request is
+//       read as of its merge: a later deletion and restore of its branch is no
+//       arrival.
+//   (b) or the review's ORIGINAL head A — the head the branch stood at when the
+//       review was submitted, derived from submitted_at against the head
+//       branch's activity, never from the (re-pointable) commit_id — is not H,
+//       the review names A or H, and H is a PLAIN FORWARD of A with the same own
+//       change:
+//         - A is an ancestor of H (a rebase or a force push is no forward);
+//         - every commit H carries beyond A and beyond the base is a two-parent
+//           merge whose second parent was the base branch's tip when GitHub
+//           recorded that merge's newest arrival on the head branch. The tip is
+//           read from the base branch's own newest-first activity, never inferred
+//           from today's ancestry or a commit date. Its tree must be exactly the
+//           clean merge of its parents (§5c's content-free merge): a new commit,
+//           an old/foreign base parent or a hand-settled overlap refuses;
+//         - the pull request's own diff (merge-base(base, X)..X) has the same
+//           `git patch-id --stable` at A and at H, re-derived here; and
+//         - the §5 content fingerprint of that own diff is equal at A and at H
+//           too. patch-id coalesces whitespace and reads a changed binary file
+//           by its path only; the fingerprint binds both, so "the same own
+//           change" means the same bytes.
+// Otherwise the approval does not count at H. Every read that fails or answers
+// malformed, and every git reading that cannot be made, refuses (fail closed).
+//
+// Both readings mirror the merge tools' own: the head-arrival reading of the
+// merge road (a review GitHub re-pointed is not an approval of the new head)
+// and the forward's patch-id rule (a forward that keeps the own change carries
+// the approval; one that needs a hand-settled resolution does not). The
+// authority is the merge road's merge-time reader (devops head_arrival.py and
+// head-arrival.mjs); this gate is a second reader in another repository, so it
+// runs that reader's conformance corpus (scripts/__tests__/fixtures/approval-corpus/,
+// vendored byte for byte under a digest pin).
+//
+// KB-243: every closed set below IS GitHub's published one, pinned in the vendored
+// excerpt scripts/__tests__/fixtures/github-rest-excerpt.json and compared with it
+// by a test: the repository activity types (all six; pr_merge and merge_queue_merge
+// set the head branch like a push), the review states, and the timeline's
+// issue-event types (an event outside the published list refuses; the head-moving
+// ones are named). A field the excerpt documents as nullable is passed over where
+// it cannot decide (a deleted reviewer, a fork's check suite), never a refusal of
+// the whole reading. A login is a free string, compared by ASCII case folding only.
+//
+// `read(endpoint)` answers ONE REST read (parsed JSON) or throws; this module
+// makes no other call, so the caller's credential road is the only one used.
+// ===========================================================================
+
+class HeadReadingUnreadable extends Error {}
+// The platform's own timestamp form: whole seconds, UTC (`YYYY-MM-DDTHH:MM:SSZ`). A fractional
+// second or an offset is no answer of the platform and refuses, so every comparison below is
+// a comparison of whole seconds, and "the same second refuses" means exactly that.
+const HEAD_READ_STAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+const HEAD_READ_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const HEAD_READ_MAX_PAGES = 30;
+/** The timeline's issue-event types: GitHub's published list (its issue-event-types page). A name outside it refuses the reading. */
+export const TIMELINE_EVENTS = Object.freeze([
+  "assigned", "automatic_base_change_failed", "automatic_base_change_succeeded", "base_ref_changed", "closed", "commented",
+  "committed", "connected", "convert_to_draft", "converted_to_discussion", "cross-referenced", "demilestoned", "deployed",
+  "deployment_environment_changed", "disconnected", "head_ref_deleted", "head_ref_restored", "head_ref_force_pushed", "labeled",
+  "locked", "mentioned", "marked_as_duplicate", "merged", "milestoned", "pinned", "ready_for_review", "referenced", "renamed",
+  "reopened", "review_dismissed", "review_requested", "review_request_removed", "reviewed", "subscribed", "transferred",
+  "unassigned", "unlabeled", "unlocked", "unmarked_as_duplicate", "unpinned", "unsubscribed", "user_blocked"]);
+/** The published event types that move the head; of them, the ones whose row carries a time GitHub recorded. `committed` names the commit and gives no time. */
+export const HEAD_EVENTS = Object.freeze(["committed", "head_ref_force_pushed", "head_ref_restored"]);
+const HEAD_REF_EVENTS = ["head_ref_force_pushed", "head_ref_restored"];
+const ZERO_SHA = "0".repeat(40);
+/** The repository activity types (the REST description's enum). */
+export const ACTIVITY_KINDS = Object.freeze(["push", "force_push", "branch_deletion", "branch_creation", "pr_merge", "merge_queue_merge"]);
+/** The activity kinds that set the head branch to a commit (their `after`); a deletion is the one other kind. */
+export const HEAD_ACTIVITY_KINDS = Object.freeze(ACTIVITY_KINDS.filter((kind) => kind !== "branch_deletion"));
+const HEAD_ACTIVITY_ALL = ACTIVITY_KINDS;
+/** Page size of the link-paged reads (the head branch's activity, the pull request's timeline). */
+export const HEAD_HISTORY_PAGE = 100;
+
+/**
+ * The ONE timestamp parser of the arrival rule (§5d, KB-239): epoch ms of a platform
+ * timestamp, or null. Only `YYYY-MM-DDTHH:MM:SSZ` is accepted, and it must round-trip
+ * exactly (`new Date(t).toISOString() === t` with `.000` added): Date.parse normalises a
+ * calendar-impossible value such as 2026-02-30T00:00:01Z into another day, which the
+ * round-trip refuses.
+ */
+export function canonicalTime(value) {
+  if (typeof value !== "string" || !HEAD_READ_STAMP.test(value)) return null;
+  const moment = Date.parse(value);
+  if (!Number.isFinite(moment) || new Date(moment).toISOString() !== value.replace("Z", ".000Z")) return null;
+  return moment;
+}
+
+function headReadTime(value, what) {
+  const moment = canonicalTime(value);
+  if (moment === null) throw new HeadReadingUnreadable(`${what} is not a timestamp`);
+  return moment;
+}
+const headReadIso = (moment) => new Date(moment).toISOString().replace(/\.[0-9]{3}Z$/, "Z");
+/** A 40-hex lowercase sha exactly as given, or null (no case folding: the platform answers lowercase). */
+const exactSha = (v) => (typeof v === "string" && /^[0-9a-f]{40}$/.test(v) ? v : null);
+
+/** The review states (GitHub's PullRequestReviewState; the REST description types the field as a free string). */
+export const REVIEW_STATES = Object.freeze(["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"]);
+/** The states that decide a reviewer's standing: a COMMENTED review leaves the earlier decision standing; a dismissed one decides (no approval stands). */
+export const DECIDING_STATES = Object.freeze(["APPROVED", "CHANGES_REQUESTED", "DISMISSED"]);
+/** The fields the excerpt documents as not required: validated when present, passed over when absent. */
+export const OPTIONAL_FIELDS = Object.freeze({ review: Object.freeze(["submitted_at"]) });
+/** Two logins are one account when both are ASCII and equal by ASCII case folding; a look-alike with a non-ASCII letter is another account. */
+export function sameLogin(a, b) {
+  return typeof a === "string" && typeof b === "string" && /^[\x00-\x7f]+$/.test(a) && /^[\x00-\x7f]+$/.test(b) && a.toLowerCase() === b.toLowerCase();
+}
+
+// ---------------------------------------------------------------------------
+// §5d (KB-239): ONE validated reading of every API answer the arrival rule uses.
+//
+// Each endpoint row is parsed ONCE against a closed schema: every field the rule
+// reads — including a field used only to FILTER rows (another repository, another
+// branch) — must be present and well-formed BEFORE any filter runs. A malformed
+// field makes the whole read unreadable (a refusal), never a skipped row. The
+// parse returns only the declared fields, so the rule cannot read an undeclared
+// one: a reader added later has to declare its fields here, and the gate's tests
+// generate their mutation matrix from this declaration.
+// ---------------------------------------------------------------------------
+
+/** A GitHub account name: alphanumerics and single inner hyphens, at most 39 characters. */
+const GITHUB_ACCOUNT = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+/** The account part of a repository's full name in a request path: an Enterprise Managed User's namespace has "_"; "." and ".." refuse. */
+const REPO_ACCOUNT = /^(?!\.\.?$)[A-Za-z0-9_.-]+$/;
+/** A GitHub repository name (not "." or ".."), at most 100 characters. */
+const GITHUB_REPO_NAME = /^(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/;
+
+/**
+ * A branch name by git's check-ref-format rules: no whitespace or control character, none of
+ * `~ ^ : ? * [ \`, no `..`, no `@{`, not `@`, no leading `-` or `/`, no trailing `/` or `.`, no
+ * empty component, and no component that starts with `.` or ends with `.lock`.
+ */
+export function isBranchName(v) {
+  if (typeof v !== "string" || v === "" || v === "@") return false;
+  if (/[\u0000- \u007f~^:?*[\\]/.test(v)) return false;
+  if (v.includes("..") || v.includes("@{") || v.includes("//")) return false;
+  if (v.startsWith("-") || v.startsWith("/") || v.endsWith("/") || v.endsWith(".")) return false;
+  return v.split("/").every((part) => !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
+
+/** The validators of the field kinds the schemas use: one per field syntax, never a shared "any text". */
+export const ARRIVAL_FIELD_KINDS = Object.freeze({
+  time: (v) => canonicalTime(v) !== null,
+  sha: (v) => exactSha(v) !== null,
+  shaOrNull: (v) => v === null || exactSha(v) !== null,
+  timeOrNull: (v) => v === null || canonicalTime(v) !== null,
+  // KB-243: GitHub types a login as a free string: a non-empty string, used only for the ASCII-folded equality (sameLogin)
+  login: (v) => typeof v === "string" && v !== "",
+  // a review's user: null (a deleted account) is the only value read through this path; any other value is read as a user
+  nullUser: (v) => v === null,
+  repoSlug: (v) => {
+    if (typeof v !== "string") return false;
+    const parts = v.split("/");
+    return parts.length === 2 && REPO_ACCOUNT.test(parts[0]) && GITHUB_REPO_NAME.test(parts[1]);
+  },
+  branchName: (v) => isBranchName(v),
+  branchNameOrNull: (v) => v === null || isBranchName(v),
+  branchRef: (v) => typeof v === "string" && v.startsWith("refs/heads/") && isBranchName(v.slice("refs/heads/".length)),
+  timelineEvent: (v) => TIMELINE_EVENTS.includes(v),
+  reviewState: (v) => REVIEW_STATES.includes(v),
+  activityKind: (v) => HEAD_ACTIVITY_ALL.includes(v),
+  // GitHub types a review id as int64: any positive integer up to 2^63 - 1 (JS reads ids above 2^53 inexactly; no decision orders by id)
+  reviewId: (v) => Number.isInteger(v) && v > 0 && v <= 9223372036854775807,
+});
+
+/**
+ * Every endpoint row the arrival rule reads, and every field of it the rule uses
+ * (dotted paths), with the field's kind. A review in the reader's own PENDING state
+ * is read for its state and reviewer only (the rule ignores it); a timeline row that
+ * is no head event is read for its event name only.
+ */
+export const ARRIVAL_SCHEMAS = Object.freeze({
+  pull: Object.freeze({ "head.sha": "sha", "head.ref": "branchName", "head.repo.full_name": "repoSlug", "base.ref": "branchName", merged_at: "timeOrNull" }),
+  review: Object.freeze({ id: "reviewId", state: "reviewState", user: "nullUser", "user.login": "login", submitted_at: "time", commit_id: "shaOrNull" }),
+  checkSuite: Object.freeze({ head_sha: "sha", head_branch: "branchNameOrNull", "repository.full_name": "repoSlug", created_at: "timeOrNull" }),
+  activity: Object.freeze({ activity_type: "activityKind", ref: "branchRef", before: "sha", after: "sha", timestamp: "time" }),
+  timeline: Object.freeze({ event: "timelineEvent", created_at: "time", commit_id: "shaOrNull", sha: "sha" }),
+});
+
+const isPlainRow = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+function rowField(row, path) {
+  let value = row;
+  for (const key of path.split(".")) {
+    if (!isPlainRow(value) || !Object.prototype.hasOwnProperty.call(value, key)) return undefined;
+    value = value[key];
+  }
+  return value;
+}
+
+/** The fields of `raw` the rule uses (its discriminator — a review's state, a timeline row's event — is itself one of them). */
+function arrivalPathsOf(endpoint, raw) {
+  const paths = Object.keys(ARRIVAL_SCHEMAS[endpoint]);
+  const has = (key) => Object.prototype.hasOwnProperty.call(raw, key);
+  if (endpoint === "review") {
+    if (has("user") && raw.user === null) return ["id", "state", "user"];   // a deleted account's review (nullable-simple-user): never the owner's
+    const used = raw.state === "PENDING" ? ["id", "state", "user.login"] : paths.filter((p) => p !== "user");
+    return used.filter((p) => !OPTIONAL_FIELDS.review.includes(p) || has(p));
+  }
+  if (endpoint === "timeline" && HEAD_REF_EVENTS.includes(raw.event)) return ["event", "created_at", "commit_id"];
+  if (endpoint === "timeline" && raw.event === "committed") return ["event", "sha"];
+  if (endpoint === "timeline") return ["event"];   // an event outside the published list refuses here; a published one that moves nothing is passed over
+  return paths;
+}
+
+/**
+ * The names a projection answers besides its own declared fields, each answering undefined:
+ *   toJSON   - JSON.stringify asks for it first; the refusal then comes from the key
+ *              enumeration (ownKeys), which names the projection;
+ *   toString - a projection has no text form; asking for one reads undefined instead of
+ *              Object.prototype's, so String() fails on the next lookup, never silently.
+ * Nothing else is answered: no symbol, no other Object.prototype name (`constructor`).
+ */
+const PROJECTION_NAMED = new Set(["toJSON", "toString"]);
+
+/**
+ * A frozen projection that refuses every inspection beyond its declaration, so a reader
+ * added later without a schema entry makes the reading refuse instead of reading undefined:
+ * a read (`get`), a presence test (`in`), an own-property test (`Object.hasOwn`,
+ * `hasOwnProperty`) of an undeclared name, any enumeration of its keys (`Object.keys`, a
+ * spread, JSON), its prototype (`constructor` included), and every write throw
+ * HeadReadingUnreadable. Only its own declared fields, and PROJECTION_NAMED, answer.
+ */
+function sealedProjection(value, where) {
+  const target = Object.freeze(value);
+  const own = (prop) => typeof prop === "string" && Object.prototype.hasOwnProperty.call(target, prop);
+  const refuse = (what) => { throw new HeadReadingUnreadable(`${where}: ${what} (only the fields declared in ARRIVAL_SCHEMAS are read)`); };
+  return new Proxy(target, {
+    get(t, prop, receiver) {
+      if (own(prop)) return Reflect.get(t, prop, receiver);
+      if (PROJECTION_NAMED.has(prop)) return undefined;
+      return refuse(`the field ${String(prop)} is read but not declared`);
+    },
+    has(t, prop) { return own(prop) ? true : refuse(`the presence of ${String(prop)} is tested but it is not declared`); },
+    getOwnPropertyDescriptor(t, prop) { return own(prop) ? Reflect.getOwnPropertyDescriptor(t, prop) : refuse(`the own property ${String(prop)} is tested but it is not declared`); },
+    ownKeys() { return refuse("its keys are enumerated"); },
+    getPrototypeOf() { return refuse("its prototype is read"); },
+    setPrototypeOf() { return refuse("its prototype is set"); },
+    set(t, prop) { return refuse(`the field ${String(prop)} is written`); },
+    defineProperty(t, prop) { return refuse(`the field ${String(prop)} is defined`); },
+    deleteProperty(t, prop) { return refuse(`the field ${String(prop)} is deleted`); },
+  });
+}
+
+/**
+ * Parse ONE row of `endpoint` against its closed schema: a frozen projection carrying only
+ * the declared fields the row uses, each validated (nested objects frozen and sealed the
+ * same way). Every reader of the rule reads the projection only; the raw row is never kept.
+ * Throws HeadReadingUnreadable naming the first field that is missing or malformed.
+ */
+export function parseArrivalRow(endpoint, raw, where = endpoint) {
+  const schema = ARRIVAL_SCHEMAS[endpoint];
+  if (!schema) throw new HeadReadingUnreadable(`${where}: no schema declares this reading`);
+  if (!isPlainRow(raw)) throw new HeadReadingUnreadable(`${where} reads malformed (not an object)`);
+  const out = {};
+  for (const path of arrivalPathsOf(endpoint, raw)) {
+    const value = rowField(raw, path);
+    if (!ARRIVAL_FIELD_KINDS[schema[path]](value)) throw new HeadReadingUnreadable(`${where}: the field ${path} is missing or malformed`);
+    const keys = path.split(".");
+    let into = out;
+    for (const key of keys.slice(0, -1)) into = (into[key] ??= {});
+    into[keys[keys.length - 1]] = value;
+  }
+  const seal = (node, at) => {
+    for (const [key, child] of Object.entries(node)) if (isPlainRow(child)) node[key] = seal(child, `${at}.${key}`);
+    return sealedProjection(node, at);
+  };
+  return seal(out, where);
+}
+
+/**
+ * Parse a whole reviews read: { rows } (the frozen projections, in order) or { problem } (the
+ * first malformed row; no row of such a read is trusted).
+ */
+export function projectReviews(reviews) {
+  if (!Array.isArray(reviews)) return { problem: "the reviews read is not a list" };
+  const rows = [];
+  const seen = new Set();
+  for (let i = 0; i < reviews.length; i++) {
+    try { rows.push(parseArrivalRow("review", reviews[i], `review row ${i}`)); }
+    catch (e) {
+      if (!(e instanceof HeadReadingUnreadable)) throw e;
+      return { problem: e.message };
+    }
+    // a review listed twice means the listing moved during the reading (a row may then be missing too)
+    const id = rows[rows.length - 1].id;
+    if (seen.has(id)) return { problem: `the review ${id} is listed twice: the reviews moved during the reading` };
+    seen.add(id);
+  }
+  return { rows: Object.freeze(rows) };
+}
+
+/** The submitted_at of a projected review as epoch ms, or null when the row carries none (it is optional) or it is no timestamp. */
+export function submittedOf(row) {
+  try { return canonicalTime(row.submitted_at); }
+  catch (e) {
+    if (!(e instanceof HeadReadingUnreadable)) throw e;
+    return null;
+  }
+}
+
+/**
+ * §5d: the reviews read is judged WHOLE. Any row that is not an object, has no
+ * known state, names no reviewer login, or (unless it is the reader's own
+ * PENDING review) carries no readable submitted_at or no full commit_id makes
+ * the whole read unreadable: a malformed later row could be the change request
+ * that withdrew an approval, so no row of such a read is trusted. Returns null
+ * for a well-formed read, else the reason.
+ */
+export function reviewRowsProblem(reviews) {
+  return projectReviews(reviews).problem || null;
+}
+
+/**
+ * The reviews read every arm of main() uses: a read with any malformed row (see
+ * reviewRowsProblem) throws, which the arm reports as an unreadable API — so
+ * every approval claim of that run fails closed.
+ */
+export function checkedReviews(reviews) {
+  const read = projectReviews(reviews);
+  if (read.problem) throw new Error(`the reviews read is malformed (${read.problem})`);
+  return read.rows;   // the projections: no raw review row stays reachable downstream
+}
+
+/** One page answer of a link-paged list: { body: [...], next: endpoint | null }; throws when it is not one. */
+function pagedAnswer(answer, what) {
+  if (!answer || typeof answer !== "object" || !Array.isArray(answer.body) || !(answer.next === null || (typeof answer.next === "string" && answer.next !== ""))) {
+    throw new HeadReadingUnreadable(`the ${what} reads malformed`);
+  }
+  if (answer.next !== null && answer.body.length === 0) throw new HeadReadingUnreadable(`the ${what} answered an empty page before its end`);
+  return answer;
+}
+
+/**
+ * Read every page of a link-paged list. `readPage(endpoint)` answers
+ * { body, next } (next: the next page's endpoint, or null at the end) or
+ * throws. Completion is never inferred from a page's length: the read ends only
+ * on next === null, and a read that does not reach its end within the page cap
+ * refuses.
+ */
+function readPagedList(readPage, first, what) {
+  const rows = [];
+  let endpoint = first;
+  // at the bound the next page is read too; only a non-empty page past the bound refuses
+  for (let page = 1; page <= HEAD_READ_MAX_PAGES + 1; page++) {
+    let answer;
+    try { answer = readPage(endpoint); }
+    catch (e) { throw new HeadReadingUnreadable(`the ${what} cannot be read (${String(e?.message || "failed").slice(0, 160)})`); }
+    pagedAnswer(answer, what);
+    if (page > HEAD_READ_MAX_PAGES && answer.body.length) throw new HeadReadingUnreadable(`the ${what} holds more than ${HEAD_READ_MAX_PAGES} pages`);
+    rows.push(...answer.body);
+    if (answer.next === null) return rows;
+    endpoint = answer.next;
+  }
+  throw new HeadReadingUnreadable(`the ${what} did not reach its end`);
+}
+
+/** One activity entry of a named branch, validated whole; throws on a wrong ref or impossible head value. */
+function branchActivityRow(row, fullRef, what) {
+  if (row.ref !== fullRef) throw new HeadReadingUnreadable(`the ${what} answered a change of another branch (${row.ref})`);
+  if (row.activity_type === "branch_deletion" ? row.after !== ZERO_SHA : row.after === ZERO_SHA) throw new HeadReadingUnreadable(`an activity entry (${row.activity_type}) carries an impossible after commit`);
+  return { kind: row.activity_type, at: canonicalTime(row.timestamp), after: row.after };
+}
+
+/**
+ * Validate one direction=desc activity page before a caller relies on its first or last row.
+ * Equal-second rows are valid ordering; a later timestamp after an earlier one is not.
+ */
+function branchActivityPage(raw, ref, what) {
+  if (!Array.isArray(raw)) throw new HeadReadingUnreadable(`the ${what} read is not a list`);
+  const fullRef = `refs/heads/${ref}`;
+  const rows = raw.map((row, i) => branchActivityRow(parseArrivalRow("activity", row, `${what} row ${i}`), fullRef, what));
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].at > rows[i - 1].at) throw new HeadReadingUnreadable(`the ${what} is not newest-first within its page`);
+  }
+  return rows;
+}
+
+/** One non-paged activity read, as used by the owner's plain-forward rule for the base branch. */
+function readBranchActivity(read, slug, ref, perPage, what) {
+  const fullRef = `refs/heads/${ref}`;
+  const endpoint = `/repos/${slug}/activity?ref=${encodeURIComponent(fullRef).replaceAll("%2F", "/")}&direction=desc&per_page=${perPage}`;
+  let answer;
+  try { answer = read(endpoint); }
+  catch (e) {
+    if (e instanceof HeadReadingUnreadable) throw e;
+    throw new HeadReadingUnreadable(`the ${what} cannot be read (${String(e?.message || "failed").slice(0, 160)})`);
+  }
+  return branchActivityPage(answer, ref, what);
+}
+
+/**
+ * The head branch's activity, newest first, read page by page through its
+ * next links. `activity` holds { fullRef, rows, pages, next }; this reads ONE more
+ * page into it, validated whole; the entries must stay newest-first across
+ * pages. Throws HeadReadingUnreadable.
+ */
+function extendHeadHistory(readPage, activity) {
+  if (activity.next === null) return;
+  if (activity.pages > HEAD_READ_MAX_PAGES) throw new HeadReadingUnreadable("the activity of the head branch did not reach its end");
+  let answer;
+  try { answer = readPage(activity.next); }
+  catch (e) { throw new HeadReadingUnreadable(`the activity of the head branch cannot be read (${String(e?.message || "failed").slice(0, 160)})`); }
+  pagedAnswer(answer, "activity of the head branch");
+  // at the bound the next page is read too; only a non-empty page past the bound refuses
+  if (activity.pages >= HEAD_READ_MAX_PAGES && answer.body.length) throw new HeadReadingUnreadable(`the activity of the head branch holds more than ${HEAD_READ_MAX_PAGES} pages`);
+  const ref = activity.fullRef.slice("refs/heads/".length);
+  const page = branchActivityPage(answer.body, ref, "activity of the head branch");
+  const last = activity.rows[activity.rows.length - 1];
+  if (last && page.length && page[0].at > last.at) throw new HeadReadingUnreadable("the activity of the head branch is not newest-first across its pages");
+  activity.rows.push(...page);
+  activity.pages += 1;
+  activity.next = answer.next;
+}
+
+/**
+ * Every platform reading of H's arrival in the pull request, plus the first
+ * pages of the head branch's history (read until its newest head-setting change
+ * is known; later pages are read on demand by settleHeadHistory). `read(endpoint)`
+ * answers one REST read; `readPage(endpoint)` one page of a link-paged list as
+ * { body, next }. Throws HeadReadingUnreadable on any failed, incomplete or
+ * malformed read.
+ */
+export function collectHeadArrival(read, { slug, pr, head, readPage }) {
+  if (!HEAD_READ_SLUG.test(String(slug))) throw new HeadReadingUnreadable("the repository is not <org>/<repo>");
+  if (!exactSha(head)) throw new HeadReadingUnreadable("the head is not a full commit sha");
+  if (!/^[1-9][0-9]*$/.test(String(pr))) throw new HeadReadingUnreadable("the pull request number is malformed");
+  if (typeof read !== "function" || typeof readPage !== "function") throw new HeadReadingUnreadable("the platform cannot be read (no reader)");
+  const get = (endpoint, what) => {
+    try { return read(endpoint); }
+    catch (e) { throw new HeadReadingUnreadable(`the ${what} cannot be read (${String(e?.message || "failed").slice(0, 160)})`); }
+  };
+  const pullHead = () => {
+    const pull = parseArrivalRow("pull", get(`/repos/${slug}/pulls/${pr}`, "pull request"), "the pull request");
+    if (pull.head.sha !== head) throw new HeadReadingUnreadable(`the pull request's head is ${pull.head.sha.slice(0, 12)} now, not ${head.slice(0, 12)}`);
+    return { ref: pull.head.ref, headSlug: pull.head.repo.full_name, baseRef: pull.base.ref, mergedAt: pull.merged_at };
+  };
+  const { ref, headSlug, baseRef, mergedAt } = pullHead();
+  // the head commit's own dates are never read: its maker sets them (only times GitHub recorded date the arrival)
+  const cutoff = mergedAt === null ? null : canonicalTime(mergedAt);   // a merged pull request is read as of its merge
+  // Check suites: the read is complete only when it saw exactly total_count suites, the total
+  // is the same on every page, and every suite names H. Only the suites of THIS pull
+  // request's head branch in its head repository are readings of the arrival.
+  const suites = [];
+  let total = null, seen = 0, ended = false;
+  for (let page = 1; page <= HEAD_READ_MAX_PAGES; page++) {
+    // Read from the HEAD repository: for a fork, the head branch's suites live in the fork.
+    const answer = get(`/repos/${headSlug}/commits/${head}/check-suites?per_page=100&page=${page}`, "check suites of the head");
+    if (!answer || !Array.isArray(answer.check_suites) || !Number.isInteger(answer.total_count) || answer.total_count < 0) throw new HeadReadingUnreadable("the check suites of the head read malformed");
+    if (total === null) total = answer.total_count;
+    else if (answer.total_count !== total) throw new HeadReadingUnreadable(`the check suites of the head changed their total during the reading (${total}, then ${answer.total_count})`);
+    if (answer.check_suites.length === 0 && seen < total) throw new HeadReadingUnreadable(`the check suites of the head ended at ${seen} of ${total}`);
+    // Validated whole first: a suite whose branch or repository is missing or malformed makes
+    // the read unreadable; only a VALID other branch or other repository excludes a suite.
+    const rows = answer.check_suites.map((raw) => parseArrivalRow("checkSuite", raw, "a check suite of the head"));
+    for (const row of rows) {
+      if (row.head_sha !== head) throw new HeadReadingUnreadable("a check suite read for the head does not name the head");
+      seen += 1;
+      // a null head_branch (a fork's push) is no branch of this pull request, and a null created_at gives no time: both are passed over
+      if (row.head_branch === ref && row.repository.full_name === headSlug && row.created_at !== null) {
+        const at = canonicalTime(row.created_at);
+        if (cutoff === null || at <= cutoff) suites.push(at);
+      }
+    }
+    if (seen > total) throw new HeadReadingUnreadable(`the check suites of the head read ${seen} suites of a total of ${total}`);
+    if (seen === total) { ended = true; break; }
+  }
+  if (!ended) throw new HeadReadingUnreadable("the check suites of the head did not reach their end");
+  // Timeline: every page through its next links; every row must carry its event name; a head
+  // event must carry its time and a full commit (or none).
+  const timeline = readPagedList(readPage, `/repos/${slug}/issues/${pr}/timeline?per_page=${HEAD_HISTORY_PAGE}`, "pull request timeline");
+  const events = [], commits = new Set();
+  for (const row of timeline.map((raw) => parseArrivalRow("timeline", raw, "a pull request timeline row"))) {
+    if (row.event === "committed") { commits.add(row.sha); continue; }   // it moves the head, but carries only the commit's own dates: it names, never dates
+    if (!HEAD_REF_EVENTS.includes(row.event)) continue;
+    const at = canonicalTime(row.created_at);
+    if (cutoff === null || at <= cutoff) events.push({ event: row.event, at, commit: row.commit_id });
+  }
+  // The head is read again before the activity, the last reading; the head branch's newest
+  // head-setting change must set it to H.
+  const again = pullHead();
+  if (again.ref !== ref || again.headSlug !== headSlug || again.baseRef !== baseRef || again.mergedAt !== mergedAt) throw new HeadReadingUnreadable("the pull request's head branch, head repository, base branch or merge changed during the reading");
+  const fullRef = `refs/heads/${ref}`;
+  const activity = { fullRef, rows: [], pages: 0,
+    next: `/repos/${headSlug}/activity?ref=${encodeURIComponent(fullRef).replaceAll("%2F", "/")}&direction=desc&per_page=${HEAD_HISTORY_PAGE}` };
+  // a deletion brings no commit; a change after the merge of a merged pull request is no arrival in it
+  const setsHead = (item) => item.kind !== "branch_deletion" && (cutoff === null || item.at <= cutoff);
+  extendHeadHistory(readPage, activity);
+  while (!activity.rows.some(setsHead) && activity.next !== null) extendHeadHistory(readPage, activity);
+  const newest = activity.rows.find(setsHead);
+  if (!newest) throw new HeadReadingUnreadable(`the activity of the head branch ${ref} has no push`);
+  if (newest.after !== head) throw new HeadReadingUnreadable(`the newest change of the head branch ${ref} is no push of ${head.slice(0, 12)}: the branch moved`);
+  return { head, ref, headSlug, baseRef, suites, events, commits: [...commits].sort(), newestPush: newest, activity };
+}
+
+/** (a): { ok, line } — was an approval submitted at `submittedAt` given after H arrived? */
+export function headArrivalVerdict(submittedAt, readings) {
+  const head = readings.head, named = [];
+  if (!readings.newestPush || readings.newestPush.after !== head) return { ok: false, unreadable: true, line: `${head.slice(0, 12)}'s push time cannot be read (no activity entry of the head branch names it)` };
+  named.push("branch activity");
+  if (readings.events.some((item) => item.commit === head)) named.push("timeline head event");
+  if ((readings.commits || []).includes(head)) named.push("timeline commit of the head");
+  if (readings.suites.length) named.push("check suite of the head branch");
+  // every candidate is a time GitHub recorded; the commit's own dates are none of them
+  const candidates = [];
+  if (readings.suites.length) candidates.push([Math.min(...readings.suites), "earliest check suite of the head branch"]);
+  if (readings.events.length) candidates.push([Math.max(...readings.events.map((item) => item.at)), "timeline head event"]);
+  candidates.push([readings.newestPush.at, "head branch activity"]);
+  const moment = Math.max(...candidates.map(([value]) => value));
+  const sources = candidates.filter(([value]) => value === moment).map(([, name]) => name);
+  let submitted;
+  try { submitted = headReadTime(submittedAt, "the approval's submitted_at"); }
+  catch { return { ok: false, unreadable: true, line: `the approval's submitted_at at ${head.slice(0, 12)} is unreadable` }; }
+  const words = `${headReadIso(moment)}, read from ${sources.join(" and ")}; platform readings of the head: ${named.join(", ")}`;
+  if (submitted > moment) return { ok: true, line: `submitted ${headReadIso(submitted)}, after the head arrived ${words}` };
+  return { ok: false, line: `submitted ${headReadIso(submitted)}, not after the head arrived ${words}` };
+}
+
+/**
+ * Read further pages of the head branch's history until the head at `submitted`
+ * (epoch ms) is settled: an entry strictly before it has been read AND the
+ * oldest entry read is older than the newest such entry (so every entry of that
+ * second has been read), or the history has ended. Throws HeadReadingUnreadable.
+ */
+export function settleHeadHistory(readPage, activity, submitted) {
+  for (;;) {
+    const before = activity.rows.filter((item) => item.at < submitted);
+    if (before.length && activity.rows[activity.rows.length - 1].at < before[0].at) return;
+    if (activity.next === null) return;
+    extendHeadHistory(readPage, activity);
+  }
+}
+
+/**
+ * (b): the head the branch stood at when the review was submitted — the newest
+ * change of the head branch's history strictly before submitted_at. { sha } or
+ * { sha: null, reason }: a change in the review's own second, two changes in
+ * the second of that newest one, a deletion as that change, or a history that
+ * does not place it refuse. `activity` must be settled for submitted_at first.
+ */
+export function originalApprovedHead(submittedAt, activity) {
+  let submitted;
+  try { submitted = headReadTime(submittedAt, "the approval's submitted_at"); }
+  catch { return { sha: null, reason: "the approval's submitted_at is unreadable" }; }
+  const rows = Array.isArray(activity?.rows) ? activity.rows : [];
+  if (rows.some((item) => item.at === submitted)) return { sha: null, reason: `the head branch changed in the second the approval was submitted (${headReadIso(submitted)}); the head it was given at cannot be told` };
+  const before = rows.filter((item) => item.at < submitted);
+  if (!before.length) {
+    return { sha: null, reason: activity?.next === null
+      ? `the head branch has no change before the approval (${headReadIso(submitted)})`
+      : `the head branch's history read does not reach back to the approval (${headReadIso(submitted)})` };
+  }
+  const newest = before[0];
+  if (activity?.next !== null && rows[rows.length - 1].at >= newest.at) return { sha: null, reason: `the head branch's history read does not settle the second ${headReadIso(newest.at)}` };
+  if (before.some((item) => item.at === newest.at && (item.after !== newest.after || item.kind !== newest.kind))) return { sha: null, reason: `two changes of the head branch share the second ${headReadIso(newest.at)}; the head the approval was given at cannot be told` };
+  if (newest.kind === "branch_deletion") return { sha: null, reason: `the head branch did not exist when the approval was submitted (${headReadIso(submitted)})` };
+  return { sha: newest.after, at: newest.at };
+}
+
+/** `git patch-id --stable` of the change base..head, read from `git diff`; "" for an empty change, null on any git failure. */
+export function ownPatchId(base, head, cwd = process.cwd(), { maxBuffer = 64 * 1024 * 1024 } = {}) {
+  if (!base || !head) return null;
+  try {
+    const diff = execFileSync("git", ["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--end-of-options", base, head, "--"], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"], maxBuffer,
+    });
+    const out = execFileSync("git", ["patch-id", "--stable"], { encoding: "utf8", cwd, input: diff, stdio: ["pipe", "pipe", "ignore"], maxBuffer });
+    const id = String(out).trim().split(/\s+/)[0] || "";
+    return id === "" || /^[0-9a-f]{40}$/.test(id) ? id : null;
+  } catch { return null; }
+}
+
+/** Is `a` an ancestor of (or equal to) `b`? true | false | undefined (git could not tell). */
+export function isAncestorOf(a, b, cwd = process.cwd()) {
+  if (!a || !b) return undefined;
+  try {
+    execFileSync("git", ["--literal-pathspecs", "merge-base", "--is-ancestor", "--end-of-options", a, b], { cwd, stdio: ["ignore", "ignore", "ignore"] });
+    return true;
+  } catch (e) { return e && e.status === 1 ? false : undefined; }
+}
+
+/** The commits `head` carries beyond `approved` and beyond `anchor` (oldest first); null on any git failure. */
+export function forwardCommitsOf(approved, head, anchor, cwd = process.cwd()) {
+  try {
+    const out = execFileSync("git", ["--literal-pathspecs", "rev-list", "--reverse", "--end-of-options", head, `^${approved}`, `^${anchor}`], {
+      encoding: "utf8", cwd, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const shas = out.split("\n").map((s) => s.trim()).filter(Boolean);
+    return shas.every((s) => /^[0-9a-f]{40}$/.test(s)) ? shas : null;
+  } catch { return null; }
+}
+
+/**
+ * (b)'s git half: is `head` a PLAIN FORWARD of `approvedHead` that keeps the
+ * pull request's own change? { ok: true|false|undefined, reason, patchId }.
+ * false names what refuses; undefined says what could not be read. Both refuse.
+ */
+export function plainForwardOf({ anchor, approvedHead, head, baseRef, headHistory, baseHistory, baseHistoryComplete, cwd = process.cwd(),
+  isAncestor = isAncestorOf, forwardCommits = forwardCommitsOf, mergeInfo = mergeInfoOf, hasLocal = hasCommitLocally,
+  mergeBase = mergeBaseOf, patchId = ownPatchId, fingerprint = contentFingerprint } = {}) {
+  const A = asFullSha(approvedHead), H = asFullSha(head);
+  if (!anchor) return { ok: undefined, reason: "no base to read the pull request's own change against" };
+  if (!A || !H) return { ok: undefined, reason: "the approved head or the head is not a full commit sha" };
+  if (!isBranchName(baseRef)) return { ok: undefined, reason: "the pull request's base branch cannot be read" };
+  if (!Array.isArray(headHistory) || !Array.isArray(baseHistory) || typeof baseHistoryComplete !== "boolean") {
+    return { ok: undefined, reason: "the head or base branch activity cannot be read" };
+  }
+  if (A === H) return { ok: false, reason: "the head is the approved head itself, not a forward of it" };
+  const ancestor = isAncestor(A, H, cwd);
+  if (ancestor === undefined) return { ok: undefined, reason: `whether ${shortSha(H)} contains ${shortSha(A)} cannot be read` };
+  if (!ancestor) return { ok: false, reason: `${shortSha(H)} is no plain forward of the approved head ${shortSha(A)} (the approved head is not in its history: a rebase or a force push)` };
+  const beyond = forwardCommits(A, H, anchor, cwd);
+  if (!beyond) return { ok: undefined, reason: `the commits ${shortSha(H)} carries beyond ${shortSha(A)} cannot be read` };
+  if (!beyond.length) return { ok: false, reason: `${shortSha(H)} carries no commit beyond the approved head ${shortSha(A)} and the base` };
+  for (const sha of beyond) {
+    const info = mergeInfo(sha, { cwd });
+    if (!info) return { ok: false, reason: `${shortSha(H)} carries a new commit ${shortSha(sha)} after the approved head ${shortSha(A)} (only a merge from the base is a plain forward)` };
+    if (!info.parents.every((p) => hasLocal(p, cwd))) return { ok: undefined, reason: `a parent of the merge ${shortSha(sha)} is not in this checkout` };
+    const arrivals = headHistory.filter((item) => item && item.after === sha && Number.isFinite(item.at)).map((item) => item.at);
+    if (!arrivals.length) return { ok: false, reason: `the merge ${shortSha(sha)} never stood as the head of the head branch: its time cannot be read` };
+    // A commit can be pushed away and later restored. The newest platform-recorded arrival decides which base tip it merged.
+    const at = Math.max(...arrivals);
+    const tips = baseHistory.filter((item) => item && Number.isFinite(item.at) && asFullSha(item.after) && item.at <= at);
+    if (!tips.length) {
+      return baseHistoryComplete
+        ? { ok: false, reason: `the base branch ${baseRef} had no tip before the merge ${shortSha(sha)}` }
+        : { ok: undefined, reason: `the base branch's activity does not reach back to the merge ${shortSha(sha)} (${headReadIso(at)})` };
+    }
+    const tipAt = Math.max(...tips.map((item) => item.at));
+    const tipsAt = new Set(tips.filter((item) => item.at === tipAt).map((item) => item.after));
+    if (tipsAt.size !== 1 || !tipsAt.has(info.parents[1])) {
+      return { ok: false, reason: `the merge ${shortSha(sha)} merges ${shortSha(info.parents[1])}, which was not the tip of ${baseRef} at that time (${headReadIso(at)}): no plain forward from the base` };
+    }
+    if (!asFullSha(info.tree) || (info.cleanTree !== null && !asFullSha(info.cleanTree))) return { ok: undefined, reason: `the trees of the merge ${shortSha(sha)} cannot be read` };
+    if (!isContentFreeMerge(info)) return { ok: false, reason: `the merge ${shortSha(sha)} is not the clean merge of its parents: its overlap was settled by hand (or it carries an edit of its own)` };
+  }
+  const baseA = mergeBase(anchor, A, cwd), baseH = mergeBase(anchor, H, cwd);
+  if (!baseA || !baseH) return { ok: undefined, reason: "the merge base of the approved head or the head with the base cannot be read" };
+  const idA = patchId(baseA, A, cwd), idH = patchId(baseH, H, cwd);
+  if (idA === null || idH === null) return { ok: undefined, reason: "the patch-id of the pull request's own change cannot be read" };
+  if (idA === "" || idH === "") return { ok: undefined, reason: "the pull request's own change is empty: there is no change for the approval to bind" };
+  if (idA !== idH) return { ok: false, reason: `the forward changes the pull request's own change (patch-id ${idA.slice(0, 12)} at the approved head ${shortSha(A)}, ${idH.slice(0, 12)} at ${shortSha(H)})` };
+  const fpA = fingerprint(baseA, A, cwd), fpH = fingerprint(baseH, H, cwd);
+  if (!fpA || !fpH) return { ok: undefined, reason: "the content fingerprint of the pull request's own change cannot be read" };
+  if (fpA !== fpH) return { ok: false, reason: `the forward changes the pull request's own change in bytes patch-id does not read (whitespace or a binary file) at ${shortSha(H)}` };
+  return { ok: true, reason: null, patchId: idA };
+}
+
+/**
+ * The resolver every approval reading of one gate run uses:
+ * (review, head) => { ok, unreadable, via: "after-arrival" | "plain-forward" | null, reason, approvedHead }.
+ * The platform readings of a head are read once per run. `ensureLocal(sha)` is
+ * called before the git half reads a commit this checkout may not have (the
+ * post-merge arm fetches the pull request's head ref there).
+ */
+export function makeApprovalAt({ read, readPage, slug, pr, anchor, cwd = process.cwd(), ensureLocal = null, forward = plainForwardOf } = {}) {
+  const readings = new Map();
+  const readingsOf = (head) => {
+    if (!readings.has(head)) {
+      let value;
+      try { value = { readings: collectHeadArrival(read, { slug, pr, head, readPage }) }; }
+      catch (e) {
+        if (!(e instanceof HeadReadingUnreadable)) throw e;
+        value = { error: e.message };
+      }
+      readings.set(head, value);
+    }
+    return readings.get(head);
+  };
+  const judge = (given, head) => {
+    const H = asFullSha(head);
+    const refuse = (reason, approvedHead = null, unreadable = false) => ({ ok: false, unreadable, via: null, reason, approvedHead });
+    if (typeof read !== "function" || typeof readPage !== "function") return refuse("the platform readings of the head cannot be read (no reader)", null, true);
+    if (!H) return refuse("the head is not a full commit sha", null, true);
+    // The review is read through the same closed schema as every other answer (KB-239): from here
+    // on only its projection is read; the row as given is not used again.
+    let review;
+    try { review = parseArrivalRow("review", given, "the approval"); }
+    catch (e) {
+      if (!(e instanceof HeadReadingUnreadable)) throw e;
+      return refuse(`the review cannot be read (${e.message})`, null, true);
+    }
+    if (review.state !== "APPROVED") return refuse("the review is no approval");
+    const got = readingsOf(H);
+    if (got.error) return refuse(`${H.slice(0, 12)}'s push time cannot be read (${got.error})`, null, true);
+    const named = review.commit_id;
+    const arrival = headArrivalVerdict(review.submitted_at, got.readings);
+    if (arrival.unreadable) return refuse(arrival.line, null, true);
+    if (named === H && arrival.ok) return { ok: true, unreadable: false, via: "after-arrival", reason: null, approvedHead: H };
+    // (b): read the head branch's history until the head at the submission is settled (a
+    // read that fails or is malformed refuses), then place the review's original head.
+    try { settleHeadHistory(readPage, got.readings.activity, canonicalTime(review.submitted_at)); }
+    catch (e) {
+      if (!(e instanceof HeadReadingUnreadable)) throw e;
+      return refuse(`the approval at ${H.slice(0, 12)} was ${arrival.line}, and the head it was given at cannot be read (${e.message})`, null, true);
+    }
+    const original = originalApprovedHead(review.submitted_at, got.readings.activity);
+    if (!original.sha) return refuse(`the approval at ${H.slice(0, 12)} was ${arrival.line}, and ${original.reason}`);
+    if (original.sha === H) return refuse(`the approval names ${shortSha(named)}, not ${H.slice(0, 12)}, the head it was submitted at`);
+    if (named !== H && named !== original.sha) {
+      return refuse(`the approval names ${shortSha(named)}, neither the head it was submitted at (${shortSha(original.sha)}) nor ${H.slice(0, 12)}`, original.sha);
+    }
+    // The owner's plain-forward rule places every merge's second parent against the
+    // base branch tip at that merge's newest platform-recorded arrival. One validated
+    // 100-row direction=desc page is the authority's reading; a full page that does not
+    // reach a needed time is incomplete and therefore unreadable.
+    let baseHistory;
+    try { baseHistory = readBranchActivity(read, slug, got.readings.baseRef, HEAD_HISTORY_PAGE, "activity of the base branch"); }
+    catch (e) {
+      if (!(e instanceof HeadReadingUnreadable)) throw e;
+      return refuse(`the approval at ${H.slice(0, 12)} was ${arrival.line}, and the base branch's activity cannot be read (${e.message})`, original.sha, true);
+    }
+    if (typeof ensureLocal === "function") { try { ensureLocal(H); } catch { /* the git half then fails closed */ } }
+    const fwd = forward({ anchor, approvedHead: original.sha, head: H, baseRef: got.readings.baseRef,
+      headHistory: got.readings.activity.rows, baseHistory, baseHistoryComplete: baseHistory.length < HEAD_HISTORY_PAGE, cwd });
+    if (fwd.ok === true) return { ok: true, unreadable: false, via: "plain-forward", reason: null, approvedHead: original.sha, patchId: fwd.patchId };
+    return refuse(`the approval was given at ${shortSha(original.sha)} and ${arrival.line}; ${fwd.reason}${fwd.ok === undefined ? " (it cannot be read)" : ""}`, original.sha, fwd.ok === undefined);
+  };
+  return (given, head) => {
+    // A read beyond a projection's declaration (sealedProjection) is a refusal, never a pass.
+    try { return judge(given, head); }
+    catch (e) {
+      if (!(e instanceof HeadReadingUnreadable)) throw e;
+      return { ok: false, unreadable: true, via: null, reason: e.message, approvedHead: null };
+    }
   };
 }
 
@@ -2381,6 +3182,37 @@ export function combinePaginatedSlurp(out, { shape = "object", arrayField = null
   return pages;
 }
 
+const GITHUB_API_ORIGIN = "https://api.github.com/";
+
+/**
+ * §5d: one `gh api -i` answer (status line, headers, a blank line, the JSON body) as
+ * { body, next }. `next` is the Link header's rel="next" URL, or null when there is no
+ * next page. Throws on a non-2xx status, an unparseable body, or a next link that is not
+ * an API URL of github.com.
+ */
+export function parseGhPageOutput(out) {
+  const text = String(out);
+  const split = /\r?\n\r?\n/.exec(text);
+  if (!split) throw new Error("the page answer carries no header block");
+  const head = text.slice(0, split.index).split(/\r?\n/);
+  const status = /^HTTP\/[0-9.]+ ([0-9]{3})/.exec(head[0] || "");
+  if (!status || !status[1].startsWith("2")) throw new Error(`the page answer is no success (${String(head[0] || "").slice(0, 40)})`);
+  let next = null;
+  for (const line of head.slice(1)) {
+    const m = /^link:\s*(.*)$/i.exec(line);
+    if (!m) continue;
+    for (const part of m[1].split(",")) {
+      const link = /^\s*<([^>]*)>\s*;\s*rel="([^"]*)"\s*$/.exec(part);
+      if (!link) throw new Error("the page answer carries a malformed Link header");
+      if (link[2].split(/\s+/).includes("next")) {
+        if (!link[1].startsWith(GITHUB_API_ORIGIN)) throw new Error("the next page link is not an API URL of github.com");
+        next = link[1];
+      }
+    }
+  }
+  return { body: JSON.parse(text.slice(split.index + split[0].length)), next };
+}
+
 export function makeGhClient({ repo } = {}) {
   // shape: "array"  -> endpoint returns a JSON array (e.g. /reviews); with
   //                    --paginate, gh concatenates one array per page.
@@ -2414,6 +3246,19 @@ export function makeGhClient({ repo } = {}) {
   }
   return {
     repo,
+    // §5d: ONE page of one REST read, parsed (the head-arrival reading pages
+    // through its own endpoints and judges every answer's shape itself). Throws
+    // on any failure, which that reading takes for an unreadable head.
+    get(endpoint) { return ghApi(endpoint); },
+    // §5d: ONE page of a link-paged list as { body, next }, read with the response
+    // headers (`gh api -i`) so the next page comes from the platform's own Link header,
+    // never from the page's length. Only an API URL of github.com is followed.
+    getPage(endpoint) {
+      if (/^[a-z]+:/i.test(endpoint) && !String(endpoint).startsWith(GITHUB_API_ORIGIN)) throw new Error("a page link outside the GitHub API is not followed");
+      const out = execFileSync("gh", ["api", "-i", "-H", "X-GitHub-Api-Version: 2022-11-28", "-H", "Accept: application/vnd.github+json", endpoint],
+        { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+      return parseGhPageOutput(out);
+    },
     listReviews(pr) { return ghApi(`/repos/${repo}/pulls/${pr}/reviews`, { shape: "array" }); },
     permissionOf(login) { return ghApi(`/repos/${repo}/collaborators/${login}/permission`); },
     // /check-runs returns { total_count, check_runs:[...] }; merge check_runs
@@ -2540,21 +3385,53 @@ export function permissionMeetsTier(permission, tier) {
  * Latest-review semantics (exact, §5): from GET /pulls/{n}/reviews, the login's
  * review with the greatest submitted_at; DISMISSED approvals do not count; that
  * latest review must be APPROVED with commit_id == reviewedHeadSha.
+ *
+ * §5d: when `approvalAt` (makeApprovalAt) is given — every arm of main() gives
+ * it — the latest APPROVED review must count AT reviewedHeadSha by its rule
+ * (submitted after the head arrived, or the head a plain forward of the head it
+ * was submitted at with the same own change), whatever its commit_id reads: a
+ * commit_id equal to the head is no longer proof on its own, because GitHub
+ * re-points an earlier approval to a forwarded head. The §5 content binding
+ * (`contentBinds`) is then not consulted. Without `approvalAt` (an offline
+ * library caller) the exact-sha / content-binding reading below is unchanged.
  */
-export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, reviewedHeadSha, contentBinds }) {
+export function verifyReviewedLine(line, { reviews, permission, prAuthorLogin, reviewedHeadSha, contentBinds, approvalAt }) {
   const reasons = [];
   const login = line.login;
   if (prAuthorLogin && login.toLowerCase() === prAuthorLogin.toLowerCase()) {
     reasons.push(`self-approval: @${login} is the PR author (a named human cannot review their own change)`);
   }
-  const mine = reviews
-    .filter((r) => (r.user?.login || "").toLowerCase() === login.toLowerCase() && r.state !== "DISMISSED")
-    .sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
-  const latest = mine[mine.length - 1];
-  if (!latest) {
+  // §5d: with the resolver the reviews read is judged whole first (a malformed row could be
+  // the later review that withdrew an approval), the reader's own PENDING review is no
+  // review, and a latest second holding reviews of different states decides nothing.
+  // The latest DECIDING review stands, as in resolveApprovedHeads: a COMMENTED review leaves
+  // the approval standing (GitHub keeps the APPROVED row live), so it is no candidate.
+  // With the resolver (KB-246, the merge-time reader's rule): a login is the reviewer's by ASCII case folding only (a
+  // deleted account's review is passed over), and a DISMISSED review decides like a change request: no approval stands.
+  const strict = typeof approvalAt === "function";
+  const read = strict ? projectReviews(reviews) : { rows: reviews };
+  let problem = read.problem || null;
+  const mine = problem ? [] : strict
+    ? read.rows.filter((r) => r.user !== null && sameLogin(r.user.login, login) && DECIDING_STATES.includes(r.state))
+    : read.rows.filter((r) => (r.user?.login || "").toLowerCase() === login.toLowerCase() && r.state !== "DISMISSED" && r.state !== "COMMENTED");
+  if (strict && mine.some((r) => submittedOf(r) === null)) problem = `a review of @${login} carries no submitted_at: its order cannot be told`;
+  if (strict && !problem) mine.sort((a, b) => submittedOf(a) - submittedOf(b));
+  else if (!strict) mine.sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+  const latest = problem ? undefined : mine[mine.length - 1];
+  const tied = strict && latest && mine.some((r) => r !== latest && submittedOf(r) === submittedOf(latest) && r.state !== latest.state);
+  if (problem) {
+    reasons.push(`the reviews read is malformed (${problem}) — no review of it is trusted`);
+  } else if (tied) {
+    reasons.push(`@${login}'s latest reviews share one second with different states — which one stands cannot be told`);
+  } else if (!latest) {
     reasons.push(`no non-dismissed review by @${login} on this PR`);
   } else if (latest.state !== "APPROVED") {
     reasons.push(`@${login}'s latest review is ${latest.state}, not APPROVED`);
+  } else if (reviewedHeadSha && typeof approvalAt === "function") {
+    const at = approvalAt(latest, reviewedHeadSha);
+    if (!at || at.ok !== true) {
+      reasons.push(`@${login}'s approval does not count at the head ${String(reviewedHeadSha).slice(0, 8)}: ${(at && at.reason) || "it could not be read"} — re-approval required`);
+    }
   } else if (reviewedHeadSha && latest.commit_id !== reviewedHeadSha) {
     // §5 content binding (engineering#483): a differing approval SHA is no longer
     // automatically stale. If the approved commit re-derives the SAME reviewed
@@ -3537,6 +4414,7 @@ export function analyzePreMerge(ctx) {
           prAuthorLogin: ctx.prAuthorLogin,
           reviewedHeadSha: ctx.reviewedHeadSha,
           contentBinds: ctx.contentBinds,
+          approvalAt: ctx.approvalAt,
         }).ok);
       // Fallback when no declared Reviewed-by claim is available pre-merge: is
       // there ANY real maintainer-standing, non-self, non-stale APPROVED review?
@@ -3546,6 +4424,7 @@ export function analyzePreMerge(ctx) {
         prAuthorLogin: ctx.prAuthorLogin,
         reviewedHeadSha: ctx.reviewedHeadSha,
         contentBinds: ctx.contentBinds,
+        approvalAt: ctx.approvalAt,
       }).ok);
       if (!maintainerOk && !anyMaintainerApproval) {
         findings.push({
@@ -3571,6 +4450,7 @@ export function analyzePreMerge(ctx) {
           prAuthorLogin: ctx.prAuthorLogin,
           reviewedHeadSha: ctx.reviewedHeadSha,
           contentBinds: ctx.contentBinds,
+          approvalAt: ctx.approvalAt,
         });
         if (!v.ok) findings.push({ code: "reviewed-by-fabricated", severity: "error", message: `Reviewed-by @${l.login} (tier=${l.tier}) fails verification: ${v.reasons.join("; ")}` });
       }
@@ -4033,6 +4913,10 @@ export function analyzePostMerge(ctx) {
       // tree approved at head A while the approvals/contexts bound to head B).
       findings.push({ code: "content-mismatch", severity: "error", message: `the landed change is not the reviewed change (content fingerprint differs) — the landed tree is not what was reviewed; approvals/contexts do not bind` });
     } else if (ctx.approvedTreeMatch === true) {
+      // (§5d: with the resolver, the live approved heads are at most the reviewed head
+      // itself — resolveApprovedHeads admits an older head A only as H, and only when the
+      // approval counts at H — so this reads tree(landed) == tree(H), never the tree of an
+      // older approved commit.)
       // Neither bridge could DECIDE (the reviewed head is not resolvable in this
       // checkout — a fork head, or a branch deleted at merge — so the content
       // fingerprint is undefined), but the landed tree is BYTE-IDENTICAL to a
@@ -4077,6 +4961,7 @@ export function analyzePostMerge(ctx) {
           prAuthorLogin: ctx.prAuthorLogin,
           reviewedHeadSha: ctx.reviewedHeadSha,
           contentBinds: ctx.contentBinds,
+          approvalAt: ctx.approvalAt,
         });
         if (!v.ok) findings.push({ code: "reviewed-by-fabricated", severity: "error", message: `Reviewed-by @${l.login} (tier=${l.tier}) fails verification: ${v.reasons.join("; ")}` });
         else if (l.tier === "maintainer") passingMaintainer.push(l.login);
@@ -4389,8 +5274,12 @@ function main() {
         ctx.delegationRequested = /^Merge authorization:|^Merge-authorization:/im.test(pr.body || "");
         ctx.prAuthorLogin = pr.user?.login;
         ctx.reviewedHeadSha = args["head-sha"] || pr.head?.sha;
-        ctx.reviews = client.listReviews(args.pr);
+        ctx.reviews = checkedReviews(client.listReviews(args.pr));
         ctx.approverLogins = [...new Set(ctx.reviews.filter((r) => r.state === "APPROVED").map((r) => r.user?.login).filter(Boolean))];
+        // §5d: an approval counts at the reviewed head only when it was given
+        // after the head arrived, or the head is a plain forward (from the diff
+        // base) of the head it was given at with the same own change.
+        ctx.approvalAt = makeApprovalAt({ read: (endpoint) => client.get(endpoint), readPage: (endpoint) => client.getPage(endpoint), slug: repo, pr: args.pr, anchor: base });
 
         // DECLARED record: when the PR BODY carries a §1 trailer block (the
         // intended squash record — the spec's recommended merge tooling composes
@@ -4497,7 +5386,7 @@ function main() {
         // head — a head that moved after the approval must surface as exactly
         // that, not be quietly adopted as the reviewed head.
         ctx.reviewedHeadSha = ctx.membership.headAtEnqueue;
-        ctx.reviews = client.listReviews(prNumber);
+        ctx.reviews = checkedReviews(client.listReviews(prNumber));
         ctx.approverLogins = [...new Set(ctx.reviews.filter((r) => r.state === "APPROVED").map((r) => r.user?.login).filter(Boolean))];
         // The verification-boundary record is read off the pull request body by
         // the SAME parser the pre-merge arm uses.
@@ -4512,6 +5401,9 @@ function main() {
           try { ctx.permissionByLogin[login] = client.permissionOf(login).permission; } catch { /* unknown */ }
         }
         ctx.contentBinds = makeContentBinds({ anchor: groupBaseSha });
+        // §5d: the approval must count at the head AT ENQUEUE (the same rule the
+        // pre-merge arm reads), the group's base being the base it forwards from.
+        ctx.approvalAt = makeApprovalAt({ read: (endpoint) => client.get(endpoint), readPage: (endpoint) => client.getPage(endpoint), slug: repo, pr: prNumber, anchor: groupBaseSha });
         ctx.checkRuns = client.checkRunsFor(ctx.reviewedHeadSha);
         ctx.verifyGateArm = settlingVerifier(ctx.reviewedHeadSha);
         ctx.runWorkflow = makeRunWorkflowResolver(client);
@@ -4522,6 +5414,7 @@ function main() {
           reviews: ctx.reviews,
           prAuthorLogin: ctx.prAuthorLogin,
           permissionByLogin: ctx.permissionByLogin,
+          approvalAt: ctx.approvalAt,
         });
         ctx.queueCandidate = resolveQueueCandidate({
           groupHeadSha, baseSha: groupBaseSha, prHeadSha: ctx.membership.headAtEnqueue,
@@ -4613,7 +5506,7 @@ function main() {
         const prNumber = prResolution.number;
         const pr = prResolution.pr;
         ctx.prAuthorLogin = pr.user?.login;
-        ctx.reviews = client.listReviews(prNumber);
+        ctx.reviews = checkedReviews(client.listReviews(prNumber));
         // Reviewed head: the PR head at merge stays primary (an older approval
         // must never bless commits pushed after it); the LIVE approved heads
         // (state APPROVED — GitHub rewrites a dismissed review's state, so this
@@ -4624,6 +5517,17 @@ function main() {
           if (!login || ctx.permissionByLogin[login] !== undefined) continue;
           try { ctx.permissionByLogin[login] = client.permissionOf(login).permission; } catch { /* unknown */ }
         }
+        // §5d: an approval counts at the reviewed head only by the §5d rule; the
+        // base the head forwards from is the commit the squash landed on. The
+        // pull request's head ref is fetched once when a commit the forward
+        // reading needs is not in this checkout (a squash leaves the branch's
+        // commits outside it).
+        let approvalHeadFetched = false;
+        const approvalEnsureLocal = (sha) => {
+          if (!approvalHeadFetched && !hasCommitLocally(sha)) { approvalHeadFetched = true; fetchPrHeadRef(prNumber); }
+        };
+        ctx.approvalAt = makeApprovalAt({ read: (endpoint) => client.get(endpoint), readPage: (endpoint) => client.getPage(endpoint), slug: repo, pr: prNumber,
+          anchor: firstParentOf(commit), ensureLocal: approvalEnsureLocal });
         // Reviewed head + the qualified live approvals (permissions resolved
         // above, so the peer-standing filter can be applied).
         const rh = resolveReviewedHead({
@@ -4631,6 +5535,7 @@ function main() {
           reviews: ctx.reviews,
           prAuthorLogin: ctx.prAuthorLogin,
           permissionByLogin: ctx.permissionByLogin,
+          approvalAt: ctx.approvalAt,
         });
         ctx.reviewedHeadSha = rh.headSha;
         const authorization = parseTrailers(message).authorization;
@@ -4781,6 +5686,8 @@ function main() {
           // RANGE landed on, not the tip's own parent (which is itself a landed
           // commit of this very range).
           ctx.contentBinds = makeContentBinds({ anchor: landing.base });
+          ctx.approvalAt = makeApprovalAt({ read: (endpoint) => client.get(endpoint), readPage: (endpoint) => client.getPage(endpoint), slug: repo, pr: prNumber,
+            anchor: landing.base, ensureLocal: approvalEnsureLocal });
         }
         ctx.apiBound = true;
       } catch (e) { apiSkippedReason = `GitHub API unavailable (${e.message}) — anti-fabrication checks skipped; record grammar/structure only`; ctx.apiBound = false; }
