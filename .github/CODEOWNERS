@@ -7,3 +7,10 @@
 
 # Security-relevant paths — request the owner + the org review account.
 /.github/ @groganz @megajustice
+
+# Delegated-merge trust anchors require review by the owner alone.
+/config/delegated-merge-authorities.json @groganz
+/scripts/delegated-merge-receipt.mjs @groganz
+/scripts/truthful-attribution-gate.mjs @groganz
+/config/high-risk-defaults.json @groganz
+/.github/workflows/truthful-attribution-gate.yml @groganz

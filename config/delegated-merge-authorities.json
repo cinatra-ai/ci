@@ -2,8 +2,8 @@
   "schema": "cinatra.delegated-merge-trust/v1",
   "authority": {
     "id": "grant-8e65116e40c6d1fb440753a9d0c93909ae7e25dff6b5ce74f08ce2ae283d3bbe",
-    "revision": 2,
-    "digest": "edd8bc07eebbdda973304bb989ce680b73f60f750709099126900146be7cca67"
+    "revision": 3,
+    "digest": "b3b0c839f2e069b785611f2532447733f90c96ea62d6eb40f11f7bccb49da918"
   },
   "ownerUserId": 8213731,
   "bot": {
