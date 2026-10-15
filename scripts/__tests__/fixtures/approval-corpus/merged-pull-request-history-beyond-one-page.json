@@ -1,0 +1,447 @@
+{
+ "corpus": 1,
+ "case": "merged-pull-request-history-beyond-one-page",
+ "about": "Merged at 10:30; its branch was reused for 100 changes after the merge, so the newest page of its activity holds no change before the merge. The history is read back through the next link until the merge is covered.",
+ "origin": "paging: a merged pull request's history is read back to its merge",
+ "ask": {
+  "reading": "owner-approval",
+  "repository": "example-org/example-app",
+  "pull": 7,
+  "head": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+  "owner": "example-owner"
+ },
+ "platform": {
+  "rest": {
+   "repos/example-org/example-app/pulls/7": {
+    "number": 7,
+    "state": "closed",
+    "merged_at": "2026-01-15T10:30:00Z",
+    "head": {
+     "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "feature/example-change",
+     "repo": {
+      "full_name": "example-org/example-app"
+     }
+    },
+    "base": {
+     "ref": "main",
+     "repo": {
+      "full_name": "example-org/example-app"
+     }
+    }
+   },
+   "repos/example-org/example-app/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11/check-suites?per_page=100&page=1": {
+    "total_count": 2,
+    "check_suites": [
+     {
+      "id": 4001,
+      "head_sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+      "head_branch": "feature/example-change",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-01-15T10:00:02Z",
+      "updated_at": "2026-01-15T10:00:02Z",
+      "repository": {
+       "full_name": "example-org/example-app"
+      },
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 4002,
+      "head_sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+      "head_branch": "feature/example-change",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-01-15T10:01:30Z",
+      "updated_at": "2026-01-15T10:01:30Z",
+      "repository": {
+       "full_name": "example-org/example-app"
+      },
+      "app": {
+       "slug": "github-actions"
+      }
+     }
+    ]
+   },
+   "repos/example-org/example-app/issues/7/timeline?per_page=100&page=1": [
+    {
+     "event": "committed",
+     "sha": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "message": "example change",
+     "committer": {
+      "date": "2026-01-15T08:59:00Z"
+     }
+    },
+    {
+     "event": "review_requested",
+     "id": 3001,
+     "created_at": "2026-01-15T09:05:00Z",
+     "commit_id": null
+    },
+    {
+     "event": "committed",
+     "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "message": "example change",
+     "committer": {
+      "date": "2026-01-15T10:00:00Z"
+     }
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=100": [
+    {"id":9000,"node_id":"A_example0","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T00:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9001,"node_id":"A_example1","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T01:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9002,"node_id":"A_example2","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T02:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9003,"node_id":"A_example3","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T03:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9004,"node_id":"A_example4","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T04:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9005,"node_id":"A_example5","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T05:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9006,"node_id":"A_example6","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T06:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9007,"node_id":"A_example7","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T07:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9008,"node_id":"A_example8","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T08:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9009,"node_id":"A_example9","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T09:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9010,"node_id":"A_example10","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T10:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9011,"node_id":"A_example11","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T11:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9012,"node_id":"A_example12","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T12:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9013,"node_id":"A_example13","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T13:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9014,"node_id":"A_example14","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T14:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9015,"node_id":"A_example15","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T15:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9016,"node_id":"A_example16","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T16:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9017,"node_id":"A_example17","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T17:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9018,"node_id":"A_example18","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T18:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9019,"node_id":"A_example19","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T19:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9020,"node_id":"A_example20","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T20:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9021,"node_id":"A_example21","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T21:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9022,"node_id":"A_example22","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T22:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9023,"node_id":"A_example23","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-01T23:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9024,"node_id":"A_example24","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T00:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9025,"node_id":"A_example25","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T01:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9026,"node_id":"A_example26","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T02:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9027,"node_id":"A_example27","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T03:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9028,"node_id":"A_example28","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T04:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9029,"node_id":"A_example29","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T05:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9030,"node_id":"A_example30","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T06:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9031,"node_id":"A_example31","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T07:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9032,"node_id":"A_example32","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T08:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9033,"node_id":"A_example33","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T09:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9034,"node_id":"A_example34","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T10:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9035,"node_id":"A_example35","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T11:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9036,"node_id":"A_example36","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T12:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9037,"node_id":"A_example37","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T13:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9038,"node_id":"A_example38","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T14:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9039,"node_id":"A_example39","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T15:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9040,"node_id":"A_example40","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T16:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9041,"node_id":"A_example41","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T17:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9042,"node_id":"A_example42","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T18:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9043,"node_id":"A_example43","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T19:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9044,"node_id":"A_example44","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T20:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9045,"node_id":"A_example45","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T21:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9046,"node_id":"A_example46","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T22:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9047,"node_id":"A_example47","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-02T23:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9048,"node_id":"A_example48","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T00:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9049,"node_id":"A_example49","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T01:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9050,"node_id":"A_example50","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T02:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9051,"node_id":"A_example51","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T03:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9052,"node_id":"A_example52","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T04:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9053,"node_id":"A_example53","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T05:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9054,"node_id":"A_example54","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T06:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9055,"node_id":"A_example55","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T07:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9056,"node_id":"A_example56","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T08:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9057,"node_id":"A_example57","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T09:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9058,"node_id":"A_example58","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T10:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9059,"node_id":"A_example59","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T11:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9060,"node_id":"A_example60","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T12:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9061,"node_id":"A_example61","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T13:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9062,"node_id":"A_example62","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T14:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9063,"node_id":"A_example63","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T15:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9064,"node_id":"A_example64","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T16:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9065,"node_id":"A_example65","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T17:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9066,"node_id":"A_example66","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T18:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9067,"node_id":"A_example67","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T19:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9068,"node_id":"A_example68","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T20:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9069,"node_id":"A_example69","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T21:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9070,"node_id":"A_example70","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T22:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9071,"node_id":"A_example71","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-03T23:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9072,"node_id":"A_example72","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T00:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9073,"node_id":"A_example73","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T01:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9074,"node_id":"A_example74","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T02:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9075,"node_id":"A_example75","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T03:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9076,"node_id":"A_example76","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T04:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9077,"node_id":"A_example77","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T05:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9078,"node_id":"A_example78","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T06:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9079,"node_id":"A_example79","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T07:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9080,"node_id":"A_example80","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T08:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9081,"node_id":"A_example81","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T09:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9082,"node_id":"A_example82","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T10:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9083,"node_id":"A_example83","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T11:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9084,"node_id":"A_example84","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T12:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9085,"node_id":"A_example85","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T13:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9086,"node_id":"A_example86","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T14:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9087,"node_id":"A_example87","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T15:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9088,"node_id":"A_example88","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T16:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9089,"node_id":"A_example89","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T17:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9090,"node_id":"A_example90","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T18:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9091,"node_id":"A_example91","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T19:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9092,"node_id":"A_example92","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T20:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9093,"node_id":"A_example93","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T21:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9094,"node_id":"A_example94","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T22:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9095,"node_id":"A_example95","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-04T23:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9096,"node_id":"A_example96","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-05T00:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9097,"node_id":"A_example97","before":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-05T01:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9098,"node_id":"A_example98","before":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","after":"4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e","ref":"refs/heads/feature/example-change","timestamp":"2026-02-05T02:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}},
+    {"id":9099,"node_id":"A_example99","before":"ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66","after":"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c","ref":"refs/heads/feature/example-change","timestamp":"2026-02-05T03:00:00Z","activity_type":"push","actor":{"login":"example-author","id":5001,"type":"User"}}
+   ],
+   "repos/example-org/example-app/pulls/7/reviews?per_page=100&page=1": [
+    {
+     "id": 1001,
+     "node_id": "R_example1001",
+     "user": {
+      "login": "example-owner",
+      "id": 6001,
+      "type": "User"
+     },
+     "body": "",
+     "state": "APPROVED",
+     "commit_id": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "author_association": "MEMBER",
+     "submitted_at": "2026-01-15T10:15:00Z"
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/main&direction=desc&per_page=100": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "after": "dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T09:50:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "after": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T08:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/git/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11": {
+    "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+    "tree": {
+     "sha": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    },
+    "parents": [
+     {
+      "sha": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22"
+     }
+    ],
+    "message": "example change",
+    "author": {
+     "name": "Example Author",
+     "date": "2026-01-15T10:00:00Z"
+    },
+    "committer": {
+     "name": "Example Author",
+     "date": "2026-01-15T10:00:00Z"
+    }
+   },
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=10": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "after": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T00:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "after": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T01:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9002,
+     "node_id": "A_example2",
+     "before": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "after": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T02:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9003,
+     "node_id": "A_example3",
+     "before": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "after": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T03:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9004,
+     "node_id": "A_example4",
+     "before": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "after": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T04:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9005,
+     "node_id": "A_example5",
+     "before": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "after": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T05:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9006,
+     "node_id": "A_example6",
+     "before": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "after": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T06:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9007,
+     "node_id": "A_example7",
+     "before": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "after": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T07:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9008,
+     "node_id": "A_example8",
+     "before": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "after": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T08:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9009,
+     "node_id": "A_example9",
+     "before": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+     "after": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-02-01T09:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=100&after=Y3Vyc29yOmV4YW1wbGUtMg": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "after": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T10:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "0000000000000000000000000000000000000000",
+     "after": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T09:00:00Z",
+     "activity_type": "branch_creation",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ]
+  },
+  "diffs": {
+   "repos/example-org/example-app/compare/main...aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11": "diff --git a/src/example.ts b/src/example.ts\nindex 1111111..2222222 100644\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n",
+   "repos/example-org/example-app/compare/main...bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22": "diff --git a/src/example.ts b/src/example.ts\nindex 1111111..2222222 100644\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n"
+  },
+  "mergeTrees": {},
+  "links": {
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=100": "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=100&after=Y3Vyc29yOmV4YW1wbGUtMg"
+  }
+ },
+ "expect": {
+  "exit": 0,
+  "verdict": "counts",
+  "line": "after the head arrived 2026-01-15T10:00:02Z"
+ }
+}

@@ -1,0 +1,477 @@
+{
+ "about": "The minimal excerpt of GitHub's published schema that the approval authority (head_arrival.py, head-arrival.mjs) reads: for every endpoint they read, the type, nullability, requiredness and enum of every field they use, and the published value sets of the two fields the REST description types as free strings. Generated from the pinned sources below; a test in each language compares every closed set and every nullable field of the readers with it (KB-243).",
+ "sources": {
+  "rest": {
+   "repository": "github/rest-api-description",
+   "commit": "02a2bc3d6b42b69c18938c31b434342aa08fcd2b",
+   "path": "descriptions/api.github.com/api.github.com.2026-03-10.json",
+   "sha256": "fdfb492d0f0cb121f0dc298e85efeaf52d04432477a9c13ce4859b3e6a69e7fc"
+  },
+  "eventTypes": {
+   "repository": "github/docs",
+   "commit": "c174b7fcadbafa3a060e684cd943f50d2cc52ef7",
+   "path": "content/rest/using-the-rest-api/issue-event-types.md",
+   "sha256": "957dd55de6287026f362704eedfde425151c340ddfb7f082252a95480a4e640f",
+   "read": "every '## <event>' heading of the page"
+  },
+  "reviewStates": {
+   "repository": "github/docs",
+   "commit": "c174b7fcadbafa3a060e684cd943f50d2cc52ef7",
+   "path": "src/graphql/data/fpt/schema.docs.graphql",
+   "sha256": "489d255a212bf5fecc0d31e9307adbaff2dbfdde6f92b5dc8537f9d4c74ff783",
+   "read": "enum PullRequestReviewState (the REST description types a review's state as a free string)"
+  }
+ },
+ "endpoints": {
+  "pull": {
+   "get": "/repos/{owner}/{repo}/pulls/{pull_number}",
+   "row": "the answer",
+   "schema": "pull-request",
+   "fields": {
+    "head": {
+     "type": "object",
+     "nullable": false,
+     "required": true
+    },
+    "head.sha": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "head.ref": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "head.repo": {
+     "type": "object",
+     "nullable": false,
+     "required": true,
+     "schema": "repository"
+    },
+    "head.repo.full_name": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "base": {
+     "type": "object",
+     "nullable": false,
+     "required": true
+    },
+    "base.ref": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "merged_at": {
+     "type": "string",
+     "nullable": true,
+     "required": true,
+     "format": "date-time"
+    }
+   }
+  },
+  "commit": {
+   "get": "/repos/{owner}/{repo}/git/commits/{commit_sha}",
+   "row": "the answer",
+   "schema": "git-commit",
+   "fields": {
+    "sha": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "tree": {
+     "type": "object",
+     "nullable": false,
+     "required": true
+    },
+    "tree.sha": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "parents": {
+     "type": "array",
+     "nullable": false,
+     "required": true
+    },
+    "parents[].sha": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    }
+   }
+  },
+  "review": {
+   "get": "/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+   "row": "items",
+   "schema": "pull-request-review",
+   "fields": {
+    "id": {
+     "type": "integer",
+     "nullable": false,
+     "required": true,
+     "format": "int64"
+    },
+    "state": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "user": {
+     "type": "object",
+     "nullable": true,
+     "required": true,
+     "schema": "nullable-simple-user"
+    },
+    "user.login": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "submitted_at": {
+     "type": "string",
+     "nullable": false,
+     "required": false,
+     "format": "date-time"
+    },
+    "commit_id": {
+     "type": "string",
+     "nullable": true,
+     "required": true
+    }
+   }
+  },
+  "checkSuitePage": {
+   "get": "/repos/{owner}/{repo}/commits/{ref}/check-suites",
+   "row": "the answer",
+   "schema": null,
+   "fields": {
+    "total_count": {
+     "type": "integer",
+     "nullable": false,
+     "required": true
+    },
+    "check_suites": {
+     "type": "array",
+     "nullable": false,
+     "required": true
+    }
+   }
+  },
+  "checkSuite": {
+   "get": "/repos/{owner}/{repo}/commits/{ref}/check-suites",
+   "row": "check_suites[]",
+   "schema": "check-suite",
+   "fields": {
+    "head_sha": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "head_branch": {
+     "type": "string",
+     "nullable": true,
+     "required": true
+    },
+    "repository": {
+     "type": "object",
+     "nullable": false,
+     "required": true,
+     "schema": "minimal-repository"
+    },
+    "repository.full_name": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "created_at": {
+     "type": "string",
+     "nullable": true,
+     "required": true,
+     "format": "date-time"
+    }
+   }
+  },
+  "activity": {
+   "get": "/repos/{owner}/{repo}/activity",
+   "row": "items",
+   "schema": "activity",
+   "fields": {
+    "activity_type": {
+     "type": "string",
+     "nullable": false,
+     "required": true,
+     "enum": [
+      "push",
+      "force_push",
+      "branch_deletion",
+      "branch_creation",
+      "pr_merge",
+      "merge_queue_merge"
+     ]
+    },
+    "ref": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "before": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "after": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    },
+    "timestamp": {
+     "type": "string",
+     "nullable": false,
+     "required": true,
+     "format": "date-time"
+    }
+   }
+  },
+  "timeline": {
+   "get": "/repos/{owner}/{repo}/issues/{issue_number}/timeline",
+   "row": "items",
+   "schema": "timeline-issue-events",
+   "fields": {
+    "event": {
+     "shapes": [
+      {
+       "nullable": false,
+       "required": false,
+       "type": "string",
+       "schemas": [
+        "timeline-commit-commented-event",
+        "timeline-committed-event",
+        "timeline-line-commented-event"
+       ]
+      },
+      {
+       "nullable": false,
+       "required": true,
+       "type": "string",
+       "schemas": [
+        "added-to-project-issue-event",
+        "blocked-by-added-issue-event",
+        "blocked-by-removed-issue-event",
+        "blocking-added-issue-event",
+        "blocking-removed-issue-event",
+        "converted-note-to-issue-issue-event",
+        "demilestoned-issue-event",
+        "issue-type-added-issue-event",
+        "issue-type-changed-issue-event",
+        "issue-type-removed-issue-event",
+        "labeled-issue-event",
+        "locked-issue-event",
+        "milestoned-issue-event",
+        "moved-column-in-project-issue-event",
+        "parent-issue-added-issue-event",
+        "parent-issue-removed-issue-event",
+        "removed-from-project-issue-event",
+        "renamed-issue-event",
+        "review-dismissed-issue-event",
+        "review-request-removed-issue-event",
+        "review-requested-issue-event",
+        "state-change-issue-event",
+        "sub-issue-added-issue-event",
+        "sub-issue-removed-issue-event",
+        "timeline-assigned-issue-event",
+        "timeline-comment-event",
+        "timeline-connected-event",
+        "timeline-cross-referenced-event",
+        "timeline-disconnected-event",
+        "timeline-reviewed-event",
+        "timeline-unassigned-issue-event",
+        "unlabeled-issue-event"
+       ]
+      }
+     ]
+    },
+    "created_at": {
+     "shapes": [
+      {
+       "format": "date-time",
+       "nullable": false,
+       "required": true,
+       "type": "string",
+       "schemas": [
+        "timeline-comment-event",
+        "timeline-cross-referenced-event"
+       ]
+      },
+      {
+       "nullable": false,
+       "required": true,
+       "type": "string",
+       "schemas": [
+        "added-to-project-issue-event",
+        "blocked-by-added-issue-event",
+        "blocked-by-removed-issue-event",
+        "blocking-added-issue-event",
+        "blocking-removed-issue-event",
+        "converted-note-to-issue-issue-event",
+        "demilestoned-issue-event",
+        "issue-type-added-issue-event",
+        "issue-type-changed-issue-event",
+        "issue-type-removed-issue-event",
+        "labeled-issue-event",
+        "locked-issue-event",
+        "milestoned-issue-event",
+        "moved-column-in-project-issue-event",
+        "parent-issue-added-issue-event",
+        "parent-issue-removed-issue-event",
+        "removed-from-project-issue-event",
+        "renamed-issue-event",
+        "review-dismissed-issue-event",
+        "review-request-removed-issue-event",
+        "review-requested-issue-event",
+        "state-change-issue-event",
+        "sub-issue-added-issue-event",
+        "sub-issue-removed-issue-event",
+        "timeline-assigned-issue-event",
+        "timeline-connected-event",
+        "timeline-disconnected-event",
+        "timeline-unassigned-issue-event",
+        "unlabeled-issue-event"
+       ]
+      }
+     ]
+    },
+    "commit_id": {
+     "shapes": [
+      {
+       "nullable": false,
+       "required": false,
+       "type": "string",
+       "schemas": [
+        "timeline-commit-commented-event"
+       ]
+      },
+      {
+       "nullable": false,
+       "required": true,
+       "type": "string",
+       "schemas": [
+        "timeline-reviewed-event"
+       ]
+      },
+      {
+       "nullable": true,
+       "required": true,
+       "type": "string",
+       "schemas": [
+        "added-to-project-issue-event",
+        "blocked-by-added-issue-event",
+        "blocked-by-removed-issue-event",
+        "blocking-added-issue-event",
+        "blocking-removed-issue-event",
+        "converted-note-to-issue-issue-event",
+        "demilestoned-issue-event",
+        "issue-type-added-issue-event",
+        "issue-type-changed-issue-event",
+        "issue-type-removed-issue-event",
+        "labeled-issue-event",
+        "locked-issue-event",
+        "milestoned-issue-event",
+        "moved-column-in-project-issue-event",
+        "parent-issue-added-issue-event",
+        "parent-issue-removed-issue-event",
+        "removed-from-project-issue-event",
+        "renamed-issue-event",
+        "review-dismissed-issue-event",
+        "review-request-removed-issue-event",
+        "review-requested-issue-event",
+        "state-change-issue-event",
+        "sub-issue-added-issue-event",
+        "sub-issue-removed-issue-event",
+        "timeline-assigned-issue-event",
+        "timeline-connected-event",
+        "timeline-disconnected-event",
+        "timeline-unassigned-issue-event",
+        "unlabeled-issue-event"
+       ]
+      }
+     ]
+    },
+    "sha": {
+     "type": "string",
+     "nullable": false,
+     "required": true
+    }
+   }
+  }
+ },
+ "enums": {
+  "activity.activity_type": [
+   "push",
+   "force_push",
+   "branch_deletion",
+   "branch_creation",
+   "pr_merge",
+   "merge_queue_merge"
+  ],
+  "review.state": [
+   "APPROVED",
+   "CHANGES_REQUESTED",
+   "COMMENTED",
+   "DISMISSED",
+   "PENDING"
+  ],
+  "timeline.event": [
+   "assigned",
+   "automatic_base_change_failed",
+   "automatic_base_change_succeeded",
+   "base_ref_changed",
+   "closed",
+   "commented",
+   "committed",
+   "connected",
+   "convert_to_draft",
+   "converted_to_discussion",
+   "cross-referenced",
+   "demilestoned",
+   "deployed",
+   "deployment_environment_changed",
+   "disconnected",
+   "head_ref_deleted",
+   "head_ref_restored",
+   "head_ref_force_pushed",
+   "labeled",
+   "locked",
+   "mentioned",
+   "marked_as_duplicate",
+   "merged",
+   "milestoned",
+   "pinned",
+   "ready_for_review",
+   "referenced",
+   "renamed",
+   "reopened",
+   "review_dismissed",
+   "review_requested",
+   "review_request_removed",
+   "reviewed",
+   "subscribed",
+   "transferred",
+   "unassigned",
+   "unlabeled",
+   "unlocked",
+   "unmarked_as_duplicate",
+   "unpinned",
+   "unsubscribed",
+   "user_blocked"
+  ]
+ },
+ "headMovingEvents": {
+  "committed": "A commit was added to the pull request's `HEAD` branch.",
+  "head_ref_force_pushed": "The pull request's HEAD branch was force pushed.",
+  "head_ref_restored": "The pull request's `HEAD` branch was restored to the last known commit."
+ }
+}

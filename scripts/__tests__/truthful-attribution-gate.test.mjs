@@ -522,14 +522,14 @@ const OLD = "b".repeat(40);
 
 test("§5 check2: a real, non-stale, non-self maintainer approval verifies", () => {
   const line = { login: "groganz", tier: "maintainer" };
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000001, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine(line, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
   assert.ok(v.ok, v.reasons.join("; "));
 });
 
 test("§5 check2: self-approval is rejected (author == reviewer)", () => {
   const line = { login: "groganz", tier: "maintainer" };
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000002, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine(line, { reviews, permission: "admin", prAuthorLogin: "groganz", reviewedHeadSha: HEAD });
   assert.ok(!v.ok);
   assert.ok(v.reasons.some((r) => /self-approval/.test(r)));
@@ -537,7 +537,7 @@ test("§5 check2: self-approval is rejected (author == reviewer)", () => {
 
 test("§5 check2: a stale approval (older commit) is rejected", () => {
   const line = { login: "groganz", tier: "maintainer" };
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000003, user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine(line, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
   assert.ok(!v.ok);
   assert.ok(v.reasons.some((r) => /STALE/.test(r)));
@@ -546,8 +546,8 @@ test("§5 check2: a stale approval (older commit) is rejected", () => {
 test("§5 check2: latest review wins — a later CHANGES_REQUESTED kills an earlier APPROVED", () => {
   const line = { login: "groganz", tier: "maintainer" };
   const reviews = [
-    { user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" },
-    { user: { login: "groganz" }, state: "CHANGES_REQUESTED", commit_id: HEAD, submitted_at: "2026-06-12T11:00:00Z" },
+    { id: 7000004, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" },
+    { id: 7000005, user: { login: "groganz" }, state: "CHANGES_REQUESTED", commit_id: HEAD, submitted_at: "2026-06-12T11:00:00Z" },
   ];
   const v = verifyReviewedLine(line, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
   assert.ok(!v.ok);
@@ -556,7 +556,7 @@ test("§5 check2: latest review wins — a later CHANGES_REQUESTED kills an earl
 
 test("§5 check2: a DISMISSED approval does not count", () => {
   const line = { login: "groganz", tier: "maintainer" };
-  const reviews = [{ user: { login: "groganz" }, state: "DISMISSED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000006, user: { login: "groganz" }, state: "DISMISSED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine(line, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
   assert.ok(!v.ok);
   assert.ok(v.reasons.some((r) => /no non-dismissed review/.test(r)));
@@ -564,7 +564,7 @@ test("§5 check2: a DISMISSED approval does not count", () => {
 
 test("§5 check2: claimed tier exceeding actual permission is rejected", () => {
   const line = { login: "patpeer", tier: "maintainer" };
-  const reviews = [{ user: { login: "patpeer" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000007, user: { login: "patpeer" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine(line, { reviews, permission: "write", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
   assert.ok(!v.ok);
   assert.ok(v.reasons.some((r) => /does not meet claimed tier/.test(r)));
@@ -769,7 +769,7 @@ test("R2 postMerge: a PR-merge correction (reviewed head present) still enforces
   const r = analyzePostMerge({
     message, changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: null,
     apiBound: true, treeMatch: false,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000008, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
   });
   assert.ok(r.findings.some((f) => f.code === "tree-mismatch"), "a PR-merge correction must not bypass the tree bridge");
@@ -950,7 +950,7 @@ test("R3 preMerge: a truthful Reviewed-by DECLARED in the PR body and actually a
   const r = analyzePreMerge({
     changedFiles: ["src/x.ts"], rangeIdentities: [], messageBySha: {},
     defaults: DEFAULTS_OK, repoSuite: null, apiBound: true,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000009, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     approverLogins: ["groganz"], prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD,
     permissionByLogin: { groganz: "admin" },
     declaredReviewedBy: declared.reviewed,
@@ -966,7 +966,7 @@ test("analyzePostMerge: a clean human-arm record on an ordinary change is findin
     "Assisted-by: Claude Code (claude-opus-4-8)",
     "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
   ].join("\n");
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000010, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
   const r = analyzePostMerge({
     message, changedFiles: ["src/Button.tsx"], defaults: DEFAULTS_OK, repoSuite: null,
     reviews, prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
@@ -1000,7 +1000,7 @@ test("analyzePostMerge: tree mismatch is flagged", () => {
   const message = "x\n\nAssisted-by: none\nReviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)";
   const r = analyzePostMerge({
     message, changedFiles: ["docs/readme.md"], defaults: DEFAULTS_OK, repoSuite: null,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000011, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" }, treeMatch: false, apiBound: true,
   });
   assert.ok(r.findings.some((f) => f.code === "tree-mismatch"));
@@ -1057,7 +1057,7 @@ test("analyzePostMerge: a squash of agent work carrying Assisted-by: none is fla
   const r = analyzePostMerge({
     message, changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: null,
     apiBound: true, treeMatch: true,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000012, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
     agentTokens: DEFAULT_AGENT_NAME_TOKENS,
     rangeIdentities: [{ sha: "a".repeat(40), authorName: "Claude Code", authorEmail: "noreply@anthropic.com", committerName: "Claude Code", committerEmail: "noreply@anthropic.com" }],
@@ -1111,7 +1111,7 @@ test("§5 check3: Accountable with matching login but forged name is fabrication
 });
 
 test("analyzePreMerge: high-risk PR with a verified maintainer approval passes", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }];
+  const reviews = [{ id: 7000013, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }];
   const r = analyzePreMerge({
     changedFiles: [".github/workflows/ci.yml"], rangeIdentities: [], messageBySha: {},
     defaults: DEFAULTS_OK, repoSuite: null,
@@ -1122,7 +1122,7 @@ test("analyzePreMerge: high-risk PR with a verified maintainer approval passes",
 });
 
 test("analyzePreMerge: high-risk PR with only a self-approval fails check4", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }];
+  const reviews = [{ id: 7000014, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }];
   const r = analyzePreMerge({
     changedFiles: [".github/workflows/ci.yml"], rangeIdentities: [], messageBySha: {},
     defaults: DEFAULTS_OK, repoSuite: null,
@@ -2179,35 +2179,35 @@ test("WF-id end-to-end: analyzePostMerge gate-arm record where a context referen
 // ---- verifyReviewedLine: the injected staleness resolver -----------------
 
 test("§5 content-bind: approved sha != head but contentBinds=>true is NOT stale (rebase/update-branch survives)", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000015, user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => true });
   assert.equal(v.ok, true, JSON.stringify(v.reasons));
   assert.ok(!v.reasons.some((r) => /STALE/.test(r)));
 });
 
 test("§5 content-bind: contentBinds=>false is STALE (materially changed diff)", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000016, user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => false });
   assert.equal(v.ok, false);
   assert.ok(v.reasons.some((r) => /STALE/.test(r) && !/content unverifiable/.test(r)));
 });
 
 test("§5 content-bind: contentBinds=>undefined is STALE + flagged content unverifiable (fail closed)", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000017, user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => undefined });
   assert.equal(v.ok, false);
   assert.ok(v.reasons.some((r) => /STALE/.test(r) && /content unverifiable/.test(r)));
 });
 
 test("§5 content-bind: NO resolver + differing sha => STALE (exact-sha back-compat preserved)", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000018, user: { login: "groganz" }, state: "APPROVED", commit_id: OLD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD });
   assert.equal(v.ok, false);
   assert.ok(v.reasons.some((r) => /STALE/.test(r)));
 });
 
 test("§5 content-bind: exact sha match => not stale, resolver NEVER consulted (fast path)", () => {
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
+  const reviews = [{ id: 7000019, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }];
   const v = verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, contentBinds: () => { throw new Error("resolver must not be called on the exact-sha fast path"); } });
   assert.equal(v.ok, true, JSON.stringify(v.reasons));
 });
@@ -2261,7 +2261,7 @@ function cbPostCtx(extra) {
   return {
     message: ["feat: button", "", "Assisted-by: Claude Code (claude-opus-4-8)", "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n"),
     changedFiles: ["src/Button.tsx"], defaults: DEFAULTS_OK, repoSuite: null,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }],
+    reviews: [{ id: 7000020, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }],
     prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" }, apiBound: true,
     ...extra,
   };
@@ -2826,26 +2826,26 @@ test("REVIEWED HEAD: live approvals are resolved from APPROVED reviews, never fr
   assert.deepEqual(rh.approvedHeads, ["ef2350ae3".padEnd(40, "0")]);
   // Newest live approval first when several REVIEWERS have one.
   const many = [
-    { state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "peerdev" } },
-    { state: "APPROVED", commit_id: "b".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
+    { id: 7000034, state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "peerdev" } },
+    { id: 7000035, state: "APPROVED", commit_id: "b".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
   ];
   assert.deepEqual(resolveApprovedHeads(many), ["b".repeat(40), "a".repeat(40)]);
   // Per LOGIN only the LATEST review counts: an approval the same reviewer later
   // superseded with CHANGES_REQUESTED is NOT a live approval.
   const superseded = [
-    { state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "groganz" } },
-    { state: "CHANGES_REQUESTED", commit_id: "b".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
+    { id: 7000036, state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "groganz" } },
+    { id: 7000037, state: "CHANGES_REQUESTED", commit_id: "b".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
   ];
   assert.deepEqual(resolveApprovedHeads(superseded), [], "a withdrawn approval must not bind anything");
   // A later COMMENTED review does NOT withdraw an approval (GitHub keeps it live).
   const commentedAfter = [
-    { state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "groganz" } },
-    { state: "COMMENTED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
+    { id: 7000038, state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "groganz" } },
+    { id: 7000039, state: "COMMENTED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T12:00:00Z", user: { login: "groganz" } },
   ];
   assert.deepEqual(resolveApprovedHeads(commentedAfter), ["a".repeat(40)]);
   // A SELF-approval never qualifies, and an unknown/insufficient permission never
   // qualifies when permission data is being applied (fail closed).
-  const selfApproved = [{ state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "author" } }];
+  const selfApproved = [{ id: 7000040, state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-07-27T10:00:00Z", user: { login: "author" } }];
   assert.deepEqual(resolveApprovedHeads(selfApproved, { prAuthorLogin: "author" }), []);
   assert.deepEqual(resolveApprovedHeads(selfApproved, { permissionByLogin: {} }), [], "unknown permission does not qualify");
   assert.deepEqual(resolveApprovedHeads(selfApproved, { permissionByLogin: { author: "read" } }), []);
@@ -2900,7 +2900,7 @@ test("POST-MERGE: a truthful squash matching the APPROVED head passes even when 
     apiBound: true, reviewedHeadSha: head, prAuthorLogin: "cinatra-agent-bot[bot]",
     reviews: [
       { state: "DISMISSED", commit_id: "86e52e721".padEnd(40, "0"), submitted_at: "2026-07-27T17:00:23Z", user: { login: "groganz" } },
-      { state: "APPROVED", commit_id: head, submitted_at: "2026-07-27T17:28:03Z", user: { login: "groganz" } },
+      { id: 7000041, state: "APPROVED", commit_id: head, submitted_at: "2026-07-27T17:28:03Z", user: { login: "groganz" } },
     ],
     permissionByLogin: { groganz: "admin" },
     checkRuns: SUITE_FILE.value.requiredContexts.map((c) => ({ name: c.context, status: "completed", conclusion: "success" })),
@@ -3066,7 +3066,7 @@ test("TREE-EQUALITY: the approved-tree fallback NEVER overrides a proven content
   const base = {
     message, changedFiles: ["src/app.ts"], defaults: DEFAULTS_OK, repoSuite: SUITE_FILE,
     apiBound: true, reviewedHeadSha: head, prAuthorLogin: "cinatra-agent-bot[bot]",
-    reviews: [{ state: "APPROVED", commit_id: head, submitted_at: "2026-07-27T17:28:03Z", user: { login: "groganz" } }],
+    reviews: [{ id: 7000042, state: "APPROVED", commit_id: head, submitted_at: "2026-07-27T17:28:03Z", user: { login: "groganz" } }],
     permissionByLogin: { groganz: "admin" },
     treeMatch: false, approvedTreeMatch: true,
   };
@@ -3248,7 +3248,7 @@ function cdCtx(extra = {}) {
   return {
     message: ["feat: the change", "", "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n"), // no Assisted-by => invalid
     changedFiles: ["src/x.ts"], defaults: DEFAULTS_OK, repoSuite: null,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }],
+    reviews: [{ id: 7000021, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-06-12T10:00:00Z" }],
     prAuthorLogin: "claude-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
     apiBound: true, treeMatch: true,
     correctionDiscovery: true, targetSha: CD_X,
@@ -3597,7 +3597,7 @@ function rlCtx({ commits = null, contentMatch = true, changedFiles = ["src/repai
   return {
     message: message || landed[landed.length - 1].message,
     changedFiles, defaults: DEFAULTS_OK, repoSuite: null,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-08-13T10:00:00Z" }],
+    reviews: [{ id: 7000022, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "2026-08-13T10:00:00Z" }],
     prAuthorLogin: "cinatra-agent-bot", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
     apiBound: true,
     // The tree moved (the base moved under the rebase) — the RANGE content bridge
@@ -3879,7 +3879,7 @@ const send = (v) => { process.stdout.write((process.argv.includes("-i") ? "HTTP/
 // §5d: the head-arrival reading of the approval. The pull request names its head branch and
 // head repository, and the head was pushed (its only reading) before every fixture review.
 const pushed = "2026-07-01T00:00:00Z", headRef = "feature/repair";
-const withHead = { ...pr, head: { ref: headRef, repo: { full_name: "cinatra-ai/cinatra" }, ...pr.head } };
+const withHead = { merged_at: null, ...pr, head: { ref: headRef, repo: { full_name: "cinatra-ai/cinatra" }, ...pr.head } };
 if (/\\/git\\/commits\\/[0-9a-f]{40}$/.test(endpoint)) send({ sha: endpoint.split("/").pop(), committer: { date: pushed } });
 if (/\\/commits\\/[0-9a-f]{40}\\/check-suites\\?/.test(endpoint)) send({ total_count: 0, check_suites: [] });
 if (/\\/issues\\/\\d+\\/timeline\\?per_page=100$/.test(endpoint)) send([]);
@@ -3920,7 +3920,7 @@ test("§7 PUSH ARM (ci#94 AC1): a six-commit rebase merge concludes GREEN end-to
     });
   const bin = rlStubGh(dir, {
     pr: { number: 2709, merged: true, merge_commit_sha: tip, head: { sha: prHead }, user: { login: "cinatra-agent-bot" }, body: "" },
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
+    reviews: [{ id: 7000023, user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
     prCommits,
   });
 
@@ -3942,7 +3942,7 @@ test("§7 PUSH ARM FAIL-CLOSED: the same landing with one commit's content tampe
     .map((message) => ({ sha: "0".repeat(40), commit: { message, author: { name: "Sandro Groganz", email: "sandro@cinatra.ai" }, committer: { name: "Sandro Groganz", email: "sandro@cinatra.ai" } } }));
   const bin = rlStubGh(dir, {
     pr: { number: 2709, merged: true, merge_commit_sha: tip, head: { sha: prHead }, user: { login: "cinatra-agent-bot" }, body: "" },
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
+    reviews: [{ id: 7000024, user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
     prCommits,
   });
 
@@ -3966,7 +3966,7 @@ test("§7 PUSH ARM: a SQUASH landing of the same PR is bound exactly as before (
   const prCommits = reviewedMessages.map((message) => ({ sha: "0".repeat(40), commit: { message, author: { name: "Sandro Groganz", email: "sandro@cinatra.ai" }, committer: { name: "Sandro Groganz", email: "sandro@cinatra.ai" } } }));
   const bin = rlStubGh(dir, {
     pr: { number: 2709, merged: true, merge_commit_sha: squash, head: { sha: prHead }, user: { login: "cinatra-agent-bot" }, body: "" },
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
+    reviews: [{ id: 7000025, user: { login: "groganz" }, state: "APPROVED", commit_id: prHead, submitted_at: "2026-08-13T10:00:00Z" }],
     prCommits,
   });
 
@@ -3987,7 +3987,7 @@ function lcRunSquash(landedText) {
   const author = { name: "Sandro Groganz", email: "sandro@cinatra.ai" };
   const bin = rlStubGh(dir, {
     pr: { number: 1, merged: true, merge_commit_sha: squash, head: { sha: reviewedHead }, user: { login: "cinatra-agent-bot" }, body: "" },
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: reviewedHead, submitted_at: "2026-10-01T10:00:00Z" }],
+    reviews: [{ id: 7000026, user: { login: "groganz" }, state: "APPROVED", commit_id: reviewedHead, submitted_at: "2026-10-01T10:00:00Z" }],
     prCommits: [{ sha: "0".repeat(40), commit: { message: "pr: the change", author, committer: author } }],
   });
   return { dir, ...rlRunPushArm(dir, bin, squash) };
@@ -4117,7 +4117,7 @@ test("QUEUE ARM: a group with exactly ONE queued pull request whose approved hea
   assert.equal(membership.number, 42);
   assert.equal(membership.headAtEnqueue, Q_HEAD, "the head at enqueue is the group head's parent, never the live PR head");
 
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const reviews = [{ id: 7000027, user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
   const approvedHeadCheck = verifyQueuedApprovedHead({
     headAtEnqueue: membership.headAtEnqueue, reviews,
     prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
@@ -4140,7 +4140,7 @@ test("QUEUE ARM: a group whose pull request head MOVED AFTER the approval FAILS"
   });
   assert.equal(membership.status, "resolved");
   // the approval was cast on Q_OLD; the enqueued head is Q_HEAD.
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_OLD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const reviews = [{ id: 7000028, user: { login: "groganz" }, state: "APPROVED", commit_id: Q_OLD, submitted_at: "2026-09-09T10:00:00Z" }];
   const approvedHeadCheck = verifyQueuedApprovedHead({
     headAtEnqueue: membership.headAtEnqueue, reviews,
     prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
@@ -4194,7 +4194,7 @@ test("QUEUE ARM: a record that is PROOF-FAILED (a required context concluded non
     groupHeadSha: Q_GROUP, parents: [Q_BASE, Q_HEAD],
     queuePulls: [{ number: 42, head: { sha: Q_HEAD } }],
   });
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const reviews = [{ id: 7000029, user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
   const approvedHeadCheck = verifyQueuedApprovedHead({
     headAtEnqueue: membership.headAtEnqueue, reviews,
     prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
@@ -4217,7 +4217,7 @@ test("QUEUE ARM: a PRESERVED-FAILING record (a Reviewed-by claim nobody cast) FA
     groupHeadSha: Q_GROUP, parents: [Q_BASE, Q_HEAD],
     queuePulls: [{ number: 42, head: { sha: Q_HEAD } }],
   });
-  const reviews = [{ user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
+  const reviews = [{ id: 7000030, user: { login: "groganz" }, state: "APPROVED", commit_id: Q_HEAD, submitted_at: "2026-09-09T10:00:00Z" }];
   const approvedHeadCheck = verifyQueuedApprovedHead({
     headAtEnqueue: membership.headAtEnqueue, reviews,
     prAuthorLogin: "cinatra-agent-bot", permissionByLogin: { groganz: "admin" },
@@ -4505,7 +4505,7 @@ test("§5b the exemption never ERASES a named agent a bump commit declares", () 
     message: "chore: deps\n\nAssisted-by: none\nReviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
     changedFiles: ["package.json"], defaults: DEFAULTS_OK, repoSuite: null,
     apiBound: true, treeMatch: true,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000031, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
     agentTokens: BUMP_TOKENS,
     rangeIdentities: [bumpIdentity],
@@ -4666,7 +4666,7 @@ test("§5c a CLEAN bring-up-to-date merge by the bot is CONTENT-FREE: accepted, 
     message: "chore: forward\n\nAssisted-by: none\nReviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)",
     changedFiles: ["app.txt"], defaults: DEFAULTS_OK, repoSuite: null,
     apiBound: true, treeMatch: true,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000032, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     prAuthorLogin: LOOP_BOT_NAME, reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
     agentTokens: LOOP_TOKENS,
     rangeIdentities: [fx.identity],
@@ -4734,7 +4734,7 @@ test("§5c the union of a squash range carrying a clean bot merge and a named-ag
       "Reviewed-by: Sandro Groganz <sandro@cinatra.ai> (@groganz, tier=maintainer)"].join("\n"),
     changedFiles: ["src/thing.ts"], defaults: DEFAULTS_OK, repoSuite: null,
     apiBound: true, treeMatch: true,
-    reviews: [{ user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
+    reviews: [{ id: 7000033, user: { login: "groganz" }, state: "APPROVED", commit_id: HEAD, submitted_at: "t" }],
     prAuthorLogin: LOOP_BOT_NAME, reviewedHeadSha: HEAD, permissionByLogin: { groganz: "admin" },
     agentTokens: LOOP_TOKENS,
     rangeIdentities: [
@@ -4870,6 +4870,7 @@ test("delegated actual CLI uses immutable engine authority and real pre/queue/po
   f.receipt.scope.fileInventoryDigest = authorizationDigest(authorizationFiles(f.files));
   f.pr.head.sha = head; f.pr.base.sha = oldBase;
   f.pr.user = { login: "fixture-contributor" };
+  f.pr.merged_at = null;   // GitHub's pull request always carries merged_at (null while open); the arrival reader reads it
   f.seal();
   const oldRoot = f.root, api = f.api;
   for (const key of Object.keys(api)) if (key.includes("/git/")) delete api[key];
@@ -5027,7 +5028,7 @@ process.stdout.write(JSON.stringify(args.includes('--slurp')?[value]:value,
   // same exact current identity projection, without a fabricated delegation.
   const reviewEndpoint = oldRoot + "/pulls/7/reviews";
   f.pr.body = "Assisted-by: Codex (gpt-6)\nReviewed-by: Fixture Reviewer <review@example.invalid> (@fixture-reviewer, tier=maintainer)";
-  api[reviewEndpoint] = [{ state: "APPROVED", user: { login: "fixture-reviewer" }, commit_id: head, submitted_at: stamp(now - 1000) }];
+  api[reviewEndpoint] = [{ id: 7100001, state: "APPROVED", user: { login: "fixture-reviewer" }, commit_id: head, submitted_at: stamp(now - 1000) }];
   api[oldRoot + "/collaborators/fixture-reviewer/permission"] = { permission: "maintain" };
   // §5d: the review must count at the enqueued head — the head arrived (was pushed) two minutes before it.
   api[oldRoot + "/git/commits/" + head].committer = { date: stamp(now - 120000) };
@@ -5801,7 +5802,7 @@ function d5Read({ A, H, committed = D5_H_AT, suiteAt = "2026-10-14T14:22:41Z", h
   suites = null, activityPages = null, timelinePages = null, headSlug = D5_SLUG, baseSuites = { total_count: 0, check_suites: [] } } = {}) {
   // headSlug: the pull request's head repository (a fork when it is not D5_SLUG). The head branch's check suites are
   // answered there; the base repository answers `baseSuites` (by default none of the head branch).
-  const pull = { number: D5_PR, head: { sha: H, ref: D5_REF, repo: { full_name: headSlug } } };
+  const pull = { number: D5_PR, merged_at: null, head: { sha: H, ref: D5_REF, repo: { full_name: headSlug } } };
   const withRef = (rows) => rows.map((row) => ("ref" in row ? row : { ...row, ref: `refs/heads/${D5_REF}` }));
   const activity = activityPages || [history || [
     { activity_type: "push", timestamp: D5_H_AT, before: A, after: H },
@@ -5854,8 +5855,9 @@ function d5Read({ A, H, committed = D5_H_AT, suiteAt = "2026-10-14T14:22:41Z", h
   return read;
 }
 
-function d5Review(commitId, submittedAt = D5_APPROVED_AT) {
-  return { id: 5519191066, user: { login: "groganz" }, state: "APPROVED", commit_id: commitId, submitted_at: submittedAt };
+let d5ReviewIds = 5519191066;   // GitHub's review ids: unique (a review listed twice refuses the read)
+function d5Review(commitId, submittedAt = D5_APPROVED_AT, id = d5ReviewIds++) {
+  return { id, user: { login: "groganz" }, state: "APPROVED", commit_id: commitId, submitted_at: submittedAt };
 }
 
 /** The resolver the gate hands verifyReviewedLine, or undefined on a build that has none. */
@@ -5906,6 +5908,42 @@ test("§5d (b): the forwarded shape (approved at A, forwarded from main to H, eq
   fs.rmSync(r.dir, { recursive: true, force: true });
 });
 
+// KB-243: every activity type but a deletion sets the head branch, a merge of the pull request (pr_merge) and a merge-queue merge
+// (merge_queue_merge) among them, with their `after` commit. Such an arrival, then an approval one second later: the approval counts;
+// in the arrival's own second it does not (the platform's clocks read whole seconds).
+test("§5d: a pr_merge or merge_queue_merge arrival of the head, then an approval one second later, is counted", () => {
+  const r = d5Repo({ mainEdit: "near" });
+  const H = d5Forward(r);
+  for (const kind of ["pr_merge", "merge_queue_merge"]) {
+    const history = [{ activity_type: kind, timestamp: D5_H_AT, before: r.A, after: H },
+      { activity_type: "branch_creation", timestamp: D5_A_AT, before: "0".repeat(40), after: r.A }];
+    const approvalAt = d5ApprovalAt({ read: d5Read({ A: r.A, H, history, suites: { total_count: 0, check_suites: [] } }), anchor: r.main1, cwd: r.dir });
+    assert.equal(typeof approvalAt, "function", "the gate exports no approval-at-head resolver");
+    const later = approvalAt(d5Review(H, "2026-10-14T14:22:40Z"), H);
+    assert.equal(later.ok, true, kind + ": " + later.reason);
+    assert.equal(later.via, "after-arrival", kind);
+    const same = approvalAt(d5Review(H, D5_H_AT), H);
+    assert.equal(same.ok, false, kind + ": an approval in the arrival's own second");
+  }
+});
+
+// The paging rule of the merge-time reader: a list is read through its next links up to 30 pages; at the bound the next page is read
+// too, and only a non-empty page past the bound refuses (a full last page is no refusal of a list that ends there).
+test("§5d: a list that ends on an empty page past the 30-page bound is read; a non-empty one past it refuses", () => {
+  const r = d5Repo({ mainEdit: "near" });
+  const H = d5Forward(r);
+  const filler = [{ event: "labeled" }];
+  const first = [{ event: "committed", sha: r.A }, { event: "committed", sha: H }];
+  const ended = [first, ...Array.from({ length: 29 }, () => filler), []];
+  const approvalAt = d5ApprovalAt({ read: d5Read({ A: r.A, H, timelinePages: ended }), anchor: r.main1, cwd: r.dir });
+  const read = approvalAt(d5Review(H, D5_FRESH), H);
+  assert.equal(read.ok, true, read.reason);
+  const over = [first, ...Array.from({ length: 30 }, () => filler)];
+  const refused = d5ApprovalAt({ read: d5Read({ A: r.A, H, timelinePages: over }), anchor: r.main1, cwd: r.dir })(d5Review(H, D5_FRESH), H);
+  assert.equal(refused.ok, false);
+  assert.match(refused.reason, /holds more than 30 pages/);
+});
+
 test("§5d (a): a fresh approval submitted after the head's arrival counts at the head", () => {
   const r = d5Repo({ mainEdit: "near" });
   const H = d5Forward(r);
@@ -5928,7 +5966,7 @@ test("§5d (a): a fresh approval submitted after the head's arrival counts at th
 test("§5d: any failed or malformed read refuses the approval at the head", () => {
   const r = d5Repo({ mainEdit: "other-file" });
   const H = d5Forward(r);
-  for (const kind of ["pull", "commit", "suites", "timeline", "activity"]) {
+  for (const kind of ["pull", "suites", "timeline", "activity"]) {   // the head commit is never read: its dates are no time of the rule
     for (const how of ["fail", "malformed"]) {
       const read = d5Read({ A: r.A, H, [how]: kind });
       const approvalAt = d5ApprovalAt({ read, anchor: r.main1, cwd: r.dir });
@@ -6082,13 +6120,13 @@ test("§5d: a reviews read with any malformed row trusts no row of it (a malform
   const H = d5Forward(r);
   const approvalAt = d5ApprovalAt({ read: d5Read({ A: r.A, H }), anchor: r.main1, cwd: r.dir });
   const approved = d5Review(H, D5_FRESH);
-  const later = (patch) => ({ ...d5Review(H, "2026-10-14T15:00:00Z"), state: "CHANGES_REQUESTED", ...patch });
+  const later = (patch) => ({ ...d5Review(H, "2026-10-14T15:00:00Z"), state: "CHANGES_REQUESTED", ...patch, id: 6000000001 });
   const cases = [
     later({ submitted_at: "not a time" }),
     later({ submitted_at: undefined }),
     later({ state: undefined }),
     later({ state: "WITHDRAWN" }),
-    later({ user: null }),
+    later({ user: {} }),
     later({ user: { login: "" } }),
     later({ commit_id: undefined }),
     later({ commit_id: "abc123" }),
@@ -6105,8 +6143,13 @@ test("§5d: a reviews read with any malformed row trusts no row of it (a malform
     assert.deepEqual(resolveApprovedHeads(reviews, { prAuthorLogin: "groganz-bot[bot]", permissionByLogin: { groganz: "admin" }, approvalAt, head: H }), [], JSON.stringify(bad));
     assert.throws(() => gateExports.checkedReviews(reviews), /malformed/);
   }
+  // KB-243: GitHub documents a review's user as nullable (a deleted account): such a later change request is no decision of the
+  // reviewer, and the read stays whole.
+  const deleted = [approved, later({ user: null })];
+  assert.equal(verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews: deleted, permission: "admin", prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt }).ok, true);
+  assert.equal(gateExports.reviewRowsProblem(deleted), null);
   // The same second holding an approval and a change request decides nothing.
-  const tied = [approved, { ...approved, state: "CHANGES_REQUESTED" }];
+  const tied = [approved, { ...approved, state: "CHANGES_REQUESTED", id: approved.id + 1 }];
   assert.equal(verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews: tied, permission: "admin", prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt }).ok, false);
   assert.equal(verifyQueuedApprovedHead({ headAtEnqueue: H, reviews: tied, prAuthorLogin: "groganz-bot[bot]", permissionByLogin: { groganz: "admin" }, approvalAt }).ok, false);
   fs.rmSync(r.dir, { recursive: true, force: true });
@@ -6118,7 +6161,8 @@ test("§5d: an activity entry with a missing, unknown or malformed field refuses
   const push = { activity_type: "push", timestamp: D5_H_AT, before: r.A, after: H };
   const cases = [
     { ...push, activity_type: undefined },
-    { ...push, activity_type: "pr_merge" },
+    { ...push, activity_type: "branch_rename" },
+    { ...push, activity_type: "PUSH" },
     { ...push, ref: undefined },
     { ...push, ref: "refs/heads/another-branch" },
     { ...push, before: undefined },
@@ -6276,7 +6320,6 @@ test("§5d: only the platform's whole-second UTC time is a reading; a fraction o
   const pushH = { activity_type: "push", timestamp: D5_H_AT, before: r.A, after: H };
   const createA = { activity_type: "branch_creation", timestamp: D5_A_AT, before: "0".repeat(40), after: r.A };
   const readings = [
-    { committed: "2026-10-14T14:22:39.250Z" },
     { suiteAt: "2026-10-14T14:22:41.500Z" },
     { history: [{ ...pushH, timestamp: "2026-10-14T16:22:39+02:00" }, createA] },
     { timelinePages: [[{ event: "head_ref_force_pushed", created_at: "2026-10-14T14:22:39.100Z", commit_id: H }]] },
@@ -6292,6 +6335,8 @@ test("§5d: only the platform's whole-second UTC time is a reading; a fraction o
   assert.equal(placed(d5Review(H), H).ok, false, "a fractional history time placed the original head");
   // A tie between an approval and a change request differing only below the second refuses (the read is malformed).
   const tie = [d5Review(H, D5_FRESH), { ...d5Review(H, "2026-10-14T14:30:00.400Z"), state: "CHANGES_REQUESTED" }];
+  // A commit's own date, fractional or not, is never read (only times GitHub recorded date the arrival).
+  assert.equal(d5ApprovalAt({ read: d5Read({ A: r.A, H, committed: "2026-10-14T14:22:39.250Z" }), anchor: r.main1, cwd: r.dir })(fresh, H).ok, true);
   assert.equal(verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews: tie, permission: "admin", prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt }).ok, false);
   assert.equal(verifyQueuedApprovedHead({ headAtEnqueue: H, reviews: tie, prAuthorLogin: "groganz-bot[bot]", permissionByLogin: { groganz: "admin" }, approvalAt }).ok, false);
   // The whole-second form still counts at the second after the arrival.
@@ -6367,7 +6412,7 @@ test("§5d: a check suite whose repository or branch is missing or malformed mak
   const bad = [
     { ...good, repository: undefined }, { ...good, repository: null }, { ...good, repository: {} }, { ...good, repository: { full_name: 42 } },
     { ...good, repository: { full_name: "" } }, { ...good, repository: "cinatra-ai/cinatra" },
-    { ...good, head_branch: undefined }, { ...good, head_branch: null }, { ...good, head_branch: "" }, { ...good, head_branch: 7 },
+    { ...good, head_branch: undefined }, { ...good, head_branch: "" }, { ...good, head_branch: 7 }, { ...good, created_at: "" },
   ];
   for (const suite of bad) {
     const read = d5Read({ A: r.A, H, suites: { total_count: 1, check_suites: [suite] } });
@@ -6376,8 +6421,10 @@ test("§5d: a check suite whose repository or branch is missing or malformed mak
     const v = approvalAt(d5Review(H, "2026-10-14T14:22:40Z"), H);
     assert.equal(v.ok, false, `a malformed suite was skipped: ${JSON.stringify(suite)}`);
   }
-  // A VALID other branch or other repository still excludes a suite (it is no reading of this head branch).
-  for (const other of [{ ...good, head_branch: "another-branch" }, { ...good, repository: { full_name: "someone/else" } }]) {
+  // A VALID other branch or other repository still excludes a suite (it is no reading of this head branch), and so do the
+  // documented nulls: a fork's push has a null head_branch, and a suite with a null created_at gives no time.
+  for (const other of [{ ...good, head_branch: "another-branch" }, { ...good, repository: { full_name: "someone/else" } }, { ...good, head_branch: null },
+    { ...good, created_at: null }]) {
     const approvalAt = d5ApprovalAt({ read: d5Read({ A: r.A, H, suites: { total_count: 1, check_suites: [other] } }), anchor: r.main1, cwd: r.dir });
     assert.equal(approvalAt(d5Review(H, "2026-10-14T14:22:40Z"), H).ok, true, JSON.stringify(other));
   }
@@ -6389,12 +6436,11 @@ test("§5d: a check suite whose repository or branch is missing or malformed mak
  * matrix takes its fields and kinds from ARRIVAL_SCHEMAS alone).
  */
 const D5_REQUIRED_PATHS = {
-  pull: ["head.sha", "head.ref", "head.repo.full_name"],
-  commit: ["committer.date"],
-  review: ["state", "user.login", "submitted_at", "commit_id"],
+  pull: ["head.sha", "head.ref", "head.repo.full_name", "merged_at"],
+  review: ["id", "state", "user", "user.login", "submitted_at", "commit_id"],
   checkSuite: ["head_sha", "head_branch", "repository.full_name", "created_at"],
   activity: ["activity_type", "ref", "before", "after", "timestamp"],
-  timeline: ["event", "created_at", "commit_id"],
+  timeline: ["event", "created_at", "commit_id", "sha"],
 };
 
 /** The mutations of each field kind: every one must make the reading refuse. A kind without a list fails the matrix. */
@@ -6415,18 +6461,27 @@ const D5_MUTATIONS = (() => {
     ["trailing dot", "a."], ["at alone", "@"], ["delete character", "a\u007fb"]];
   return {
     time: [...common, ...nul, ...time],
+    timeOrNull: [...common, ...time],
     sha: [...common, ...nul, ...sha],
     shaOrNull: [...common, ...sha],
-    login: [...common, ...nul, ["leading hyphen", { set: "-abc" }], ["trailing hyphen", { set: "abc-" }], ["double hyphen", { set: "a--b" }],
-      ["too long", { set: "a".repeat(40) }], ["underscore", { set: "a_b" }], ["bot suffix twice", { set: "a[bot][bot]" }], ["bare bot suffix", { set: "[bot]" }]],
+    // KB-243: a login is a free string: only its presence, its type and its emptiness are read
+    login: [["missing", { drop: true }], ["wrong type (number)", { set: 42 }], ["wrong type (object)", { set: { x: 1 } }], ["empty", { set: "" }], ...nul],
+    // a review's user: null (a deleted account) is the only value read through this path; any other value is read as a user
+    nullUser: [["missing", { drop: true }], ["wrong type (number)", { set: 42 }], ["wrong type (text)", { set: "groganz" }],
+      ["an object without its login", { set: {} }], ["an empty login", { set: { login: "" } }]],
+    reviewId: [["missing", { drop: true }], ["zero", { set: 0 }], ["negative", { set: -1 }], ["text", { set: "1" }], ["fraction", { set: 1.5 }], ...nul,
+      ["above int64", { set: 1e19 }]],
     repoSlug: [...common, ...nul, ["no owner", { set: "cinatra" }], ["empty owner", { set: "/cinatra" }], ["empty repository", { set: "cinatra-ai/" }],
-      ["three parts", { set: "a/b/c" }], ["dot-dot repository", { set: "cinatra-ai/.." }], ["bad owner", { set: "-x/cinatra" }], ["space in name", { set: "cinatra-ai/a b" }]],
+      ["three parts", { set: "a/b/c" }], ["dot-dot repository", { set: "cinatra-ai/.." }], ["dot-dot owner", { set: "../cinatra" }], ["space in name", { set: "cinatra-ai/a b" }]],
     branchName: [...common, ...nul, ...badBranches.map(([label, v]) => [label, { set: v }])],
+    branchNameOrNull: [...common, ...badBranches.map(([label, v]) => [label, { set: v }])],
     branchRef: [...common, ...nul, ["a tag", { set: "refs/tags/v1" }], ["no namespace", { set: "feature" }], ["empty branch", { set: "refs/heads/" }],
       ...badBranches.map(([label, v]) => [`branch ${label}`, { set: `refs/heads/${v}` }])],
-    timelineEvent: [...common, ...nul, ["upper case", { set: "Committed" }], ["double hyphen", { set: "cross--referenced" }], ["mixed separators", { set: "head_-ref" }], ["leading hyphen", { set: "-referenced" }], ["trailing underscore", { set: "committed_" }], ["dot", { set: "head.ref" }], ["digit", { set: "event1" }], ["leading digit", { set: "1event" }], ["too long", { set: "a".repeat(65) }]],
-    reviewState: [...common, ...nul, ["unknown state", { set: "WITHDRAWN" }]],
-    activityKind: [...common, ...nul, ["unknown kind", { set: "pr_merge" }]],
+    // KB-243: the published issue-event types only (an unpublished name may move the head)
+    timelineEvent: [...common, ...nul, ["upper case", { set: "Committed" }], ["double hyphen", { set: "cross--referenced" }], ["unpublished", { set: "head_ref_rebased" }],
+      ["unpublished hyphen form", { set: "line-commented" }], ["a webhook action", { set: "auto_merge_enabled" }], ["a retired type", { set: "added_to_project" }]],
+    reviewState: [...common, ...nul, ["unknown state", { set: "WITHDRAWN" }], ["lower case", { set: "approved" }]],
+    activityKind: [...common, ...nul, ["unknown kind", { set: "branch_rename" }], ["upper case", { set: "PR_MERGE" }]],
   };
 })();
 
@@ -6501,7 +6556,8 @@ test("§5d (KB-239): a generated mutation matrix over every used field of every 
   const timeline = [{ event: "committed", sha: r.A }, { event: "reviewed", commit_id: H, state: "approved" }, headEvent, { event: "committed", sha: H }];
   const base = d5Read({ A: r.A, H, timelinePages: [timeline] });
   const fresh = d5Review(H, D5_FRESH);
-  const reviews = [{ ...d5Review(H, "2026-10-14T14:25:00Z"), state: "COMMENTED" }, fresh];
+  // the second row is a deleted account's review (user null, documented): it reads the `user` path alone
+  const reviews = [{ ...d5Review(H, "2026-10-14T14:25:00Z"), state: "COMMENTED" }, { ...d5Review(H, "2026-10-14T14:26:00Z"), state: "COMMENTED", user: null }, fresh];
   const verifyList = (list, at) => verifyReviewedLine({ login: "groganz", tier: "maintainer" },
     { reviews: list, permission: "admin", prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt: at });
   const unmutated = d5ApprovalAt({ read: base, anchor: r.main1, cwd: r.dir });
@@ -6510,15 +6566,19 @@ test("§5d (KB-239): a generated mutation matrix over every used field of every 
   assert.equal(verifyList(reviews, unmutated).ok, true);
   // The rows of each endpoint the matrix mutates, and the fields that apply to each row (the rule's own conditions).
   const rows = {
-    pull: [{}], commit: [{}],
+    pull: [{}],
     checkSuite: base(`/repos/${D5_SLUG}/commits/${H}/check-suites?per_page=100&page=1`).check_suites,
     activity: base.page(`/repos/${D5_SLUG}/activity?ref=refs/heads/${D5_REF}&direction=desc&per_page=100`).body,
     timeline,
     review: reviews,
   };
   const applies = (endpoint, row, path) => {
-    if (endpoint === "timeline" && !["head_ref_force_pushed", "head_ref_restored"].includes(row.event)) return path === "event";
-    if (endpoint === "review" && row.state === "PENDING") return path === "state" || path === "user.login";
+    if (endpoint === "timeline" && ["head_ref_force_pushed", "head_ref_restored"].includes(row.event)) return ["event", "created_at", "commit_id"].includes(path);
+    if (endpoint === "timeline" && row.event === "committed") return ["event", "sha"].includes(path);
+    if (endpoint === "timeline") return path === "event";
+    if (endpoint === "review" && row.user === null) return ["id", "state", "user"].includes(path);
+    if (endpoint === "review" && row.state === "PENDING") return ["id", "state", "user.login"].includes(path);
+    if (endpoint === "review") return path !== "user";
     return true;
   };
   let cases = 0;
@@ -6529,7 +6589,9 @@ test("§5d (KB-239): a generated mutation matrix over every used field of every 
       if (!mutations) { problems.push(`${endpoint}.${path}: no mutations for the kind ${kind}`); continue; }
       const indexes = rows[endpoint].map((row, i) => i).filter((i) => applies(endpoint, rows[endpoint][i], path));
       if (!indexes.length) { problems.push(`${endpoint}.${path}: no fixture row uses this field`); continue; }
-      const all = path.includes(".") ? [...mutations, ["parent missing", { parent: "drop" }], ["parent wrong type", { parent: "wrong" }]] : mutations;
+      // a field the excerpt documents as not required is validated when present: its absence is no mutation
+      const kept = (gateExports.OPTIONAL_FIELDS?.[endpoint] || []).includes(path) ? mutations.filter(([, how]) => !how.drop) : mutations;
+      const all = path.includes(".") ? [...kept, ["parent missing", { parent: "drop" }], ["parent wrong type", { parent: "wrong" }]] : kept;
       for (const index of indexes) {
         for (const [label, how] of all) {
           cases += 1;
@@ -6594,22 +6656,31 @@ test("§5d: a branch name that git refuses (a single space) does not hide a late
   fs.rmSync(r.dir, { recursive: true, force: true });
 });
 
-test("§5d: a later change request whose login GitHub would refuse (a single space) withdraws trust in the whole reviews read", () => {
+test("§5d (KB-243): a login is a free string compared by ASCII case folding; a later change request by another login leaves the approval", () => {
   const r = d5Repo({ mainEdit: "other-file" });
   const H = d5Forward(r);
   const approvalAt = d5ApprovalAt({ read: d5Read({ A: r.A, H }), anchor: r.main1, cwd: r.dir });
   const approved = d5Review(H, D5_FRESH);
-  for (const login of [" ", "groganz ", "gro ganz", "-groganz", "groganz-", "gro--ganz", "x".repeat(40), "groganz[bot][bot]"]) {
+  const opts = { prAuthorLogin: "groganz-bot[bot]", permissionByLogin: { groganz: "admin" }, approvalAt };
+  const line = (reviews) => verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt });
+  // GitHub types a login as a free string: any non-empty login is read, and one that differs is another account's
+  for (const login of [" ", "groganz ", "gro ganz", "-groganz", "groganz-", "x".repeat(40), "groganz[bot][bot]", "gro_ganz", "\u212Aroganz"]) {
     const reviews = [approved, { ...d5Review(H, "2026-10-14T15:00:00Z"), state: "CHANGES_REQUESTED", user: { login } }];
-    const opts = { prAuthorLogin: "groganz-bot[bot]", permissionByLogin: { groganz: "admin" }, approvalAt };
-    assert.equal(verifyReviewedLine({ login: "groganz", tier: "maintainer" }, { reviews, permission: "admin", prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt }).ok, false, JSON.stringify(login));
-    assert.deepEqual(resolveApprovedHeads(reviews, { ...opts, head: H }), [], JSON.stringify(login));
-    assert.equal(verifyQueuedApprovedHead({ headAtEnqueue: H, reviews, ...opts }).ok, false, JSON.stringify(login));
+    assert.equal(gateExports.reviewRowsProblem(reviews), null, JSON.stringify(login));
+    assert.equal(line(reviews).ok, true, JSON.stringify(login));
+    assert.deepEqual(resolveApprovedHeads(reviews, { ...opts, head: H }), [H], JSON.stringify(login));
   }
-  // The login forms GitHub does issue stay readable.
-  for (const login of ["groganz", "groganz-bot[bot]", "a", "a-b-c", "x".repeat(39)]) {
-    assert.equal(gateExports.reviewRowsProblem([{ ...approved, user: { login } }]), null, login);
+  // the same login in another ASCII case is the reviewer's own: its later change request decides
+  for (const login of ["Groganz", "GROGANZ"]) {
+    const reviews = [approved, { ...d5Review(H, "2026-10-14T15:00:00Z"), state: "CHANGES_REQUESTED", user: { login } }];
+    assert.equal(line(reviews).ok, false, login);
+    assert.equal(verifyQueuedApprovedHead({ headAtEnqueue: H, reviews, ...opts }).ok, false, login);
   }
+  // an approval by a look-alike with a non-ASCII letter (the Kelvin sign for K) is no approval of the reviewer
+  assert.equal(verifyReviewedLine({ login: "kelly", tier: "maintainer" }, { reviews: [{ ...approved, user: { login: "\u212Aelly" } }], permission: "admin",
+    prAuthorLogin: "groganz-bot[bot]", reviewedHeadSha: H, approvalAt }).ok, false);
+  // an empty login, or none, refuses the whole read
+  for (const user of [{ login: "" }, {}, { login: 7 }]) assert.notEqual(gateExports.reviewRowsProblem([approved, { ...d5Review(H, "2026-10-14T15:00:00Z"), user }]), null, JSON.stringify(user));
   fs.rmSync(r.dir, { recursive: true, force: true });
 });
 
@@ -6625,7 +6696,11 @@ function d5Declared(schemas, endpoint, value, log) {
   for (const path of Object.keys(schemas[endpoint] || {})) {
     let node = tree;
     const keys = path.split(".");
-    keys.forEach((key, i) => { node[key] ??= i === keys.length - 1 ? true : {}; node = node[key]; });
+    keys.forEach((key, i) => {
+      if (i === keys.length - 1) node[key] ??= true;
+      else if (typeof node[key] !== "object") node[key] = {};   // `user` and `user.login` both declared: the object of its fields
+      node = node[key];
+    });
   }
   const own = (node, prop) => Object.prototype.hasOwnProperty.call(node, prop);
   const deny = (what) => { log.push(what); throw new D5UndeclaredRead(`undeclared read: ${what}`); };
@@ -6670,7 +6745,7 @@ function d5EndToEnd(gate, r, H, { timeline: given = null } = {}) {
   const log = [];
   const schemas = gate.ARRIVAL_SCHEMAS;
   const timeline = given || [{ event: "committed", sha: r.A }, { event: "cross-referenced", created_at: "2026-10-14T14:05:00Z" },
-    { event: "head_ref_force_pushed", created_at: "2026-10-14T14:10:00Z", commit_id: r.A }, { event: "line-commented" }, { event: "committed", sha: H }];
+    { event: "head_ref_force_pushed", created_at: "2026-10-14T14:10:00Z", commit_id: r.A }, { event: "commented" }, { event: "committed", sha: H }];
   const read = d5DeclaredRead(d5Read({ A: r.A, H, timelinePages: [timeline] }), schemas, log);
   const review = (row) => d5Declared(schemas, "review", row, log);
   const fresh = d5Review(H, D5_FRESH);
@@ -6755,33 +6830,29 @@ test("§5d (KB-239): the arrival rule reads no API field its schema does not dec
   for (const dir of [raw.dir, suite.dir, reviewPlant.dir, r.dir]) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-/** GitHub's documented issue event types, plus the timeline's own comment events: every one is a well-formed event name. */
-const D5_DOCUMENTED_EVENTS = [
-  "added_to_project", "assigned", "automatic_base_change_failed", "automatic_base_change_succeeded", "base_ref_changed", "closed",
-  "commented", "committed", "connected", "convert_to_draft", "converted_note_to_issue", "converted_to_discussion", "cross-referenced",
-  "demilestoned", "deployed", "deployment_environment_changed", "disconnected", "head_ref_deleted", "head_ref_restored",
-  "head_ref_force_pushed", "labeled", "locked", "mentioned", "marked_as_duplicate", "merged", "milestoned", "moved_columns_in_project",
-  "pinned", "ready_for_review", "referenced", "removed_from_project", "renamed", "reopened", "review_dismissed", "review_requested",
-  "review_request_removed", "reviewed", "subscribed", "transferred", "unassigned", "unlabeled", "unlocked", "unmarked_as_duplicate",
-  "unpinned", "unsubscribed", "user_blocked", "line-commented", "commit-commented",
-];
+/** GitHub's published issue event types (the vendored excerpt; a test compares the gate's list with it). */
+const D5_DOCUMENTED_EVENTS = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "github-rest-excerpt.json"), "utf8")).enums["timeline.event"];
 
-test("§5d: every documented timeline event name is read, and a cross-referenced pull request keeps its approval", () => {
+test("§5d (KB-243): every published timeline event type is read, an unpublished one refuses, and a cross-referenced pull request keeps its approval", () => {
   const parse = gateExports.parseArrivalRow;
   assert.equal(typeof parse, "function", "the gate exports no schema parser");
+  assert.ok(D5_DOCUMENTED_EVENTS.length >= 40, "the excerpt names the published event types");
   for (const event of D5_DOCUMENTED_EVENTS) {
     const head = event === "head_ref_force_pushed" || event === "head_ref_restored";
-    const row = head ? { event, created_at: "2026-10-14T14:10:00Z", commit_id: null } : { event };
+    const row = head ? { event, created_at: "2026-10-14T14:10:00Z", commit_id: null } : event === "committed" ? { event, sha: "a".repeat(40) } : { event };
     assert.doesNotThrow(() => parse("timeline", row), event);
   }
-  for (const event of ["", " ", "Cross-Referenced", "cross referenced", "cross--referenced", "cross_-referenced", "-referenced", "referenced-",
-    "cross.referenced", "cross\u0007referenced", "cross/referenced", "1event", "event1", "a".repeat(65)]) {
+  // an event type GitHub does not publish may move the head: it refuses (the timeline's own comment shapes, retired project events,
+  // webhook actions and every malformed name alike)
+  for (const event of ["line-commented", "commit-commented", "added_to_project", "converted_note_to_issue", "moved_columns_in_project",
+    "removed_from_project", "auto_merge_enabled", "head_ref_rebased", "", " ", "Cross-Referenced", "cross referenced", "cross--referenced",
+    "cross_-referenced", "-referenced", "referenced-", "cross.referenced", "cross\u0007referenced", "cross/referenced", "1event", "event1", "a".repeat(65)]) {
     assert.throws(() => parse("timeline", { event }), /event/, JSON.stringify(event));
   }
   const r = d5Repo({ mainEdit: "other-file" });
   const H = d5Forward(r);
   const timeline = [{ event: "committed", sha: r.A }, { event: "cross-referenced", created_at: "2026-10-14T13:00:00Z" },
-    ...D5_DOCUMENTED_EVENTS.filter((e) => !e.startsWith("head_ref_")).map((event) => ({ event })), { event: "committed", sha: H }];
+    ...D5_DOCUMENTED_EVENTS.filter((e) => !e.startsWith("head_ref_") && e !== "committed").map((event) => ({ event })), { event: "committed", sha: H }];
   const approvalAt = d5ApprovalAt({ read: d5Read({ A: r.A, H, timelinePages: [timeline] }), anchor: r.main1, cwd: r.dir });
   const fresh = approvalAt(d5Review(H, D5_FRESH), H);
   assert.equal(fresh.ok, true, `a cross-referenced pull request lost its approval: ${fresh.reason}`);

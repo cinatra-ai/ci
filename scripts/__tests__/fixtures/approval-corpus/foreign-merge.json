@@ -1,0 +1,250 @@
+{
+ "corpus": 1,
+ "case": "foreign-merge",
+ "about": "H merges FOREIGN, a commit that becomes main's tip only after H arrived: an ancestor of main now, never its tip then.",
+ "origin": "the plain-forward rule: the base tip at the merge's time, never an ancestor of the base now",
+ "ask": {
+  "reading": "owner-approval",
+  "repository": "example-org/example-app",
+  "pull": 7,
+  "head": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+  "owner": "example-owner"
+ },
+ "platform": {
+  "rest": {
+   "repos/example-org/example-app/pulls/7": {
+    "number": 7,
+    "state": "open",
+    "merged_at": null,
+    "head": {
+     "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "feature/example-change",
+     "repo": {
+      "full_name": "example-org/example-app"
+     }
+    },
+    "base": {
+     "ref": "main",
+     "repo": {
+      "full_name": "example-org/example-app"
+     }
+    }
+   },
+   "repos/example-org/example-app/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11/check-suites?per_page=100&page=1": {
+    "total_count": 2,
+    "check_suites": [
+     {
+      "id": 4001,
+      "head_sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+      "head_branch": "feature/example-change",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-01-15T10:00:02Z",
+      "updated_at": "2026-01-15T10:00:02Z",
+      "repository": {
+       "full_name": "example-org/example-app"
+      },
+      "app": {
+       "slug": "github-actions"
+      }
+     },
+     {
+      "id": 4002,
+      "head_sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+      "head_branch": "feature/example-change",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-01-15T10:01:30Z",
+      "updated_at": "2026-01-15T10:01:30Z",
+      "repository": {
+       "full_name": "example-org/example-app"
+      },
+      "app": {
+       "slug": "github-actions"
+      }
+     }
+    ]
+   },
+   "repos/example-org/example-app/issues/7/timeline?per_page=100&page=1": [
+    {
+     "event": "committed",
+     "sha": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "message": "example change",
+     "committer": {
+      "date": "2026-01-15T08:59:00Z"
+     }
+    },
+    {
+     "event": "review_requested",
+     "id": 3001,
+     "created_at": "2026-01-15T09:05:00Z",
+     "commit_id": null
+    },
+    {
+     "event": "committed",
+     "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "message": "example change",
+     "committer": {
+      "date": "2026-01-15T10:00:00Z"
+     }
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=100": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "after": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T10:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "0000000000000000000000000000000000000000",
+     "after": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T09:00:00Z",
+     "activity_type": "branch_creation",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/pulls/7/reviews?per_page=100&page=1": [
+    {
+     "id": 1001,
+     "node_id": "R_example1001",
+     "user": {
+      "login": "example-owner",
+      "id": 6001,
+      "type": "User"
+     },
+     "body": "",
+     "state": "APPROVED",
+     "commit_id": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "author_association": "MEMBER",
+     "submitted_at": "2026-01-15T09:30:00Z"
+    }
+   ],
+   "repos/example-org/example-app/activity?ref=refs/heads/main&direction=desc&per_page=100": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44",
+     "after": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T11:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "after": "dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T09:50:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9002,
+     "node_id": "A_example2",
+     "before": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "after": "ff66ff66ff66ff66ff66ff66ff66ff66ff66ff66",
+     "ref": "refs/heads/main",
+     "timestamp": "2026-01-15T08:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ],
+   "repos/example-org/example-app/git/commits/aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11": {
+    "sha": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+    "tree": {
+     "sha": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+    },
+    "parents": [
+     {
+      "sha": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22"
+     },
+     {
+      "sha": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"
+     }
+    ],
+    "message": "example change",
+    "author": {
+     "name": "Example Author",
+     "date": "2026-01-15T10:00:00Z"
+    },
+    "committer": {
+     "name": "Example Author",
+     "date": "2026-01-15T10:00:00Z"
+    }
+   },
+   "repos/example-org/example-app/activity?ref=refs/heads/feature/example-change&direction=desc&per_page=10": [
+    {
+     "id": 9000,
+     "node_id": "A_example0",
+     "before": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "after": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T10:00:00Z",
+     "activity_type": "push",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    },
+    {
+     "id": 9001,
+     "node_id": "A_example1",
+     "before": "0000000000000000000000000000000000000000",
+     "after": "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22",
+     "ref": "refs/heads/feature/example-change",
+     "timestamp": "2026-01-15T09:00:00Z",
+     "activity_type": "branch_creation",
+     "actor": {
+      "login": "example-author",
+      "id": 5001,
+      "type": "User"
+     }
+    }
+   ]
+  },
+  "diffs": {
+   "repos/example-org/example-app/compare/main...aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11": "diff --git a/src/example.ts b/src/example.ts\nindex 1111111..2222222 100644\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n",
+   "repos/example-org/example-app/compare/main...bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22": "diff --git a/src/example.ts b/src/example.ts\nindex 1111111..2222222 100644\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n"
+  },
+  "mergeTrees": {
+   "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22 dd44dd44dd44dd44dd44dd44dd44dd44dd44dd44": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+   "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22 9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+  }
+ },
+ "expect": {
+  "exit": 1,
+  "verdict": "refused",
+  "line": "merges 9a9a9a9a9a9a, which was not the tip of main at that time (2026-01-15T10:00:00Z)"
+ }
+}
