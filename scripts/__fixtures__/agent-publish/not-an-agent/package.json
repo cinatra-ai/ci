@@ -1,0 +1,9 @@
+{
+  "name": "@example/some-connector",
+  "version": "0.1.0",
+  "private": true,
+  "cinatra": {
+    "apiVersion": "cinatra.ai/v1",
+    "kind": "connector"
+  }
+}
