@@ -661,6 +661,34 @@ cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
    scripts/lib/vendor/test-host-context.mjs
 ```
 
+## agent-publish-gate
+
+A standalone Node engine (`scripts/agent-publish-gate.mjs`, Node built-ins only)
+that checks ONE agent pack's flow (`cinatra/oas.json`) against the publish
+contract. The host stops a run in front of every step the pack declares with
+`metadata.cinatra.publishes: true` and asks one person to confirm, so the pack
+must declare its writing steps and must not keep a confirm step of its own.
+
+| Rule | Refuses |
+|------|---------|
+| `oas.publish-undeclared` | A step with no `publishes` key, unless its kind cannot reach a connector (`StartNode`, `EndNode`, `InputMessageNode`, `OutputMessageNode`, `BranchingNode`) or its `metadata.cinatra.riskClass` is exactly `read_only`. Declare `true` for a step that publishes and `false` for one that writes but does not publish. A step listed in a flow whose component is not in the file is refused too. |
+| `oas.publish-malformed` | A `publishes` value that is not a JSON boolean. |
+| `oas.publish-reserved-id` | An id, a referenced-component key or a reference that starts with the host's gate prefix `cinatra_publish_gate__`. |
+| `oas.publish-own-gate` | A confirm or approval step of the pack's own in front of a publishing step: an `InputMessageNode` with a control edge into the step (directly or through `BranchingNode`s only), `requiresApproval: true` on the step, or a root `hitlScreens` entry beside it unless the package declares that screen's renderer without `midRunHitl: true`. |
+
+A pack with no `cinatra/oas.json` passes and says so. A package whose
+`package.json` does not declare `cinatra.kind: "agent"`, an unreadable or
+non-object file, and an unknown option exit 2. Findings name ids only, never a
+value the pack wrote.
+
+### Run locally
+
+```sh
+node scripts/agent-publish-gate.mjs --package <dir> [--format json]
+```
+
+Exit codes: `0` pass, `1` findings, `2` error.
+
 ## hot-install-canary-gate
 
 A reusable GitHub Actions workflow that RUNS the host repo's **cross-kind
