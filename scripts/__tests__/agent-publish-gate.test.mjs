@@ -675,6 +675,166 @@ test("the findings are the same on every run", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Reference scopes held by an edge, values that are neither a component nor a reference, and aliases.
+
+const CONFIRM = Object.freeze({ component_type: "InputMessageNode", id: "confirm", name: "confirm" });
+const ODD_WRITE = () => ({ component_type: "Api", id: "odd", name: "odd", metadata: { cinatra: { ...WRITE } } });
+
+// A control edge from `from` to `to` (two references), with its own $referenced_components map when `refs` is given.
+function controlEdge(name, from, to, refs) {
+  const edge = { component_type: "ControlFlowEdge", name, from_node: { $component_ref: from }, to_node: { $component_ref: to } };
+  if (refs) edge.$referenced_components = refs;
+  return edge;
+}
+
+test("an inline edge that holds its own map resolves its endpoints there: an unknown-kind writing step is checked", () => {
+  const f = declaredPublishPack();
+  f.control_flow_connections.push(controlEdge("read_post_to_odd", "read_post", "odd", { odd: ODD_WRITE() }));
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-undeclared odd"]);
+});
+
+test("an inline edge that holds its own map resolves its endpoints there: an InputMessageNode into a publishing node is its own confirm gate", () => {
+  const f = declaredPublishPack();
+  f.control_flow_connections.push(controlEdge("confirm_to_publish", "confirm", "publish", { confirm: { ...CONFIRM } }));
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate confirm"]);
+});
+
+test("an edge kept as a referenced component that holds its own map resolves its endpoints there", () => {
+  const f = declaredPublishPack();
+  f.$referenced_components.gate_edge = controlEdge("gate_edge", "confirm", "publish", { confirm: { ...CONFIRM } });
+  f.control_flow_connections.push({ $component_ref: "gate_edge" });
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate confirm"]);
+});
+
+for (const [label, place] of [
+  ["a nodes entry that is a bare string", (f) => f.nodes.push("odd")],
+  ["a nodes entry that is null", (f) => f.nodes.push(null)],
+  ["a control_flow_connections entry that is a bare string", (f) => f.control_flow_connections.push("odd_edge")],
+  ["a data_flow_connections entry that is a number", (f) => f.data_flow_connections.push(7)],
+  ["a start_node that is a bare string", (f) => { f.start_node = "odd"; }],
+  ["a control edge whose to_node is a bare string", (f) => f.control_flow_connections.push({ ...controlEdge("e", "read_post", "x"), to_node: "odd" })],
+  ["a data edge whose source_node is a bare string", (f) => f.data_flow_connections.push({ component_type: "DataFlowEdge", name: "e", source_node: "odd", destination_node: { $component_ref: "publish" } })],
+]) {
+  test(`${label} is refused, by the flow's id, since the step it names cannot be checked`, () => {
+    const f = withOddStep(() => {});
+    f.$referenced_components.odd_edge = controlEdge("odd_edge", "read_post", "odd");
+    place(f);
+    assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-undeclared flow"]);
+  });
+}
+
+test("a reference to a reference is followed to the component: an aliased InputMessageNode into a publishing node is its own confirm gate", () => {
+  const f = declaredPublishPack();
+  f.$referenced_components.confirm = { ...CONFIRM };
+  f.$referenced_components.confirm_alias = { $component_ref: "confirm", metadata: { cinatra: { publishes: false } } };
+  f.control_flow_connections.push(controlEdge("alias_to_publish", "confirm_alias", "publish"));
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate confirm"]);
+});
+
+test("a loop of references ends, and a listed step that names it is refused", () => {
+  const f = declaredPublishPack();
+  f.$referenced_components.a = { $component_ref: "b" };
+  f.$referenced_components.b = { $component_ref: "a" };
+  f.nodes.push({ $component_ref: "a" });
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-undeclared a"]);
+});
+
+test("a nearer map entry that is not an object does not shadow: the reference resolves to the outer component", () => {
+  const f = flow([node("start", "StartNode"), node("sub", "FlowNode", { publishes: false }), node("end", "EndNode")], [
+    ["start", "sub"],
+    ["sub", "end"],
+  ]);
+  f.$referenced_components.shared = { component_type: "Api", id: "shared", name: "shared", metadata: { cinatra: { ...WRITE } } };
+  f.$referenced_components.sub.subflow = {
+    component_type: "Flow",
+    id: "inner",
+    name: "inner",
+    start_node: { $component_ref: "shared" },
+    nodes: [{ $component_ref: "shared" }],
+    $referenced_components: { shared: "not a component" },
+  };
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-undeclared shared"]);
+});
+
+test("a start node or an edge whose reference names nothing in the file gives no finding (there is nothing to run)", () => {
+  const f = declaredPublishPack();
+  f.start_node = { $component_ref: "nowhere" };
+  f.control_flow_connections.push({ $component_ref: "missing_edge" });
+  f.data_flow_connections.push({ $component_ref: "missing_data_edge" });
+  assert.deepEqual(checkAgentFlow(f), []);
+});
+
+test("an id with the reserved prefix is refused on a listed inline component with no component_type", () => {
+  const f = declaredPublishPack();
+  f.nodes.push({ id: `${PUBLISH_GATE_ID_PREFIX}x`, name: "x", metadata: { cinatra: { publishes: false } } });
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), [`oas.publish-reserved-id ${PUBLISH_GATE_ID_PREFIX}x`]);
+});
+
+test("a referenced-component key with the reserved prefix is refused whatever its value", () => {
+  for (const value of ["text", [1], 7, null]) {
+    const f = declaredPublishPack();
+    f.$referenced_components[`${PUBLISH_GATE_ID_PREFIX}k`] = value;
+    assert.deepEqual(rulesOf(checkAgentFlow(f)), [`oas.publish-reserved-id ${PUBLISH_GATE_ID_PREFIX}k`], JSON.stringify(value));
+  }
+});
+
+test("an empty flow object has no step, so it has no finding", () => {
+  assert.deepEqual(checkAgentFlow({}), []);
+});
+
+test("a root HITL screen whose id holds a mid-run ending only inside it is allowed when its renderer has no midRunHitl key", () => {
+  const screen = "@example/publish-agent:output-view";
+  const f = declaredPublishPack({ root: { hitlScreens: [screen] } });
+  assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: screen, kind: "example-confirm" }] }), []);
+});
+
+for (const [label, value] of [
+  ["an object", { on: false }],
+  ["a list", [false]],
+]) {
+  test(`a root HITL screen whose renderer declares midRunHitl as ${label} is refused beside a publishing node`, () => {
+    const f = declaredPublishPack({ root: { hitlScreens: [SCREEN] } });
+    assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: value }] })), [
+      "oas.publish-own-gate publish",
+    ]);
+  });
+}
+
+for (const [label, value] of [
+  ["the number 0", 0],
+  ["the empty string", ""],
+  ["the string \"false\"", "false"],
+  ["an object", { on: false }],
+  ["a list", [false]],
+]) {
+  test(`a publishing node that declares requiresApproval as ${label} is refused (only false passes)`, () => {
+    const f = declaredPublishPack({ publish: { requiresApproval: value } });
+    assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate publish"]);
+  });
+}
+
+test("with two publishing nodes, a confirm step in front of both is named once, and a step or screen finding is given for each", () => {
+  const twoPublishers = (cinatra = {}, root = {}) => {
+    const nodes = [
+      node("start", "StartNode"),
+      node("confirm", "InputMessageNode"),
+      node("pick", "BranchingNode"),
+      node("publish", "ApiNode", { ...WRITE, publishes: true, ...cinatra }),
+      node("publish2", "ApiNode", { ...WRITE, publishes: true, ...cinatra }),
+      node("end", "EndNode"),
+    ];
+    return flow(nodes, [["start", "confirm"], ["confirm", "pick"], ["pick", "publish"], ["pick", "publish2"], ["publish", "end"], ["publish2", "end"]], root);
+  };
+  assert.deepEqual(rulesOf(checkAgentFlow(twoPublishers())), ["oas.publish-own-gate confirm"]);
+  // Without the confirm step's edge: a requiresApproval, a screen, or both, give one finding per publishing node.
+  for (const [cinatra, root] of [[{ requiresApproval: true }, {}], [{}, { hitlScreens: [SCREEN] }], [{ requiresApproval: true }, { hitlScreens: [SCREEN] }]]) {
+    const g = twoPublishers(cinatra, root);
+    g.control_flow_connections = g.control_flow_connections.filter((e) => e.name !== "confirm_to_pick");
+    assert.deepEqual(rulesOf(checkAgentFlow(g)), ["oas.publish-own-gate publish", "oas.publish-own-gate publish2"]);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // The package reader and the command line, over the committed fixture packs.
 
 test("checkAgentPackage reads the flow and the package's renderers", () => {
@@ -758,6 +918,28 @@ test("-h prints the usage, and an option with no value or with another option as
   const optionAsValue = runGate(["--package", "--format", "json"]);
   assert.equal(optionAsValue.status, 2);
   assert.match(optionAsValue.stderr, /--package needs a value/);
+});
+
+test("an option value that starts with a dash is refused, so a short option is never read as a package path (exit 2)", () => {
+  const swallowed = runGate(["--package", "-h", "--help"]);
+  assert.equal(swallowed.status, 2, swallowed.stdout + swallowed.stderr);
+  assert.match(swallowed.stderr, /--package needs a value/);
+  // A folder named "-h" that holds an agent pack with no flow would pass if "-h" were read as its path.
+  withTempPack({ "-h/package.json": AGENT_PKG }, (dir) => {
+    for (const args of [["--package", "-h"], ["--format", "-h"]]) {
+      const r = spawnSync("node", [GATE, ...args], { encoding: "utf8", cwd: dir });
+      assert.equal(r.status, 2, r.stdout + r.stderr);
+      assert.match(r.stderr, new RegExp(`${args[0]} needs a value`));
+    }
+  });
+});
+
+test("a pack whose flow is an empty object passes with no finding (exit 0)", () => {
+  withTempPack({ "package.json": AGENT_PKG, "cinatra/oas.json": "{}" }, (dir) => {
+    const r = runGate(["--package", dir]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /PASS, 0 findings/);
+  });
 });
 
 test("the JSON output of a passing pack and of a pack with no flow says whether a flow was read", () => {
@@ -881,5 +1063,15 @@ test("the gate does not run when it is imported with no script path or with a sc
       assert.equal(r.status, 0, r.stdout + r.stderr);
       assert.equal(r.stdout, "");
     }
+  });
+});
+
+test("the gate does not run when it is imported by another script file that exists", () => {
+  withTempPack({}, (dir) => {
+    const runner = path.join(dir, "runner.mjs");
+    fs.writeFileSync(runner, `await import(${JSON.stringify(pathToFileURL(GATE).href)});\n`);
+    const r = spawnSync("node", [runner, "--help"], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.stdout, "");
   });
 });
