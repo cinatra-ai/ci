@@ -576,11 +576,24 @@ test("a root HITL screen whose renderer has no midRunHitl key is allowed beside 
   assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, kind: "example-confirm" }] }), []);
 });
 
-for (const ending of [":output", "-output", ":list-picker", ":scrape-schema-review", ":final-list-review", ":setup-form"]) {
+// The renderer id endings that the core's classifyMidRunHitl reads as mid-run whatever the renderer declares.
+const MID_RUN_ENDINGS = [":output", "-output", ":list-picker", ":scrape-schema-review", ":final-list-review", ":setup-form"];
+
+for (const ending of MID_RUN_ENDINGS) {
   test(`a root HITL screen whose id ends in "${ending}" is refused beside a publishing node, even when declared not mid-run`, () => {
     const screen = `@example/publish-agent:confirm${ending}`;
     const f = declaredPublishPack({ root: { hitlScreens: [screen] } });
     assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: screen, midRunHitl: false }] })), [
+      "oas.publish-own-gate publish",
+    ]);
+  });
+}
+
+for (const ending of MID_RUN_ENDINGS) {
+  test(`a root HITL screen whose id ends in "${ending}" is refused beside a publishing node when its renderer has no midRunHitl key`, () => {
+    const screen = `@example/publish-agent:confirm${ending}`;
+    const f = declaredPublishPack({ root: { hitlScreens: [screen] } });
+    assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: screen, kind: "example-confirm" }] })), [
       "oas.publish-own-gate publish",
     ]);
   });
