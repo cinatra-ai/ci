@@ -21,6 +21,7 @@ const EDGE_ENDS = { control_flow_connections: ["from_node", "to_node"], data_flo
 
 // The kinds that cannot reach a connector, so they need no declaration.
 const NO_CONNECTOR_KINDS = new Set(["StartNode", "EndNode", "InputMessageNode", "OutputMessageNode", "BranchingNode"]);
+const CORE_MID_RUN_ENDINGS = [":output", "-output", ":list-picker", ":scrape-schema-review", ":final-list-review", ":setup-form"];
 
 export class GateError extends Error {}
 
@@ -239,13 +240,13 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     if (!Array.isArray(screens)) {
       offending = "a hitlScreens value that is not a list of screen ids";
     } else {
-      // A screen passes only when this package declares its renderer exactly
-      // once, with midRunHitl false or without the key (the core reads only
-      // true as mid-run: packages/agents/src/orchestrator-mid-run-hitl.ts in
-      // cinatra-ai/cinatra). Any other value, or a second entry, is refused.
+      // A screen passes only when this package declares its renderer exactly once, with midRunHitl false or
+      // without the key, and its id has no ending in CORE_MID_RUN_ENDINGS. The core reads the key as mid-run only
+      // when it is true, and those endings as mid-run whatever is declared (cinatra-ai/cinatra at 9ee9adf8,
+      // packages/agents/src/orchestrator-mid-run-hitl.ts:24-28 and 40-50). Any other value, or a second entry, is refused.
       for (const screen of screens) {
         const matches = typeof screen === "string" ? renderers.filter((r) => r.id === screen) : [];
-        const notMidRun = matches.length === 1 && (!Object.hasOwn(matches[0], "midRunHitl") || matches[0].midRunHitl === false);
+        const notMidRun = matches.length === 1 && (!Object.hasOwn(matches[0], "midRunHitl") || matches[0].midRunHitl === false) && !CORE_MID_RUN_ENDINGS.some((end) => screen.endsWith(end));
         if (!notMidRun) {
           offending = typeof screen === "string" ? `hitlScreens entry ${quoteId(screen)}` : "a hitlScreens entry that is not a screen id";
           break;
@@ -257,7 +258,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         const stepName = nameOf(step);
         ownGate(
           stepName,
-          `the flow root lists ${offending} beside publishing node ${quoteId(stepName)}; only a screen whose renderer this package declares once, with midRunHitl false or without it, is not a confirm step of the pack's own`,
+          `the flow root lists ${offending} beside publishing node ${quoteId(stepName)}; only a screen whose renderer this package declares once, with midRunHitl false or without it, and whose id has no ending the core reads as mid-run, is not a confirm step of the pack's own`,
         );
       }
     }
