@@ -672,21 +672,19 @@ must declare its writing steps and must not keep a confirm step of its own.
 
 | Rule | Refuses |
 |------|---------|
-| `oas.publish-undeclared` | A step with no `publishes` key, unless its kind cannot reach a connector (`StartNode`, `EndNode`, `InputMessageNode`, `OutputMessageNode`, `BranchingNode`) or its `metadata.cinatra.riskClass` is exactly `read_only`. Declare `true` for a step that publishes and `false` for one that writes but does not publish. A step is a component whose kind ends in `Node`, or one that a flow lists in `nodes`, names as `start_node` or reaches as an edge endpoint. A listed step whose component is not in the file is refused too. |
+| `oas.publish-undeclared` | A step with no `publishes` key, unless its kind cannot reach a connector (`StartNode`, `EndNode`, `InputMessageNode`, `OutputMessageNode`, `BranchingNode`) or its `metadata.cinatra.riskClass` is exactly `read_only`. Declare `true` for a step that publishes and `false` for one that writes but does not publish. A step is a component whose kind ends in `Node`, or one that a flow lists in `nodes`, names as `start_node` or reaches as an edge endpoint. A reference resolves in the maps in scope where it is written and where it is used (an edge's own map included), and a reference to a reference is followed. A listed step whose component is not in the file, and a value in those fields that is neither a component nor a reference, are refused too. |
 | `oas.publish-malformed` | A `publishes` value that is not a JSON boolean. |
-| `oas.publish-reserved-id` | An id, a referenced-component key or a reference that starts with the host's gate prefix `cinatra_publish_gate__`. |
+| `oas.publish-reserved-id` | An `id` of any object, a referenced-component key (whatever its value) or a reference that starts with the host's gate prefix `cinatra_publish_gate__`. |
 | `oas.publish-own-gate` | A confirm or approval step of the pack's own in front of a publishing step: an `InputMessageNode` with a control edge into the step (directly or through `BranchingNode`s only), a `requiresApproval` on the step that is not `false`, or a root `hitlScreens` entry beside it, unless the package declares that screen's renderer exactly once with `midRunHitl` `false` or without the key and the screen id has none of the endings that the core's `classifyMidRunHitl` reads as mid-run whatever is declared (`:output`, `-output`, `:list-picker`, `:scrape-schema-review`, `:final-list-review`, `:setup-form`). |
 
-A pack with no `cinatra/oas.json` passes and says so; a flow path that exists
-but cannot be read is an error. A package whose `package.json` does not declare
-`cinatra.kind: "agent"`, an unreadable or non-object file, and an unknown option
-exit 2. Texts name only ids, the package name and an unknown option, quoted and
-cut at 120 characters; never a value the pack wrote.
+A pack with no `cinatra/oas.json` passes and says so; a flow path that exists but cannot be read is an error. A
+package whose `package.json` does not declare `cinatra.kind: "agent"`, an unreadable or non-object file, an unknown
+option and an option whose value is missing or starts with `-` exit 2. Texts name only ids, the package name and an
+unknown option, quoted and cut at 120 characters; never a value the pack wrote.
 
-The gate reads what a pack declares, not what a step does: a writing step
-declared `riskClass: "read_only"` or `publishes: false`, or a confirm screen
-declared not mid-run whose id has none of the six endings, passes. The review of the pack's own change stays the
-second check.
+The gate reads what a pack declares, not what a step does: a writing step declared `riskClass: "read_only"` or
+`publishes: false`, or a confirm screen declared not mid-run whose id has none of the six endings, passes. The review
+of the pack's own change stays the second check.
 
 Run locally: `node scripts/agent-publish-gate.mjs --package <dir> [--format json]`.
 Exit codes: `0` pass, `1` findings, `2` error.

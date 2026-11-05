@@ -81,10 +81,11 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   };
 
   const keyOf = new WeakMap(); // component -> its key in a $referenced_components map
+  const scopeOf = new WeakMap(); // object -> the $referenced_components maps in scope at it, nearest first
   const nameOf = (component) => keyOf.get(component) ?? (typeof component.id === "string" ? component.id : "(no id)");
   const nodes = []; // node components, in file order
   const nodeSet = new Set();
-  const flows = []; // { component, chain }: every component with a field of FLOW_FIELDS
+  const flows = []; // every object with a field of FLOW_FIELDS
 
   const reserved = (candidate) => {
     if (typeof candidate === "string" && candidate.startsWith(PUBLISH_GATE_ID_PREFIX)) {
@@ -107,20 +108,21 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     );
   };
 
-  // The walk: every object in the file, in file order. `chain` is the list of
+  // The walk: every value in the file, in file order. `chain` is the list of
   // $referenced_components maps in scope, nearest first.
   const walk = (value, chain, key) => {
+    reserved(key);
     if (Array.isArray(value)) {
       for (const item of value) walk(item, chain, undefined);
       return;
     }
     if (!isObject(value)) return;
     if (key !== undefined) keyOf.set(value, key);
-    reserved(key);
-    if (key !== undefined || typeof value.component_type === "string") reserved(value.id);
+    reserved(value.id);
     reserved(value.$component_ref);
     const refs = isObject(value.$referenced_components) ? value.$referenced_components : null;
     const scope = refs ? [refs, ...chain] : chain;
+    scopeOf.set(value, scope);
     const flag = readPublishes(value);
     if (flag.present && typeof flag.value !== "boolean") {
       const name = nameOf(value);
@@ -131,7 +133,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
       );
     }
     if (isNodeKind(value.component_type)) checkNode(value);
-    if (FLOW_FIELDS.some((field) => value[field] !== undefined)) flows.push({ component: value, chain: scope });
+    if (FLOW_FIELDS.some((field) => value[field] !== undefined)) flows.push(value);
     for (const [field, child] of Object.entries(value)) {
       if (field === "$referenced_components" && refs) {
         for (const [refKey, component] of Object.entries(refs)) walk(component, scope, refKey);
@@ -148,37 +150,47 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     }
     return null;
   };
-  // A reference or an inline component, resolved to the component.
-  const resolveEntry = (entry, chain) => {
-    if (!isObject(entry)) return null;
-    if (typeof entry.$component_ref === "string") return resolveRef(entry.$component_ref, chain);
-    return entry;
+  const ownMap = (value) => (isObject(value.$referenced_components) ? [value.$referenced_components] : []);
+  // The components an object names: itself, or what its reference resolves to, both in the maps in scope where
+  // the reference is written and in those where it is used (`chain`). A reference to a reference is followed.
+  const resolveAll = (entry, chain, seen = new Set()) => {
+    if (typeof entry.$component_ref !== "string") return [entry];
+    if (seen.has(entry)) return [];
+    seen.add(entry);
+    const ref = entry.$component_ref;
+    const found = new Set([resolveRef(ref, scopeOf.get(entry) ?? []), resolveRef(ref, [...ownMap(entry), ...chain])]);
+    return [...found].filter(Boolean).flatMap((target) => resolveAll(target, chain, seen));
   };
 
-  // Every component a flow lists in `nodes`, names as `start_node` or reaches as an edge
-  // endpoint is a step, whatever its kind. A listed step whose component is not in the file
-  // is refused; an endpoint whose component is not in the file names nothing that can run.
-  for (const { component, chain } of flows) {
-    for (const entry of Array.isArray(component.nodes) ? component.nodes : []) {
-      const target = resolveEntry(entry, chain);
-      if (target) {
-        checkNode(target);
-      } else if (isObject(entry) && typeof entry.$component_ref === "string") {
-        add(
-          "oas.publish-undeclared",
-          entry.$component_ref,
-          `node ${quoteId(entry.$component_ref)} is listed in a flow, but its component is not in the file, so its declaration cannot be read`,
-        );
+  // Every component a flow lists in `nodes`, names as `start_node` or reaches as an edge endpoint is a step,
+  // whatever its kind. A value there that is neither a component nor a reference, and a listed step whose component
+  // is not in the file, are refused; a start node, edge or endpoint whose component is not in the file names
+  // nothing that can run. Control edges are kept as predecessor lists.
+  const predecessors = new Map();
+  for (const holder of flows) {
+    const holderName = nameOf(holder);
+    const stepsAt = (field, value, chain) => {
+      if (value === undefined) return [];
+      if (!isObject(value)) {
+        add("oas.publish-undeclared", holderName, `flow ${quoteId(holderName)} has a value in ${field} that is neither a component nor a reference, so the step it names cannot be checked`);
+        return [];
       }
-    }
-    const start = resolveEntry(component.start_node, chain);
-    if (start) checkNode(start);
-    for (const [field, ends] of Object.entries(EDGE_ENDS)) {
-      for (const entry of Array.isArray(component[field]) ? component[field] : []) {
-        const edge = resolveEntry(entry, chain);
-        for (const end of edge ? ends : []) {
-          const target = resolveEntry(edge[end], chain);
-          if (target) checkNode(target);
+      const found = resolveAll(value, chain);
+      if (field === "nodes" && found.length === 0) {
+        add("oas.publish-undeclared", value.$component_ref, `node ${quoteId(value.$component_ref)} is listed in a flow, but its component is not in the file, so its declaration cannot be read`);
+      }
+      return found;
+    };
+    const chain = scopeOf.get(holder);
+    for (const entry of Array.isArray(holder.nodes) ? holder.nodes : []) stepsAt("nodes", entry ?? null, chain).forEach(checkNode);
+    stepsAt("start_node", holder.start_node, chain).forEach(checkNode);
+    for (const [field, [first, second]] of Object.entries(EDGE_ENDS)) {
+      for (const entry of Array.isArray(holder[field]) ? holder[field] : []) {
+        for (const edge of stepsAt(field, entry ?? null, chain)) {
+          const at = [...ownMap(edge), ...chain];
+          const [froms, tos] = [stepsAt(field, edge[first], at), stepsAt(field, edge[second], at)];
+          [...froms, ...tos].forEach(checkNode);
+          if (field === "control_flow_connections") for (const to of tos) predecessors.set(to, [...(predecessors.get(to) ?? []), ...froms]);
         }
       }
     }
@@ -186,21 +198,6 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
 
   const publishing = nodes.filter((component) => readPublishes(component).value === true);
   if (publishing.length === 0) return findings;
-
-  // Control edges, as predecessor lists.
-  const predecessors = new Map();
-  for (const { component, chain } of flows) {
-    if (!Array.isArray(component.control_flow_connections)) continue;
-    for (const entry of component.control_flow_connections) {
-      const edge = resolveEntry(entry, chain);
-      if (!edge) continue;
-      const from = resolveEntry(edge.from_node, chain);
-      const to = resolveEntry(edge.to_node, chain);
-      if (!from || !to) continue;
-      if (!predecessors.has(to)) predecessors.set(to, []);
-      predecessors.get(to).push(from);
-    }
-  }
 
   const ownGate = (name, message) => add("oas.publish-own-gate", name, message);
   for (const step of publishing) {
@@ -311,7 +308,7 @@ function parseArgs(argv) {
     if (arg === "--help" || arg === "-h") out.help = true;
     else if (arg === "--package" || arg === "--format") {
       const value = argv[++i];
-      if (value === undefined || value.startsWith("--")) throw new GateError(`${arg} needs a value`);
+      if (value === undefined || value.startsWith("-")) throw new GateError(`${arg} needs a value`);
       out[arg.slice(2)] = value;
     } else throw new GateError(`unknown option ${quoteId(arg)}`);
   }
