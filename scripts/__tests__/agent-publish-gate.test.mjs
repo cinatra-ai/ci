@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   PUBLISH_GATE_ID_PREFIX,
@@ -277,6 +278,56 @@ test("an edge endpoint whose component is not in the file gives no undeclared fi
   assert.deepEqual(checkAgentFlow(f), []);
 });
 
+// The two ends of each edge kind.
+const EDGE_FIELDS = {
+  control_flow_connections: ["from_node", "to_node"],
+  data_flow_connections: ["source_node", "destination_node"],
+};
+
+// A component whose kind is not a Node name, reached at one place only: as the start node, or as one end of a control
+// or data edge. The component is inline or kept in the root map; the edge is inline or kept as a referenced component.
+function oddStepAt(field, end, { inline = false, edgeRef = false } = {}) {
+  const f = inline ? declaredPublishPack() : withOddStep(() => {});
+  const odd = inline
+    ? { component_type: "Api", id: "odd", name: "odd", metadata: { cinatra: { ...WRITE } } }
+    : { $component_ref: "odd" };
+  if (field === "start_node") {
+    f.start_node = odd;
+    return f;
+  }
+  const other = { $component_ref: "read_post" };
+  const [first, second] = EDGE_FIELDS[field];
+  const edge =
+    field === "control_flow_connections"
+      ? { component_type: "ControlFlowEdge", name: "odd_edge" }
+      : { component_type: "DataFlowEdge", name: "odd_edge", source_output: "text", destination_input: "text" };
+  edge[first] = end === first ? odd : other;
+  edge[second] = end === second ? odd : other;
+  if (edgeRef) {
+    f.$referenced_components.odd_edge = edge;
+    f[field].push({ $component_ref: "odd_edge" });
+  } else {
+    f[field].push(edge);
+  }
+  return f;
+}
+
+for (const [label, field, end, options] of [
+  ["inline, as the start node", "start_node", null, { inline: true }],
+  ["by reference, as a control edge's from_node", "control_flow_connections", "from_node", {}],
+  ["inline, as a control edge's from_node", "control_flow_connections", "from_node", { inline: true }],
+  ["inline, as a control edge's to_node", "control_flow_connections", "to_node", { inline: true }],
+  ["by reference, as the to_node of a control edge kept as a referenced component", "control_flow_connections", "to_node", { edgeRef: true }],
+  ["inline, as a data edge's source_node", "data_flow_connections", "source_node", { inline: true }],
+  ["by reference, as a data edge's destination_node", "data_flow_connections", "destination_node", {}],
+  ["inline, as a data edge's destination_node", "data_flow_connections", "destination_node", { inline: true }],
+  ["by reference, as the source_node of a data edge kept as a referenced component", "data_flow_connections", "source_node", { edgeRef: true }],
+]) {
+  test(`a component whose kind is not a Node name, reached only ${label}, is checked`, () => {
+    assert.deepEqual(rulesOf(checkAgentFlow(oddStepAt(field, end, options))), ["oas.publish-undeclared odd"]);
+  });
+}
+
 test("a reference resolves to the nearest map: an inner map shadows an outer one, and an outer map serves an inner flow", () => {
   const inner = (refs) => ({
     component_type: "Flow",
@@ -525,6 +576,22 @@ test("a root HITL screen whose renderer has no midRunHitl key is allowed beside 
   assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, kind: "example-confirm" }] }), []);
 });
 
+for (const ending of [":output", "-output", ":list-picker", ":scrape-schema-review", ":final-list-review", ":setup-form"]) {
+  test(`a root HITL screen whose id ends in "${ending}" is refused beside a publishing node, even when declared not mid-run`, () => {
+    const screen = `@example/publish-agent:confirm${ending}`;
+    const f = declaredPublishPack({ root: { hitlScreens: [screen] } });
+    assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: screen, midRunHitl: false }] })), [
+      "oas.publish-own-gate publish",
+    ]);
+  });
+}
+
+test("a root HITL screen whose id holds a mid-run ending only inside it is allowed when declared not mid-run", () => {
+  const screen = "@example/publish-agent:output-view";
+  const f = declaredPublishPack({ root: { hitlScreens: [screen] } });
+  assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: screen, midRunHitl: false }] }), []);
+});
+
 test("a root HITL screen whose renderer id this package declares twice is refused beside a publishing node", () => {
   const f = declaredPublishPack({ root: { hitlScreens: [SCREEN] } });
   for (const second of [true, false]) {
@@ -695,17 +762,18 @@ test("the JSON output of a passing pack and of a pack with no flow says whether 
 test("the JSON output cuts a long node id and package name at 120 characters and escapes U+2028 and U+2029", () => {
   const longId = "x".repeat(200);
   const f = flow(
-    [node("start", "StartNode"), node(longId, "ApiNode", WRITE), node("a b", "ApiNode", WRITE), node("end", "EndNode")],
-    [["start", longId], [longId, "a b"], ["a b", "end"]],
+    [node("start", "StartNode"), node(longId, "ApiNode", WRITE), node("a b", "ApiNode", WRITE), node("c\u2029d", "ApiNode", WRITE), node("end", "EndNode")],
+    [["start", longId], [longId, "a b"], ["a b", "c\u2029d"], ["c\u2029d", "end"]],
   );
   const pkg = JSON.stringify({ name: "p".repeat(150), cinatra: { kind: "agent" } });
   withTempPack({ "package.json": pkg, "cinatra/oas.json": JSON.stringify(f) }, (dir) => {
     const r = runGate(["--package", dir, "--format", "json"]);
     assert.equal(r.status, 1, r.stdout + r.stderr);
     assert.ok(!r.stdout.includes(" "), "a raw U+2028 is in the JSON output");
+    assert.ok(!r.stdout.includes("\u2029"), "a raw U+2029 is in the JSON output");
     const out = JSON.parse(r.stdout);
     assert.equal(out.package, `${"p".repeat(120)}...`);
-    assert.deepEqual(out.findings.map((x) => x.node), [`${"x".repeat(120)}...`, "a b"]);
+    assert.deepEqual(out.findings.map((x) => x.node), [`${"x".repeat(120)}...`, "a b", "c\u2029d"]);
   });
 });
 
@@ -752,6 +820,25 @@ test("a flow path that exists but cannot be read as a file is an error (exit 2),
   });
 });
 
+test("a flow path inside a loop of symbolic links is an error (exit 2), never a pack with no flow", () => {
+  // `cinatra` is a link to itself, so the flow path cannot be resolved (ELOOP).
+  withTempPack({ "package.json": AGENT_PKG }, (dir) => {
+    fs.symlinkSync("cinatra", path.join(dir, "cinatra"));
+    const r = runGate(["--package", dir]);
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stderr, /cannot read cinatra\/oas\.json \(ELOOP\)/);
+  });
+});
+
+test("a cinatra folder that is a symbolic link to nothing reads as a pack with no flow (a stated limit)", () => {
+  withTempPack({ "package.json": AGENT_PKG }, (dir) => {
+    fs.symlinkSync(path.join(dir, "absent"), path.join(dir, "cinatra"));
+    const r = runGate(["--package", dir]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /no cinatra\/oas\.json/);
+  });
+});
+
 test("a flow nested too deep to walk is an error (exit 2), never a pass", () => {
   const depth = 100000;
   const text = `${'{"a":'.repeat(depth)}1${"}".repeat(depth)}`;
@@ -770,5 +857,16 @@ test("the gate runs when it is called through a symbolic link", () => {
     const r = spawnSync("node", [link, "--help"], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /Usage: agent-publish-gate/);
+  });
+});
+
+test("the gate does not run when it is imported with no script path or with a script path that does not exist", () => {
+  const code = `import(${JSON.stringify(pathToFileURL(GATE).href)})`;
+  withTempPack({}, (dir) => {
+    for (const extra of [[], [path.join(dir, "absent.mjs")]]) {
+      const r = spawnSync("node", ["-e", code, ...extra], { encoding: "utf8" });
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      assert.equal(r.stdout, "");
+    }
   });
 });
