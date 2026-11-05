@@ -1,41 +1,23 @@
 #!/usr/bin/env node
-// ---------------------------------------------------------------------------
-// agent-publish-gate: the publish check for ONE agent pack, run in the pack's CI.
-// The host stops a run in front of every flow step declared
-// `metadata.cinatra.publishes: true` and asks one person to confirm. Rules:
-//   oas.publish-undeclared   a step that can reach a connector declares
-//     `publishes` true or false. Allow-list: only the kinds StartNode, EndNode,
-//     InputMessageNode, OutputMessageNode, BranchingNode and a riskClass of
-//     exactly `read_only` are exempt; a listed step whose component is not in
-//     the file is refused, since its declaration cannot be read.
-//   oas.publish-malformed    `publishes` is present and not a JSON boolean.
-//   oas.publish-reserved-id  an id, a referenced-component key or a reference
-//     takes the host's gate prefix.
-//   oas.publish-own-gate     the pack keeps its own confirm or approval step in
-//     front of a publishing step: an InputMessageNode with a control edge into
-//     it, directly or through BranchingNodes only; `requiresApproval: true` on
-//     the step; or a root `hitlScreens` entry, unless this package declares the
-//     screen's renderer and it is not `midRunHitl`.
-// The flow is `cinatra/oas.json`; a pack without one passes and says so. A
-// package that is not an agent pack, an unreadable file and an unknown option
-// are errors, never a pass. Findings name ids only, never a value or a kind
-// the pack wrote. Node built-ins only.
+// agent-publish-gate: the publish check for ONE agent pack's flow (`cinatra/oas.json`),
+// run in the pack's CI. The four rules, what counts as a step, the texts and the exit codes
+// are in README.md, section "agent-publish-gate". The gate reads what a pack declares; it
+// cannot see what a step does. Node built-ins only.
 // Usage: node scripts/agent-publish-gate.mjs [--package <dir>] [--format text|json]
 // Exit codes: 0 = pass, 1 = findings, 2 = error.
-// ---------------------------------------------------------------------------
 
-import { readFileSync, existsSync, realpathSync } from "node:fs";
+import { readFileSync, lstatSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const PUBLISH_GATE_ID_PREFIX = "cinatra_publish_gate__";
 
-export const RULES = Object.freeze([
-  "oas.publish-undeclared",
-  "oas.publish-malformed",
-  "oas.publish-reserved-id",
-  "oas.publish-own-gate",
-]);
+export const RULES = Object.freeze(["oas.publish-undeclared", "oas.publish-malformed", "oas.publish-reserved-id", "oas.publish-own-gate"]);
+
+// The fields of a flow that name its steps.
+const FLOW_FIELDS = ["nodes", "start_node", "control_flow_connections", "data_flow_connections"];
+// The fields of an edge that name a step.
+const EDGE_ENDS = { control_flow_connections: ["from_node", "to_node"], data_flow_connections: ["source_node", "destination_node"] };
 
 // The kinds that cannot reach a connector, so they need no declaration.
 const NO_CONNECTOR_KINDS = new Set(["StartNode", "EndNode", "InputMessageNode", "OutputMessageNode", "BranchingNode"]);
@@ -64,13 +46,20 @@ function describeType(value) {
   return typeof value === "object" ? "an object" : `a ${typeof value}`;
 }
 
-// The id quoted with JSON escaping and cut at 120 characters; U+2028 and
-// U+2029, which JSON.stringify leaves as they are, are escaped too.
+// A text cut at 120 characters.
+function cutText(value) {
+  const text = String(value);
+  return text.length > 120 ? `${text.slice(0, 120)}...` : text;
+}
+
+// JSON text with U+2028 and U+2029 escaped (JSON.stringify leaves them as they are).
+function escapeLineSeparators(json) {
+  return json.replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+}
+
+// The id quoted with JSON escaping, cut at 120 characters, on one line.
 export function quoteId(id) {
-  const text = String(id);
-  return JSON.stringify(text.length > 120 ? `${text.slice(0, 120)}...` : text)
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
+  return escapeLineSeparators(JSON.stringify(cutText(id)));
 }
 
 function isNodeKind(kind) {
@@ -94,7 +83,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   const nameOf = (component) => keyOf.get(component) ?? (typeof component.id === "string" ? component.id : "(no id)");
   const nodes = []; // node components, in file order
   const nodeSet = new Set();
-  const flows = []; // { component, chain }: every component that lists nodes or control edges
+  const flows = []; // { component, chain }: every component with a field of FLOW_FIELDS
 
   const reserved = (candidate) => {
     if (typeof candidate === "string" && candidate.startsWith(PUBLISH_GATE_ID_PREFIX)) {
@@ -141,7 +130,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
       );
     }
     if (isNodeKind(value.component_type)) checkNode(value);
-    if (Array.isArray(value.nodes) || Array.isArray(value.control_flow_connections)) flows.push({ component: value, chain: scope });
+    if (FLOW_FIELDS.some((field) => value[field] !== undefined)) flows.push({ component: value, chain: scope });
     for (const [field, child] of Object.entries(value)) {
       if (field === "$referenced_components" && refs) {
         for (const [refKey, component] of Object.entries(refs)) walk(component, scope, refKey);
@@ -165,10 +154,11 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     return entry;
   };
 
-  // Every component a flow lists as a node is a node, whatever its kind.
+  // Every component a flow lists in `nodes`, names as `start_node` or reaches as an edge
+  // endpoint is a step, whatever its kind. A listed step whose component is not in the file
+  // is refused; an endpoint whose component is not in the file names nothing that can run.
   for (const { component, chain } of flows) {
-    if (!Array.isArray(component.nodes)) continue;
-    for (const entry of component.nodes) {
+    for (const entry of Array.isArray(component.nodes) ? component.nodes : []) {
       const target = resolveEntry(entry, chain);
       if (target) {
         checkNode(target);
@@ -178,6 +168,17 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
           entry.$component_ref,
           `node ${quoteId(entry.$component_ref)} is listed in a flow, but its component is not in the file, so its declaration cannot be read`,
         );
+      }
+    }
+    const start = resolveEntry(component.start_node, chain);
+    if (start) checkNode(start);
+    for (const [field, ends] of Object.entries(EDGE_ENDS)) {
+      for (const entry of Array.isArray(component[field]) ? component[field] : []) {
+        const edge = resolveEntry(entry, chain);
+        for (const end of edge ? ends : []) {
+          const target = resolveEntry(edge[end], chain);
+          if (target) checkNode(target);
+        }
       }
     }
   }
@@ -203,10 +204,11 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   const ownGate = (name, message) => add("oas.publish-own-gate", name, message);
   for (const step of publishing) {
     const stepName = nameOf(step);
-    if (cinatraOf(step)?.requiresApproval === true) {
+    const stepCinatra = cinatraOf(step);
+    if (stepCinatra && Object.hasOwn(stepCinatra, "requiresApproval") && stepCinatra.requiresApproval !== false) {
       ownGate(
         stepName,
-        `publishing node ${quoteId(stepName)} also declares metadata.cinatra.requiresApproval: true; the host's publish confirmation is the one approval in front of it`,
+        `publishing node ${quoteId(stepName)} declares a metadata.cinatra.requiresApproval that is not false; the host's publish confirmation is to be the one approval in front of it`,
       );
     }
     // Walk back from the step through BranchingNodes only.
@@ -220,7 +222,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         const gateName = nameOf(before);
         ownGate(
           gateName,
-          `node ${quoteId(gateName)} waits for a person in front of publishing node ${quoteId(stepName)}; the host stops the run there itself, so the pack keeps no confirm step of its own`,
+          `node ${quoteId(gateName)} waits for a person in front of publishing node ${quoteId(stepName)}; the host's publish confirmation is to be the one stop there, so the pack keeps no confirm step of its own`,
         );
       } else if (before.component_type === "BranchingNode") {
         queue.push(...(predecessors.get(before) ?? []));
@@ -237,9 +239,14 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     if (!Array.isArray(screens)) {
       offending = "a hitlScreens value that is not a list of screen ids";
     } else {
+      // A screen passes only when this package declares its renderer exactly
+      // once, with midRunHitl false or without the key (the core reads only
+      // true as mid-run: packages/agents/src/orchestrator-mid-run-hitl.ts in
+      // cinatra-ai/cinatra). Any other value, or a second entry, is refused.
       for (const screen of screens) {
-        const renderer = typeof screen === "string" ? renderers.find((r) => r.id === screen) : undefined;
-        if (!renderer || renderer.midRunHitl === true) {
+        const matches = typeof screen === "string" ? renderers.filter((r) => r.id === screen) : [];
+        const notMidRun = matches.length === 1 && (!Object.hasOwn(matches[0], "midRunHitl") || matches[0].midRunHitl === false);
+        if (!notMidRun) {
           offending = typeof screen === "string" ? `hitlScreens entry ${quoteId(screen)}` : "a hitlScreens entry that is not a screen id";
           break;
         }
@@ -250,7 +257,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         const stepName = nameOf(step);
         ownGate(
           stepName,
-          `the flow root lists ${offending} beside publishing node ${quoteId(stepName)}; a mid-run screen (or one this package does not declare) would be a confirm step of the pack's own`,
+          `the flow root lists ${offending} beside publishing node ${quoteId(stepName)}; only a screen whose renderer this package declares once, with midRunHitl false or without it, is not a confirm step of the pack's own`,
         );
       }
     }
@@ -282,7 +289,13 @@ export function checkAgentPackage(dir) {
   if (cinatra.kind !== "agent") throw new GateError("the package is not an agent pack (package.json cinatra.kind is not \"agent\")");
   const packageName = typeof pkg.name === "string" ? pkg.name : "(no name)";
   const flowFile = join(dir, "cinatra", "oas.json");
-  if (!existsSync(flowFile)) return { status: "no-flow", packageName, findings: [] };
+  // Only a missing path is "no flow"; any other failure to read it is an error.
+  try {
+    lstatSync(flowFile);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { status: "no-flow", packageName, findings: [] };
+    throw new GateError(`cannot read cinatra/oas.json (${error?.code ?? "read error"})`);
+  }
   const flow = readJson(flowFile, "cinatra/oas.json");
   if (!isObject(flow)) throw new GateError("cinatra/oas.json is not a JSON object");
   return { status: "checked", packageName, findings: checkAgentFlow(flow, { fieldRenderers: cinatra.fieldRenderers }) };
@@ -323,7 +336,10 @@ function main(argv) {
   }
   const pass = result.findings.length === 0;
   if (args.format === "json") {
-    console.log(JSON.stringify({ package: result.packageName, status: pass ? "pass" : "fail", flow: result.status === "checked", findings: result.findings }, null, 2));
+    // The same cut as the text output; the messages already quote cut ids.
+    const findings = result.findings.map((finding) => ({ ...finding, node: cutText(finding.node) }));
+    const report = { package: cutText(result.packageName), status: pass ? "pass" : "fail", flow: result.status === "checked", findings };
+    console.log(escapeLineSeparators(JSON.stringify(report, null, 2)));
   } else {
     console.log(`agent-publish-gate: package ${quoteId(result.packageName)}`);
     if (result.status === "no-flow") {
