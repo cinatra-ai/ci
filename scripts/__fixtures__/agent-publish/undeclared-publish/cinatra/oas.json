@@ -1,0 +1,156 @@
+{
+  "agentspec_version": "26.1.0",
+  "component_type": "Flow",
+  "id": "example-publish-agent-flow",
+  "name": "Example publish agent",
+  "metadata": {
+    "cinatra": {
+      "type": "flow",
+      "packageName": "@example/publish-agent",
+      "hitlScreens": [
+        "@example/publish-agent:confirm"
+      ]
+    }
+  },
+  "inputs": [],
+  "outputs": [],
+  "start_node": {
+    "$component_ref": "start"
+  },
+  "nodes": [
+    {
+      "$component_ref": "start"
+    },
+    {
+      "$component_ref": "read_post_record"
+    },
+    {
+      "$component_ref": "read_post_text"
+    },
+    {
+      "$component_ref": "publish"
+    },
+    {
+      "$component_ref": "write_address"
+    },
+    {
+      "$component_ref": "end"
+    }
+  ],
+  "control_flow_connections": [
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "start_to_read_post_record",
+      "from_node": {
+        "$component_ref": "start"
+      },
+      "to_node": {
+        "$component_ref": "read_post_record"
+      }
+    },
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "read_post_record_to_read_post_text",
+      "from_node": {
+        "$component_ref": "read_post_record"
+      },
+      "to_node": {
+        "$component_ref": "read_post_text"
+      }
+    },
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "read_post_text_to_publish",
+      "from_node": {
+        "$component_ref": "read_post_text"
+      },
+      "to_node": {
+        "$component_ref": "publish"
+      }
+    },
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "publish_to_write_address",
+      "from_node": {
+        "$component_ref": "publish"
+      },
+      "to_node": {
+        "$component_ref": "write_address"
+      }
+    },
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "write_address_to_end",
+      "from_node": {
+        "$component_ref": "write_address"
+      },
+      "to_node": {
+        "$component_ref": "end"
+      }
+    }
+  ],
+  "data_flow_connections": [],
+  "$referenced_components": {
+    "start": {
+      "component_type": "StartNode",
+      "id": "start",
+      "name": "start",
+      "metadata": {
+        "cinatra": {
+          "required": [
+            "postArtifactId"
+          ]
+        }
+      }
+    },
+    "read_post_record": {
+      "component_type": "ApiNode",
+      "id": "read_post_record",
+      "name": "read_post_record",
+      "metadata": {
+        "cinatra": {
+          "riskClass": "read_only",
+          "requiresApproval": false
+        }
+      }
+    },
+    "read_post_text": {
+      "component_type": "ApiNode",
+      "id": "read_post_text",
+      "name": "read_post_text",
+      "metadata": {
+        "cinatra": {
+          "riskClass": "read_only",
+          "requiresApproval": false
+        }
+      }
+    },
+    "publish": {
+      "component_type": "ApiNode",
+      "id": "publish",
+      "name": "publish",
+      "metadata": {
+        "cinatra": {
+          "riskClass": "write",
+          "requiresApproval": false
+        }
+      }
+    },
+    "write_address": {
+      "component_type": "ApiNode",
+      "id": "write_address",
+      "name": "write_address",
+      "metadata": {
+        "cinatra": {
+          "riskClass": "write",
+          "requiresApproval": false
+        }
+      }
+    },
+    "end": {
+      "component_type": "EndNode",
+      "id": "end",
+      "name": "end"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@example/publish-agent",
+  "version": "0.1.0",
+  "private": true,
+  "cinatra": {
+    "apiVersion": "cinatra.ai/v1",
+    "kind": "agent",
+    "fieldRenderers": [
+      {
+        "id": "@example/publish-agent:confirm",
+        "kind": "example-confirm",
+        "midRunHitl": true,
+        "component": {
+          "entry": "./src/renderers/confirm.tsx",
+          "propsApiVersion": 1
+        }
+      }
+    ]
+  }
+}
