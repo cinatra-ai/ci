@@ -44,6 +44,14 @@ jobs:
             exit 1
           fi
 
+      - name: agent-publish-gate passes the declared fixture + fails the undeclared fixture
+        run: |
+          node scripts/agent-publish-gate.mjs --package scripts/__fixtures__/agent-publish/declared-publish
+          if node scripts/agent-publish-gate.mjs --package scripts/__fixtures__/agent-publish/undeclared-publish; then
+            echo "::error::agent-publish-gate did not fail the undeclared-publish fixture" >&2
+            exit 1
+          fi
+
       - name: Gitignore gate runs clean on its own repository
         run: node scripts/gitignore-gate.mjs
 
@@ -218,6 +226,8 @@ jobs:
             scripts/__tests__/gate-suite-audit-report.test.mjs \
             scripts/__tests__/doc-code-value-gate.test.mjs \
             scripts/__tests__/extension-ioc-gate.test.mjs \
+            scripts/__tests__/agent-publish-gate.test.mjs \
+            scripts/__tests__/agent-publish-gate-workflow.test.mjs \
             scripts/__tests__/secrets-required-gate.test.mjs \
             scripts/__tests__/secret-scan-engine-pin.test.mjs \
             scripts/__tests__/secret-scan-scan-errors.test.mjs \
