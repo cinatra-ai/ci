@@ -1,0 +1,71 @@
+name: agent-publish-gate
+
+# Reusable workflow: the agent pack publish gate. An agent pack calls it from
+# its own thin caller:
+#
+#   jobs:
+#     agent-publish-gate:
+#       # Pin BOTH the workflow ref (`@<sha>`) and the `ref` input below to the
+#       # SAME commit SHA, so the gate code is not pulled from mutable main.
+#       uses: cinatra-ai/ci/.github/workflows/agent-publish-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         package: "."   # the agent package directory to check
+#         ref: <sha>
+#
+# Checks ONE agent pack's flow (`cinatra/oas.json`): every writing step declares
+# `metadata.cinatra.publishes`, and the pack keeps no confirm step of its own in
+# front of a publishing step. Node built-ins only, no install step.
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: "Path (in the caller repo) to the agent package directory to check."
+        type: string
+        default: "."
+      format:
+        description: "Output format: text | json."
+        type: string
+        default: "text"
+      use_slim:
+        description: "Run this lightweight gate on ubuntu-slim; opt in after validating the caller. Standard runners remain the default."
+        type: boolean
+        default: false
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  agent-publish-gate:
+    runs-on: ${{ inputs.use_slim && 'ubuntu-slim' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Checkout gate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .agent-publish-gate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+
+      - name: Run gate
+        # Caller inputs are passed via ENV, never interpolated into the shell
+        # source, so a crafted `package` or `format` input cannot inject a command.
+        env:
+          APG_PACKAGE: ${{ inputs.package }}
+          APG_FORMAT: ${{ inputs.format }}
+        run: |
+          node .agent-publish-gate/scripts/agent-publish-gate.mjs \
+            --package "$APG_PACKAGE" \
+            --format "$APG_FORMAT"

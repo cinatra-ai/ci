@@ -12,11 +12,11 @@ repos add a thin caller workflow that pins both the workflow ref and the inner
 
 ## Lightweight runners
 
-The `actions-pinned-gate`, `gitignore-gate`, and `source-leak-gate` workflows
-accept `use_slim: true` to select `ubuntu-slim`. The default remains
-`ubuntu-latest`. Runner selection does not change the gate commands, their
-permissions, or their status names. Pin the workflow and inner `ref` together
-when adopting this input.
+The `actions-pinned-gate`, `agent-publish-gate`, `gitignore-gate`, and
+`source-leak-gate` workflows accept `use_slim: true` to select
+`ubuntu-slim`. The default remains `ubuntu-latest`. Runner selection does
+not change the gate commands, their permissions, or their status names. Pin
+the workflow and inner `ref` together when adopting this input.
 
 GitHub bills a reusable workflow to its caller. Public workflow definitions do
 not make a private caller free. The single-CPU runner is suitable for these
@@ -688,6 +688,28 @@ of the pack's own change stays the second check.
 
 Run locally: `node scripts/agent-publish-gate.mjs --package <dir> [--format json]`.
 Exit codes: `0` pass, `1` findings, `2` error.
+
+An agent pack calls the reusable workflow from its own thin caller. Pin the
+workflow ref and the inner `ref` input to the same commit SHA:
+
+```yaml
+jobs:
+  agent-publish-gate:
+    uses: cinatra-ai/ci/.github/workflows/agent-publish-gate.yml@<sha>  # vX.Y.Z
+    with:
+      package: "."   # the agent package directory, default "."
+      ref: <sha>
+```
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `package` | `.` | The agent package directory in the caller repository. |
+| `format` | `text` | `text` or `json`. |
+| `use_slim` | `false` | Run on `ubuntu-slim` instead of `ubuntu-latest`. |
+| `ref` | `main` | The commit of this repository whose engine runs; pin it to a SHA. |
+
+The workflow has read-only permissions and takes no secrets. It passes the
+inputs to the engine through the environment, never into the shell text.
 
 ## hot-install-canary-gate
 
