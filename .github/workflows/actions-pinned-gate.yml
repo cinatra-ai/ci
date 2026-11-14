@@ -9,6 +9,11 @@ name: actions-pinned-gate
 on:
   workflow_call:
     inputs:
+      runner:
+        description: "JSON runs-on value chosen by the caller: a label array such as '[\"self-hosted\",\"linux\"]' or a quoted label such as '\"ubuntu-24.04\"'. Empty (the default) keeps the GitHub-hosted runner."
+        type: string
+        required: false
+        default: ""
       use_slim:
         description: "Run this lightweight gate on ubuntu-slim; opt in after validating the caller. Standard runners remain the default."
         type: boolean
@@ -23,7 +28,7 @@ permissions:
 
 jobs:
   actions-pinned-gate:
-    runs-on: ${{ inputs.use_slim && 'ubuntu-slim' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner && fromJSON(inputs.runner) || (inputs.use_slim && 'ubuntu-slim' || 'ubuntu-latest') }}
     timeout-minutes: 5
     steps:
       - name: Checkout caller repository

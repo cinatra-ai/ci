@@ -60,6 +60,11 @@ name: truthful-attribution-gate
 on:
   workflow_call:
     inputs:
+      runner:
+        description: "JSON runs-on value chosen by the caller: a label array such as '[\"self-hosted\",\"linux\"]' or a quoted label such as '\"ubuntu-24.04\"'. Empty (the default) keeps the GitHub-hosted runner."
+        type: string
+        required: false
+        default: ""
       mode:
         description: "warn (Stage 2 — annotates, never fails) | enforce (gates an error-severity finding). Enforce is gated on the machine-identity [owner] issue (spec §8.5)."
         type: string
@@ -94,7 +99,7 @@ permissions:
 
 jobs:
   truthful-attribution-gate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner && fromJSON(inputs.runner) || 'ubuntu-latest' }}
     # The gate-arm verification WAITS (bounded, default up to 10 minutes) for a
     # required context that has not concluded yet, instead of reading a sibling
     # gate mid-flight and calling that a failure. The job budget must therefore

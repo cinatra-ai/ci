@@ -23,6 +23,32 @@ not make a private caller free. The single-CPU runner is suitable for these
 short Node checks; container-based secret scans and jobs needing more than its
 15-minute limit should retain a compatible standard runner.
 
+## Caller-chosen runner
+
+The `actions-pinned-gate`, `gitignore-gate`, `source-leak-gate`,
+`secret-scan-gate`, and `truthful-attribution-gate` workflows accept a
+`runner` input: a JSON `runs-on` value, either a label array such as
+`'["self-hosted","linux"]'` or a quoted label such as `'"ubuntu-24.04"'`.
+The default is empty, and an empty input keeps the GitHub-hosted runner
+(`ubuntu-latest`, or `ubuntu-slim` when `use_slim` is set). A non-empty
+`runner` takes precedence over `use_slim`.
+
+The gates read the runner only from this input, never from a variable, so
+a caller that does not pass it cannot be moved to another runner. A public
+repository should leave it empty: code from public pull requests should not
+run on a self-hosted runner. Runner selection does not change the gate
+commands, their permissions, or their status names. Pin the workflow and the
+inner `ref` together when adopting this input.
+
+```yaml
+jobs:
+  gitignore-gate:
+    uses: cinatra-ai/ci/.github/workflows/gitignore-gate.yml@<sha>  # vX.Y.Z
+    with:
+      ref: <sha>
+      runner: '["self-hosted","linux"]'
+```
+
 Cancel outdated pull-request runs in the caller, using a group containing the
 workflow name and pull-request number. Give other events a unique run ID so
 successive pushes retain their verification runs. Keep this concurrency group
