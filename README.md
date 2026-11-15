@@ -2316,6 +2316,132 @@ node --test scripts/__tests__/truthful-attribution-gate.test.mjs \
             scripts/__tests__/gate-suite-audit-report.test.mjs
 ```
 
+## red-first-gate
+
+A reusable workflow + engine that proves the tests a pull request adds or
+changes are real red-first tests: they fail on the code before the fix, for the
+right reason, and pass with the fix. It runs the repository's own test runner
+(`node:test` or vitest) in two trees and reads machine reports, never exit
+codes alone.
+
+- **New tests**: the JavaScript and TypeScript test files (`*.test.*` and
+  `*.spec.*` ending in `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.mts` or
+  `.cts`, outside `__fixtures__/`) the pull request adds or changes in the range
+  from the merge base to the head. A test file in another language is not a new
+  test here.
+- **Test side**: the new tests plus test support paths: `__tests__/`,
+  `__fixtures__/`, `__snapshots__/`, `__mocks__/`, `__stubs__/`, the vitest or
+  vite config and workspace files, setup files under common names
+  (`vitest.setup.*`, `vitest.global-setup.*`, `setupTests.*`, `setup-tests.*`,
+  `test-setup.*`, `global-setup.*`, `test/setup.*`, `tests/setup.*`), the files
+  a vitest config names in `setupFiles` or `globalSetup` as string literals, and
+  the paths that match the `test_support` input. A setup file under another name
+  whose path is built at run time is the fix side unless `test_support` names it.
+  Every other changed path is the **fix side**.
+- **Before the fix**: the merge base with the pull request's test side applied.
+  The gate checks that this tree and the head differ by exactly the fix side.
+- **Right reason**: before the fix, each new test file must load, collect at
+  least one test and fail at least one test by an assertion (`AssertionError`),
+  or by the text of a `red-first-expect: <text>` marker line in the file. A
+  marker text must appear in a test failure of that file (ANSI and whitespace
+  normalized, case-sensitive); a load error never counts.
+- **With the fix**: each new test file must load and pass, at least one test
+  must pass, every test that failed before must pass (each occurrence: a test
+  name reported twice before needs two passing results), the runner must exit
+  0, and a vitest report must say `success: true`.
+- **Reports**: read fail closed. A vitest report with a missing or non-boolean
+  `success`, an unknown status, a malformed entry, or a contradiction (success
+  with a failed file, a failed test in a passed file) is `NO-REPORT`; a file
+  reported as failed although none of its tests failed is `FILE-ERROR`.
+- **A module the fix adds**: a test file that imports it at the top does not
+  load before the fix (`LOAD-ERROR`). Import it inside the test (for example
+  `const { sum } = await import("../src/sum.mjs")`) and add a marker with the
+  text of the error, such as `red-first-expect: Cannot find module`.
+
+The `red-first` job fails with a named reason: `INSTALL-FAILED`, `NO-REPORT`,
+`NOT-COLLECTED`, `LOAD-ERROR`, `FILE-ERROR`, `NOT-RED-BEFORE`, `WRONG-REASON`,
+`TEXT-MISMATCH`, `NOT-GREEN-AT-HEAD`, `RUNNER-EXIT`, `TEST-CHANGED` (the
+install or the run changed a tracked test-side file, staged, committed or not),
+`TIMEOUT` or `TREE-MISMATCH`. A pull request without a new test
+(`NO-NEW-TESTS`), with no change besides tests (`TESTS-ONLY`), or whose new
+tests all match `exclude` (`EXCLUDED-ONLY`, for example only end-to-end or
+database tests) skips the `red-first` job: neutral, with the reason in the
+`plan` job's summary, never red and never success.
+
+New tests that match `exclude` beside other new tests are not proven here and
+do not fail the job: each is a notice (`EXCLUDED`) in both jobs, the plan
+output `excluded` counts them, and the other new tests decide. So a `success`
+of the `red-first` job at the head proves the new tests outside `exclude`;
+read the `EXCLUDED` notices (or the plan output) for the rest.
+
+Time: `timeout_minutes` is the job's limit. The gate stops 120 seconds before
+it, with `TIMEOUT`, so the verdict is written before GitHub ends the job. Each
+install and test run also has its own limit (20 minutes by default).
+
+Processes: every install and test run starts in its own process group, and the
+group is killed when it exits or times out, so a background process cannot
+outlive its step. The trees and reports are removed at the end of each run.
+
+The gate runs the pull request's own code and dependencies, like any test job.
+It proves that the fix side turns the new tests from red to green; whether the
+tests are meaningful, and whether a tool goes out of its way to hide a change
+(for example by restoring a file after the run), is for review.
+
+### Use it from another repo
+
+```yaml
+name: red-first-gate
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: red-first-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  red-first-gate:
+    # Pin BOTH to the same commit SHA: the workflow ref and the `ref` input.
+    uses: cinatra-ai/ci/.github/workflows/red-first-gate.yml@main  # @<sha> in prod
+    with:
+      ref: main  # the same <sha> in production
+      install: npm ci
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
+| `runner` | `""` | JSON `runs-on` value, as for the other gates; empty keeps `ubuntu-latest`. Linux or macOS only. |
+| `install` | `""` | Shell command run at the root of each tree before its tests. |
+| `setup_pnpm` | `false` | Set up pnpm from the caller's `packageManager` field. |
+| `vitest` | `npx --no-install vitest run` | Command that runs vitest; the gate appends the files and the JSON reporter options. |
+| `exclude` | `""` | Regular expression of test paths this check cannot prove (for example end-to-end specs, database tests). |
+| `test_support` | `""` | Regular expression of more test-side paths (setup files under other names). |
+| `node_version` | `24` | Node.js version. |
+| `timeout_minutes` | `30` | Time limit of the `red-first` job; the gate stops 120 s before it with `TIMEOUT`. |
+
+### Run locally
+
+```sh
+node scripts/red-first-gate.mjs plan --base <sha> --head <sha>
+node scripts/red-first-gate.mjs run --base <sha> --head <sha> --work /tmp/red-first --install "npm ci"
+```
+
+`plan` exits 0 when it decides (run or skip); `run` exits 0 on PASS, 1 on RED,
+3 on SKIP and 2 on a usage or internal error. `--verdict <file>` writes the
+result as JSON. `--job-started <epoch seconds> --job-minutes <n>` set the job's
+time budget; `--test-support <re>` adds test-side paths. The work folder must
+be empty or absent; the run leaves it so.
+
+### Develop
+
+```sh
+node --test scripts/__tests__/red-first-gate.test.mjs
+```
+
+Node built-ins only; requires Node 24+, git and bash on Linux or macOS.
+
 ## Developing in this repo
 
 ### Run the full test suite
