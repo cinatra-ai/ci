@@ -216,6 +216,7 @@ jobs:
             scripts/__tests__/actions-pinned-gate.test.mjs \
             scripts/__tests__/lightweight-runner.test.mjs \
             scripts/__tests__/runner-input.test.mjs \
+            scripts/__tests__/red-first-gate.test.mjs \
             scripts/__tests__/ui-design-system-gate.test.mjs \
             scripts/__tests__/skills-drift-gate.test.mjs \
             scripts/__tests__/collect-skills-acks.test.mjs \
