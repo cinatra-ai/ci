@@ -65,7 +65,7 @@ on:
         required: false
         default: "24"
       timeout_minutes:
-        description: "Time limit of the red-first job, in minutes. The gate stops its last step 120 seconds before it, with the reason TIMEOUT."
+        description: "Time limit of the red-first job, in minutes, from 3 to 7200. The gate stops its last step 120 seconds before it, with the reason TIMEOUT. The plan job fails on a value outside that range, before the red-first job starts."
         type: number
         required: false
         default: 30
@@ -109,10 +109,11 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EXCLUDE: ${{ inputs.exclude }}
           TEST_SUPPORT: ${{ inputs.test_support }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         run: >-
           node .red-first-gate/scripts/red-first-gate.mjs plan
           --base "$BASE_SHA" --head "$HEAD_SHA" --exclude "$EXCLUDE"
-          --test-support "$TEST_SUPPORT"
+          --test-support "$TEST_SUPPORT" --job-minutes "$TIMEOUT_MINUTES"
           --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
 
   red-first:

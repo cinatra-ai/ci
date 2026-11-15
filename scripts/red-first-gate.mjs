@@ -28,15 +28,15 @@
 //
 // Usage:
 //   red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <re>]
-//                           [--test-support <re>] [--verdict <file>]
+//                           [--test-support <re>] [--job-minutes <n>] [--verdict <file>]
 //                           [--github-output <file>] [--summary <file>]
 //   red-first-gate.mjs run  --base <sha> --head <sha> --work <empty dir> [--repo <dir>]
 //                           [--install <cmd>] [--vitest <cmd>] [--exclude <re>]
 //                           [--test-support <re>] [--timeout-seconds <n>]
 //                           [--job-started <epoch s> --job-minutes <n>]
 //                           [--verdict <file>] [--summary <file>]
-// Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED, 3 SKIP;
-// 2 usage or internal error (both modes).
+// Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED, 3 SKIP,
+// 130/143 stopped by SIGINT/SIGTERM; 2 usage or internal error (both modes).
 //
 // Node built-ins, git and bash; Linux or macOS.
 // ---------------------------------------------------------------------------
@@ -59,12 +59,26 @@ export const TEST_SUPPORT_RE =
 const FIXTURE_DIR_RE = /(^|\/)__fixtures__\//;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const VITEST_CONFIG_RE = /^(?:vitest|vite)\.config\.[cm]?[jt]s$|^vitest\.workspace\.(?:[cm]?[jt]s|json)$/;
-const SETUP_KEY_RE = /\b(?:setupFiles|globalSetup)\s*:\s*(\[[^\]]*\]|"[^"]*"|'[^']*'|`[^`$]*`)/g;
+// The key bare, quoted ("setupFiles", 'setupFiles', `setupFiles`) or computed
+// (["setupFiles"]), as JavaScript, TypeScript and JSON configs write it.
+const SETUP_KEY_RE = /(\[\s*)?(["'`]?)\b(?:setupFiles|globalSetup)\2\s*(?:\]\s*)?:\s*(\[[^\]]*\]|"[^"]*"|'[^']*'|`[^`$]*`)/g;
 const STRING_RE = /"([^"]*)"|'([^']*)'|`([^`$]*)`/g;
 const SCRIPT_EXT_RE = /\.[cm]?[jt]sx?$/;
 // Time kept back from the job's limit for the verdict, the summary and the
 // removal of the trees, so the gate names TIMEOUT before GitHub stops the job.
 export const JOB_RESERVE_SECONDS = 120;
+// The job limits the gate accepts: at least the reserve plus a minute of work,
+// at most the longest job GitHub runs (5 days on a self-hosted runner).
+export const JOB_MINUTES_MIN = 3;
+export const JOB_MINUTES_MAX = 7200;
+// After a kill, the time a child has to report its exit before the gate stops
+// waiting for it (a process stuck in the kernel may never report one).
+const KILL_GRACE_MS = 5000;
+// After a stop signal, the time the run has to reach its own cleanup before
+// the gate cleans up and leaves (GitHub sends SIGTERM 7.5 s after SIGINT).
+const STOP_GRACE_MS = 5000;
+// Each git call of the cleanup, which runs inside the reserve.
+const CLEANUP_GIT_MS = 30_000;
 const NODE_TEST_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["']node:test["']/;
 const MARKER_RE = /red-first-expect:[ \t]*(.*?)[ \t]*(?:\*\/[ \t]*)?$/;
 const ASSERTION_TEXT_RE = /^(?:AssertionError|JestAssertionError)\b/;
@@ -90,10 +104,12 @@ const CHILD_ENV_DROP = [
 ];
 
 const USAGE = `usage:
-  red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <re>] [--test-support <re>] [--verdict <file>] [--github-output <file>] [--summary <file>]
+  red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <re>] [--test-support <re>] [--job-minutes <n>] [--verdict <file>] [--github-output <file>] [--summary <file>]
   red-first-gate.mjs run  --base <sha> --head <sha> --work <empty dir> [--repo <dir>] [--install <cmd>] [--vitest <cmd>] [--exclude <re>] [--test-support <re>] [--timeout-seconds <n>] [--job-started <epoch s> --job-minutes <n>] [--verdict <file>] [--summary <file>]`;
 
 export class GateError extends Error {}
+// A step the job's time budget cut: the run ends RED with TIMEOUT.
+export class BudgetError extends GateError {}
 
 // ---------------------------------------------------------------------------
 // Text helpers
@@ -118,6 +134,22 @@ function clip(text, max = 240) {
 function firstLine(text, max = 200) {
   const line = String(text ?? "").split(/\r?\n/).find((l) => l.trim()) ?? "";
   return clip(line, max);
+}
+
+// Every line the gate writes to stdout or stderr goes through this: a CR or LF
+// inside a path or a message (paths come from the pull request) is shown as
+// \r or \n, so it can never start a new line that the runner reads as a
+// workflow command.
+export function oneLine(text) {
+  return String(text ?? "").replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+}
+
+function say(text) {
+  console.log(oneLine(text));
+}
+
+function sayErr(text) {
+  console.error(oneLine(text));
 }
 
 function byPath(a, b) {
@@ -164,7 +196,9 @@ export function setupPathsFromConfig(configPath, source) {
   const dir = posix.dirname(configPath);
   const paths = [];
   for (const match of String(source).matchAll(SETUP_KEY_RE)) {
-    for (const lit of match[1].matchAll(STRING_RE)) {
+    // A computed key needs its closing bracket, a quoted key its closing quote.
+    if (match[1] && !match[2]) continue;
+    for (const lit of match[3].matchAll(STRING_RE)) {
       const raw = (lit[1] ?? lit[2] ?? lit[3] ?? "").trim();
       // A package or an alias ("@scope/pkg", "~/x", "virtual:x") is not a path here.
       if (!raw || raw.startsWith("@") || raw.startsWith("~") || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(raw)) continue;
@@ -277,6 +311,11 @@ export function parseVitestReport(report, treeRoot) {
     const fileFailed = entry.status === "failed";
     const testFailed = tests.some((t) => t.status === "failed");
     if (testFailed && !fileFailed) return bad(`${at} reports a failed test in a file whose status is ${entry.status}`);
+    // A file reported as skipped, pending or todo ran no test: a passed test in
+    // it contradicts the file status.
+    if (entry.status !== "passed" && !fileFailed && tests.some((t) => t.status === "passed")) {
+      return bad(`${at} reports a passed test in a file whose status is ${entry.status}`);
+    }
     if (fileFailed) anyFailed = true;
     const rel = relativeIn(entry.name, roots);
     if (rel === null) continue;
@@ -339,15 +378,22 @@ export function parseNodeReport(text, fileArg) {
   const open = [];
   let wrapper = null;
   for (const e of events) {
-    if (e?.kind === "stderr") {
+    if (e?.kind !== "stderr" && e?.kind !== "test") return null;
+  }
+  // The runner reports the file itself as a top-level test named after the
+  // path it was given, after all of the file's own results, when the file's
+  // process reported no test or exited with an error. Only that final result
+  // is the file: a test of the file with the same name anywhere before it is
+  // a test like any other, so no occurrence of it is ever dropped.
+  const testEvents = events.filter((e) => e.kind === "test");
+  const last = testEvents.at(-1);
+  const isWrapper = (e) => e === last && e.nesting === 0 && e.type === "test" && e.name === fileArg;
+  for (const e of events) {
+    if (e.kind === "stderr") {
       stderr.push(String(e.message ?? ""));
       continue;
     }
-    if (e?.kind !== "test") return null;
-    // The runner reports the file itself as a top-level test named after the
-    // path it was given when the file's process reported no test or exited
-    // with an error.
-    if (e.nesting === 0 && e.type === "test" && e.name === fileArg) {
+    if (isWrapper(e)) {
       wrapper = { ok: Boolean(e.ok), ...nodeFailure(e.error) };
       continue;
     }
@@ -479,12 +525,32 @@ function gitEnv(extra = {}) {
   return env;
 }
 
-function git(repo, args, { allowFail = false, env = {} } = {}) {
+// The deadline of the run's git calls (the job's budget less the reserve), or
+// null when the run has no job budget. The cleanup's git calls run inside the
+// reserve, each with CLEANUP_GIT_MS.
+const gitBudget = { deadlineMs: null };
+
+function gitTimeout(cleanup) {
+  if (cleanup) return CLEANUP_GIT_MS;
+  if (gitBudget.deadlineMs == null) return undefined;
+  return gitBudget.deadlineMs - Date.now();
+}
+
+function git(repo, args, { allowFail = false, env = {}, cleanup = false } = {}) {
+  const timeout = gitTimeout(cleanup);
+  if (timeout !== undefined && timeout <= 0) throw new BudgetError(`the job's time budget was spent before git ${args[0]}`);
   const r = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "--literal-pathspecs", "-C", repo, ...args], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
     env: gitEnv(env),
+    timeout,
+    killSignal: "SIGKILL",
   });
+  if (r.error?.code === "ETIMEDOUT") {
+    const what = `git ${args[0]} did not finish within ${cleanup ? `${CLEANUP_GIT_MS / 1000}s` : "the job's time budget"}`;
+    if (cleanup && allowFail) return { status: null, stdout: "", stderr: what };
+    throw new BudgetError(what);
+  }
   if (r.error) throw new GateError(`git ${args[0]}: ${r.error.message}`);
   if (r.status !== 0 && !allowFail) throw new GateError(`git ${args.join(" ")} failed: ${firstLine(r.stderr)}`);
   return r;
@@ -515,9 +581,41 @@ function killGroup(pid) {
   }
 }
 
+// A stop of the gate (SIGINT or SIGTERM, for example a cancelled job). The
+// first signal kills the children and asks the run to stop: it ends with the
+// reason STOPPED and removes its trees in its own cleanup. When the run has
+// not left within STOP_GRACE_MS, or at a second signal, the gate removes the
+// trees itself and leaves. Either way the work folder is left clean.
+export const stopState = { signal: null };
+let activeCleanup = null;
+
+function stopCode(signal) {
+  return signal === "SIGINT" ? 130 : 143;
+}
+
+function cleanupNow() {
+  const cleanup = activeCleanup;
+  activeCleanup = null;
+  if (cleanup) {
+    try {
+      cleanup();
+    } catch {
+      // leave anyway
+    }
+  }
+}
+
 function onStop(signal) {
   for (const pid of liveGroups) killGroup(pid);
-  process.exit(signal === "SIGINT" ? 130 : 143);
+  if (stopState.signal) {
+    cleanupNow();
+    process.exit(stopCode(stopState.signal));
+  }
+  stopState.signal = signal;
+  setTimeout(() => {
+    cleanupNow();
+    process.exit(stopCode(signal));
+  }, STOP_GRACE_MS).unref();
 }
 
 // A child runs in its own process group (detached), with its output on this
@@ -526,7 +624,10 @@ function onStop(signal) {
 // cannot outlive it and change a later phase or run. (A process that leaves
 // the group on purpose, with setsid, is outside this; the gate trusts the pull
 // request's toolchain as any test job does.)
-function spawnChild(command, args, cwd, timeoutMs) {
+// The promise always settles: when the time is up the group is killed, and
+// when no exit is reported within the grace time after that kill (the kill
+// failed, or the process is stuck in the kernel), it settles as timed out.
+export function spawnChild(command, args, cwd, timeoutMs, { kill = killGroup, graceMs = KILL_GRACE_MS } = {}) {
   return new Promise((done) => {
     let child;
     try {
@@ -537,16 +638,19 @@ function spawnChild(command, args, cwd, timeoutMs) {
     }
     let timedOut = false;
     let settled = false;
+    let grace = null;
     if (child.pid) liveGroups.add(child.pid);
     const timer = setTimeout(() => {
       timedOut = true;
-      killGroup(child.pid);
+      kill(child.pid);
+      grace = setTimeout(() => finish({ status: null, signal: null, timedOut: true, error: null }), Math.max(1, graceMs));
     }, Math.max(1, timeoutMs));
     const finish = (value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      killGroup(child.pid);
+      if (grace) clearTimeout(grace);
+      kill(child.pid);
       liveGroups.delete(child.pid);
       done(value);
     };
@@ -560,12 +664,12 @@ function shell(script, cwd, timeoutMs, args = []) {
 }
 
 function group(title) {
-  if (process.env.GITHUB_ACTIONS === "true") console.log(`::group::${title}`);
-  else console.error(`== ${title}`);
+  if (process.env.GITHUB_ACTIONS === "true") say(`::group::${escapeData(title)}`);
+  else sayErr(`== ${title}`);
 }
 
 function endGroup() {
-  if (process.env.GITHUB_ACTIONS === "true") console.log("::endgroup::");
+  if (process.env.GITHUB_ACTIONS === "true") say("::endgroup::");
 }
 
 // Tracked test-side files of a tree whose bytes or mode differ from the head
@@ -589,8 +693,22 @@ function exitText(res) {
 // Setup files named by every vitest config of the head, read from git objects.
 // In the plan job (a partial clone) a config whose blob is not local is not
 // fetched: the run job, with the full clone, reads it (strict = true).
-function configSetupPaths(repo, head, strict) {
-  const names = nulList(git(repo, ["ls-tree", "-r", "--name-only", "-z", head]).stdout);
+// Every entry of the head tree: path -> mode ("100644", "100755", "120000"
+// for a symlink, "160000" for a gitlink).
+function headModes(repo, head) {
+  const modes = new Map();
+  for (const line of nulList(git(repo, ["ls-tree", "-r", "-z", head]).stdout)) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) throw new GateError("the head tree listing is not readable");
+    modes.set(line.slice(tab + 1), line.split(" ")[0]);
+  }
+  return modes;
+}
+
+const REGULAR_MODES = new Set(["100644", "100755"]);
+
+function configSetupPaths(repo, head, strict, modes) {
+  const names = [...modes.keys()];
   const paths = [];
   for (const name of names.filter((n) => VITEST_CONFIG_RE.test(posix.basename(n)))) {
     const r = git(repo, ["cat-file", "blob", `${head}:${name}`], { allowFail: true, env: { GIT_NO_LAZY_FETCH: "1" } });
@@ -609,7 +727,7 @@ export function checkPlatform(platform = process.platform) {
 
 export function planRange({ repo = process.cwd(), base, head, exclude = "", testSupport = "", strict = false }) {
   if (!base && !head) {
-    return { verdict: "skip", reason: "NOT-A-PULL-REQUEST", detail: "no pull request base and head were given", newTests: [], excluded: [], fixSide: [], testSide: [] };
+    return { verdict: "skip", reason: "NOT-A-PULL-REQUEST", detail: "no pull request base and head were given", newTests: [], excluded: [], fixSide: [], testSide: [], notFiles: [] };
   }
   if (!SHA_RE.test(base ?? "") || !SHA_RE.test(head ?? "")) throw new GateError("--base and --head must both be 40-hex commit SHAs");
   for (const sha of [base, head]) git(repo, ["cat-file", "-e", `${sha}^{commit}`]);
@@ -619,17 +737,24 @@ export function planRange({ repo = process.cwd(), base, head, exclude = "", test
   if (parts.length % 2) throw new GateError("the range's name-status list is not readable");
   const entries = [];
   for (let i = 0; i < parts.length; i += 2) entries.push({ status: parts[i].charAt(0), path: parts[i + 1] });
-  const setupPaths = configSetupPaths(repo, head, strict);
+  const modes = headModes(repo, head);
+  const setupPaths = configSetupPaths(repo, head, strict, modes);
   const c = classifyPaths(entries, { exclude, testSupport, setupPaths });
-  const plan = { base, head, mergeBase, testSupport, setupPaths, ...c };
+  // Test-side entries of the head that are not regular files (a symlink, whose
+  // target may be fix side, or a gitlink): the test that runs would not be the
+  // pull request's test file, so run refuses them (NOT-A-FILE).
+  const notFiles = c.testSide.filter((e) => e.status !== "D" && !REGULAR_MODES.has(modes.get(e.path))).map((e) => e.path);
+  const plan = { base, head, mergeBase, testSupport, setupPaths, notFiles, ...c };
   if (c.newTests.length + c.excluded.length === 0) {
     return { ...plan, verdict: "skip", reason: "NO-NEW-TESTS", detail: "the pull request adds or changes no test file" };
   }
-  if (c.fixSide.length === 0) {
-    return { ...plan, verdict: "skip", reason: "TESTS-ONLY", detail: "the pull request changes only tests and test support files: there is no fix to prove" };
-  }
+  // Every new test excluded decides first: with or without a fix, this check
+  // cannot prove them.
   if (c.newTests.length === 0) {
     return { ...plan, verdict: "skip", reason: "EXCLUDED-ONLY", detail: `every new or changed test file (${c.excluded.length}) matches --exclude: this check cannot prove them, so it is neutral (skipped), not red` };
+  }
+  if (c.fixSide.length === 0) {
+    return { ...plan, verdict: "skip", reason: "TESTS-ONLY", detail: "the pull request changes only tests and test support files: there is no fix to prove" };
   }
   const also = c.excluded.length ? `; ${c.excluded.length} more match --exclude and are not proven here` : "";
   return { ...plan, verdict: "run", reason: "", detail: `${c.newTests.length} new or changed test file(s) to prove${also}` };
@@ -655,10 +780,12 @@ function prepareWork(work) {
 // Removes the trees (and their worktree registrations) and the reports, so a
 // later run on the same runner and work path starts clean.
 function cleanWork(repo, work) {
+  if (work.cleaned) return;
+  work.cleaned = true;
   for (const tree of ["before", "head"]) {
-    if (existsSync(join(work.path, tree))) git(repo, ["worktree", "remove", "--force", "--force", join(work.path, tree)], { allowFail: true });
+    if (existsSync(join(work.path, tree))) git(repo, ["worktree", "remove", "--force", "--force", join(work.path, tree)], { allowFail: true, cleanup: true });
   }
-  git(repo, ["worktree", "prune"], { allowFail: true });
+  git(repo, ["worktree", "prune"], { allowFail: true, cleanup: true });
   for (const name of WORK_ENTRIES) rmSync(join(work.path, name), { recursive: true, force: true });
   if (work.created) rmSync(work.path, { recursive: true, force: true });
 }
@@ -731,7 +858,16 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
   const invocations = [];
   // Before each step: when the job's budget is spent, stop with TIMEOUT, so
   // the verdict is written before GitHub ends the job.
+  // After a stop signal: end with STOPPED, read nothing more from this tree.
+  const halted = (step, pending) => {
+    if (!stopState.signal) return null;
+    reasons.push({ code: "STOPPED", phase, file: null, detail: `the gate was stopped by ${stopState.signal} ${step}; no further test ran` });
+    for (const file of pending) perFile.set(file, { run: "stopped" });
+    return { stop: true, reasons, perFile, invocations };
+  };
   const outOfTime = (step, pending) => {
+    const halt = halted(`before ${step}`, pending);
+    if (halt) return halt;
     const left = allowance(opts);
     if (left.ms > 0) return null;
     reasons.push({ code: "TIMEOUT", phase, file: null, detail: `the job's time budget was spent before ${step}; no further test ran` });
@@ -745,6 +881,8 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     group(`red-first: install (${phase})`);
     const res = await shell(opts.install, tree, left.ms);
     endGroup();
+    const halt = halted("during the install", files.map((x) => x.file));
+    if (halt) return halt;
     if (res.timedOut) {
       reasons.push({ code: "TIMEOUT", phase, file: null, detail: `the install did not finish within ${timeText(opts, left.byJob)}; no test ran in this tree` });
       return { stop: true, reasons, perFile, invocations };
@@ -775,6 +913,8 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
       left.ms,
     );
     endGroup();
+    const halt = halted(`during node --test ${f.file}`, [...nodeFiles.slice(i).map((x) => x.file), ...files.filter((x) => x.runner === "vitest").map((x) => x.file)]);
+    if (halt) return halt;
     if (res.timedOut) {
       reasons.push({ code: "TIMEOUT", phase, file: f.file, detail: `node --test did not finish within ${timeText(opts, left.byJob)}` });
       perFile.set(f.file, { run: "timeout" });
@@ -808,6 +948,8 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     group(`red-first: vitest in ${where} (${phase})`);
     const res = await shell(`${opts.vitest} "$@"`, cwd, left.ms, [...args, "--reporter=default", "--reporter=json", `--outputFile.json=${out}`]);
     endGroup();
+    const halt = halted(`during vitest in ${where}`, groupList.slice(i).flatMap(([, l]) => l));
+    if (halt) return halt;
     if (res.timedOut) {
       reasons.push({ code: "TIMEOUT", phase, file: null, detail: `vitest in ${where} did not finish within ${timeText(opts, left.byJob)}` });
       for (const file of list) perFile.set(file, { run: "timeout" });
@@ -836,8 +978,28 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
   return { stop: false, reasons, perFile, invocations };
 }
 
+function budgetResult(error, mergeBase = null) {
+  return { mode: "run", verdict: "RED", reason: "", detail: "", mergeBase, reasons: [{ code: "TIMEOUT", phase: null, file: null, detail: error.message }], notes: [], files: [] };
+}
+
 export async function runGate(opts) {
-  const plan = planRange({ ...opts, strict: true });
+  // Every git call of the run stops at the job's budget (BudgetError: TIMEOUT).
+  gitBudget.deadlineMs = opts.deadlineMs ?? null;
+  try {
+    return await runGateIn(opts);
+  } finally {
+    gitBudget.deadlineMs = null;
+  }
+}
+
+async function runGateIn(opts) {
+  let plan;
+  try {
+    plan = planRange({ ...opts, strict: true });
+  } catch (error) {
+    if (error instanceof BudgetError) return budgetResult(error);
+    throw error;
+  }
   if (plan.verdict === "skip") {
     return { mode: "run", verdict: "SKIP", reason: plan.reason, detail: plan.detail, mergeBase: plan.mergeBase ?? null, reasons: [], notes: [], files: [] };
   }
@@ -846,9 +1008,19 @@ export async function runGate(opts) {
   // New tests that match --exclude beside other new tests: listed, not proven,
   // and no reason to fail the proof of the others.
   const notes = plan.excluded.map((file) => ({ code: "EXCLUDED", phase: "plan", file, detail: "the path matches --exclude: this check does not prove it" }));
-  git(repo, ["worktree", "prune"], { allowFail: true });
-  const work = prepareWork(opts.work);
   const result = { mode: "run", verdict: "RED", reason: "", detail: "", mergeBase: plan.mergeBase, reasons, notes, files: [] };
+  if (plan.notFiles.length) {
+    for (const file of plan.notFiles) reasons.push({ code: "NOT-A-FILE", phase: "plan", file, detail: "a test-side path of the head is a symlink or a submodule, not a regular file: the test that would run is not this file" });
+    return result;
+  }
+  try {
+    git(repo, ["worktree", "prune"], { allowFail: true });
+  } catch (error) {
+    if (error instanceof BudgetError) return budgetResult(error, plan.mergeBase);
+    throw error;
+  }
+  const work = prepareWork(opts.work);
+  activeCleanup = () => cleanWork(repo, work);
   const trees = { before: join(work.path, "before"), head: join(work.path, "head") };
   try {
     git(repo, ["worktree", "add", "-q", "--detach", trees.head, plan.head]);
@@ -858,8 +1030,10 @@ export async function runGate(opts) {
       return result;
     }
 
+    // The new test's bytes from the head commit (a regular file, checked by
+    // plan), never through the file system.
     const files = plan.newTests.map((file) => {
-      const source = readFileSync(join(trees.head, file), "utf8");
+      const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
       return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source) };
     });
     const phases = {};
@@ -868,6 +1042,9 @@ export async function runGate(opts) {
       reasons.push(...run.reasons);
       if (run.stop) break;
       phases[phase] = run;
+    }
+    if (stopState.signal && !reasons.some((r) => r.code === "STOPPED")) {
+      reasons.push({ code: "STOPPED", phase: null, file: null, detail: `the gate was stopped by ${stopState.signal}` });
     }
 
     const headReasonFiles = new Set();
@@ -894,10 +1071,17 @@ export async function runGate(opts) {
     }
     if (!reasons.length && result.files.length > 0 && result.files.every((f) => f.proven)) result.verdict = "PASS";
     return result;
+  } catch (error) {
+    if (!(error instanceof BudgetError)) throw error;
+    reasons.push({ code: "TIMEOUT", phase: null, file: null, detail: error.message });
+    for (const f of result.files) f.proven = false;
+    result.verdict = "RED";
+    return result;
   } finally {
     for (const r of reasons) {
       if (r.detail) for (const root of [...rootsOf(trees.before), ...rootsOf(trees.head)]) r.detail = r.detail.split(root).join("<tree>");
     }
+    activeCleanup = null;
     cleanWork(repo, work);
   }
 }
@@ -925,17 +1109,17 @@ function reasonLine(r) {
 function emit(result, opts) {
   const gha = process.env.GITHUB_ACTIONS === "true";
   for (const r of result.reasons ?? []) {
-    console.log(`REASON ${reasonLine(r)}`);
+    say(`REASON ${reasonLine(r)}`);
     if (gha) {
       const fileProp = r.file ? `file=${escapeProperty(r.file)},` : "";
-      console.log(`::error ${fileProp}title=${escapeProperty(`red-first ${r.code}`)}::${escapeData(reasonLine(r))}`);
+      say(`::error ${fileProp}title=${escapeProperty(`red-first ${r.code}`)}::${escapeData(reasonLine(r))}`);
     }
   }
   // Excluded new tests: a note in both jobs (plan lists them from the range).
   const notes = result.mode === "plan" ? (result.excluded ?? []).map((file) => ({ code: "EXCLUDED", phase: "plan", file, detail: "the path matches --exclude: this check does not prove it" })) : (result.notes ?? []);
   for (const r of notes) {
-    console.log(`NOTE ${reasonLine(r)}`);
-    if (gha) console.log(`::notice file=${escapeProperty(r.file)},title=${escapeProperty(`red-first ${r.code}`)}::${escapeData(reasonLine(r))}`);
+    say(`NOTE ${reasonLine(r)}`);
+    if (gha) say(`::notice file=${escapeProperty(r.file)},title=${escapeProperty(`red-first ${r.code}`)}::${escapeData(reasonLine(r))}`);
   }
   const notProven = notes.length ? `; ${notes.length} excluded new test file(s) not proven here` : "";
   let headline;
@@ -943,8 +1127,8 @@ function emit(result, opts) {
   else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.length} new test file(s) fail before the fix and pass with it${notProven})`;
   else if (result.verdict === "SKIP") headline = `RED-FIRST: SKIP ${result.reason}: ${result.detail}`;
   else headline = `RED-FIRST: RED (${result.reasons.length} reason(s))`;
-  console.log(headline);
-  if (gha && result.verdict === "SKIP") console.log(`::notice title=red-first SKIP::${escapeData(`${result.reason}: ${result.detail}`)}`);
+  say(headline);
+  if (gha && result.verdict === "SKIP") say(`::notice title=red-first SKIP::${escapeData(`${result.reason}: ${result.detail}`)}`);
 
   if (opts.verdict) writeFileSync(opts.verdict, `${JSON.stringify(result, null, 2)}\n`);
   if (opts.githubOutput && result.mode === "plan") {
@@ -1018,15 +1202,25 @@ export function parseArgs(argv) {
   // At most a day: a larger value would overflow the timer and fire at once.
   if (!Number.isInteger(seconds) || seconds <= 0 || seconds > 86400) throw new GateError("--timeout-seconds must be a whole number from 1 to 86400");
   opts.timeoutSeconds = seconds;
-  // The job's budget: both or neither. The deadline keeps JOB_RESERVE_SECONDS
-  // back for the verdict and the removal of the trees.
+  // The job's budget. run: both or neither; the deadline keeps
+  // JOB_RESERVE_SECONDS back for the verdict and the removal of the trees.
+  // plan: --job-minutes alone, checked so that a limit the reserve does not fit
+  // in fails the plan job before the red-first job starts.
   opts.deadlineMs = null;
   if (opts.jobStarted !== "" || opts.jobMinutes !== "") {
-    const started = Number(opts.jobStarted);
     const minutes = Number(opts.jobMinutes);
-    if (opts.jobStarted === "" || !Number.isInteger(started) || started <= 0) throw new GateError("--job-started must be the job's start as epoch seconds (with --job-minutes)");
-    if (opts.jobMinutes === "" || !Number.isFinite(minutes) || minutes <= 0) throw new GateError("--job-minutes must be a positive number (with --job-started)");
-    opts.deadlineMs = (started + minutes * 60 - JOB_RESERVE_SECONDS) * 1000;
+    if (opts.jobMinutes === "" || !Number.isFinite(minutes) || minutes < JOB_MINUTES_MIN || minutes > JOB_MINUTES_MAX) {
+      throw new GateError(`--job-minutes must be a number from ${JOB_MINUTES_MIN} to ${JOB_MINUTES_MAX} (the job's limit; the gate keeps ${JOB_RESERVE_SECONDS}s of it back)`);
+    }
+    if (mode === "run" || opts.jobStarted !== "") {
+      const started = Number(opts.jobStarted);
+      // At most five minutes ahead of this clock: a start in the future would
+      // move the deadline past the job's real limit.
+      if (opts.jobStarted === "" || !Number.isInteger(started) || started <= 0 || started > Date.now() / 1000 + 300) {
+        throw new GateError("--job-started must be the job's start as epoch seconds, not in the future (with --job-minutes)");
+      }
+      opts.deadlineMs = (started + minutes * 60 - JOB_RESERVE_SECONDS) * 1000;
+    }
   }
   opts.repo = resolve(opts.repo);
   return opts;
@@ -1037,7 +1231,8 @@ export async function main(argv) {
   try {
     opts = parseArgs(argv);
   } catch (error) {
-    console.error(`red-first-gate: ${error.message}\n${USAGE}`);
+    sayErr(`red-first-gate: ${error.message}`);
+    console.error(USAGE);
     return 2;
   }
   try {
@@ -1048,12 +1243,15 @@ export async function main(argv) {
     }
     const result = await runGate(opts);
     emit(result, opts);
+    if (stopState.signal) return stopCode(stopState.signal);
     if (result.verdict === "PASS") return 0;
     return result.verdict === "SKIP" ? 3 : 1;
   } catch (error) {
-    if (!(error instanceof GateError)) throw error;
-    console.error(`red-first-gate: ${error.message}`);
-    if (process.env.GITHUB_ACTIONS === "true") console.log(`::error title=red-first ERROR::${escapeData(error.message)}`);
+    // Any error, not only a GateError, is exit 2 with its message (the
+    // contract: 2 is a usage or internal error, never a crash).
+    const message = error instanceof GateError ? error.message : `internal error: ${error?.message ?? error}`;
+    sayErr(`red-first-gate: ${message}`);
+    if (process.env.GITHUB_ACTIONS === "true") say(`::error title=red-first ERROR::${escapeData(message)}`);
     return 2;
   }
 }
@@ -1067,7 +1265,7 @@ function invokedDirectly() {
 }
 
 if (invokedDirectly()) {
-  process.once("SIGINT", onStop);
-  process.once("SIGTERM", onStop);
+  process.on("SIGINT", onStop);
+  process.on("SIGTERM", onStop);
   process.exitCode = await main(process.argv.slice(2));
 }

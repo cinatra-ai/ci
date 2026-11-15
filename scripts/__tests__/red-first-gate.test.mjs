@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -430,10 +430,11 @@ test("an install that does not finish in time is RED (TIMEOUT)", async (t) => {
 
 test("the job's time budget ends a slow install with TIMEOUT before the job limit", async (t) => {
   const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST } });
-  const started = Math.floor(Date.now() / 1000);
-  // 2.05 minutes less the 120 s reserve leaves about 3 s of budget.
+  // A 3-minute job that started 57 s ago, less the 120 s reserve, leaves about
+  // 3 s of budget.
+  const started = Math.floor(Date.now() / 1000) - 57;
   const t0 = Date.now();
-  const r = runGate(sc, "run", ["--install", "sleep 20", "--job-started", String(started), "--job-minutes", "2.05"]);
+  const r = runGate(sc, "run", ["--install", "sleep 20", "--job-started", String(started), "--job-minutes", "3"]);
   assertRed(r, "TIMEOUT");
   assert.ok(Date.now() - t0 < 15_000, "the install ran past the job's budget");
   assert.match(r.verdict.reasons.find((x) => x.code === "TIMEOUT").detail, /job's time budget/);
@@ -442,9 +443,12 @@ test("the job's time budget ends a slow install with TIMEOUT before the job limi
 test("a job budget already spent stops with TIMEOUT before the install runs", async (t) => {
   const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST } });
   const mark = path.join(sc.root, "install-ran");
-  const r = runGate(sc, "run", ["--install", `touch '${mark}'`, "--job-started", String(Math.floor(Date.now() / 1000)), "--job-minutes", "1"]);
+  // A 3-minute job that started 10 minutes ago: its budget is spent.
+  const r = runGate(sc, "run", ["--install", `touch '${mark}'`, "--job-started", String(Math.floor(Date.now() / 1000) - 600), "--job-minutes", "3"]);
   assertRed(r, "TIMEOUT");
-  assert.match(r.verdict.reasons.find((x) => x.code === "TIMEOUT").detail, /spent before the install/);
+  // Every step after the budget is spent is refused, from the first git call
+  // on (finding 6 of review 2), so the install is never reached.
+  assert.match(r.verdict.reasons.find((x) => x.code === "TIMEOUT").detail, /time budget was spent before (the install|git )/);
   assert.equal(fs.existsSync(mark), false, "the install ran although the budget was spent");
 });
 
@@ -972,4 +976,152 @@ test("workflow: the red-first job starts its time budget first and hands it to t
 
 test("self-check runs this test file", () => {
   assert.match(fs.readFileSync(SELF_CHECK, "utf8"), /scripts\/__tests__\/red-first-gate\.test\.mjs/);
+});
+
+// ---------------------------------------------------------------------------
+// Review findings F1 to F9: one case each (each fails on the previous engine)
+// ---------------------------------------------------------------------------
+
+test("F1 vitest: a passed test in a file reported as skipped, pending or todo makes the report unreadable (NO-REPORT), never a pass", async (t) => {
+  for (const status of ["skipped", "pending", "todo"]) {
+    const head = vitestReport([{ rel: "src/calc.test.ts", status, tests: [{ title: "adds", status: "passed" }] }], { success: true });
+    const r = runVitest(t, { before: { report: GOOD_BEFORE, exit: 1 }, head: { report: head, exit: 0 } });
+    assertRed(r, "NO-REPORT");
+    assert.match(r.verdict.reasons.find((x) => x.code === "NO-REPORT").detail, new RegExp(`a passed test in a file whose status is ${status}`));
+  }
+});
+
+test("F2 node:test: tests named like the file are tests: a failed-before copy skipped at head is RED (NOT-GREEN-AT-HEAD)", async (t) => {
+  const { parseNodeReport } = await gateModule();
+  const ev = (o) => JSON.stringify({ kind: "test", nesting: 0, type: "test", skip: false, todo: false, error: null, ...o });
+  const failure = { failureType: "testCodeFailure", name: "AssertionError", code: "ERR_ASSERTION", message: "x", causeName: null, causeCode: null, causeMessage: "" };
+  const parsed = parseNodeReport([ev({ name: "f.test.mjs", ok: false, error: failure }), ev({ name: "f.test.mjs", ok: true }), ev({ name: "x", ok: true })].join("\n"), "f.test.mjs");
+  assert.deepEqual(parsed.tests.map((x) => [x.name, x.status]), [["f.test.mjs", "failed"], ["f.test.mjs", "passed"], ["x", "passed"]]);
+  // Only the final top-level result named like the file is the file itself.
+  const wrapped = parseNodeReport([ev({ name: "x", ok: true }), ev({ name: "f.test.mjs", ok: false, error: failure })].join("\n"), "f.test.mjs");
+  assert.deepEqual(wrapped.tests.map((x) => x.name), ["x"]);
+  assert.ok(wrapped.fileError);
+  const src = `${TEST_HEAD}import { existsSync } from "node:fs";\nimport { add } from "../src/calc.mjs";\n\nconst fixed = existsSync(new URL("../src/FIXED", import.meta.url));\ntest("test/calc.test.mjs", { skip: fixed }, () => {\n  assert.equal(add(1, 2), 3);\n});\ntest("add sums two numbers", () => {\n  assert.equal(add(1, 2), 3);\n});\ntest("test/calc.test.mjs", () => {});\n`;
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "src/FIXED": "", "test/calc.test.mjs": src } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-GREEN-AT-HEAD");
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-GREEN-AT-HEAD").detail, /test\/calc\.test\.mjs \(0 of 1 passed\)/);
+});
+
+test("F3 a setup file a vitest config names under a quoted or computed key is test side (TESTS-ONLY)", async (t) => {
+  const { setupPathsFromConfig } = await gateModule();
+  assert.deepEqual(setupPathsFromConfig("vitest.workspace.json", '[{ "test": { "setupFiles": ["./a.ts"], "globalSetup": "b.ts" } }]'), ["a.ts", "b.ts"]);
+  const config = 'export default { "test": { "setupFiles": "./support.ts", \'globalSetup\': [`./gs.ts`], ["setupFiles"]: ["./more.ts"] } };\n';
+  const sc = scenario(t, {
+    base: { ...V_BASE, "packages/pkg/vitest.config.mjs": config, "packages/pkg/support.ts": "export {};\n" },
+    head: { "packages/pkg/support.ts": "globalThis.ready = true;\n", "packages/pkg/src/calc.test.ts": V_TEST },
+  });
+  const plan = runGate(sc, "plan");
+  assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
+  assert.deepEqual(plan.verdict.setupPaths, ["packages/pkg/gs.ts", "packages/pkg/more.ts", "packages/pkg/support.ts"]);
+  assert.equal(plan.verdict.verdict, "skip");
+  assert.equal(plan.verdict.reason, "TESTS-ONLY");
+});
+
+test("F4 a new test that is a symlink, or a broken one, is RED (NOT-A-FILE): never followed, never a crash", async (t) => {
+  const check = `${TEST_HEAD}import { add } from "./calc.mjs";\n\ntest("add sums two numbers", () => {\n  assert.equal(add(1, 2), 3);\n});\n`;
+  // The link's target is fix side: before the fix it fails, at the head it is
+  // rewritten to pass, with no fix of calc at all.
+  const sc = scenario(t, { base: { ...BASE, "src/check.mjs": check }, head: { "src/check.mjs": `${TEST_HEAD}test("add sums two numbers", () => {\n  assert.ok(true);\n});\n` } });
+  fs.mkdirSync(path.join(sc.repo, "test"), { recursive: true });
+  fs.symlinkSync("../src/check.mjs", path.join(sc.repo, "test", "link.test.mjs"));
+  sc.head = commitAll(sc.repo, "link");
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-A-FILE");
+  assert.equal(r.verdict.reasons.find((x) => x.code === "NOT-A-FILE").file, "test/link.test.mjs");
+  const broken = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX } });
+  fs.mkdirSync(path.join(broken.repo, "test"), { recursive: true });
+  fs.symlinkSync("../src/nowhere.mjs", path.join(broken.repo, "test", "broken.test.mjs"));
+  broken.head = commitAll(broken.repo, "broken link");
+  assertRed(runGate(broken, "run"), "NOT-A-FILE");
+});
+
+test("F5 a child whose group kill fails still settles as timed out after the grace time", async () => {
+  const { spawnChild } = await gateModule();
+  assert.equal(typeof spawnChild, "function", "spawnChild is not exported");
+  const t0 = Date.now();
+  const res = await spawnChild("sleep", ["4"], os.tmpdir(), 100, { kill: () => {}, graceMs: 300 });
+  assert.equal(res.timedOut, true);
+  assert.ok(Date.now() - t0 < 2500, `settled after ${Date.now() - t0} ms, not after the grace time`);
+});
+
+test("F6 job budget: limits the reserve does not fit in are refused in plan and run; a hanging git step ends with TIMEOUT in time", async (t) => {
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST } });
+  const now = Math.floor(Date.now() / 1000);
+  for (const minutes of ["2", "2.5", "7201", "1e308"]) {
+    assert.equal(runGate(sc, "run", ["--job-started", String(now), "--job-minutes", minutes]).code, 2, `run --job-minutes ${minutes}`);
+    assert.equal(runGate(sc, "plan", ["--job-minutes", minutes]).code, 2, `plan --job-minutes ${minutes}`);
+  }
+  assert.equal(runGate(sc, "run", ["--job-started", String(now + 3600), "--job-minutes", "30"]).code, 2, "a start in the future");
+  assert.equal(runGate(sc, "plan", ["--job-minutes", "30"]).code, 0, "plan takes a valid limit alone");
+  const wf = load(fs.readFileSync(WORKFLOW, "utf8"));
+  const planStep = wf.jobs.plan.steps.find((s) => /red-first-gate\.mjs plan/.test(s.run ?? ""));
+  assert.match(String(planStep.env.TIMEOUT_MINUTES), /inputs\.timeout_minutes/);
+  assert.match(planStep.run, /--job-minutes "\$TIMEOUT_MINUTES"/);
+  // A git step that hangs (here: worktree add) is cut by the job's budget.
+  const bin = path.join(sc.root, "bin");
+  fs.mkdirSync(bin);
+  const realGit = spawnSync("bash", ["-c", "command -v git"], { encoding: "utf8", env: ENV }).stdout.trim();
+  fs.writeFileSync(path.join(bin, "git"), `#!/bin/bash\ncase " $* " in *" worktree add "*) exec sleep 40 ;; esac\nexec '${realGit}' "$@"\n`, { mode: 0o755 });
+  const t0 = Date.now();
+  const r = runGate(sc, "run", ["--job-started", String(Math.floor(Date.now() / 1000) - 57), "--job-minutes", "3"], { PATH: `${bin}:${ENV.PATH}` });
+  assertRed(r, "TIMEOUT");
+  assert.ok(Date.now() - t0 < 20_000, `the hanging git step ran past the job's budget (${Date.now() - t0} ms)`);
+});
+
+test("F7 a stop signal (a cancelled job) ends the run with STOPPED, kills the install and removes the trees", async (t) => {
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST } });
+  const work = path.join(sc.root, "stop-work");
+  const mark = path.join(sc.root, "started");
+  const verdictFile = path.join(sc.root, "stop.json");
+  const child = spawn(process.execPath, [GATE, "run", "--repo", sc.repo, "--base", sc.base, "--head", sc.head, "--work", work, "--verdict", verdictFile, "--install", `echo $$ > '${mark}'; sleep 60`], { env: ENV, stdio: "ignore" });
+  const exited = new Promise((done) => child.on("exit", (code, signal) => done({ code, signal })));
+  let installPid = 0;
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    if (installPid && alive(installPid)) process.kill(installPid, "SIGKILL");
+  });
+  const end = Date.now() + 30_000;
+  while (!(fs.existsSync(mark) && fs.readFileSync(mark, "utf8").trim())) {
+    assert.ok(Date.now() < end, "the install never started");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  installPid = Number(fs.readFileSync(mark, "utf8").trim());
+  child.kill("SIGTERM");
+  const res = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 15_000))]);
+  assert.ok(res, "the gate did not leave after SIGTERM");
+  assert.equal(res.code, 143);
+  assert.ok(!fs.existsSync(work) || fs.readdirSync(work).length === 0, `the stop left ${fs.existsSync(work) ? fs.readdirSync(work).join(", ") : ""}`);
+  assert.equal(git(sc.repo, "worktree", "list", "--porcelain").split("\n").filter((l) => l.startsWith("worktree ")).length, 1, "the stop left a worktree registration");
+  assert.ok(await goneWithin(installPid, 3000), "the install outlived the stop");
+  const verdict = JSON.parse(fs.readFileSync(verdictFile, "utf8"));
+  assert.equal(verdict.verdict, "RED");
+  assert.ok(verdict.reasons.some((x) => x.code === "STOPPED"), JSON.stringify(verdict.reasons));
+});
+
+test("F8 a pull request whose only change is excluded new tests is EXCLUDED-ONLY, not TESTS-ONLY", async (t) => {
+  const sc = scenario(t, { base: BASE, head: { "e2e/flow.spec.mjs": `${TEST_HEAD}test("flow", () => {});\n` } });
+  const plan = runGate(sc, "plan", ["--exclude", "^e2e/"]);
+  assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
+  assert.equal(plan.verdict.verdict, "skip");
+  assert.equal(plan.verdict.reason, "EXCLUDED-ONLY");
+  const run = runGate(sc, "run", ["--exclude", "^e2e/"]);
+  assert.equal(run.verdict?.reason, "EXCLUDED-ONLY");
+  assert.equal(run.code, 3);
+});
+
+test("F9 a path with a line break never starts a workflow command line in plan or run output", async (t) => {
+  const evil = "e2e/x\n::warning title=INJECTED::boom.spec.mjs";
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST, [evil]: `${TEST_HEAD}test("flow", () => {});\n` } });
+  for (const mode of ["plan", "run"]) {
+    const r = runGate(sc, mode, ["--exclude", "^e2e/"], { GITHUB_ACTIONS: "true" });
+    assert.equal(r.code, 0, `${mode}: ${r.stderr.slice(0, 400)}`);
+    for (const line of `${r.stdout}\n${r.stderr}`.split(/\r\n|\n|\r/)) assert.doesNotMatch(line, /^\s*::warning/, `${mode} wrote an injected command line`);
+    assert.match(r.stdout, /^NOTE EXCLUDED plan e2e\/x\\n::warning title=INJECTED::boom\.spec\.mjs: /m);
+  }
 });
