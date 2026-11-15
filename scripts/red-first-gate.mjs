@@ -27,12 +27,12 @@
 // exits or times out; the trees and reports are removed at the end of a run.
 //
 // Usage:
-//   red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <re>]
-//                           [--test-support <re>] [--job-minutes <n>] [--verdict <file>]
+//   red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <globs>]
+//                           [--test-support <globs>] [--job-minutes <n>] [--verdict <file>]
 //                           [--github-output <file>] [--summary <file>]
 //   red-first-gate.mjs run  --base <sha> --head <sha> --work <empty dir> [--repo <dir>]
-//                           [--install <cmd>] [--vitest <cmd>] [--exclude <re>]
-//                           [--test-support <re>] [--timeout-seconds <n>]
+//                           [--install <cmd>] [--vitest <cmd>] [--exclude <globs>]
+//                           [--test-support <globs>] [--timeout-seconds <n>]
 //                           [--job-started <epoch s> --job-minutes <n>]
 //                           [--verdict <file>] [--summary <file>]
 // Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED, 3 SKIP,
@@ -104,8 +104,8 @@ const CHILD_ENV_DROP = [
 ];
 
 const USAGE = `usage:
-  red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <re>] [--test-support <re>] [--job-minutes <n>] [--verdict <file>] [--github-output <file>] [--summary <file>]
-  red-first-gate.mjs run  --base <sha> --head <sha> --work <empty dir> [--repo <dir>] [--install <cmd>] [--vitest <cmd>] [--exclude <re>] [--test-support <re>] [--timeout-seconds <n>] [--job-started <epoch s> --job-minutes <n>] [--verdict <file>] [--summary <file>]`;
+  red-first-gate.mjs plan --base <sha> --head <sha> [--repo <dir>] [--exclude <globs>] [--test-support <globs>] [--job-minutes <n>] [--verdict <file>] [--github-output <file>] [--summary <file>]
+  red-first-gate.mjs run  --base <sha> --head <sha> --work <empty dir> [--repo <dir>] [--install <cmd>] [--vitest <cmd>] [--exclude <globs>] [--test-support <globs>] [--timeout-seconds <n>] [--job-started <epoch s> --job-minutes <n>] [--verdict <file>] [--summary <file>]`;
 
 export class GateError extends Error {}
 // A step the job's time budget cut: the run ends RED with TIMEOUT.
@@ -172,21 +172,101 @@ export function isTestSide(path) {
   return isTestFile(path) || TEST_SUPPORT_RE.test(path);
 }
 
-function pattern(flag, source) {
-  if (!source) return null;
-  try {
-    return new RegExp(source);
-  } catch (error) {
-    throw new GateError(`${flag} is not a valid regular expression: ${error.message}`);
+// --exclude and --test-support: path patterns, separated by commas or line
+// breaks. A pattern matches the whole repository path: `*` is any run of
+// characters but `/`, `?` one character but `/`, `**` any run including `/`
+// (`**/` also matches no folder, but only at the start of a folder name, so
+// `**/calc.test.mjs` never matches `src/mycalc.test.mjs`); every other
+// character matches itself. No regular expression is ever built from these
+// inputs. The matcher is a table filled without recursion, in time and memory
+// proportional to pattern times path. Characters of regular-expression or
+// shell-glob syntax ([ ] { } ( ) ! ^ $ + | \) are refused, and so is a pattern
+// ending in "/" (it can never match a file). `?` stands for one refused
+// character (for example `app/?marketing?/**` for a folder `(marketing)`).
+const PATTERN_REFUSED = new Set(["[", "]", "{", "}", "(", ")", "!", "^", "$", "+", "|", "\\"]);
+const PATTERN_MAX = 1024;
+
+export function globMatch(glob, path) {
+  const P = glob.length;
+  const S = path.length;
+  const width = S + 1;
+  // ok[pi * width + si]: glob from pi matches path from si. Rows are filled
+  // from the end of the glob, each row from the end of the path, so every
+  // cell reads only cells already filled.
+  const ok = new Uint8Array((P + 1) * width);
+  ok[P * width + S] = 1;
+  for (let pi = P - 1; pi >= 0; pi -= 1) {
+    const row = pi * width;
+    const globstar = glob[pi] === "*" && glob[pi + 1] === "*";
+    for (let si = S; si >= 0; si -= 1) {
+      let v = 0;
+      if (globstar) {
+        const after = pi + 2;
+        // the empty `**/`: only where a folder name starts
+        if (glob[after] === "/" && (si === 0 || path[si - 1] === "/") && ok[(after + 1) * width + si]) v = 1;
+        else if (ok[after * width + si]) v = 1;
+        else if (si < S && ok[row + si + 1]) v = 1;
+      } else if (glob[pi] === "*") {
+        if (ok[(pi + 1) * width + si]) v = 1;
+        else if (si < S && path[si] !== "/" && ok[row + si + 1]) v = 1;
+      } else if (glob[pi] === "?") {
+        if (si < S && path[si] !== "/" && ok[(pi + 1) * width + si + 1]) v = 1;
+      } else if (si < S && path[si] === glob[pi] && ok[(pi + 1) * width + si + 1]) v = 1;
+      ok[row + si] = v;
+    }
   }
+  return ok[0] === 1;
+}
+
+export function pathMatcher(flag, source) {
+  if (!source) return null;
+  const globs = String(source).split(/[,\r\n]/).map((g) => g.trim()).filter(Boolean);
+  for (const glob of globs) {
+    const bad = [...glob].find((ch) => PATTERN_REFUSED.has(ch));
+    let why = null;
+    if (bad !== undefined) why = `"${bad}" is refused (write ? for it)`;
+    else if (glob.startsWith("/")) why = "a leading / is refused";
+    else if (glob.endsWith("/")) why = "a pattern ending in / never matches a file (write folder/**)";
+    else if (glob.length > PATTERN_MAX) why = `a pattern is at most ${PATTERN_MAX} characters`;
+    if (why) throw new GateError(`${flag}: ${JSON.stringify(glob.slice(0, 120))} is not a path pattern (use *, ** and ?; ${why})`);
+  }
+  return globs.length ? (path) => globs.some((glob) => globMatch(glob, path)) : null;
+}
+
+// --vitest: the command split into words (spaces separate words; single or
+// double quotes group them; no escapes, no expansion). It runs without a shell.
+export function splitCommand(text) {
+  const words = [];
+  let word = "";
+  let started = false;
+  let quote = null;
+  for (const ch of String(text ?? "")) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else word += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+    } else if (/\s/.test(ch)) {
+      if (started) words.push(word);
+      word = "";
+      started = false;
+    } else {
+      word += ch;
+      started = true;
+    }
+  }
+  if (quote) throw new GateError("--vitest has a quote that is not closed");
+  if (started) words.push(word);
+  return words;
 }
 
 // The test-side test of one path: the default names, the caller's
 // --test-support pattern and the setup files a vitest config names.
 export function testSideOf({ testSupport = "", setupPaths = [] } = {}) {
-  const supportRe = pattern("--test-support", testSupport);
+  const supportMatch = pathMatcher("--test-support", testSupport);
   const setup = new Set(setupPaths);
-  return (path) => isTestSide(path) || setup.has(path) || setup.has(path.replace(SCRIPT_EXT_RE, "")) || Boolean(supportRe?.test(path));
+  return (path) => isTestSide(path) || setup.has(path) || setup.has(path.replace(SCRIPT_EXT_RE, "")) || Boolean(supportMatch?.(path));
 }
 
 // The setup files a vitest config names in setupFiles or globalSetup as string
@@ -211,7 +291,7 @@ export function setupPathsFromConfig(configPath, source) {
 }
 
 export function classifyPaths(entries, { exclude = "", testSupport = "", setupPaths = [] } = {}) {
-  const excludeRe = pattern("--exclude", exclude);
+  const excludeMatch = pathMatcher("--exclude", exclude);
   const onTestSide = testSideOf({ testSupport, setupPaths });
   const newTests = [];
   const excluded = [];
@@ -221,7 +301,7 @@ export function classifyPaths(entries, { exclude = "", testSupport = "", setupPa
     if (onTestSide(path)) {
       testSide.push({ status, path });
       // A test-named file inside a fixtures folder is test data, not a test.
-      if (isTestFile(path) && status !== "D" && !FIXTURE_DIR_RE.test(path)) (excludeRe?.test(path) ? excluded : newTests).push(path);
+      if (isTestFile(path) && status !== "D" && !FIXTURE_DIR_RE.test(path)) (excludeMatch?.(path) ? excluded : newTests).push(path);
     } else {
       fixSide.push(path);
     }
@@ -659,8 +739,10 @@ export function spawnChild(command, args, cwd, timeoutMs, { kill = killGroup, gr
   });
 }
 
-function shell(script, cwd, timeoutMs, args = []) {
-  return spawnChild("bash", ["-c", script, "red-first", ...args], cwd, timeoutMs);
+// The caller's install command is a shell script, as a `run:` step is; it gets
+// no argument from the gate.
+function shell(script, cwd, timeoutMs) {
+  return spawnChild("bash", ["-c", script], cwd, timeoutMs);
 }
 
 function group(title) {
@@ -946,7 +1028,9 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     const cwd = join(tree, dir);
     const args = list.map((file) => asArgument(toPosix(relative(cwd, join(tree, file)))));
     group(`red-first: vitest in ${where} (${phase})`);
-    const res = await shell(`${opts.vitest} "$@"`, cwd, left.ms, [...args, "--reporter=default", "--reporter=json", `--outputFile.json=${out}`]);
+    // vitest runs from its argument list, without a shell.
+    const [command, ...words] = splitCommand(opts.vitest);
+    const res = await spawnChild(command, [...words, ...args, "--reporter=default", "--reporter=json", `--outputFile.json=${out}`], cwd, left.ms);
     endGroup();
     const halt = halted(`during vitest in ${where}`, groupList.slice(i).flatMap(([, l]) => l));
     if (halt) return halt;
@@ -1098,8 +1182,12 @@ function escapeProperty(text) {
   return escapeData(text).replace(/:/g, "%3A").replace(/,/g, "%2C");
 }
 
-function cell(text) {
-  return String(text ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ");
+// Text from the pull request (paths, details) in the Markdown summary: plain
+// text on one line, with every character Markdown or a table could read as
+// syntax escaped by a backslash (the backslash itself first, in the same pass):
+// \ ` * _ [ ] < > | ~ & $. Never inside a code span, where no escape works.
+export function cell(text) {
+  return String(text ?? "").replace(/\s+/g, " ").replace(/[\\`*_[\]<>|~&$]/g, "\\$&");
 }
 
 function reasonLine(r) {
@@ -1137,15 +1225,15 @@ function emit(result, opts) {
   if (opts.summary) {
     const lines = [`### red-first-gate: ${headline.replace(/^RED-FIRST( PLAN)?: /, "")}`, ""];
     if (result.mode === "plan" && result.verdict === "run") {
-      lines.push(`New or changed test files: ${[...(result.newTests ?? []), ...(result.excluded ?? [])].map((f) => `\`${cell(f)}\``).join(", ")}`, "");
+      lines.push(`New or changed test files: ${[...(result.newTests ?? []), ...(result.excluded ?? [])].map((f) => cell(f)).join(", ")}`, "");
     }
     if (result.files?.length) {
       lines.push("| test file | runner | proven |", "| --- | --- | --- |");
-      for (const f of result.files) lines.push(`| \`${cell(f.file)}\` | ${f.runner} | ${f.proven ? "yes" : "no"} |`);
+      for (const f of result.files) lines.push(`| ${cell(f.file)} | ${f.runner} | ${f.proven ? "yes" : "no"} |`);
       lines.push("");
     }
-    for (const r of result.reasons ?? []) lines.push(`- \`${r.code}\` ${cell(r.phase ?? "")} ${r.file ? `\`${cell(r.file)}\`` : ""}: ${cell(r.detail)}`);
-    for (const r of notes) lines.push(`- note \`${r.code}\` \`${cell(r.file)}\`: ${cell(r.detail)}`);
+    for (const r of result.reasons ?? []) lines.push(`- \`${r.code}\` ${cell(r.phase ?? "")} ${r.file ? cell(r.file) : ""}: ${cell(r.detail)}`);
+    for (const r of notes) lines.push(`- note \`${r.code}\` ${cell(r.file)}: ${cell(r.detail)}`);
     appendFileSync(opts.summary, `${lines.join("\n")}\n`);
   }
 }
@@ -1198,6 +1286,7 @@ export function parseArgs(argv) {
     i += 1;
   }
   if (!String(opts.vitest).trim()) opts.vitest = DEFAULT_VITEST;
+  if (splitCommand(opts.vitest).length === 0) throw new GateError("--vitest names no command");
   const seconds = Number(opts.timeoutSeconds);
   // At most a day: a larger value would overflow the timer and fire at once.
   if (!Number.isInteger(seconds) || seconds <= 0 || seconds > 86400) throw new GateError("--timeout-seconds must be a whole number from 1 to 86400");

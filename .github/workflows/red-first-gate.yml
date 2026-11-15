@@ -45,17 +45,17 @@ on:
         required: false
         default: false
       vitest:
-        description: "Command that runs vitest once; the gate appends the test files and the JSON reporter options."
+        description: "Command that runs vitest once, split into words (single or double quotes group words; no shell, no expansion); the gate appends the test files and the JSON reporter options."
         type: string
         required: false
         default: "npx --no-install vitest run"
       exclude:
-        description: "Regular expression of test paths this check cannot prove (for example end-to-end specs that need a running app, or tests that need a database). When every new test file matches, the red-first job is skipped (EXCLUDED-ONLY); beside other new tests, a match is a notice (EXCLUDED, not proven here) and the other new tests decide."
+        description: "Test paths this check cannot prove (for example end-to-end specs that need a running app, or tests that need a database), e.g. 'e2e/**, **/*.db.test.*'. Path patterns, separated by commas or line breaks, each matching the whole repository path: * is any run of characters but /, ? one character but /, ** any run including / (**/ also matches no folder, only at the start of a folder name). Regular-expression syntax ([ ] { } ( ) ! ^ $ + | and backslash) and a leading or trailing / are refused; write ? for a refused character. When every new test file matches, the red-first job is skipped (EXCLUDED-ONLY); beside other new tests, a match is a notice (EXCLUDED, not proven here) and the other new tests decide."
         type: string
         required: false
         default: ""
       test_support:
-        description: "Regular expression of more test-side paths, for test setup files under names the gate does not know and that no vitest config names as a string literal. They are taken from the head into the tree before the fix."
+        description: "More test-side paths, for test setup files under names the gate does not know and that no vitest config names as a string literal; they are taken from the head into the tree before the fix. Path patterns, separated by commas or line breaks, each matching the whole repository path: * is any run of characters but /, ? one character but /, ** any run including / (**/ also matches no folder, only at the start of a folder name). Regular-expression syntax ([ ] { } ( ) ! ^ $ + | and backslash) and a leading or trailing / are refused; write ? for a refused character."
         type: string
         required: false
         default: ""

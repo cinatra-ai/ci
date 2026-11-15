@@ -2436,11 +2436,31 @@ jobs:
 | `runner` | `""` | JSON `runs-on` value, as for the other gates; empty keeps `ubuntu-latest`. Linux or macOS only. |
 | `install` | `""` | Shell command run at the root of each tree before its tests. |
 | `setup_pnpm` | `false` | Set up pnpm from the caller's `packageManager` field. |
-| `vitest` | `npx --no-install vitest run` | Command that runs vitest; the gate appends the files and the JSON reporter options. |
-| `exclude` | `""` | Regular expression of test paths this check cannot prove (for example end-to-end specs, database tests). |
-| `test_support` | `""` | Regular expression of more test-side paths (setup files under other names). |
+| `vitest` | `npx --no-install vitest run` | Command that runs vitest, split into words (quotes group words); it runs without a shell. The gate appends the files and the JSON reporter options. |
+| `exclude` | `""` | Path patterns of tests this check cannot prove (for example `e2e/**, **/*.db.test.*`). |
+| `test_support` | `""` | Path patterns of more test-side paths (setup files under other names). |
 | `node_version` | `24` | Node.js version. |
 | `timeout_minutes` | `30` | Time limit of the `red-first` job, 3 to 7200; the gate stops 120 s before it with `TIMEOUT`. |
+
+Path patterns (`exclude`, `test_support`): separated by commas or line breaks;
+each matches the whole repository path. `*` is any run of characters but `/`,
+`?` one character but `/`, `**` any run including `/`; `**/` also matches no
+folder, but only where a folder name starts (`**/calc.test.mjs` matches
+`calc.test.mjs` and `src/calc.test.mjs`, never `src/mycalc.test.mjs`). Every
+other character matches itself; no regular expression is built from these
+inputs. Regular-expression syntax (`[ ] { } ( ) ! ^ $ + |` and the backslash),
+a leading `/` and a trailing `/` are refused with exit 2. To match a path that
+holds a refused character or a comma, write `?` for it: Next.js
+`app/?marketing?/**` for `(marketing)` and `app/?id?/*.test.tsx` for `[id]`,
+SvelteKit `**/?page.test.ts` for `+page`, Remix `**/?param.test.tsx` for
+`$param`. A pattern written out of habit as a regular expression without a
+refused character (`.spec.ts`, `e2e/.*`) is still a valid path pattern: it
+matches literally and may match nothing, so write `**/*.spec.ts` or `e2e/**`.
+
+The install command is a shell script (run with `bash -c`, as a `run:` step);
+the vitest command is not: it runs from its words, so shell syntax in it is a
+plain argument. The job summary shows paths and messages as plain text with
+every Markdown character escaped.
 
 ### Run locally
 
@@ -2454,7 +2474,7 @@ node scripts/red-first-gate.mjs run --base <sha> --head <sha> --work /tmp/red-fi
 stop signal ends `run` with 130 (SIGINT) or 143 (SIGTERM). `--verdict <file>`
 writes the result as JSON. `--job-started <epoch seconds> --job-minutes <n>`
 set the job's time budget (`plan` takes `--job-minutes` alone and checks it);
-`--test-support <re>` adds test-side paths. The work folder must
+`--test-support <patterns>` adds test-side paths. The work folder must
 be empty or absent; the run leaves it so.
 
 ### Develop

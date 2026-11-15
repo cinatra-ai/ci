@@ -341,13 +341,13 @@ test("a new test file matching --exclude beside a unit test is a note, not a red
     head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST, "e2e/flow.spec.mjs": `${TEST_HEAD}test("flow", () => {});\n` },
   });
   const summary = path.join(sc.root, "summary.md");
-  const r = runGate(sc, "run", ["--exclude", "^e2e/", "--summary", summary]);
+  const r = runGate(sc, "run", ["--exclude", "e2e/**", "--summary", summary]);
   assertPass(r);
   assert.deepEqual(r.verdict.files.map((f) => f.file), ["test/calc.test.mjs"]);
   assert.deepEqual(r.verdict.notes.map((n) => `${n.code} ${n.file}`), ["EXCLUDED e2e/flow.spec.mjs"]);
   assert.match(r.stdout, /^NOTE EXCLUDED plan e2e\/flow\.spec\.mjs: /m);
   assert.match(r.stdout, /^RED-FIRST: PASS \(1 new test file\(s\) fail before the fix and pass with it; 1 excluded new test file\(s\) not proven here\)/m);
-  assert.match(fs.readFileSync(summary, "utf8"), /note `EXCLUDED` `e2e\/flow\.spec\.mjs`/);
+  assert.match(fs.readFileSync(summary, "utf8"), /note `EXCLUDED` e2e\/flow\.spec\.mjs: /);
 });
 
 test("a unit test beside an excluded test still has to be red first: the excluded file hides nothing", async (t) => {
@@ -356,7 +356,7 @@ test("a unit test beside an excluded test still has to be red first: the exclude
     base: BASE,
     head: { "src/calc.mjs": CALC_FIX, "test/mul.test.mjs": mulTest, "e2e/flow.spec.mjs": `${TEST_HEAD}test("flow", () => {});\n` },
   });
-  assertRed(runGate(sc, "run", ["--exclude", "^e2e/"]), "NOT-RED-BEFORE");
+  assertRed(runGate(sc, "run", ["--exclude", "e2e/**"]), "NOT-RED-BEFORE");
 });
 
 test("e2e and database tests without a unit test: neutral (skipped) with its reason, never red", async (t) => {
@@ -368,7 +368,7 @@ test("e2e and database tests without a unit test: neutral (skipped) with its rea
       "src/calc.integration.test.mjs": `${TEST_HEAD}test("db", () => {});\n`,
     },
   });
-  const exclude = ["--exclude", "^tests/e2e/.+\\.spec\\.[cm]?[jt]sx?$|\\.integration\\.test\\.[cm]?[jt]sx?$"];
+  const exclude = ["--exclude", "tests/e2e/**/*.spec.*, **/*.integration.test.*"];
   const out = path.join(sc.root, "github-output.txt");
   const summary = path.join(sc.root, "summary.md");
   const plan = runGate(sc, "plan", [...exclude, "--github-output", out, "--summary", summary]);
@@ -391,11 +391,11 @@ test("a pull request whose only new tests match --exclude is skipped (EXCLUDED-O
     base: BASE,
     head: { "src/calc.mjs": CALC_FIX, "e2e/flow.spec.mjs": `${TEST_HEAD}test("flow", () => {});\n` },
   });
-  const plan = runGate(sc, "plan", ["--exclude", "^e2e/"]);
+  const plan = runGate(sc, "plan", ["--exclude", "e2e/**"]);
   assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
   assert.equal(plan.verdict.verdict, "skip");
   assert.equal(plan.verdict.reason, "EXCLUDED-ONLY");
-  const run = runGate(sc, "run", ["--exclude", "^e2e/"]);
+  const run = runGate(sc, "run", ["--exclude", "e2e/**"]);
   assert.ok(run.verdict, `no run verdict (exit ${run.code}): ${run.stderr.slice(0, 400)}`);
   assert.equal(run.verdict.verdict, "SKIP");
   assert.equal(run.code, 3, "a skip must never exit 0");
@@ -613,7 +613,7 @@ const ASSERT_FAIL = "AssertionError: expected -1 to be 3 // Object.is equality\n
 const GOOD_BEFORE = vitestReport([{ rel: "src/calc.test.ts", status: "failed", tests: [{ title: "adds", status: "failed", failure: ASSERT_FAIL }] }]);
 const GOOD_HEAD = vitestReport([{ rel: "src/calc.test.ts", status: "passed", tests: [{ title: "adds", status: "passed" }] }]);
 
-function runVitest(t, spec) {
+function runVitest(t, spec, vitestTail = "") {
   const sc = scenario(t, { base: V_BASE, head: V_HEAD });
   const fake = path.join(sc.root, "fake-vitest.mjs");
   const specFile = path.join(sc.root, "fake-spec.json");
@@ -623,7 +623,7 @@ function runVitest(t, spec) {
   ENV.FAKE_VITEST_SPEC = specFile;
   ENV.FAKE_VITEST_LOG = log;
   try {
-    const r = runGate(sc, "run", ["--vitest", `'${process.execPath}' '${fake}' run`]);
+    const r = runGate(sc, "run", ["--vitest", `'${process.execPath}' '${fake}' run${vitestTail}`]);
     const calls = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [];
     return { ...r, calls };
   } finally {
@@ -653,11 +653,11 @@ test("a setup file under another name is test side when it matches --test-suppor
   const plain = runGate(sc, "plan");
   assert.ok(plain.verdict, `no plan verdict (exit ${plain.code}): ${plain.stderr.slice(0, 400)}`);
   assert.equal(plain.verdict.verdict, "run");
-  const plan = runGate(sc, "plan", ["--test-support", "^support/"]);
+  const plan = runGate(sc, "plan", ["--test-support", "support/**"]);
   assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
   assert.equal(plan.verdict.verdict, "skip");
   assert.equal(plan.verdict.reason, "TESTS-ONLY");
-  assert.equal(runGate(sc, "run", ["--test-support", "^support/"]).code, 3);
+  assert.equal(runGate(sc, "run", ["--test-support", "support/**"]).code, 3);
   assert.equal(runGate(sc, "plan", ["--test-support", "(["]).code, 2);
 });
 
@@ -755,7 +755,7 @@ test("classify: test files, test support paths (fixture test files are data) and
     { status: "M", path: "src/a.ts" },
     { status: "A", path: "tests/e2e/flow.spec.ts" },
     { status: "M", path: "src/contest.ts" },
-  ], { exclude: "^tests/e2e/" });
+  ], { exclude: "tests/e2e/**" });
   assert.deepEqual(c.newTests, ["packages/x/src/b.spec.tsx", "scripts/__tests__/c.test.mjs", "src/a.test.ts"]);
   assert.deepEqual(c.excluded, ["tests/e2e/flow.spec.ts"]);
   assert.deepEqual(c.fixSide, ["src/a.ts", "src/contest.ts"]);
@@ -801,7 +801,7 @@ test("classify: common setup names, config-named setup files and the --test-supp
     { status: "M", path: "src/setup.ts" },
     { status: "M", path: "src/app.ts" },
     { status: "A", path: "tool.test.py" },
-  ], { setupPaths: ["packages/web/test/setup-dom.ts"], testSupport: "^support/" });
+  ], { setupPaths: ["packages/web/test/setup-dom.ts"], testSupport: "support/**" });
   assert.deepEqual(c.fixSide, ["src/app.ts", "src/setup.ts", "tool.test.py"]);
   assert.deepEqual(c.newTests, []);
   assert.throws(() => classifyPaths([], { testSupport: "([" }));
@@ -814,7 +814,7 @@ test("platform: Windows runners are refused with a usage error, Linux and macOS 
   assert.doesNotThrow(() => checkPlatform("darwin"));
 });
 
-test("classify: an exclude pattern that is not a valid regular expression is refused", async () => {
+test("classify: an exclude pattern that is not a valid path pattern is refused", async () => {
   const { classifyPaths } = await gateModule();
   assert.throws(() => classifyPaths([{ status: "A", path: "a.test.ts" }], { exclude: "([" }));
 });
@@ -1106,11 +1106,11 @@ test("F7 a stop signal (a cancelled job) ends the run with STOPPED, kills the in
 
 test("F8 a pull request whose only change is excluded new tests is EXCLUDED-ONLY, not TESTS-ONLY", async (t) => {
   const sc = scenario(t, { base: BASE, head: { "e2e/flow.spec.mjs": `${TEST_HEAD}test("flow", () => {});\n` } });
-  const plan = runGate(sc, "plan", ["--exclude", "^e2e/"]);
+  const plan = runGate(sc, "plan", ["--exclude", "e2e/**"]);
   assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
   assert.equal(plan.verdict.verdict, "skip");
   assert.equal(plan.verdict.reason, "EXCLUDED-ONLY");
-  const run = runGate(sc, "run", ["--exclude", "^e2e/"]);
+  const run = runGate(sc, "run", ["--exclude", "e2e/**"]);
   assert.equal(run.verdict?.reason, "EXCLUDED-ONLY");
   assert.equal(run.code, 3);
 });
@@ -1119,9 +1119,101 @@ test("F9 a path with a line break never starts a workflow command line in plan o
   const evil = "e2e/x\n::warning title=INJECTED::boom.spec.mjs";
   const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST, [evil]: `${TEST_HEAD}test("flow", () => {});\n` } });
   for (const mode of ["plan", "run"]) {
-    const r = runGate(sc, mode, ["--exclude", "^e2e/"], { GITHUB_ACTIONS: "true" });
+    const r = runGate(sc, mode, ["--exclude", "e2e/**"], { GITHUB_ACTIONS: "true" });
     assert.equal(r.code, 0, `${mode}: ${r.stderr.slice(0, 400)}`);
     for (const line of `${r.stdout}\n${r.stderr}`.split(/\r\n|\n|\r/)) assert.doesNotMatch(line, /^\s*::warning/, `${mode} wrote an injected command line`);
     assert.match(r.stdout, /^NOTE EXCLUDED plan e2e\/x\\n::warning title=INJECTED::boom\.spec\.mjs: /m);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Code scanning findings S1 to S3: one case each (each fails on the previous engine)
+// ---------------------------------------------------------------------------
+
+test("S1 --exclude and --test-support are path patterns, never regular expressions: * ** ? match, regex syntax is refused", async (t) => {
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST, "e2e/deep/flow.spec.mjs": `${TEST_HEAD}test("flow", () => {});\n` } });
+  const plan = runGate(sc, "plan", ["--exclude", "e2e/**/*.spec.mjs"]);
+  assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
+  assert.deepEqual(plan.verdict.excluded, ["e2e/deep/flow.spec.mjs"]);
+  assert.deepEqual(plan.verdict.newTests, ["test/calc.test.mjs"]);
+  // Regular-expression syntax is refused (exit 2), never compiled; that
+  // includes a pattern that would backtrack without end.
+  for (const bad of ["^e2e/", "(a+)+$", "e2e/[x]/*", "src|e2e"]) {
+    assert.equal(runGate(sc, "plan", ["--exclude", bad]).code, 2, `--exclude ${bad}`);
+    assert.equal(runGate(sc, "plan", ["--test-support", bad]).code, 2, `--test-support ${bad}`);
+  }
+  const { globMatch } = await gateModule();
+  const t0 = Date.now();
+  assert.equal(globMatch(`${"*".repeat(40)}x`, "a".repeat(4000)), false);
+  assert.equal(globMatch("**/**/**/**/**/x", `${"a/".repeat(500)}y`), false);
+  assert.ok(Date.now() - t0 < 2000, `the matcher took ${Date.now() - t0} ms on a hostile pattern`);
+});
+
+test("S2 the summary escapes every Markdown character of a file name, the backslash included", async (t) => {
+  const odd = "test/a`b\\|c*_<d>~&$.test.mjs";
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, [odd]: ADD_TEST } });
+  const summary = path.join(sc.root, "summary.md");
+  const plan = runGate(sc, "plan", ["--summary", summary]);
+  assert.equal(plan.code, 0, plan.stderr.slice(0, 400));
+  const text = fs.readFileSync(summary, "utf8");
+  assert.ok(text.includes("New or changed test files: test/a\\`b\\\\\\|c\\*\\_\\<d\\>\\~\\&\\$.test.mjs\n"), text);
+  const { cell } = await gateModule();
+  assert.equal(cell("x\\|y"), "x\\\\\\|y");
+  assert.equal(cell("a\n b\tc"), "a b c");
+});
+
+test("S3 the vitest command runs without a shell: shell syntax in it stays a plain argument", async (t) => {
+  const mark = path.join(os.tmpdir(), `red-first-s3-${process.pid}-${Date.now()}`);
+  t.after(() => fs.rmSync(mark, { force: true }));
+  const r = runVitest(t, { before: { report: GOOD_BEFORE, exit: 1 }, head: { report: GOOD_HEAD, exit: 0 } }, ` "$(touch ${mark})" ';' 'x y'`);
+  assertPass(r);
+  assert.equal(fs.existsSync(mark), false, "a shell ran the vitest command");
+  for (const call of r.calls) {
+    assert.ok(call.args.includes(`$(touch ${mark})`), JSON.stringify(call.args));
+    assert.ok(call.args.includes(";") && call.args.includes("x y"), JSON.stringify(call.args));
+  }
+});
+
+test("S1b an empty **/ matches only where a folder name starts; long paths and habit patterns are safe", async (t) => {
+  const { globMatch } = await gateModule();
+  const cases = [
+    ["**/calc.test.mjs", "src/mycalc.test.mjs", false],
+    ["**/calc.test.mjs", "src/calc.test.mjs", true],
+    ["**/calc.test.mjs", "calc.test.mjs", true],
+    ["**/e2e/**", "apps/admin-e2e/src/a.test.ts", false],
+    ["**/e2e/**", "apps/e2e/src/a.test.ts", true],
+    ["**/e2e/**", "e2e/a.test.ts", true],
+    ["a/**/b", "a/xb", false],
+    ["a/**/b", "a/b", true],
+    ["a/**/b", "a/x/y/b", true],
+  ];
+  for (const [glob, file, want] of cases) assert.equal(globMatch(glob, file), want, `${glob} on ${file}`);
+  // A wrong match must not skip a unit test (exclude) or hide a fix (test_support).
+  const sc = scenario(t, {
+    base: { ...BASE, "apps/admin-e2e/helper.mjs": "export {};\n" },
+    head: { "apps/admin-e2e/helper.mjs": "export const x = 1;\n", "src/mycalc.test.mjs": ADD_TEST.replace("../src/calc.mjs", "./calc.mjs") },
+  });
+  const plan = runGate(sc, "plan", ["--exclude", "**/calc.test.mjs", "--test-support", "**/e2e/**"]);
+  assert.ok(plan.verdict, `no plan verdict (exit ${plan.code}): ${plan.stderr.slice(0, 400)}`);
+  assert.equal(plan.verdict.verdict, "run");
+  assert.deepEqual(plan.verdict.newTests, ["src/mycalc.test.mjs"]);
+  assert.deepEqual(plan.verdict.excluded, []);
+  assert.deepEqual(plan.verdict.fixSide, ["apps/admin-e2e/helper.mjs"]);
+  // A pattern ending in / never matches a file; an overlong pattern is refused.
+  for (const bad of ["e2e/", "x".repeat(1025)]) assert.equal(runGate(sc, "plan", ["--exclude", bad]).code, 2, bad.slice(0, 20));
+  // No recursion: a very long path cannot overflow the stack.
+  assert.equal(globMatch("**/x", `${"a/".repeat(20000)}y`), false);
+  assert.equal(globMatch("**/y", `${"a/".repeat(20000)}y`), true);
+});
+
+test("S1c README: the red-first Inputs table lists every workflow input, in one table", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const section = readme.slice(readme.indexOf("## red-first-gate"));
+  const lines = section.slice(section.indexOf("### Inputs")).split("\n");
+  const start = lines.findIndex((l) => l.startsWith("| Input |"));
+  assert.ok(start > 0, "no Inputs table");
+  const names = [];
+  for (let i = start + 2; i < lines.length && lines[i].startsWith("|"); i += 1) names.push(/^\| `([a-z_]+)` \|/.exec(lines[i])?.[1]);
+  const wf = load(fs.readFileSync(WORKFLOW, "utf8"));
+  assert.deepEqual(names.sort(), Object.keys(wf.on.workflow_call.inputs).sort());
 });
