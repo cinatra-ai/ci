@@ -95,7 +95,6 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   const nodeSet = new Set();
   const flows = []; // every object with a field of FLOW_FIELDS
   const declaringTrue = []; // every object that declares publishes true, in file order
-  const allComponents = []; // every object in the file, in file order
 
   const reserved = (candidate) => {
     if (typeof candidate === "string" && candidate.startsWith(PUBLISH_GATE_ID_PREFIX)) {
@@ -128,7 +127,6 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     }
     if (!isObject(value)) return;
     if (key !== undefined) keyOf.set(value, key);
-    allComponents.push(value);
     reserved(value.id);
     reserved(value.$component_ref);
     const refs = isObject(value.$referenced_components) ? value.$referenced_components : null;
@@ -179,6 +177,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   // is not in the file, are refused; a start node, edge or endpoint whose component is not in the file names
   // nothing that can run. Control edges are kept as predecessor lists.
   const predecessors = new Map();
+  const flowSteps = new Set(); // every component a flow lists, starts at or reaches by an edge (never a reference wrapper)
   for (const holder of flows) {
     const holderName = nameOf(holder);
     const stepsAt = (field, value, chain) => {
@@ -188,6 +187,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         return [];
       }
       const found = resolveAll(value, chain);
+      if (field !== "control_flow_connections" && field !== "data_flow_connections") found.forEach((step) => flowSteps.add(step));
       if (field === "nodes" && found.length === 0) {
         add("oas.publish-undeclared", value.$component_ref, `node ${quoteId(value.$component_ref)} is listed in a flow, but its component is not in the file, so its declaration cannot be read`);
       }
@@ -201,6 +201,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         for (const edge of stepsAt(field, entry ?? null, chain)) {
           const at = [...ownMap(edge), ...chain];
           const [froms, tos] = [stepsAt(field, edge[first], at), stepsAt(field, edge[second], at)];
+          [...froms, ...tos].forEach((step) => flowSteps.add(step));
           [...froms, ...tos].forEach(checkNode);
           if (field === "control_flow_connections") for (const to of tos) predecessors.set(to, [...(predecessors.get(to) ?? []), ...froms]);
         }
@@ -209,15 +210,21 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   }
 
   // Every object that declares publishes true, in file order. Only a component that the root flow lists in `nodes`
-  // by a reference to a key of its own $referenced_components can carry it: as the core reads it, any other
-  // place (a node inside a nested subflow, a subflow definition, the flow root, a node the root does not list)
-  // gets no stop in front of it (cinatra-ai/cinatra packages/agents/src/oas-compiler.ts, collectPublishingSteps,
-  // PUBLISHES_MISPLACED).
+  // by a reference to a key of its own $referenced_components can carry it, and only when that reference resolves
+  // to exactly that component (no nearer map shadows the key, and the component is no reference wrapper). The core
+  // refuses true on a node inside a nested subflow, a subflow definition, the flow root and a root map component
+  // the root does not list (cinatra-ai/cinatra packages/agents/src/oas-compiler.ts, collectPublishingSteps,
+  // PUBLISHES_MISPLACED). The gate is stricter on purpose: it also refuses true on an inline node in the root
+  // `nodes` list, a wrapper or a shadowed key, which the core does not read as a publishing step (no stop).
   const rootRefs = isObject(flow.$referenced_components) ? flow.$referenced_components : {};
   const topLevel = new Set();
   for (const entry of Array.isArray(flow.nodes) ? flow.nodes : []) {
     const ref = isObject(entry) ? entry.$component_ref : undefined;
-    if (typeof ref === "string" && Object.hasOwn(rootRefs, ref) && isObject(rootRefs[ref])) topLevel.add(rootRefs[ref]);
+    if (typeof ref !== "string" || !Object.hasOwn(rootRefs, ref) || !isObject(rootRefs[ref])) continue;
+    const target = rootRefs[ref];
+    if (typeof target.$component_ref === "string") continue;
+    const resolved = resolveAll(entry, scopeOf.get(flow) ?? []);
+    if (resolved.length > 0 && resolved.every((component) => component === target)) topLevel.add(target);
   }
   for (const holder of declaringTrue) {
     if (topLevel.has(holder)) continue;
@@ -268,7 +275,8 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   }
 
   // Root hitlScreens in front of a publishing step. A screen is placed on every step whose
-  // metadata.cinatra.renderer names it. It stands in front of a publishing step when one of those steps is in
+  // metadata.cinatra.renderer names it: a component that a flow lists, starts at or reaches by an edge. A renderer
+  // on any other object (a reference wrapper, a component no flow uses, a value inside metadata) places nothing. It stands in front of a publishing step when one of those steps is in
   // the step itself (its own subflow included) or on a control path back from the step that ends at the first
   // InputMessageNode (the person's last stop before the write) or at another publishing step. A screen that no
   // step names counts as in front of every publishing step. A screen placed only elsewhere (after the write,
@@ -278,7 +286,8 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     const screens = rootCinatra.hitlScreens;
     const renderers = Array.isArray(fieldRenderers) ? fieldRenderers.filter(isObject) : [];
     const placedOn = new Map(); // screen id -> the components that name it as their renderer
-    for (const component of allComponents) {
+    for (const component of flowSteps) {
+      if (typeof component.$component_ref === "string") continue;
       const renderer = cinatraOf(component)?.renderer;
       if (typeof renderer === "string") placedOn.set(renderer, [...(placedOn.get(renderer) ?? []), component]);
     }

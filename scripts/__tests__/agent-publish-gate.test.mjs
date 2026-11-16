@@ -1036,6 +1036,79 @@ test("a mid-run screen that no step places is still refused beside every publish
   ]);
 });
 
+// Review 1 cases: the top-level identity of a true declaration, and what may place a screen.
+
+test("publishes true on a root map object that a nearer map shadows for the listed reference is refused as misplaced", () => {
+  const f = declaredPublishPack({ publish: { publishes: true } });
+  const runs = { component_type: "ApiNode", id: "publish", name: "publish", metadata: { cinatra: { ...WRITE, publishes: false } } };
+  const at = f.nodes.findIndex((entry) => entry.$component_ref === "publish");
+  f.nodes[at] = { $component_ref: "publish", $referenced_components: { publish: runs } };
+  assert.ok(rulesOf(checkAgentFlow(f)).includes("oas.publish-misplaced publish"), JSON.stringify(rulesOf(checkAgentFlow(f))));
+});
+
+test("publishes true on a root map reference wrapper is refused as misplaced, even when the listed target declares false", () => {
+  const f = declaredPublishPack({ publish: { publishes: false } });
+  f.$referenced_components.publish_alias = { $component_ref: "publish", metadata: { cinatra: { publishes: true } } };
+  const at = f.nodes.findIndex((entry) => entry.$component_ref === "publish");
+  f.nodes[at] = { $component_ref: "publish_alias" };
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-misplaced publish_alias"]);
+});
+
+test("publishes true on an inline node in the root nodes list is refused as misplaced (stricter than the core, which does not read it)", () => {
+  const f = declaredPublishPack({ publish: { publishes: false } });
+  f.nodes.push({ component_type: "ApiNode", id: "inline_send", name: "inline_send", metadata: { cinatra: { ...WRITE, publishes: true } } });
+  assert.ok(rulesOf(checkAgentFlow(f)).includes("oas.publish-misplaced inline_send"));
+});
+
+test("publishes true on a node named only as start_node is refused as misplaced", () => {
+  const f = declaredPublishPack();
+  f.$referenced_components.first = { component_type: "ApiNode", id: "first", name: "first", metadata: { cinatra: { ...WRITE, publishes: true } } };
+  f.start_node = { $component_ref: "first" };
+  assert.ok(rulesOf(checkAgentFlow(f)).includes("oas.publish-misplaced first"));
+});
+
+const DECOY_SCREEN = "@example/publish-agent:decoy";
+
+test("a renderer on an object that is not a component does not place a screen: the screen stays unplaced and is refused", () => {
+  const f = declaredPublishPack({ root: { hitlScreens: [DECOY_SCREEN] } });
+  f.metadata.cinatra.decoy = { metadata: { cinatra: { renderer: DECOY_SCREEN } } };
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: DECOY_SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a renderer on a reference wrapper does not place a screen: the screen stays unplaced and is refused", () => {
+  const f = declaredPublishPack({ root: { hitlScreens: [DECOY_SCREEN] } });
+  f.$referenced_components.end_alias = { $component_ref: "end", component_type: "EndNode", metadata: { cinatra: { renderer: DECOY_SCREEN } } };
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: DECOY_SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a renderer on a component that no flow lists, reaches or starts at does not place a screen", () => {
+  const f = declaredPublishPack({ root: { hitlScreens: [DECOY_SCREEN] } });
+  f.$referenced_components.spare_gate = { component_type: "InputMessageNode", id: "spare_gate", name: "spare_gate", metadata: { cinatra: { renderer: DECOY_SCREEN } } };
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: DECOY_SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a screen placed both after and in front of the publishing node is refused, and a control loop in front of it ends", () => {
+  const f = flow(
+    [
+      node("start", "StartNode", {}),
+      node("prep", "ApiNode", { ...WRITE, publishes: false, renderer: SCREEN }),
+      node("loop", "BranchingNode"),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("after", "InputMessageNode", { renderer: SCREEN }),
+      node("end", "EndNode"),
+    ],
+    [["start", "prep"], ["prep", "loop"], ["loop", "prep"], ["loop", "publish"], ["publish", "after"], ["after", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] })), ["oas.publish-own-gate publish"]);
+});
+
 test("checkAgentPackage reads the flow and the package's renderers", () => {
   assert.deepEqual(checkAgentPackage(path.join(FIX, "declared-publish")).findings, []);
   assert.deepEqual(rulesOf(checkAgentPackage(path.join(FIX, "kept-confirm-screen")).findings), [
