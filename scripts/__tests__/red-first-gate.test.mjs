@@ -1748,7 +1748,8 @@ test("judgeFile: every way an earlier version is unreadable keeps the file NOT-R
   assert.deepEqual(unread.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
   assert.match(unread.reasons[0].detail, /the file's diff is not readable/);
   // a skipped test of the earlier version still counts as a test of that name
-  const skipped = judge({ earlier: ok([{ name: "a", status: "skipped", text: null, assertion: false }, { name: "z", status: "failed", text: "AssertionError: x", assertion: true }]), changedTestLine: null });
+  const az = ok([...quiet, { name: "z", status: "passed", text: null, assertion: false }]);
+  const skipped = judgeFile({ file: "t.test.mjs", status: "M" }, az, az, { earlier: ok([{ name: "a", status: "skipped", text: null, assertion: false }, { name: "z", status: "failed", text: "AssertionError: x", assertion: true }]), changedTestLine: null });
   assert.equal(skipped.kind, "collateral");
   // a collateral file must stay green: a test that passed before and is skipped with the fix is RED
   const lost = judgeFile({ file: "t.test.mjs", status: "M" }, ok([...quiet, { name: "b", status: "passed", text: null, assertion: false }]), ok([...quiet, { name: "b", status: "skipped", text: null, assertion: false }]), {

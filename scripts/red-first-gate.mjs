@@ -425,13 +425,21 @@ function afterKeyword(out) {
 // spaces (line breaks kept); with keepQuotes a quoted string keeps its quote
 // characters, so an import specifier's place can be found and read from the
 // source. A text inside a comment or a string never reads as an export or an
-// import.
+// import. The code of a template's `${...}` is scanned as code (its strings,
+// comments, regular expressions and nested templates), so that a brace or a
+// backtick inside them never ends it; the whole template is blanked.
 export function codeText(source, keepQuotes = false) {
-  const s = String(source);
+  return scanCode(String(source), 0, keepQuotes, false).out;
+}
+
+// Scans code from `start`; inner: the code of a template's `${...}`, which
+// ends at its unmatched `}`. Returns the code text and the end offset.
+function scanCode(s, start, keepQuotes, inner) {
   const blank = (t) => t.replace(/[^\n]/g, " ");
   let out = "";
   let prev = "";
-  let i = 0;
+  let depth = 0;
+  let i = start;
   while (i < s.length) {
     const c = s[i];
     const n = s[i + 1];
@@ -451,7 +459,6 @@ export function codeText(source, keepQuotes = false) {
     }
     if (c === '"' || c === "'" || c === "`") {
       let j = i + 1;
-      let depth = 0;
       for (; j < s.length; j += 1) {
         const d = s[j];
         if (d === "\\") {
@@ -459,12 +466,9 @@ export function codeText(source, keepQuotes = false) {
           continue;
         }
         if (c === "`") {
-          if (d === "$" && s[j + 1] === "{") {
-            depth += 1;
-            j += 1;
-          } else if (depth && d === "{") depth += 1;
-          else if (depth && d === "}") depth -= 1;
-          else if (!depth && d === "`") break;
+          // the interpolation's code, up to its own closing brace
+          if (d === "$" && s[j + 1] === "{") j = scanCode(s, j + 2, false, true).end - 1;
+          else if (d === "`") break;
         } else if (d === c || d === "\n") break;
       }
       const end = Math.min(j + 1, s.length);
@@ -491,11 +495,16 @@ export function codeText(source, keepQuotes = false) {
       i = end;
       continue;
     }
+    if (inner && c === "{") depth += 1;
+    else if (inner && c === "}") {
+      if (depth === 0) return { out, end: i + 1 };
+      depth -= 1;
+    }
     out += c;
     if (!/\s/.test(c)) prev = c;
     i += 1;
   }
-  return out;
+  return { out, end: s.length };
 }
 
 // The value exports of a whole script (code only, see codeText).
@@ -631,13 +640,21 @@ function moduleCandidates({ spec, importer, kind }, file, roots, runnerDir) {
   return out;
 }
 
+// The TypeScript sources an import that names a script's extension may load.
+const TS_SOURCE_EXT = { ".js": [".ts", ".tsx"], ".jsx": [".tsx"], ".mjs": [".mts"], ".cjs": [".cts"] };
+
+// The added script a module path means. Without an extension: that path with
+// any script extension, or its folder's index. With one: that very file, or
+// only its TypeScript source (x.js -> x.ts), never an index or another script.
 function addedModule(candidate, added) {
   if (added.has(candidate)) return candidate;
+  const ext = SCRIPT_EXT_RE.exec(candidate)?.[0];
   const stem = candidate.replace(SCRIPT_EXT_RE, "");
   for (const path of added) {
-    if (!SCRIPT_EXT_RE.test(path)) continue;
-    const own = path.replace(SCRIPT_EXT_RE, "");
-    if (own === stem || own === candidate || own === `${candidate}/index` || own === `${stem}/index`) return path;
+    const own = SCRIPT_EXT_RE.exec(path);
+    if (!own) continue;
+    const name = path.slice(0, own.index);
+    if (ext ? name === stem && (TS_SOURCE_EXT[ext] ?? []).includes(own[0]) : name === candidate || name === `${candidate}/index`) return path;
   }
   return null;
 }
@@ -985,8 +1002,13 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         // The earlier version run in the tree with the fix: its failed tests.
         const brokenByFix = why || status === "A" ? [] : context.earlier.result.tests.filter((t) => t.status === "failed");
         const offAdded = status === "A" ? undefined : pins.find((p, i) => !added.some((t) => normalizeText(t.name).includes(wantedPins[i])));
+        // The earlier version's tests that the new version no longer reports
+        // (by name and count): a collateral edit and a pin keep every one.
+        const dropped = why || status === "A" ? [] : addedTests(context.earlier.result.tests, r.tests);
         if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})`);
-        else if (undeclared.length) {
+        else if (dropped.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${dropped.length} test(s) of the file's earlier version: ${dropped.slice(0, 3).map((t) => t.name).join(" | ")} (a collateral edit or a pin keeps every existing test)`);
+        } else if (undeclared.length) {
           const names = undeclared.slice(0, 3).map((t) => t.name).join(" | ");
           add("NOT-RED-BEFORE", "before", `${base}; ${undeclared.length} test(s) the pull request adds do not fail first: ${names} (a test that pins behaviour the fix keeps is declared with a red-first-pin: <test name> line)`);
         } else if (added.length) {
@@ -1544,8 +1566,10 @@ async function runPhase(phase, tree, files, plan, opts, reportDir, { skipInstall
     for (const file of list) perFile.set(file, { run: "ok", result: parsed.files.get(file) ?? null });
     invocations.push({ label: `vitest in ${where}`, files: list, res, reportFailed: parsed.success === false });
   }
-  for (const file of changedTestSide(tree, plan)) {
-    if (swapped.includes(file)) continue;
+  // A swapped file differs from the head on purpose: it must still be the
+  // merge base's version after the run.
+  const moved = swapped.length ? nulList(git(tree, ["diff", "--name-only", "--no-renames", "-z", plan.mergeBase, "--", ...swapped]).stdout) : [];
+  for (const file of [...new Set([...changedTestSide(tree, plan).filter((p) => !swapped.includes(p)), ...moved])].sort(byPath)) {
     reasons.push({ code: "TEST-CHANGED", phase, file, detail: "the test run changed this tracked test-side file" });
   }
   return { stop: false, reasons, perFile, invocations };

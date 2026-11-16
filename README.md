@@ -2369,7 +2369,10 @@ codes alone.
   import`, `Failed to load url`, at the start of the error, never inside
   another message) whose path is a regular file the fix side adds, that the
   test file imports by a relative path, and that is outside the test file's
-  folder. A fix-side path that is test code by its place or name (`test/`,
+  folder. An import path without an extension means that path with a script
+  extension or its folder's `index`; a path with an extension means that very
+  file, or only its TypeScript source (`x.js` for `x.ts`). A fix-side path
+  that is test code by its place or name (`test/`,
   `tests/`, `spec/`, `mocks/`, `fixtures/`, `test-utils/`, `e2e/` folders, or
   a `test`, `spec`, `mock`, `fixture`, `stub` or `fake` name part) is never
   such evidence, and an absolute path outside the checkout counts only as a
@@ -2402,10 +2405,13 @@ codes alone.
   pull request does not add, more than one test, or a name the report gives
   more than once, or a test that does not pass before the fix, is
   `PIN-MISMATCH`; an added test without a marker must fail first. In a
-  changed file, pins hold only when the edit only adds lines and the file's
-  earlier version passes with the fix (the added lines change no existing
-  test's outcome); otherwise the file is `NOT-RED-BEFORE`. Markers are part
-  of the diff: review them as you review `red-first-expect:`.
+  changed file, pins hold only when the edit only adds lines, the file's
+  earlier version passes with the fix, and the new version still reports
+  every test of the earlier version (by name and count); otherwise the file
+  is `NOT-RED-BEFORE`. Added lines can still weaken an existing test without
+  removing it (an early `return`, for example): the gate does not see that,
+  so review added lines beside pins as a change to an existing test. Markers
+  are part of the diff: review them as you review `red-first-expect:`.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit
@@ -2438,8 +2444,10 @@ never red and never success.
 New tests that match `exclude` beside other new tests are not proven here and
 do not fail the job: each is a notice (`EXCLUDED`) in both jobs, the plan
 output `excluded` counts them, and the other new tests decide. So a `success`
-of the `red-first` job at the head proves the new tests outside `exclude`;
-read the `EXCLUDED` notices (or the plan output) for the rest.
+of the `red-first` job at the head proves at least one new test file outside
+`exclude`, not each of them: the files the job lists as notices (see below)
+are not proven, and the `EXCLUDED` notices (or the plan output) name the
+rest.
 
 `COLLATERAL` and `PIN` files are notices too: they are not proven, the job's
 headline counts them as not proven, and they do not fail the job beside a
