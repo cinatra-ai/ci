@@ -451,9 +451,20 @@ function literalRanges(ts, file) {
   return ranges;
 }
 
-// An HTML-like comment (`<!--` anywhere, `-->` at a line start), which a
-// CommonJS script may hold and the parser reads as code; outside a literal.
-const HTML_COMMENT_RE = /<!--|^[ \t]*-->/gm;
+// The offsets of the HTML-like comments of a text (`<!--` anywhere, `-->` at
+// a line start after spaces or tabs only), which a CommonJS script may hold
+// and the parser reads as code. A plain scan, not a pattern over the markup.
+const LINE_BREAKS = "\n\r\u2028\u2029";
+function htmlCommentOffsets(text) {
+  const at = [];
+  for (let i = text.indexOf("<!--"); i !== -1; i = text.indexOf("<!--", i + 4)) at.push(i);
+  for (let i = text.indexOf("-->"); i !== -1; i = text.indexOf("-->", i + 3)) {
+    let j = i - 1;
+    while (j >= 0 && (text[j] === " " || text[j] === "\t")) j -= 1;
+    if (j < 0 || LINE_BREAKS.includes(text[j])) at.push(i);
+  }
+  return at;
+}
 
 // The parsed source, and whether the parser may not read it as JavaScript
 // does: a syntax error, or an HTML-like comment outside a literal.
@@ -462,12 +473,10 @@ function parse(source, path = "") {
   const text = String(source);
   const file = ts.createSourceFile(path || "source.js", text, ts.ScriptTarget.Latest, true, scriptKind(ts, path));
   let unsure = file.parseDiagnostics.length > 0;
-  if (!unsure && /<!--|^[ \t]*-->/m.test(text)) {
+  const comments = unsure ? [] : htmlCommentOffsets(text);
+  if (comments.length) {
     const ranges = literalRanges(ts, file);
-    for (const match of text.matchAll(HTML_COMMENT_RE)) {
-      const at = match.index + match[0].indexOf(match[0].trimStart()[0]);
-      if (!ranges.some(([start, end]) => at >= start && at < end)) unsure = true;
-    }
+    if (comments.some((at) => !ranges.some(([start, end]) => at >= start && at < end))) unsure = true;
   }
   return { ts, file, unsure };
 }
