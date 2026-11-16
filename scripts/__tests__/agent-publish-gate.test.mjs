@@ -1132,7 +1132,7 @@ test("a renderer on a step of a subflow definition that no running step runs doe
   ]);
 });
 
-test("a screen placed in a subflow that a running step before the stop runs is still placed there (not refused when after the write)", () => {
+test("a screen placed in a subflow that a running step after the write runs is still placed there, and is no finding", () => {
   const f = nestedSendPack({ outer: { publishes: false } });
   f.$referenced_components.publish = { component_type: "ApiNode", id: "publish", name: "publish", metadata: { cinatra: { ...WRITE, publishes: true } } };
   f.nodes.splice(2, 0, { $component_ref: "publish" });
@@ -1143,6 +1143,72 @@ test("a screen placed in a subflow that a running step before the stop runs is s
   inside.$referenced_components["send-gate"] = { component_type: "InputMessageNode", id: "send-gate", name: "send-gate", metadata: { cinatra: { renderer: SCREEN } } };
   inside.nodes.push({ $component_ref: "send-gate" });
   f.metadata.cinatra.hitlScreens = [SCREEN];
+  assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] }), []);
+});
+
+// Review 3 cases: a subflow runs only under the kinds that run one, and what a step in front holds is in front.
+
+// A small flow whose one gate step names `renderer`.
+function gateFlow(prefix, renderer) {
+  const f = flow([node(`${prefix}-start`, "StartNode", {}), node(`${prefix}-gate`, "InputMessageNode", { renderer }), node(`${prefix}-end`, "EndNode")], [
+    [`${prefix}-start`, `${prefix}-gate`],
+    [`${prefix}-gate`, `${prefix}-end`],
+  ]);
+  f.id = `${prefix}-flow`;
+  return f;
+}
+
+for (const [label, attach] of [
+  ["an inline subflow on the EndNode", (f) => { f.$referenced_components.end.subflow = gateFlow("d", DECOY_SCREEN); }],
+  ["a subflows list on the EndNode", (f) => { f.$referenced_components.end.subflows = [gateFlow("d", DECOY_SCREEN)]; }],
+  ["an inline subflow on an ApiNode", (f) => { f.$referenced_components.write_address.subflow = gateFlow("d", DECOY_SCREEN); }],
+  ["a referenced subflow on the EndNode", (f) => {
+    f.$referenced_components["d-flow"] = gateFlow("d", DECOY_SCREEN);
+    f.$referenced_components.end.subflow = { $component_ref: "d-flow" };
+  }],
+  ["a start_node-only subflow on the EndNode", (f) => {
+    const g = gateFlow("d", DECOY_SCREEN);
+    f.$referenced_components.end.subflow = { start_node: { $component_ref: "d-gate" }, $referenced_components: g.$referenced_components };
+  }],
+]) {
+  test(`a screen in ${label} after the write does not place it: the step kind runs no subflow, so the screen is refused`, () => {
+    const f = declaredPublishPack({ root: { hitlScreens: [DECOY_SCREEN] } });
+    attach(f);
+    assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: DECOY_SCREEN, midRunHitl: true }] })), [
+      "oas.publish-own-gate publish",
+    ]);
+  });
+}
+
+// start -> prep (a container step that runs a subflow holding a gate) -> publish -> end.
+function containerBeforeWrite(kind, field) {
+  const prep = node("prep", kind, { publishes: false });
+  prep.comp[field] = field === "subflows" ? [{ $component_ref: "p-flow" }] : { $component_ref: "p-flow" };
+  const f = flow(
+    [node("start", "StartNode", {}), prep, node("publish", "ApiNode", { ...WRITE, publishes: true }), node("end", "EndNode")],
+    [["start", "prep"], ["prep", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  f.$referenced_components["p-flow"] = gateFlow("p", SCREEN);
+  return f;
+}
+
+for (const [kind, field] of [["FlowNode", "subflow"], ["MapNode", "subflow"], ["ParallelMapNode", "subflow"], ["ParallelFlowNode", "subflows"]]) {
+  test(`a screen inside the subflow of a ${kind} in front of the publishing node is refused`, () => {
+    const f = containerBeforeWrite(kind, field);
+    assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] })), ["oas.publish-own-gate publish"]);
+  });
+}
+
+test("a screen inside the subflow of a FlowNode after the publishing node is no finding", () => {
+  const prep = node("later", "FlowNode", { publishes: false });
+  prep.comp.subflow = { $component_ref: "p-flow" };
+  const f = flow(
+    [node("start", "StartNode", {}), node("publish", "ApiNode", { ...WRITE, publishes: true }), prep, node("end", "EndNode")],
+    [["start", "publish"], ["publish", "later"], ["later", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  f.$referenced_components["p-flow"] = gateFlow("p", SCREEN);
   assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] }), []);
 });
 

@@ -29,6 +29,9 @@ const EDGE_ENDS = { control_flow_connections: ["from_node", "to_node"], data_flo
 
 // The kinds that cannot reach a connector, so they need no declaration.
 const NO_CONNECTOR_KINDS = new Set(["StartNode", "EndNode", "InputMessageNode", "OutputMessageNode", "BranchingNode"]);
+// The kinds that run a subflow, and the field that names it.
+const SUBFLOW_KINDS = new Set(["FlowNode", "MapNode", "ParallelMapNode"]);
+const SUBFLOWS_KINDS = new Set(["ParallelFlowNode"]);
 const CORE_MID_RUN_ENDINGS = [":output", "-output", ":list-picker", ":scrape-schema-review", ":final-list-review", ":setup-form"];
 
 export class GateError extends Error {}
@@ -211,9 +214,15 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     }
   }
 
-  // The steps that run: those of the root flow, and of every subflow that a running step runs (its `subflow`, or an
-  // entry of its `subflows`, references followed). A flow-shaped value anywhere else (inside metadata, a subflow
-  // definition no running step runs) runs nothing, so its steps are not here.
+  // The steps that run: those of the root flow, and of every subflow that a running step runs, references followed.
+  // Only these kinds run a subflow (Agent Spec): FlowNode, MapNode and ParallelMapNode through `subflow`,
+  // ParallelFlowNode through `subflows`. A subflow field on any other kind, and a flow-shaped value anywhere else
+  // (inside metadata, a subflow definition no running step runs), runs nothing, so its steps are not here.
+  const subflowsRunBy = (step) => {
+    if (SUBFLOW_KINDS.has(step.component_type)) return isObject(step.subflow) ? [step.subflow] : [];
+    if (SUBFLOWS_KINDS.has(step.component_type)) return (Array.isArray(step.subflows) ? step.subflows : []).filter(isObject);
+    return [];
+  };
   const flowSteps = new Set();
   const runningFlows = new Set();
   const flowQueue = stepsOf.has(flow) ? [flow] : [];
@@ -223,7 +232,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     runningFlows.add(holder);
     for (const step of stepsOf.get(holder)) {
       flowSteps.add(step);
-      const runs = [step.subflow, ...(Array.isArray(step.subflows) ? step.subflows : [])].filter(isObject);
+      const runs = subflowsRunBy(step);
       for (const sub of runs) {
         for (const target of resolveAll(sub, scopeOf.get(step) ?? [])) if (stepsOf.has(target)) flowQueue.push(target);
       }
@@ -314,22 +323,26 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
     }
     const inFrontOf = (step) => {
       const front = new Set();
-      // The step itself and what it holds: every object inside it, references followed.
-      const inside = [step];
+      // A step and what it holds: every object inside it, references followed.
       const insideSeen = new Set();
-      while (inside.length > 0) {
-        const value = inside.pop();
-        if (Array.isArray(value)) {
-          inside.push(...value);
-          continue;
+      const addHeld = (start) => {
+        const inside = [start];
+        while (inside.length > 0) {
+          const value = inside.pop();
+          if (Array.isArray(value)) {
+            inside.push(...value);
+            continue;
+          }
+          if (!isObject(value) || insideSeen.has(value)) continue;
+          insideSeen.add(value);
+          front.add(value);
+          if (typeof value.$component_ref === "string") inside.push(...resolveAll(value, scopeOf.get(value) ?? []));
+          inside.push(...Object.values(value));
         }
-        if (!isObject(value) || insideSeen.has(value)) continue;
-        insideSeen.add(value);
-        front.add(value);
-        if (typeof value.$component_ref === "string") inside.push(...resolveAll(value, scopeOf.get(value) ?? []));
-        inside.push(...Object.values(value));
-      }
-      // The control paths back from the step, to the first stop or the first other publishing step.
+      };
+      addHeld(step);
+      // The control paths back from the step, to the first stop or the first other publishing step. What a step
+      // on that path holds (a subflow it runs) is in front too; an earlier publishing step's own content is its own.
       const visited = new Set([step]);
       const queue = [...(predecessors.get(step) ?? [])];
       while (queue.length > 0) {
@@ -337,7 +350,9 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         if (visited.has(before)) continue;
         visited.add(before);
         front.add(before);
-        if (before.component_type === "InputMessageNode" || readPublishes(before).value === true) continue;
+        if (readPublishes(before).value === true) continue;
+        addHeld(before);
+        if (before.component_type === "InputMessageNode") continue;
         queue.push(...(predecessors.get(before) ?? []));
       }
       return front;
