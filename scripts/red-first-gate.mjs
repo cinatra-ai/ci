@@ -707,11 +707,28 @@ function onStop(signal) {
 // The promise always settles: when the time is up the group is killed, and
 // when no exit is reported within the grace time after that kill (the kill
 // failed, or the process is stuck in the kernel), it settles as timed out.
-export function spawnChild(command, args, cwd, timeoutMs, { kill = killGroup, graceMs = KILL_GRACE_MS } = {}) {
+// A program runs from its argument list, without a shell (spawnChild); the
+// install is the only shell (shell). Each starts its child at its own spawn
+// call, so an argument list the gate builds never reaches a shell.
+function childOptions(cwd) {
+  return { cwd, stdio: ["ignore", 2, 2], env: childEnv(), detached: true };
+}
+
+export function spawnChild(command, args, cwd, timeoutMs, options = {}) {
+  return watchChild(() => spawn(command, args, childOptions(cwd)), timeoutMs, options);
+}
+
+// The caller's install command is a shell script, as a `run:` step is; it gets
+// no argument from the gate.
+export function shell(script, cwd, timeoutMs, options = {}) {
+  return watchChild(() => spawn("bash", ["-c", script], childOptions(cwd)), timeoutMs, options);
+}
+
+function watchChild(start, timeoutMs, { kill = killGroup, graceMs = KILL_GRACE_MS } = {}) {
   return new Promise((done) => {
     let child;
     try {
-      child = spawn(command, args, { cwd, stdio: ["ignore", 2, 2], env: childEnv(), detached: true });
+      child = start();
     } catch (error) {
       done({ status: null, signal: null, timedOut: false, error: error.message });
       return;
@@ -737,12 +754,6 @@ export function spawnChild(command, args, cwd, timeoutMs, { kill = killGroup, gr
     child.on("error", (error) => finish({ status: null, signal: null, timedOut: false, error: error.message }));
     child.on("exit", (status, signal) => finish({ status, signal, timedOut, error: null }));
   });
-}
-
-// The caller's install command is a shell script, as a `run:` step is; it gets
-// no argument from the gate.
-function shell(script, cwd, timeoutMs) {
-  return spawnChild("bash", ["-c", script], cwd, timeoutMs);
 }
 
 function group(title) {

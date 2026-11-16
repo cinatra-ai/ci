@@ -1050,6 +1050,42 @@ test("F5 a child whose group kill fails still settles as timed out after the gra
   assert.ok(Date.now() - t0 < 2500, `settled after ${Date.now() - t0} ms, not after the grace time`);
 });
 
+// The install is the only shell the gate starts. It starts bash at its own
+// spawn call, so the argument lists the gate builds for node --test and vitest
+// (which carry paths of the work folder) never reach a call that may start a
+// shell with -c.
+function functionText(source, name) {
+  const start = [`\nfunction ${name}(`, `\nexport function ${name}(`].map((s) => source.indexOf(s)).find((i) => i >= 0);
+  assert.ok(start !== undefined, `function ${name} not found`);
+  return source.slice(start, source.indexOf("\n}\n", start));
+}
+
+test("F5b the install shell has its own spawn call: spawnChild never starts a shell", () => {
+  const source = fs.readFileSync(GATE, "utf8");
+  const spawns = source.split("\n").filter((line) => /(^|[^A-Za-z.])spawn\(/.test(line));
+  assert.equal(spawns.length, 2, `spawn calls:\n${spawns.join("\n")}`);
+  const shellText = functionText(source, "shell");
+  assert.ok(!shellText.includes("spawnChild("), "the install shell runs through spawnChild");
+  assert.ok(shellText.includes('spawn("bash", ["-c", script], '), "the install shell does not start bash itself");
+  const childText = functionText(source, "spawnChild");
+  assert.ok(childText.includes("spawn(command, args, "), "spawnChild does not start its command from the argument list");
+  assert.ok(!childText.includes('"bash"') && !childText.includes('"-c"'), "spawnChild names a shell");
+});
+
+test("F5c the install shell runs in its folder, reports its exit and is killed when its time is up", async (t) => {
+  const { shell } = await gateModule();
+  assert.equal(typeof shell, "function", "shell is not exported");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfg-shell-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ok = await shell("printf here > marker; exit 3", dir, 10000);
+  assert.deepEqual(ok, { status: 3, signal: null, timedOut: false, error: null });
+  assert.equal(fs.readFileSync(path.join(dir, "marker"), "utf8"), "here");
+  const t0 = Date.now();
+  const slow = await shell("sleep 4", dir, 100);
+  assert.equal(slow.timedOut, true);
+  assert.ok(Date.now() - t0 < 2500, `settled after ${Date.now() - t0} ms`);
+});
+
 test("F6 job budget: limits the reserve does not fit in are refused in plan and run; a hanging git step ends with TIMEOUT in time", async (t) => {
   const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST } });
   const now = Math.floor(Date.now() / 1000);
