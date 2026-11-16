@@ -96,9 +96,10 @@ function rulesOf(findings) {
 // ---------------------------------------------------------------------------
 // The rule names.
 
-test("the gate has exactly the four rules, and reserves the host's gate prefix", () => {
+test("the gate has exactly the five rules, and reserves the host's gate prefix", () => {
   assert.deepEqual([...RULES].sort(), [
     "oas.publish-malformed",
+    "oas.publish-misplaced",
     "oas.publish-own-gate",
     "oas.publish-reserved-id",
     "oas.publish-undeclared",
@@ -836,6 +837,204 @@ test("with two publishing nodes, a confirm step in front of both is named once, 
 
 // ---------------------------------------------------------------------------
 // The package reader and the command line, over the committed fixture packs.
+
+// ---------------------------------------------------------------------------
+// The external-write declaration: the undeclared text, a `confirmations` list on a step declared true,
+// publishes true on a node that is not a top-level node, and review screens bound to the write they stand in front of.
+
+test("the undeclared text says what an external write is", () => {
+  const f = declaredPublishPack();
+  delete f.$referenced_components.publish.metadata.cinatra.publishes;
+  const [finding] = checkAgentFlow(f);
+  assert.match(finding.message, /external write/);
+  assert.match(finding.message, /creates, changes or deletes data in a system outside Cinatra/);
+  assert.match(finding.message, /sending an email counts/);
+});
+
+test("a publishing node that keeps a confirmations list of its own is refused", () => {
+  const f = declaredPublishPack({ publish: { confirmations: [{ gateRenderer: "@example/publish-agent:send-confirmation" }] } });
+  const findings = checkAgentFlow(f);
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate publish"]);
+  assert.match(findings[0].message, /confirmations/);
+  assert.ok(!JSON.stringify(findings).includes("send-confirmation"), "the text names no value the pack wrote");
+});
+
+for (const [label, value] of [
+  ["an object", { gateRenderer: "x" }],
+  ["a string", "x"],
+  ["null", null],
+  ["true", true],
+]) {
+  test(`a publishing node that declares confirmations as ${label} is refused`, () => {
+    const f = declaredPublishPack({ publish: { confirmations: value } });
+    assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate publish"]);
+  });
+}
+
+test("an empty confirmations list on a publishing node, or a confirmations list on a step declared false, is no finding", () => {
+  assert.deepEqual(checkAgentFlow(declaredPublishPack({ publish: { confirmations: [] } })), []);
+  assert.deepEqual(checkAgentFlow(declaredPublishPack({ write_address: { confirmations: [{ gateRenderer: "x" }] } })), []);
+});
+
+// A flow whose top-level FlowNode `send_flow` runs a subflow (kept in the root map) that ends in `send`.
+function nestedSendPack({ outer = {}, inner = {}, subflowCinatra = {} } = {}) {
+  const inside = flow(
+    [node("send-start", "StartNode", {}), node("send", "ApiNode", { ...WRITE, publishes: false, ...inner }), node("send-end", "EndNode")],
+    [["send-start", "send"], ["send", "send-end"]],
+    subflowCinatra,
+  );
+  inside.id = "send-subflow";
+  inside.name = "send-subflow";
+  const outerNode = node("send_flow", "FlowNode", { publishes: false, ...outer });
+  outerNode.comp.subflow = { $component_ref: "send-subflow" };
+  const f = flow([node("start", "StartNode", {}), node("read_post", "ApiNode", READ), outerNode, node("end", "EndNode")], [
+    ["start", "read_post"],
+    ["read_post", "send_flow"],
+    ["send_flow", "end"],
+  ]);
+  f.$referenced_components["send-subflow"] = inside;
+  return f;
+}
+
+test("publishes true on the top-level node that runs a subflow is no finding", () => {
+  assert.deepEqual(checkAgentFlow(nestedSendPack({ outer: { publishes: true } })), []);
+});
+
+test("publishes true on a node inside a nested subflow is refused as misplaced, as the core refuses it", () => {
+  const findings = checkAgentFlow(nestedSendPack({ inner: { publishes: true } }));
+  assert.deepEqual(rulesOf(findings), ["oas.publish-misplaced send"]);
+  assert.match(findings[0].message, /not a top-level node/);
+});
+
+test("publishes true on a subflow definition is refused as misplaced", () => {
+  assert.deepEqual(rulesOf(checkAgentFlow(nestedSendPack({ subflowCinatra: { publishes: true } }))), [
+    "oas.publish-misplaced send-subflow",
+  ]);
+});
+
+test("publishes true on the flow root is refused as misplaced", () => {
+  assert.deepEqual(rulesOf(checkAgentFlow(declaredPublishPack({ root: { publishes: true } }))), [
+    "oas.publish-misplaced (flow root)",
+  ]);
+});
+
+test("publishes true on a root map component that the root flow does not list in nodes is refused as misplaced", () => {
+  const f = declaredPublishPack();
+  f.$referenced_components.spare = { component_type: "ApiNode", id: "spare", name: "spare", metadata: { cinatra: { ...WRITE, publishes: true } } };
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-misplaced spare"]);
+});
+
+test("publishes false inside a nested subflow is no finding", () => {
+  assert.deepEqual(checkAgentFlow(nestedSendPack({ outer: { publishes: false }, inner: { publishes: false } })), []);
+});
+
+const EARLY_SCREEN = "@example/curate-agent:schema-review";
+const LATE_SCREEN = "@example/curate-agent:final-list-review";
+
+// propose -> schema_gate (screen) -> collect -> list_gate (screen) -> create (publishes) -> summary.
+function twoScreenPack({ createCinatra = {}, screens = [EARLY_SCREEN, LATE_SCREEN] } = {}) {
+  return flow(
+    [
+      node("start", "StartNode", {}),
+      node("propose", "ApiNode", READ),
+      node("schema_gate", "InputMessageNode", { riskClass: "read_only", renderer: EARLY_SCREEN }),
+      node("collect", "ApiNode", { ...WRITE, publishes: false }),
+      node("list_gate", "InputMessageNode", { riskClass: "approval", renderer: LATE_SCREEN }),
+      node("list_branch", "BranchingNode"),
+      node("create", "ApiNode", { ...WRITE, publishes: true, ...createCinatra }),
+      node("summary", "OutputMessageNode"),
+      node("end", "EndNode"),
+    ],
+    [
+      ["start", "propose"],
+      ["propose", "schema_gate"],
+      ["schema_gate", "collect"],
+      ["collect", "list_gate"],
+      ["list_gate", "list_branch"],
+      ["list_branch", "create"],
+      ["list_branch", "collect"],
+      ["create", "summary"],
+      ["summary", "end"],
+    ],
+    { hitlScreens: screens },
+  );
+}
+
+test("a mid-run screen placed before an earlier stop, not in front of the publishing node, is no finding", () => {
+  const f = twoScreenPack({ screens: [EARLY_SCREEN] });
+  const findings = checkAgentFlow(f, { fieldRenderers: [{ id: EARLY_SCREEN, midRunHitl: true }] });
+  // Only the stop right in front of the write is named (by the InputMessageNode rule), never the early screen.
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate list_gate"]);
+  assert.ok(!JSON.stringify(findings).includes("schema-review"), JSON.stringify(findings));
+});
+
+test("a mid-run screen placed on the last stop in front of the publishing node is still refused", () => {
+  const f = twoScreenPack();
+  const findings = checkAgentFlow(f, {
+    fieldRenderers: [
+      { id: EARLY_SCREEN, midRunHitl: true },
+      { id: LATE_SCREEN, midRunHitl: true },
+    ],
+  });
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate list_gate", "oas.publish-own-gate create"]);
+  assert.match(findings[1].message, /final-list-review/);
+  assert.ok(!findings[1].message.includes("schema-review"), findings[1].message);
+});
+
+test("a mid-run screen placed after the publishing node is no finding", () => {
+  const f = flow(
+    [
+      node("start", "StartNode", {}),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("follow_up", "InputMessageNode", { renderer: SCREEN }),
+      node("end", "EndNode"),
+    ],
+    [["start", "publish"], ["publish", "follow_up"], ["follow_up", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] }), []);
+});
+
+test("a mid-run screen with steps but no stop between it and the publishing node is refused", () => {
+  const f = flow(
+    [
+      node("start", "StartNode", {}),
+      node("approve", "InputMessageNode", { renderer: SCREEN }),
+      node("file_recipients", "ApiNode", { ...WRITE, publishes: false }),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("end", "EndNode"),
+    ],
+    [["start", "approve"], ["approve", "file_recipients"], ["file_recipients", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a mid-run screen placed inside the subflow of the publishing node is refused", () => {
+  const f = nestedSendPack({ outer: { publishes: true } });
+  const inside = f.$referenced_components["send-subflow"];
+  inside.$referenced_components["send-gate"] = { component_type: "InputMessageNode", id: "send-gate", name: "send-gate", metadata: { cinatra: { renderer: SCREEN } } };
+  inside.nodes.push({ $component_ref: "send-gate" });
+  inside.control_flow_connections = [
+    { component_type: "ControlFlowEdge", name: "a", from_node: { $component_ref: "send-start" }, to_node: { $component_ref: "send-gate" } },
+    { component_type: "ControlFlowEdge", name: "b", from_node: { $component_ref: "send-gate" }, to_node: { $component_ref: "send" } },
+    { component_type: "ControlFlowEdge", name: "c", from_node: { $component_ref: "send" }, to_node: { $component_ref: "send-end" } },
+  ];
+  f.metadata.cinatra.hitlScreens = [SCREEN];
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate send_flow",
+  ]);
+});
+
+test("a mid-run screen that no step places is still refused beside every publishing node", () => {
+  const f = twoScreenPack({ screens: ["@example/curate-agent:unplaced"] });
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: "@example/curate-agent:unplaced", midRunHitl: true }] })), [
+    "oas.publish-own-gate list_gate",
+    "oas.publish-own-gate create",
+  ]);
+});
 
 test("checkAgentPackage reads the flow and the package's renderers", () => {
   assert.deepEqual(checkAgentPackage(path.join(FIX, "declared-publish")).findings, []);
