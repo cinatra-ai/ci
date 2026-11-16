@@ -1924,3 +1924,70 @@ test("finding 4: an earlier version that changes a tracked test-side file is RED
   assertRed(r, "TEST-CHANGED");
   assert.equal(r.verdict.reasons.find((x) => x.code === "TEST-CHANGED").phase, "earlier");
 });
+
+// ---------------------------------------------------------------------------
+// The second review: shapes that still gave a false green.
+// ---------------------------------------------------------------------------
+
+test("second review 1: a template interpolation with a brace in a string and a nested template exposes no export", async () => {
+  const { exportsOf } = await gateModule();
+  // a closing brace inside a string of the interpolation must not end it
+  assert.deepEqual([...exportsOf('const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n')], ["ready"]);
+  // a regular expression and a comment inside an interpolation are read as code there
+  assert.deepEqual([...exportsOf("const a = `${ /`/.test(x) ? \"{\" : '}' /* } ` */ }\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+  // nested templates with interpolations of their own
+  assert.deepEqual([...exportsOf("const a = `x ${ `y ${ { z: 1 }.z } ` } w\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+});
+
+// A table of existing tests: each row is one test of the file.
+const ROWS_TEST = (rows, extra = "") =>
+  `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst rows = [\n${rows.map((x) => `  ${JSON.stringify(x)},\n`).join("")}];\n${extra}for (const [name, ok] of rows) {\n  test(name, () => {\n    assert.match(publish(() => ({ ok })), /^published/);\n  });\n}\n`;
+
+test("second review 2: an edit that removes the test the fix breaks is not collateral: RED, also beside a proven file", async (t) => {
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": ROWS_TEST([["with a good compile", true], ["with a failed compile", false]]) },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": ROWS_TEST([["with a good compile", true]]), "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /the edit removes 1 test\(s\) of the file's earlier version: with a failed compile/);
+});
+
+test("second review 3: a pin beside added lines that drop an existing test is RED", async (t) => {
+  const two = [["with a good compile", true], ["with another good compile", true]];
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": ROWS_TEST(two) },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": `${ROWS_TEST(two, "rows.pop();\n")}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /the edit removes 1 test\(s\) of the file's earlier version: with another good compile/);
+});
+
+test("second review 4: an import that names its extension is that file, never a folder's index or another script of its stem", async () => {
+  const { addedByFix } = await gateModule();
+  const map = new Map([["src/pkg/index.mjs", new Set(["ghost"])]]);
+  const ctx = { source: 'import * as api from "../src/pkg.mjs";\n', exportsByFile: () => map, addedFix: new Set(["src/pkg/index.mjs"]), roots: ["/t"], runnerDir: "" };
+  assert.equal(addedByFix("TypeError: api.ghost is not a function", "test/a.test.mjs", ctx), null);
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/pkg.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), null);
+  // without the extension the folder's index is the module
+  const bare = { ...ctx, source: 'import * as api from "../src/pkg";\n' };
+  assert.equal(addedByFix("TypeError: api.ghost is not a function", "test/a.test.mjs", bare), "the export ghost");
+  // a named extension stands only for its TypeScript source (x.mjs -> x.mts), not for x.js
+  const stem = { ...ctx, source: 'import { s } from "../src/sum.mjs";\n', addedFix: new Set(["src/sum.js"]) };
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", stem), null);
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", { ...stem, addedFix: new Set(["src/sum.mts"]) }), "the module src/sum.mts");
+});
+
+test("second review 5: an earlier version that rewrites its own test file during its run is RED (TEST-CHANGED in the earlier run)", async (t) => {
+  const writesSelf = PUB_OLD.replace("import { publish }", 'import { writeFileSync } from "node:fs";\nwriteFileSync(new URL(import.meta.url), "// rewritten\\n");\nimport { publish }');
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": writesSelf },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "TEST-CHANGED");
+  const changed = r.verdict.reasons.find((x) => x.code === "TEST-CHANGED");
+  assert.equal(changed.phase, "earlier");
+  assert.equal(changed.file, "test/publish.test.mjs");
+});
