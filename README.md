@@ -2316,6 +2316,175 @@ node --test scripts/__tests__/truthful-attribution-gate.test.mjs \
             scripts/__tests__/gate-suite-audit-report.test.mjs
 ```
 
+## red-first-gate
+
+A reusable workflow + engine that proves the tests a pull request adds or
+changes are real red-first tests: they fail on the code before the fix, for the
+right reason, and pass with the fix. It runs the repository's own test runner
+(`node:test` or vitest) in two trees and reads machine reports, never exit
+codes alone.
+
+- **New tests**: the JavaScript and TypeScript test files (`*.test.*` and
+  `*.spec.*` ending in `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.mts` or
+  `.cts`, outside `__fixtures__/`) the pull request adds or changes in the range
+  from the merge base to the head. A test file in another language is not a new
+  test here.
+- **Test side**: the new tests plus test support paths: `__tests__/`,
+  `__fixtures__/`, `__snapshots__/`, `__mocks__/`, `__stubs__/`, the vitest or
+  vite config and workspace files, setup files under common names
+  (`vitest.setup.*`, `vitest.global-setup.*`, `setupTests.*`, `setup-tests.*`,
+  `test-setup.*`, `global-setup.*`, `test/setup.*`, `tests/setup.*`), the files
+  a vitest config names in `setupFiles` or `globalSetup` as string literals, and
+  the paths that match the `test_support` input. The config key may be bare,
+  quoted or computed (`setupFiles`, `"setupFiles"`, `["setupFiles"]`). A setup
+  file under another name whose path is built at run time is the fix side
+  unless `test_support` names it. Every other changed path is the **fix side**.
+- **Regular files only**: a test-side path of the head that is a symlink or a
+  submodule fails the job (`NOT-A-FILE`): its target could be fix side, so the
+  test that runs would not be the file of the pull request.
+- **Before the fix**: the merge base with the pull request's test side applied.
+  The gate checks that this tree and the head differ by exactly the fix side.
+- **Right reason**: before the fix, each new test file must load, collect at
+  least one test and fail at least one test by an assertion (`AssertionError`),
+  or by the text of a `red-first-expect: <text>` marker line in the file. A
+  marker text must appear in a test failure of that file (ANSI and whitespace
+  normalized, case-sensitive); a load error never counts.
+- **With the fix**: each new test file must load and pass, at least one test
+  must pass, every test that failed before must pass (each occurrence: a test
+  name reported twice before needs two passing results), the runner must exit
+  0, and a vitest report must say `success: true`.
+- **Reports**: read fail closed. A vitest report with a missing or non-boolean
+  `success`, an unknown status, a malformed entry, or a contradiction (success
+  with a failed file, a failed test in a file not reported as failed, a passed
+  test in a file reported as skipped, pending or todo) is `NO-REPORT`; a file
+  reported as failed although none of its tests failed is `FILE-ERROR`. In a
+  `node:test` report only the final top-level result named like the file is
+  the file itself; a test with that name anywhere before it counts as a test.
+- **A module the fix adds**: a test file that imports it at the top does not
+  load before the fix (`LOAD-ERROR`). Import it inside the test (for example
+  `const { sum } = await import("../src/sum.mjs")`) and add a marker with the
+  text of the error, such as `red-first-expect: Cannot find module`.
+
+The `red-first` job fails with a named reason: `INSTALL-FAILED`, `NO-REPORT`,
+`NOT-COLLECTED`, `LOAD-ERROR`, `FILE-ERROR`, `NOT-RED-BEFORE`, `WRONG-REASON`,
+`TEXT-MISMATCH`, `NOT-GREEN-AT-HEAD`, `RUNNER-EXIT`, `TEST-CHANGED` (the
+install or the run changed a tracked test-side file, staged, committed or not),
+`NOT-A-FILE`, `TIMEOUT`, `STOPPED` or `TREE-MISMATCH`. A pull request without a
+new test (`NO-NEW-TESTS`), whose new tests all match `exclude`
+(`EXCLUDED-ONLY`, for example only end-to-end or database tests, with or
+without other changes), or with no change besides tests (`TESTS-ONLY`) skips
+the `red-first` job: neutral, with the reason in the `plan` job's summary,
+never red and never success.
+
+New tests that match `exclude` beside other new tests are not proven here and
+do not fail the job: each is a notice (`EXCLUDED`) in both jobs, the plan
+output `excluded` counts them, and the other new tests decide. So a `success`
+of the `red-first` job at the head proves the new tests outside `exclude`;
+read the `EXCLUDED` notices (or the plan output) for the rest.
+
+Time: `timeout_minutes` is the job's limit, from 3 to 7200 minutes; the `plan`
+job fails on a value outside that range. The gate stops 120 seconds before the
+limit, with `TIMEOUT`, so the verdict is written before GitHub ends the job:
+each install and test run, and each git call of the run, is cut at that point
+(the removal of the trees runs inside the 120 seconds). Each install and test
+run also has its own limit (20 minutes by default). The checkouts and the
+Node.js setup before the gate count against the limit but are not cut by it.
+
+Processes: every install and test run starts in its own process group, and the
+group is killed when it exits or times out, so a background process cannot
+outlive its step; when no exit is reported within 5 seconds after that kill,
+the gate stops waiting and names `TIMEOUT`. The trees and reports are removed
+at the end of each run. A stop of the gate (SIGINT or SIGTERM, as when the job
+is cancelled) kills the running group and ends the run with `STOPPED`, exit
+130 or 143, after the same removal; if the run has not ended within 5 seconds,
+or at a second signal, the gate removes the trees itself and leaves.
+
+Output: every line the gate writes shows a line break inside a path or a
+message as `\n`, so a file name from the pull request can never start a
+workflow command line.
+
+The gate runs the pull request's own code and dependencies, like any test job.
+It proves that the fix side turns the new tests from red to green; whether the
+tests are meaningful, and whether a tool goes out of its way to hide a change
+(for example by restoring a file after the run), is for review.
+
+### Use it from another repo
+
+```yaml
+name: red-first-gate
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: red-first-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  red-first-gate:
+    # Pin BOTH to the same commit SHA: the workflow ref and the `ref` input.
+    uses: cinatra-ai/ci/.github/workflows/red-first-gate.yml@main  # @<sha> in prod
+    with:
+      ref: main  # the same <sha> in production
+      install: npm ci
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `ref` | `main` | Ref of this repo to check out (pin to a SHA in production). |
+| `runner` | `""` | JSON `runs-on` value, as for the other gates; empty keeps `ubuntu-latest`. Linux or macOS only. |
+| `install` | `""` | Shell command run at the root of each tree before its tests. |
+| `setup_pnpm` | `false` | Set up pnpm from the caller's `packageManager` field. |
+| `vitest` | `npx --no-install vitest run` | Command that runs vitest, split into words (quotes group words); it runs without a shell. The gate appends the files and the JSON reporter options. |
+| `exclude` | `""` | Path patterns of tests this check cannot prove (for example `e2e/**, **/*.db.test.*`). |
+| `test_support` | `""` | Path patterns of more test-side paths (setup files under other names). |
+| `node_version` | `24` | Node.js version. |
+| `timeout_minutes` | `30` | Time limit of the `red-first` job, 3 to 7200; the gate stops 120 s before it with `TIMEOUT`. |
+
+Path patterns (`exclude`, `test_support`): separated by commas or line breaks;
+each matches the whole repository path. `*` is any run of characters but `/`,
+`?` one character but `/`, `**` any run including `/`; `**/` also matches no
+folder, but only where a folder name starts (`**/calc.test.mjs` matches
+`calc.test.mjs` and `src/calc.test.mjs`, never `src/mycalc.test.mjs`). Every
+other character matches itself; no regular expression is built from these
+inputs. Regular-expression syntax (`[ ] { } ( ) ! ^ $ + |` and the backslash),
+a leading `/` and a trailing `/` are refused with exit 2. To match a path that
+holds a refused character or a comma, write `?` for it: Next.js
+`app/?marketing?/**` for `(marketing)` and `app/?id?/*.test.tsx` for `[id]`,
+SvelteKit `**/?page.test.ts` for `+page`, Remix `**/?param.test.tsx` for
+`$param`. A pattern written out of habit as a regular expression without a
+refused character (`.spec.ts`, `e2e/.*`) is still a valid path pattern: it
+matches literally and may match nothing, so write `**/*.spec.ts` or `e2e/**`.
+
+The install command is a shell script (run with `bash -c`, as a `run:` step);
+the vitest command is not: it runs from its words, so shell syntax in it is a
+plain argument. The job summary shows paths and messages as plain text with
+every Markdown character escaped.
+
+### Run locally
+
+```sh
+node scripts/red-first-gate.mjs plan --base <sha> --head <sha>
+node scripts/red-first-gate.mjs run --base <sha> --head <sha> --work /tmp/red-first --install "npm ci"
+```
+
+`plan` exits 0 when it decides (run or skip); `run` exits 0 on PASS, 1 on RED,
+3 on SKIP and 2 on a usage or internal error (any error, never a crash); a
+stop signal ends `run` with 130 (SIGINT) or 143 (SIGTERM). `--verdict <file>`
+writes the result as JSON. `--job-started <epoch seconds> --job-minutes <n>`
+set the job's time budget (`plan` takes `--job-minutes` alone and checks it);
+`--test-support <patterns>` adds test-side paths. The work folder must
+be empty or absent; the run leaves it so.
+
+### Develop
+
+```sh
+node --test scripts/__tests__/red-first-gate.test.mjs
+```
+
+Node built-ins only; requires Node 24+, git and bash on Linux or macOS.
+
 ## Developing in this repo
 
 ### Run the full test suite

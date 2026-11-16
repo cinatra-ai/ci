@@ -1,0 +1,168 @@
+name: red-first-gate
+
+# Reusable workflow: the tests a pull request adds or changes must fail on the
+# code before the fix, for the right reason, and pass with the fix. A consuming
+# repository calls it from a thin caller on pull_request, e.g.:
+#
+#   on:
+#     pull_request:
+#   jobs:
+#     red-first-gate:
+#       uses: cinatra-ai/ci/.github/workflows/red-first-gate.yml@<sha>  # vX.Y.Z
+#       with:
+#         ref: <sha>
+#         install: npm ci
+#
+# Two jobs. `plan` reads the pull request range and decides run or skip (no new
+# test, no change besides tests, or only excluded tests: the reason is in its
+# summary). `red-first` runs only on a plan verdict of run and exits 0 only
+# when every new test file outside `exclude` was proven red before the fix and
+# green with it; anything it cannot read or prove fails it with a named reason
+# (scripts/red-first-gate.mjs). So a pull request without new tests shows
+# `red-first` as skipped, never as success. New tests that match `exclude`
+# beside other new tests are listed as notices: they are not proven here.
+# Linux or macOS runners only: the steps run in bash.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref of this gate repo to check out (pin to a SHA in production)."
+        type: string
+        default: "main"
+      runner:
+        description: "JSON runs-on value chosen by the caller: a label array such as '[\"self-hosted\",\"linux\"]' or a quoted label such as '\"ubuntu-24.04\"'. Linux or macOS only (the gate refuses Windows). Empty (the default) keeps the GitHub-hosted runner."
+        type: string
+        required: false
+        default: ""
+      install:
+        description: "Shell command run at the root of each tree (before the fix, then the head) before its tests, e.g. 'npm ci'. Empty: no install."
+        type: string
+        required: false
+        default: ""
+      setup_pnpm:
+        description: "Set up pnpm (version from the caller's packageManager field) before the install."
+        type: boolean
+        required: false
+        default: false
+      vitest:
+        description: "Command that runs vitest once, split into words (single or double quotes group words; no shell, no expansion); the gate appends the test files and the JSON reporter options."
+        type: string
+        required: false
+        default: "npx --no-install vitest run"
+      exclude:
+        description: "Test paths this check cannot prove (for example end-to-end specs that need a running app, or tests that need a database), e.g. 'e2e/**, **/*.db.test.*'. Path patterns, separated by commas or line breaks, each matching the whole repository path: * is any run of characters but /, ? one character but /, ** any run including / (**/ also matches no folder, only at the start of a folder name). Regular-expression syntax ([ ] { } ( ) ! ^ $ + | and backslash) and a leading or trailing / are refused; write ? for a refused character. When every new test file matches, the red-first job is skipped (EXCLUDED-ONLY); beside other new tests, a match is a notice (EXCLUDED, not proven here) and the other new tests decide."
+        type: string
+        required: false
+        default: ""
+      test_support:
+        description: "More test-side paths, for test setup files under names the gate does not know and that no vitest config names as a string literal; they are taken from the head into the tree before the fix. Path patterns, separated by commas or line breaks, each matching the whole repository path: * is any run of characters but /, ? one character but /, ** any run including / (**/ also matches no folder, only at the start of a folder name). Regular-expression syntax ([ ] { } ( ) ! ^ $ + | and backslash) and a leading or trailing / are refused; write ? for a refused character."
+        type: string
+        required: false
+        default: ""
+      node_version:
+        description: "Node.js version for the gate and the tests."
+        type: string
+        required: false
+        default: "24"
+      timeout_minutes:
+        description: "Time limit of the red-first job, in minutes, from 3 to 7200. The gate stops its last step 120 seconds before it, with the reason TIMEOUT. The plan job fails on a value outside that range, before the red-first job starts."
+        type: number
+        required: false
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runner && fromJSON(inputs.runner) || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      verdict: ${{ steps.plan.outputs.verdict }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Checkout gate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .red-first-gate
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Plan
+        id: plan
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXCLUDE: ${{ inputs.exclude }}
+          TEST_SUPPORT: ${{ inputs.test_support }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        run: >-
+          node .red-first-gate/scripts/red-first-gate.mjs plan
+          --base "$BASE_SHA" --head "$HEAD_SHA" --exclude "$EXCLUDE"
+          --test-support "$TEST_SUPPORT" --job-minutes "$TIMEOUT_MINUTES"
+          --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
+  red-first:
+    needs: plan
+    if: needs.plan.outputs.verdict == 'run'
+    runs-on: ${{ inputs.runner && fromJSON(inputs.runner) || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Start the time budget
+        shell: bash
+        run: echo "RED_FIRST_JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout caller repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout gate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: cinatra-ai/ci
+          ref: ${{ inputs.ref }}
+          path: .red-first-gate
+          persist-credentials: false
+
+      - name: Set up pnpm
+        if: inputs.setup_pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Red before the fix, green with it
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          INSTALL: ${{ inputs.install }}
+          VITEST: ${{ inputs.vitest }}
+          EXCLUDE: ${{ inputs.exclude }}
+          TEST_SUPPORT: ${{ inputs.test_support }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        run: >-
+          node .red-first-gate/scripts/red-first-gate.mjs run
+          --base "$BASE_SHA" --head "$HEAD_SHA" --work "$RUNNER_TEMP/red-first"
+          --install "$INSTALL" --vitest "$VITEST" --exclude "$EXCLUDE"
+          --test-support "$TEST_SUPPORT"
+          --job-started "$RED_FIRST_JOB_STARTED" --job-minutes "$TIMEOUT_MINUTES"
+          --summary "$GITHUB_STEP_SUMMARY"
