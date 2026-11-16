@@ -16,11 +16,15 @@ name: red-first-gate
 # Two jobs. `plan` reads the pull request range and decides run or skip (no new
 # test, no change besides tests, or only excluded tests: the reason is in its
 # summary). `red-first` runs only on a plan verdict of run and exits 0 only
-# when every new test file outside `exclude` was proven red before the fix and
-# green with it; anything it cannot read or prove fails it with a named reason
-# (scripts/red-first-gate.mjs). So a pull request without new tests shows
-# `red-first` as skipped, never as success. New tests that match `exclude`
-# beside other new tests are listed as notices: they are not proven here.
+# when no new test file outside `exclude` lacks its proof: each was proven red
+# before the fix and green with it, or is listed as a notice that makes no
+# red-first claim (a collateral edit of an existing test file, or tests
+# declared with a `red-first-pin:` marker); anything it cannot read or prove
+# fails it with a named reason (scripts/red-first-gate.mjs). So a pull request
+# without new tests shows `red-first` as skipped, never as success, and a
+# success whose headline reads NEUTRAL proved nothing. New tests that match
+# `exclude` beside other new tests are listed as notices: they are not proven
+# here.
 # Linux or macOS runners only: the steps run in bash.
 on:
   workflow_call:

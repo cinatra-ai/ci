@@ -2354,7 +2354,37 @@ codes alone.
   least one test and fail at least one test by an assertion (`AssertionError`),
   or by the text of a `red-first-expect: <text>` marker line in the file. A
   marker text must appear in a test failure of that file (ANSI and whitespace
-  normalized, case-sensitive); a load error never counts.
+  normalized, case-sensitive).
+- **What the fix adds**: a failure before the fix is also the right reason,
+  without a marker, when its text names something only the fix side provides:
+  a `TypeError: ... <name> is not a function` (or `is not a constructor`) or
+  a `does not provide an export named '<name>'` whose `<name>` a fix-side
+  script newly exports (an added `export function|class|const|let|var|enum
+  <name>`, `export { <name> }` or `exports.<name> =` line, and no removed
+  export line of that name in the same file), or a module-not-found text
+  (`Cannot find module`, `Failed to resolve import`, `Failed to load url`)
+  whose path is a file the fix side adds. Such a file is proven and carries
+  the notice `ADDED-BY-FIX`. This is the one case in which a file that does
+  not load before the fix is proven; any other load error stays `LOAD-ERROR`,
+  and any other failure without an assertion stays `WRONG-REASON`.
+- **No red-first claim** (a notice, not a proof): a test file in which no test
+  fails before the fix is `NOT-RED-BEFORE`, except in two cases.
+  `COLLATERAL`: a changed file that only keeps existing tests working. The
+  gate runs the file's earlier version (the merge base's) in the tree before
+  the fix; the edit is collateral when both versions report the same tests
+  (by name and count), no changed line of the file declares a test or states
+  an assertion (`it`, `test`, `describe`, `expect...`, `assert...`, `.should`,
+  `.rejects`, `.resolves`, a `.toBe(`-style matcher; comment lines apart), and
+  every test passes before the fix and with it. An earlier version that cannot
+  be run and read is not collateral, and a renamed or moved test file is a new
+  file to the gate.
+  `PIN`: every test the pull request adds to the file is named by a
+  `red-first-pin: <part of the test's full name>` marker line in the file, and
+  passes before the fix and with it: a test that pins behaviour the fix keeps.
+  One marker names one test: a marker that names no test, more than one test
+  name, or a test that does not pass before the fix, is `PIN-MISMATCH`; an
+  added test without a marker must fail first. Markers are part of the diff:
+  review them as you review `red-first-expect:`.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit
@@ -2367,13 +2397,15 @@ codes alone.
   `node:test` report only the final top-level result named like the file is
   the file itself; a test with that name anywhere before it counts as a test.
 - **A module the fix adds**: a test file that imports it at the top does not
-  load before the fix (`LOAD-ERROR`). Import it inside the test (for example
+  load before the fix. It is proven when the load error names that module
+  (see "What the fix adds"). When the runner's text does not name it, import
+  the module inside the test (for example
   `const { sum } = await import("../src/sum.mjs")`) and add a marker with the
   text of the error, such as `red-first-expect: Cannot find module`.
 
 The `red-first` job fails with a named reason: `INSTALL-FAILED`, `NO-REPORT`,
 `NOT-COLLECTED`, `LOAD-ERROR`, `FILE-ERROR`, `NOT-RED-BEFORE`, `WRONG-REASON`,
-`TEXT-MISMATCH`, `NOT-GREEN-AT-HEAD`, `RUNNER-EXIT`, `TEST-CHANGED` (the
+`TEXT-MISMATCH`, `PIN-MISMATCH`, `NOT-GREEN-AT-HEAD`, `RUNNER-EXIT`, `TEST-CHANGED` (the
 install or the run changed a tracked test-side file, staged, committed or not),
 `NOT-A-FILE`, `TIMEOUT`, `STOPPED` or `TREE-MISMATCH`. A pull request without a
 new test (`NO-NEW-TESTS`), whose new tests all match `exclude`
@@ -2387,6 +2419,15 @@ do not fail the job: each is a notice (`EXCLUDED`) in both jobs, the plan
 output `excluded` counts them, and the other new tests decide. So a `success`
 of the `red-first` job at the head proves the new tests outside `exclude`;
 read the `EXCLUDED` notices (or the plan output) for the rest.
+
+The same holds for `COLLATERAL` and `PIN` files: each is a notice, the job's
+headline counts them as not proven, and the other test files decide. When
+every changed test file is such a notice, nothing is proven and nothing is
+red: the job ends `NEUTRAL` (`NOTHING-TO-PROVE`), green, with that headline
+and a notice, never with `PASS`. So a `success` of the `red-first` job says
+that no new test of the pull request lacks its proof; the headline
+(`RED-FIRST: PASS (<n> new test file(s) ...)` or `RED-FIRST: NEUTRAL ...`),
+the summary table and the notices say what was proven.
 
 Time: `timeout_minutes` is the job's limit, from 3 to 7200 minutes; the `plan`
 job fails on a value outside that range. The gate stops 120 seconds before the
@@ -2475,8 +2516,9 @@ node scripts/red-first-gate.mjs plan --base <sha> --head <sha>
 node scripts/red-first-gate.mjs run --base <sha> --head <sha> --work /tmp/red-first --install "npm ci"
 ```
 
-`plan` exits 0 when it decides (run or skip); `run` exits 0 on PASS, 1 on RED,
-3 on SKIP and 2 on a usage or internal error (any error, never a crash); a
+`plan` exits 0 when it decides (run or skip); `run` exits 0 on PASS or
+NEUTRAL, 1 on RED, 3 on SKIP and 2 on a usage or internal error (any error,
+never a crash); a
 stop signal ends `run` with 130 (SIGINT) or 143 (SIGTERM). `--verdict <file>`
 writes the result as JSON. `--job-started <epoch seconds> --job-minutes <n>`
 set the job's time budget (`plan` takes `--job-minutes` alone and checks it);

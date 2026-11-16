@@ -16,9 +16,19 @@
 //      repository's own runner (node:test or vitest), reading machine reports
 //      (a node:test reporter, the vitest JSON report), never exit codes alone;
 //   4. passes only when every new test file loads, collects tests and fails at
-//      least one test for the right reason before the fix (an assertion, or the
-//      text of a `red-first-expect:` marker in the file), and with the fix loads,
+//      least one test for the right reason before the fix (an assertion, the
+//      text of a `red-first-expect:` marker in the file, or a failure that names
+//      an export or a module the fix side adds), and with the fix loads,
 //      passes, and passes every occurrence of every test that failed before.
+// A test file with no failing test before the fix makes no red-first claim in
+// two cases only, each a note (not proven here), never a proof:
+//   - COLLATERAL: a changed file whose earlier version reports the same tests
+//     (run in the tree before the fix) and whose edit touches no test
+//     declaration and no assertion line;
+//   - PIN: every test the pull request adds to the file is named by a
+//     `red-first-pin:` marker, and passes before the fix and with it.
+// With such notes and at least one proven file the run is a PASS; with notes
+// only it is NEUTRAL (nothing to prove, exit 0), never a PASS.
 // Anything it cannot read or prove ends RED with a named reason. A pull request
 // without a new test, with no change besides tests, or whose new tests all
 // match --exclude, is a SKIP (exit 3 in `run`), never a pass. New tests that
@@ -35,8 +45,9 @@
 //                           [--test-support <globs>] [--timeout-seconds <n>]
 //                           [--job-started <epoch s> --job-minutes <n>]
 //                           [--verdict <file>] [--summary <file>]
-// Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED, 3 SKIP,
-// 130/143 stopped by SIGINT/SIGTERM; 2 usage or internal error (both modes).
+// Exit codes: plan 0 (decided: run or skip); run 0 PASS or NEUTRAL, 1 RED,
+// 3 SKIP, 130/143 stopped by SIGINT/SIGTERM; 2 usage or internal error (both
+// modes).
 //
 // Node built-ins, git and bash; Linux or macOS.
 // ---------------------------------------------------------------------------
@@ -81,7 +92,34 @@ const STOP_GRACE_MS = 5000;
 const CLEANUP_GIT_MS = 30_000;
 const NODE_TEST_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["']node:test["']/;
 const MARKER_RE = /red-first-expect:[ \t]*(.*?)[ \t]*(?:\*\/[ \t]*)?$/;
+const PIN_RE = /red-first-pin:[ \t]*(.*?)[ \t]*(?:\*\/[ \t]*)?$/;
 const ASSERTION_TEXT_RE = /^(?:AssertionError|JestAssertionError)\b/;
+// A failure before the fix that names what the fix adds. A call of something
+// that is not there yet: the name is the last identifier of the callee
+// (`calc.sum`, `(0 , __vite_ssr_import_1__.sum)`). A named import that is not
+// there yet. A module that is not there yet, as node and vite word it.
+const NOT_CALLABLE_RE = /^TypeError: (.+?) is not a (?:function|constructor)(?![A-Za-z])/;
+const TRAILING_NAME_RE = /([A-Za-z_$][\w$]*)[\s)]*$/;
+const CALLEE_MAX = 300;
+const NO_EXPORT_RE = /does not provide an export named ['"]([A-Za-z_$][\w$]*)['"]/;
+const MISSING_MODULE_RES = [
+  /Cannot find (?:module|package) ['"]([^'"]+)['"](?: imported from ['"]?([^\s'"]+))?/g,
+  /Failed to resolve import ['"]([^'"]+)['"] from ['"]([^'"]+)['"]/g,
+  /Failed to load url (\S+) \(resolved id: [^)]*\)(?: in (\S+?)\.? Does)?/g,
+];
+// Exports a script declares on one line: `export function f`, `export class
+// C`, `export const c`, `export { a, b as c }`, `exports.f =`. Types are not
+// values and `export default` has no name of its own: neither is read.
+const EXPORT_DECL_RE = /^\s*export\s+(?:declare\s+)?(?:async\s+)?(?:function\s*\*?\s*|(?:abstract\s+)?class\s+|(?:const|let|var|enum)\s+)([A-Za-z_$][\w$]*)/;
+const EXPORT_LIST_RE = /^\s*export\s*\{([^}]*)\}/;
+const CJS_EXPORT_RE = /^\s*(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=/;
+const NAME_RE = /^[A-Za-z_$][\w$]*$/;
+// A line that declares a test or states an assertion: it/test/describe (with
+// .each, .skip, ...), expect..., assert..., .should, .rejects, .resolves and
+// the matcher calls (.toBe(, .not.toEqual(, ...). Read on the changed lines
+// of a test file; a method call such as `re.test(` is not a declaration.
+const TEST_LINE_RE =
+  /(?<![.\w$])(?:it|test|describe|suite|specify|bench)\s*(?:\.\s*[A-Za-z]+\s*)*(?:\(|`)|(?<![.\w$])(?:expect|assert)[A-Za-z]*\s*[.(]|\.\s*(?:should|rejects|resolves)\b|\.\s*(?:not\s*\.\s*)?to(?:Be|Equal|StrictEqual|Have|Contain|Match|Throw|Satisfy|Include)[A-Za-z]*\s*\(/;
 const REPORTER = join(dirname(fileURLToPath(import.meta.url)), "red-first-reporter.mjs");
 export const DEFAULT_VITEST = "npx --no-install vitest run";
 // The statuses the vitest JSON report uses; any other value makes the report
@@ -324,6 +362,148 @@ export function readMarkers(source) {
   return markers;
 }
 
+// `red-first-pin: <text>` lines: each names, by a part of its full name, a test
+// that passes before the fix on purpose (it pins behaviour the fix keeps).
+export function readPins(source) {
+  const pins = [];
+  for (const line of String(source).split(/\r?\n/)) {
+    const match = PIN_RE.exec(line);
+    // A pin that is empty once normalized would name every test.
+    if (match && normalizeText(match[1])) pins.push(match[1].trim());
+  }
+  return pins;
+}
+
+// ---------------------------------------------------------------------------
+// What the fix adds, and what an edit of a test file touches
+// ---------------------------------------------------------------------------
+
+// The name a `TypeError: ... is not a function` (or constructor) text calls.
+export function missingCallable(text) {
+  const match = NOT_CALLABLE_RE.exec(normalizeText(text));
+  // A callee longer than any real name is not read.
+  if (!match || match[1].length > CALLEE_MAX) return null;
+  const name = TRAILING_NAME_RE.exec(match[1])?.[1] ?? null;
+  return name && name !== "default" ? name : null;
+}
+
+// The modules a text reports as not found: [{ spec, importer }].
+export function missingModules(text) {
+  const found = [];
+  const t = normalizeText(text);
+  for (const re of MISSING_MODULE_RES) {
+    for (const match of t.matchAll(re)) found.push({ spec: match[1], importer: match[2] ?? null });
+  }
+  return found;
+}
+
+// The names the added lines of one script export, less the names its removed
+// lines exported (a changed line is not a new export).
+export function exportNames(lines) {
+  const names = [];
+  for (const line of lines) {
+    const decl = EXPORT_DECL_RE.exec(line)?.[1] ?? CJS_EXPORT_RE.exec(line)?.[1];
+    if (decl) names.push(decl);
+    const list = EXPORT_LIST_RE.exec(line)?.[1];
+    if (list === undefined) continue;
+    for (const part of list.split(",")) {
+      const item = part.trim();
+      if (!item || /^type\s/.test(item)) continue;
+      const name = item.split(/\s+as\s+/).pop().trim();
+      if (NAME_RE.test(name) && name !== "default") names.push(name);
+    }
+  }
+  return names;
+}
+
+function isCommentLine(line) {
+  const t = line.trim();
+  if (t.startsWith("//")) return true;
+  if (!(t.startsWith("/*") || t.startsWith("*"))) return false;
+  const end = t.indexOf("*/");
+  return end < 0 || !t.slice(end + 2).trim();
+}
+
+// The first changed line (added or removed, comments apart) of a test file's
+// edit that declares a test or states an assertion, or null.
+export function changedTestLine(lines) {
+  return lines.find((line) => !isCommentLine(line) && TEST_LINE_RE.test(line)) ?? null;
+}
+
+// A unified diff with no context lines, per path: { added: [...], removed:
+// [...] }. A path git writes quoted (unusual characters) is left out: what
+// is not read here is never evidence.
+export function parseRangeDiff(text) {
+  const files = new Map();
+  let current = null;
+  let header = false;
+  for (const line of String(text).split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      header = true;
+      current = null;
+    } else if (header) {
+      if (line.startsWith("+++ b/")) {
+        current = { added: [], removed: [] };
+        files.set(line.slice(6).replace(/\t$/, ""), current);
+      } else if (line.startsWith("@@")) header = false;
+    } else if (current) {
+      if (line.startsWith("+")) current.added.push(line.slice(1));
+      else if (line.startsWith("-")) current.removed.push(line.slice(1));
+    }
+  }
+  return files;
+}
+
+// Repository paths a missing-module text may mean: an absolute path inside the
+// tree, a path from the repository root or the runner's folder (vite writes
+// `/src/x.ts`), or a relative specifier from its importer or the test file.
+function moduleCandidates({ spec, importer }, file, roots, runnerDir) {
+  const out = [];
+  const push = (p) => {
+    const n = posix.normalize(p);
+    if (n && n !== "." && !n.startsWith("../") && n !== ".." && !n.startsWith("/")) out.push(n);
+  };
+  const name = spec.replace(/^file:\/\//, "");
+  if (name.startsWith("/")) {
+    const inside = relativeIn(name, roots);
+    if (inside) push(inside);
+    push(name.replace(/^\/+/, ""));
+    if (runnerDir) push(posix.join(runnerDir, name.replace(/^\/+/, "")));
+  } else if (name.startsWith("./") || name.startsWith("../")) {
+    const from = importer ? relativeIn(importer.replace(/^file:\/\//, ""), roots) : null;
+    if (from) push(posix.join(posix.dirname(from), name));
+    push(posix.join(posix.dirname(file), name));
+  }
+  return out;
+}
+
+function addedModule(candidate, added) {
+  if (added.has(candidate)) return candidate;
+  const stem = candidate.replace(SCRIPT_EXT_RE, "");
+  for (const path of added) {
+    if (!SCRIPT_EXT_RE.test(path)) continue;
+    const own = path.replace(SCRIPT_EXT_RE, "");
+    if (own === stem || own === candidate || own === `${candidate}/index` || own === `${stem}/index`) return path;
+  }
+  return null;
+}
+
+// What a failure text before the fix names that the fix side adds: an export
+// (a call of it, or a named import of it) or a module. Returns a description
+// for the note, or null: no evidence, so the failure is judged as before.
+export function addedByFix(text, file, { exports, addedFix, roots = [], runnerDir = "" }) {
+  const t = normalizeText(text);
+  const name = missingCallable(t) ?? NO_EXPORT_RE.exec(t)?.[1] ?? null;
+  if (name && exports().has(name)) return `the export ${name}`;
+  for (const missing of missingModules(t)) {
+    for (const candidate of moduleCandidates(missing, file, roots, runnerDir)) {
+      const hit = addedModule(candidate, addedFix);
+      if (hit) return `the module ${hit}`;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Reports
 // ---------------------------------------------------------------------------
@@ -407,6 +587,8 @@ export function parseVitestReport(report, treeRoot) {
     const result = {
       loaded,
       loadError: loaded ? null : message ? firstLine(message) : `the runner reports the file as ${entry.status}`,
+      // the whole message, for the reading of what the fix adds
+      loadText: loaded ? null : normalizeText(message),
       fileError,
       tests,
     };
@@ -416,6 +598,7 @@ export function parseVitestReport(report, treeRoot) {
     if (seen) {
       result.loaded = seen.loaded && result.loaded;
       result.loadError = seen.loadError ?? result.loadError;
+      result.loadText = seen.loadText ?? result.loadText;
       result.fileError = seen.fileError ?? result.fileError;
       result.tests = [...seen.tests, ...result.tests];
     }
@@ -503,7 +686,7 @@ export function parseNodeReport(text, fileArg) {
   const result = tests.map((t) => ({ name: t.path.join(" > "), status: t.status, text: t.text, assertion: t.assertion }));
   if (wrapper && !wrapper.ok) {
     const why = firstErrorLine(stderr.join("")) ?? wrapper.text;
-    if (result.length === 0) return { loaded: false, loadError: clip(why), fileError: null, tests: result };
+    if (result.length === 0) return { loaded: false, loadError: clip(why), loadText: normalizeText(`${stderr.join("")} ${wrapper.text}`), fileError: null, tests: result };
     return { loaded: true, loadError: null, fileError: clip(why), tests: result };
   }
   return { loaded: true, loadError: null, fileError: null, tests: result };
@@ -536,39 +719,124 @@ function actual(failed) {
     .join(" | ");
 }
 
+// The tests of `tests` that `earlier` does not report, by name and count (two
+// tests of one name in the new list against one in the earlier list: one is
+// added).
+function addedTests(tests, earlier) {
+  const left = new Map();
+  for (const t of earlier) left.set(t.name, (left.get(t.name) ?? 0) + 1);
+  const added = [];
+  for (const t of tests) {
+    const n = left.get(t.name) ?? 0;
+    if (n > 0) left.set(t.name, n - 1);
+    else added.push(t);
+  }
+  return added;
+}
+
+// Why the run of a changed test file's earlier version cannot be compared, or
+// null when its tests were read.
+function earlierUnreadable(earlier) {
+  if (!earlier) return "it was not run";
+  if (earlier.run !== "ok") return earlier.run === "timeout" ? "its run did not finish in time" : "its run gave no readable report";
+  const r = earlier.result;
+  if (!r) return "it is not in the runner's report";
+  if (r.tests?.some((t) => !KNOWN_STATUS.has(t.status))) return "its report gives an unknown status";
+  if (!r.loaded) return `it does not load: ${r.loadError}`;
+  if (r.fileError) return `its run reports a file error: ${r.fileError}`;
+  return null;
+}
+
 // before / head: { run: "ok" | "no-report" | "timeout", result } or undefined
 // when the phase did not run. Reasons for no-report, timeout and a stopped
 // install are recorded where they happen; this adds the per-file reasons.
-export function judgeFile({ file, markers = [] }, before, head) {
+// context (all optional; without it the file is judged by assertions and
+// markers alone):
+//   earlier         the run of a changed file's earlier version in the tree
+//                   before the fix ({ run, result }), for its test names;
+//   changedTestLine the first changed line of the file's edit that declares a
+//                   test or states an assertion, or null;
+//   addedByFix      (text) => what the text names that the fix side adds.
+// Returns the reasons, the notes (a file that makes no red-first claim, or
+// that is red because of what the fix adds), `proven`, and `kind`: "proven",
+// "collateral", "pins" or null (not settled: a reason says why).
+export function judgeFile({ file, markers = [], pins = [], status = "A" }, before, head, context = {}) {
   const reasons = [];
+  const notes = [];
   const add = (code, phase, detail) => reasons.push({ code, phase, file, detail: clip(detail, 400) });
-  let failedBefore = [];
+  let mustPass = [];
   let beforeTests = [];
   let beforeOk = false;
   let headOk = false;
+  let noClaim = null;
+  let evidence = null;
   const unknown = (r) => r?.tests?.find((t) => !KNOWN_STATUS.has(t.status));
+  const wantedPins = pins.map((p) => normalizeText(p));
+  const pinned = (t) => wantedPins.some((p) => normalizeText(t.name).includes(p));
+  const fromFix = (text) => (text ? (context.addedByFix?.(text) ?? null) : null);
 
   if (before?.run === "ok") {
     const r = before.result;
     if (!r) add("NOT-COLLECTED", "before", "the file is not in the runner's report (outside the runner's include, or filtered out)");
     else if (unknown(r)) add("NO-REPORT", "before", `the report gives the unknown status ${JSON.stringify(unknown(r).status)} for ${unknown(r).name}`);
-    else if (!r.loaded) add("LOAD-ERROR", "before", r.loadError);
-    else if (r.fileError) add("FILE-ERROR", "before", r.fileError);
+    else if (!r.loaded) {
+      // A file that does not load is red for the right reason only when the
+      // load error names an export or a module the fix side adds.
+      evidence = fromFix(r.loadText ?? r.loadError);
+      if (!evidence) add("LOAD-ERROR", "before", r.loadError);
+      else if (pins.length) add("PIN-MISMATCH", "before", "the file does not load before the fix, so a test declared with red-first-pin: cannot pass there");
+      else beforeOk = true;
+    } else if (r.fileError) add("FILE-ERROR", "before", r.fileError);
     else {
       const ran = r.tests.filter((t) => t.status !== "skipped");
       const failed = ran.filter((t) => t.status === "failed");
+      const stray = pins.find((p, i) => !r.tests.some((t) => normalizeText(t.name).includes(wantedPins[i])));
+      // One marker names one test: a text that is in several test names (a
+      // suite name, a short word) would declare tests the author did not name.
+      const broad = pins.find((p, i) => new Set(r.tests.filter((t) => normalizeText(t.name).includes(wantedPins[i])).map((t) => t.name)).size > 1);
+      const notPinned = r.tests.find((t) => pinned(t) && t.status !== "passed");
       if (ran.length === 0) add("NOT-COLLECTED", "before", "no test ran (none collected, or all skipped)");
-      else if (failed.length === 0) add("NOT-RED-BEFORE", "before", `all ${ran.length} test(s) already pass before the fix`);
-      else {
-        failedBefore = failed;
+      else if (stray !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${stray}" is in no test name of the file`);
+      else if (broad !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${broad}" is in more than one test name of the file: write one marker for each test`);
+      else if (notPinned) add("PIN-MISMATCH", "before", `${notPinned.name} is declared with red-first-pin: but is ${notPinned.status} before the fix (a pin passes before the fix and with it)`);
+      else if (failed.length === 0) {
+        // No red-first claim is possible here. The file is settled without a
+        // proof only as a collateral edit or as declared pins; else it is RED.
+        const base = `all ${ran.length} test(s) already pass before the fix`;
+        const why = status === "A" ? null : earlierUnreadable(context.earlier);
+        const added = status === "A" ? r.tests : why ? [] : addedTests(r.tests, context.earlier.result.tests);
+        const undeclared = added.filter((t) => !pinned(t));
+        if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})`);
+        else if (undeclared.length) {
+          const names = undeclared.slice(0, 3).map((t) => t.name).join(" | ");
+          add("NOT-RED-BEFORE", "before", `${base}; ${undeclared.length} test(s) the pull request adds do not fail first: ${names} (a test that pins behaviour the fix keeps is declared with a red-first-pin: <test name> line)`);
+        } else if (added.length) {
+          noClaim = { code: "PIN", kind: "pins", detail: `${added.length} test(s) the pull request adds are declared with red-first-pin: and pass before the fix and with it; the file has no other new test: not proven here` };
+        } else if (context.changedTestLine) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test but changes a test declaration or an assertion (${clip(context.changedTestLine, 120)}): a changed test must fail first`);
+        } else {
+          noClaim = { code: "COLLATERAL", kind: "collateral", detail: `the edit adds no test and changes no test declaration or assertion line, and all ${ran.length} test(s) pass before the fix and with it: not a new test, not proven here` };
+        }
+        if (noClaim) {
+          mustPass = r.tests.filter((t) => t.status === "passed");
+          beforeTests = r.tests;
+        }
+      } else {
+        mustPass = [...failed, ...r.tests.filter(pinned)];
         beforeTests = r.tests;
         const texts = failed.map((t) => normalizeText(t.text));
         const wanted = markers.map((m) => normalizeText(m));
         const unmatched = markers.filter((m, i) => !texts.some((x) => x.includes(wanted[i])));
-        const right = failed.filter((t, i) => t.assertion || wanted.some((m) => texts[i].includes(m)));
+        const stated = failed.filter((t, i) => t.assertion || wanted.some((m) => texts[i].includes(m)));
         if (unmatched.length) add("TEXT-MISMATCH", "before", `marker "${unmatched[0]}" is in no failure text; actual: ${actual(failed)}`);
-        else if (right.length === 0) add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
-        else beforeOk = true;
+        else if (stated.length) beforeOk = true;
+        else {
+          // No assertion and no marker text: red for the right reason only
+          // when a failure names an export or a module the fix side adds.
+          evidence = failed.map((t) => fromFix(t.text)).find(Boolean) ?? null;
+          if (evidence) beforeOk = true;
+          else add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
+        }
       }
     }
   }
@@ -585,14 +853,20 @@ export function judgeFile({ file, markers = [] }, before, head) {
       if (failed.length) add("NOT-GREEN-AT-HEAD", "head", `${failed.length} test(s) do not pass with the fix: ${actual(failed)}`);
       else if (passed.length === 0) add("NOT-COLLECTED", "head", "no test passed with the fix (none collected, or all skipped)");
       else {
-        const short = notPassedAtHead(failedBefore, beforeTests, r.tests);
+        const short = notPassedAtHead(mustPass, beforeTests, r.tests);
         if (short.length) {
-          add("NOT-GREEN-AT-HEAD", "head", `failed before the fix but did not pass with it: ${short.slice(0, 3).join(" | ")}`);
+          const what = noClaim ? "passed before the fix but did not pass with it" : pins.length ? "failed before the fix, or is a declared pin, but did not pass with it" : "failed before the fix but did not pass with it";
+          add("NOT-GREEN-AT-HEAD", "head", `${what}: ${short.slice(0, 3).join(" | ")}`);
         } else headOk = true;
       }
     }
   }
-  return { reasons, proven: beforeOk && headOk && reasons.length === 0 };
+  const clean = headOk && reasons.length === 0;
+  const proven = beforeOk && clean;
+  const settled = Boolean(noClaim) && clean;
+  if (settled) notes.push({ code: noClaim.code, phase: "before", file, detail: noClaim.detail });
+  if (proven && evidence) notes.push({ code: "ADDED-BY-FIX", phase: "before", file, detail: `red before the fix because ${evidence} is not there yet: the fix side adds it, and the file passes with the fix` });
+  return { reasons, notes, proven, kind: proven ? "proven" : settled ? noClaim.kind : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -837,7 +1111,10 @@ export function planRange({ repo = process.cwd(), base, head, exclude = "", test
   // target may be fix side, or a gitlink): the test that runs would not be the
   // pull request's test file, so run refuses them (NOT-A-FILE).
   const notFiles = c.testSide.filter((e) => e.status !== "D" && !REGULAR_MODES.has(modes.get(e.path))).map((e) => e.path);
-  const plan = { base, head, mergeBase, testSupport, setupPaths, notFiles, ...c };
+  // The fix-side paths the range adds: a module only the head has.
+  const fixSide = new Set(c.fixSide);
+  const addedFix = entries.filter((e) => e.status === "A" && fixSide.has(e.path)).map((e) => e.path).sort(byPath);
+  const plan = { base, head, mergeBase, testSupport, setupPaths, notFiles, addedFix, ...c };
   if (c.newTests.length + c.excluded.length === 0) {
     return { ...plan, verdict: "skip", reason: "NO-NEW-TESTS", detail: "the pull request adds or changes no test file" };
   }
@@ -945,7 +1222,10 @@ function timeText(opts, byJob) {
   return byJob ? `the job's time budget (timeout_minutes less ${JOB_RESERVE_SECONDS}s for the verdict)` : `${opts.timeoutSeconds}s`;
 }
 
-async function runPhase(phase, tree, files, plan, opts, reportDir) {
+// swapped: test files this phase runs in their earlier version (the phase
+// "earlier"); they differ from the head on purpose. skipInstall: the tree was
+// installed by an earlier phase.
+async function runPhase(phase, tree, files, plan, opts, reportDir, { skipInstall = false, swapped = [] } = {}) {
   const reasons = [];
   const perFile = new Map();
   const invocations = [];
@@ -967,7 +1247,7 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     for (const file of pending) perFile.set(file, { run: "timeout" });
     return { stop: true, reasons, perFile, invocations };
   };
-  if (opts.install) {
+  if (opts.install && !skipInstall) {
     const stop = outOfTime("the install", []);
     if (stop) return stop;
     const left = allowance(opts);
@@ -1068,9 +1348,62 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     invocations.push({ label: `vitest in ${where}`, files: list, res, reportFailed: parsed.success === false });
   }
   for (const file of changedTestSide(tree, plan)) {
+    if (swapped.includes(file)) continue;
     reasons.push({ code: "TEST-CHANGED", phase, file, detail: "the test run changed this tracked test-side file" });
   }
   return { stop: false, reasons, perFile, invocations };
+}
+
+// A changed test file with no failing test before the fix: its earlier version
+// (the merge base's) is run in the tree before the fix, after both phases, to
+// read the names of its tests. Only a stop of the gate is a reason of its own;
+// a file whose earlier version cannot be read stays NOT-RED-BEFORE.
+function quietBefore(entry) {
+  const r = entry?.run === "ok" ? entry.result : null;
+  if (!r || !r.loaded || r.fileError || r.tests.some((t) => !KNOWN_STATUS.has(t.status))) return false;
+  const ran = r.tests.filter((t) => t.status !== "skipped");
+  return ran.length > 0 && ran.every((t) => t.status === "passed");
+}
+
+async function runEarlier(repo, plan, tree, quiet, opts, work) {
+  const paths = quiet.map((f) => f.file);
+  git(tree, ["checkout", plan.mergeBase, `--pathspec-from-file=${writePathspec(join(work, "take.lst"), paths)}`, "--pathspec-file-nul"]);
+  const files = paths.map((file) => {
+    const source = git(repo, ["cat-file", "blob", `${plan.mergeBase}:${file}`]).stdout;
+    return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest" };
+  });
+  const run = await runPhase("earlier", tree, files, plan, opts, join(work, "reports"), { skipInstall: true, swapped: paths });
+  return { perFile: run.perFile, reasons: run.reasons.filter((r) => r.code === "STOPPED") };
+}
+
+// What the fix side adds, read once from the range's diff when a judgement
+// first asks: the names its scripts newly export, and per changed test file
+// the first changed line that declares a test or states an assertion.
+function rangeReader(repo, plan) {
+  let files = null;
+  let names = null;
+  const read = () => {
+    files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    return files;
+  };
+  return {
+    exports() {
+      if (names) return names;
+      names = new Set();
+      for (const path of plan.fixSide) {
+        const diff = SCRIPT_EXT_RE.test(path) ? read().get(path) : null;
+        if (!diff) continue;
+        const gone = new Set(exportNames(diff.removed));
+        for (const name of exportNames(diff.added)) if (!gone.has(name)) names.add(name);
+      }
+      return names;
+    },
+    // A changed file whose diff is not readable here counts as touched.
+    testLine(path) {
+      const diff = read().get(path);
+      return diff ? changedTestLine([...diff.added, ...diff.removed]) : "the file's diff is not readable";
+    },
+  };
 }
 
 function budgetResult(error, mergeBase = null) {
@@ -1127,9 +1460,10 @@ async function runGateIn(opts) {
 
     // The new test's bytes from the head commit (a regular file, checked by
     // plan), never through the file system.
+    const statusOf = new Map(plan.testSide.map((e) => [e.path, e.status]));
     const files = plan.newTests.map((file) => {
       const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
-      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source) };
+      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source), pins: readPins(source), status: statusOf.get(file) ?? "A" };
     });
     const phases = {};
     for (const phase of ["before", "head"]) {
@@ -1142,12 +1476,31 @@ async function runGateIn(opts) {
       reasons.push({ code: "STOPPED", phase: null, file: null, detail: `the gate was stopped by ${stopState.signal}` });
     }
 
+    // Only a file that is a regular file on both sides (status M) has an
+    // earlier version to run; a type change (a link before) is never compared.
+    let earlier = null;
+    const quiet = phases.before && phases.head && !stopState.signal ? files.filter((f) => f.status === "M" && quietBefore(phases.before.perFile.get(f.file))) : [];
+    if (quiet.length) {
+      earlier = await runEarlier(repo, plan, trees.before, quiet, opts, work.path);
+      reasons.push(...earlier.reasons);
+    }
+
+    const range = rangeReader(repo, plan);
+    const roots = rootsOf(trees.before);
+    const addedFix = new Set(plan.addedFix);
+    const fileNotes = [];
     const headReasonFiles = new Set();
     for (const f of files) {
-      const judged = judgeFile(f, phases.before?.perFile.get(f.file), phases.head?.perFile.get(f.file));
+      const context = {
+        earlier: earlier?.perFile.get(f.file),
+        changedTestLine: quiet.includes(f) ? range.testLine(f.file) : null,
+        addedByFix: (text) => addedByFix(text, f.file, { exports: range.exports, addedFix, roots, runnerDir: f.runner === "vitest" ? vitestDir(trees.before, f.file) : "" }),
+      };
+      const judged = judgeFile(f, phases.before?.perFile.get(f.file), phases.head?.perFile.get(f.file), context);
       reasons.push(...judged.reasons);
+      fileNotes.push(...judged.notes);
       for (const r of judged.reasons) if (r.phase === "head") headReasonFiles.add(f.file);
-      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, proven: judged.proven });
+      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, pins: f.pins, proven: judged.proven, kind: judged.kind });
     }
     for (const inv of phases.head?.invocations ?? []) {
       if ((inv.res.status !== 0 || inv.reportFailed) && !inv.files.some((file) => headReasonFiles.has(file))) {
@@ -1156,20 +1509,35 @@ async function runGateIn(opts) {
       }
     }
     for (const f of result.files) {
-      if (reasons.some((r) => r.file === f.file || r.file === null)) f.proven = false;
-    }
-    // Safety net: a file that is not proven always carries a reason.
-    if (!reasons.length) {
-      for (const f of result.files) {
-        if (!f.proven) reasons.push({ code: "NOT-PROVEN", phase: null, file: f.file, detail: "the file was not proven red before the fix and green with it" });
+      if (reasons.some((r) => r.file === f.file || r.file === null)) {
+        f.proven = false;
+        f.kind = null;
       }
     }
-    if (!reasons.length && result.files.length > 0 && result.files.every((f) => f.proven)) result.verdict = "PASS";
+    // A note belongs to a file that is settled (proven, collateral or pins).
+    notes.push(...fileNotes.filter((n) => result.files.some((f) => f.file === n.file && f.kind)));
+    // Safety net: a file that is not settled always carries a reason.
+    if (!reasons.length) {
+      for (const f of result.files) {
+        if (!f.kind) reasons.push({ code: "NOT-PROVEN", phase: null, file: f.file, detail: "the file was not proven red before the fix and green with it" });
+      }
+    }
+    if (!reasons.length && result.files.length > 0 && result.files.every((f) => f.kind)) {
+      // Proven files decide a PASS. Collateral edits and declared pins alone
+      // prove nothing: the run is NEUTRAL, never a PASS.
+      if (result.files.some((f) => f.proven)) result.verdict = "PASS";
+      else {
+        result.verdict = "NEUTRAL";
+        result.reason = "NOTHING-TO-PROVE";
+        result.detail = `no test file of the pull request makes a red-first claim: ${result.files.length} changed test file(s) are collateral edits or declared pins`;
+      }
+    }
     return result;
   } catch (error) {
     if (!(error instanceof BudgetError)) throw error;
     reasons.push({ code: "TIMEOUT", phase: null, file: null, detail: error.message });
     for (const f of result.files) f.proven = false;
+    for (const f of result.files) f.kind = null;
     result.verdict = "RED";
     return result;
   } finally {
@@ -1220,14 +1588,17 @@ function emit(result, opts) {
     say(`NOTE ${reasonLine(r)}`);
     if (gha) say(`::notice file=${escapeProperty(r.file)},title=${escapeProperty(`red-first ${r.code}`)}::${escapeData(reasonLine(r))}`);
   }
-  const notProven = notes.length ? `; ${notes.length} excluded new test file(s) not proven here` : "";
+  const count = (code) => notes.filter((n) => n.code === code).length;
+  let notProven = count("EXCLUDED") ? `; ${count("EXCLUDED")} excluded new test file(s) not proven here` : "";
+  if (count("COLLATERAL")) notProven += `; ${count("COLLATERAL")} changed test file(s) collateral, not proven here`;
+  if (count("PIN")) notProven += `; ${count("PIN")} test file(s) with declared pins only, not proven here`;
   let headline;
   if (result.mode === "plan") headline = `RED-FIRST PLAN: ${result.verdict}${result.reason ? ` ${result.reason}` : ""}: ${result.detail}`;
-  else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.length} new test file(s) fail before the fix and pass with it${notProven})`;
-  else if (result.verdict === "SKIP") headline = `RED-FIRST: SKIP ${result.reason}: ${result.detail}`;
+  else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.filter((f) => f.proven).length} new test file(s) fail before the fix and pass with it${notProven})`;
+  else if (result.verdict === "SKIP" || result.verdict === "NEUTRAL") headline = `RED-FIRST: ${result.verdict} ${result.reason}: ${result.detail}`;
   else headline = `RED-FIRST: RED (${result.reasons.length} reason(s))`;
   say(headline);
-  if (gha && result.verdict === "SKIP") say(`::notice title=red-first SKIP::${escapeData(`${result.reason}: ${result.detail}`)}`);
+  if (gha && (result.verdict === "SKIP" || result.verdict === "NEUTRAL")) say(`::notice title=red-first ${result.verdict}::${escapeData(`${result.reason}: ${result.detail}`)}`);
 
   if (opts.verdict) writeFileSync(opts.verdict, `${JSON.stringify(result, null, 2)}\n`);
   if (opts.githubOutput && result.mode === "plan") {
@@ -1240,7 +1611,7 @@ function emit(result, opts) {
     }
     if (result.files?.length) {
       lines.push("| test file | runner | proven |", "| --- | --- | --- |");
-      for (const f of result.files) lines.push(`| ${cell(f.file)} | ${f.runner} | ${f.proven ? "yes" : "no"} |`);
+      for (const f of result.files) lines.push(`| ${cell(f.file)} | ${f.runner} | ${f.proven ? "yes" : f.kind ? `no (${f.kind})` : "no"} |`);
       lines.push("");
     }
     for (const r of result.reasons ?? []) lines.push(`- \`${r.code}\` ${cell(r.phase ?? "")} ${r.file ? cell(r.file) : ""}: ${cell(r.detail)}`);
@@ -1344,7 +1715,10 @@ export async function main(argv) {
     const result = await runGate(opts);
     emit(result, opts);
     if (stopState.signal) return stopCode(stopState.signal);
-    if (result.verdict === "PASS") return 0;
+    // NEUTRAL: every changed test file is a collateral edit or declared pins;
+    // the job is green and its headline, notices and verdict say that nothing
+    // was proven.
+    if (result.verdict === "PASS" || result.verdict === "NEUTRAL") return 0;
     return result.verdict === "SKIP" ? 3 : 1;
   } catch (error) {
     // Any error, not only a GateError, is exit 2 with its message (the
