@@ -252,18 +252,45 @@ test("repeat case (3): a test file that never loads is RED (LOAD-ERROR), never c
   assert.match(r.verdict.reasons.find((x) => x.code === "LOAD-ERROR").detail, /Cannot find module|ERR_MODULE_NOT_FOUND/);
 });
 
-test("repeat case (3): a test file that loads only with the fix is RED: a load error before is not a red-first failure", async (t) => {
+const SUM_FILE_TEST = `${TEST_HEAD}import { sum } from "../src/sum.mjs";\n\ntest("sum adds", () => {\n  assert.equal(sum(1, 2), 3);\n});\n`;
+
+test("repeat case (3): a test file that loads only with the fix is proven only when the load error names a module the fix adds", async (t) => {
   const sc = scenario(t, {
     base: BASE,
-    head: {
-      "src/calc.mjs": CALC_FIX,
-      "src/sum.mjs": 'export { add as sum } from "./calc.mjs";\n',
-      "test/sum.test.mjs": `${TEST_HEAD}import { sum } from "../src/sum.mjs";\n\ntest("sum adds", () => {\n  assert.equal(sum(1, 2), 3);\n});\n`,
-    },
+    head: { "src/calc.mjs": CALC_FIX, "src/sum.mjs": 'export { add as sum } from "./calc.mjs";\n', "test/sum.test.mjs": SUM_FILE_TEST },
   });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.notes.map((n) => `${n.code}:${n.file}`), ["ADDED-BY-FIX:test/sum.test.mjs"]);
+  assert.match(r.verdict.notes[0].detail, /the module src\/sum\.mjs is not there yet/);
+});
+
+test("repeat case (3): a load error before the fix that names nothing the fix adds stays RED (LOAD-ERROR), also when the file loads with the fix", async (t) => {
+  // The file throws while it loads unless the fix is there: no module and no
+  // export of the fix side is named, so this is not a red-first failure.
+  const guarded = `${TEST_HEAD}import { existsSync } from "node:fs";\nimport { add } from "../src/calc.mjs";\n\nif (!existsSync(new URL("../src/FIXED", import.meta.url))) throw new Error("the setup is not ready");\ntest("add sums two numbers", () => {\n  assert.equal(add(1, 2), 3);\n});\n`;
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "src/FIXED": "", "test/calc.test.mjs": guarded } });
   const r = runGate(sc, "run");
   assertRed(r, "LOAD-ERROR");
   assert.deepEqual(r.verdict.reasons.map((x) => `${x.code}:${x.phase}`), ["LOAD-ERROR:before"]);
+});
+
+test("a module that exists before the fix is no evidence: a load error naming it stays RED (LOAD-ERROR)", async (t) => {
+  // src/sum.mjs is there before the fix and the fix changes it; the test file
+  // imports a path beside it that nothing adds.
+  const sc = scenario(t, {
+    base: { ...BASE, "src/sum.mjs": "export const sum = (a, b) => a - b;\n" },
+    head: { "src/sum.mjs": "export const sum = (a, b) => a + b;\n", "test/sum.test.mjs": SUM_FILE_TEST.replace("../src/sum.mjs", "../src/sums.mjs") },
+  });
+  assertRed(runGate(sc, "run"), "LOAD-ERROR");
+});
+
+test("a named import of an export the fix adds: the load error before names it, and the file is proven", async (t) => {
+  const named = `${TEST_HEAD}import { sum } from "../src/calc.mjs";\n\ntest("sum adds", () => {\n  assert.equal(sum(1, 2), 3);\n});\n`;
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n`, "test/sum.test.mjs": named } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.match(r.verdict.notes[0].detail, /the export sum is not there yet/);
 });
 
 test("a module the fix adds: imported inside the test with a marker, the failure before is a test failure and is proven", async (t) => {
@@ -300,15 +327,40 @@ test("a marker that matches the failure text proves a non-assertion failure", as
   assertPass(runGate(sc, "run"));
 });
 
-test("a non-assertion failure without a marker is RED (WRONG-REASON)", async (t) => {
-  const sumTest = `${TEST_HEAD}import * as calc from "../src/calc.mjs";\n\ntest("sum adds", () => {\n  assert.equal(calc.sum(1, 2), 3);\n});\n`;
+const SUM_CALL_TEST = `${TEST_HEAD}import * as calc from "../src/calc.mjs";\n\ntest("sum adds", () => {\n  assert.equal(calc.sum(1, 2), 3);\n});\n`;
+
+test("a call of an export the fix adds fails before with a TypeError that names it: proven without a marker, with a note", async (t) => {
   const sc = scenario(t, {
     base: BASE,
-    head: { "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n`, "test/sum.test.mjs": sumTest },
+    head: { "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n`, "test/sum.test.mjs": SUM_CALL_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.notes.map((n) => n.code), ["ADDED-BY-FIX"]);
+  assert.match(r.verdict.notes[0].detail, /the export sum is not there yet/);
+});
+
+test("a non-assertion failure without a marker is RED (WRONG-REASON) when it names nothing the fix adds", async (t) => {
+  // The fix adds the export sum. The test fails before with a TypeError about
+  // a helper of its own (tools.format), which the fix does not add.
+  const unrelated = `${TEST_HEAD}import { existsSync } from "node:fs";\nimport * as calc from "../src/calc.mjs";\n\nconst tools = existsSync(new URL("../src/FIXED", import.meta.url)) ? { format: (n) => n } : {};\ntest("sum adds", () => {\n  assert.equal(tools.format(calc.sum(1, 2)), 3);\n});\n`;
+  const sc = scenario(t, {
+    base: { ...BASE, "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n` },
+    head: { "src/calc.mjs": `${CALC_FIX}export function sum(a, b) {\n  return a + b;\n}\nexport function total(list) {\n  return list.length;\n}\n`, "src/FIXED": "", "test/sum.test.mjs": unrelated },
   });
   const r = runGate(sc, "run");
   assertRed(r, "WRONG-REASON");
-  assert.match(r.verdict.reasons.find((x) => x.code === "WRONG-REASON").detail, /TypeError/);
+  assert.match(r.verdict.reasons.find((x) => x.code === "WRONG-REASON").detail, /TypeError: tools\.format is not a function/);
+});
+
+test("an export whose line the fix only changes is not a new export: the TypeError stays RED (WRONG-REASON)", async (t) => {
+  // calc.sum exists before the fix as a number, so the call throws; the fix
+  // rewrites that export line. Nothing is added: no evidence.
+  const sc = scenario(t, {
+    base: { ...BASE, "src/calc.mjs": `${CALC_BUG}export const sum = 0;\n` },
+    head: { "src/calc.mjs": `${CALC_BUG}export const sum = (a, b) => a + b;\n`, "test/sum.test.mjs": SUM_CALL_TEST },
+  });
+  assertRed(runGate(sc, "run"), "WRONG-REASON");
 });
 
 test("a fix that does not make the new test pass is RED (NOT-GREEN-AT-HEAD)", async (t) => {
@@ -578,8 +630,12 @@ const args = process.argv.slice(2);
 const spec = JSON.parse(readFileSync(process.env.FAKE_VITEST_SPEC, "utf8"));
 const cwd = process.cwd();
 const phase = existsSync(join(cwd, "src", "FIXED")) ? "head" : "before";
-appendFileSync(process.env.FAKE_VITEST_LOG, JSON.stringify({ phase, cwd, args }) + "\\n");
-const step = spec[phase];
+const log = process.env.FAKE_VITEST_LOG;
+const prior = existsSync(log) ? readFileSync(log, "utf8").split("\\n").filter((l) => l && JSON.parse(l).phase === phase).length : 0;
+const texts = Object.fromEntries(args.filter((a) => !a.startsWith("-") && a !== "run" && existsSync(join(cwd, a))).map((a) => [a, readFileSync(join(cwd, a), "utf8")]));
+appendFileSync(log, JSON.stringify({ phase, cwd, args, texts }) + "\\n");
+// The second run in the tree before the fix is the run of the earlier versions.
+const step = phase === "before" && prior > 0 && spec.earlier ? spec.earlier : spec[phase];
 const out = args.find((a) => a.startsWith("--outputFile.json="));
 if (out && step.report) writeFileSync(out.slice("--outputFile.json=".length), JSON.stringify(step.report).replaceAll("<cwd>", cwd));
 process.exit(step.exit ?? 0);
@@ -596,9 +652,9 @@ function vitestReport(files, { success } = {}) {
       status: f.status,
       message: f.message ?? "",
       assertionResults: (f.tests ?? []).map((x) => ({
-        ancestorTitles: ["calc"],
+        ancestorTitles: [f.suite ?? "calc"],
         title: x.title,
-        fullName: `calc ${x.title}`,
+        fullName: `${f.suite ?? "calc"} ${x.title}`,
         status: x.status,
         failureMessages: x.failure ? [x.failure] : [],
       })),
@@ -613,8 +669,8 @@ const ASSERT_FAIL = "AssertionError: expected -1 to be 3 // Object.is equality\n
 const GOOD_BEFORE = vitestReport([{ rel: "src/calc.test.ts", status: "failed", tests: [{ title: "adds", status: "failed", failure: ASSERT_FAIL }] }]);
 const GOOD_HEAD = vitestReport([{ rel: "src/calc.test.ts", status: "passed", tests: [{ title: "adds", status: "passed" }] }]);
 
-function runVitest(t, spec, vitestTail = "") {
-  const sc = scenario(t, { base: V_BASE, head: V_HEAD });
+function runVitest(t, spec, vitestTail = "", files = { base: V_BASE, head: V_HEAD }) {
+  const sc = scenario(t, files);
   const fake = path.join(sc.root, "fake-vitest.mjs");
   const specFile = path.join(sc.root, "fake-spec.json");
   const log = path.join(sc.root, "fake-log.jsonl");
@@ -1252,4 +1308,452 @@ test("S1c README: the red-first Inputs table lists every workflow input, in one 
   for (let i = start + 2; i < lines.length && lines[i].startsWith("|"); i += 1) names.push(/^\| `([a-z_]+)` \|/.exec(lines[i])?.[1]);
   const wf = load(fs.readFileSync(WORKFLOW, "utf8"));
   assert.deepEqual(names.sort(), Object.keys(wf.on.workflow_call.inputs).sort());
+});
+
+// ---------------------------------------------------------------------------
+// Honest shapes that make no red-first claim, and the tests that still must
+// fail first. The first block runs real node:test files; the second rebuilds,
+// with the vitest stand-in, the test-side changes and the report texts of
+// three pull requests that the gate judged RED.
+// ---------------------------------------------------------------------------
+
+// A publisher that ignores a failed compile (the bug), and refuses it (the fix).
+const PUB_BUG = 'export function publish(compile) {\n  const result = compile();\n  return result.ok ? "published with a compile" : "published";\n}\n';
+const PUB_FIX = 'export function publish(compile) {\n  const result = compile();\n  if (!result.ok) throw new Error("compile failed");\n  return "published";\n}\n';
+// The existing test file: its compile stub fails, which the bug tolerates.
+const PUB_OLD = `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst compile = () => ({ ok: false });\n\ntest("publishes the package", () => {\n  assert.match(publish(compile), /^published/);\n});\n`;
+// The collateral edit: only the stub changes, so the old test keeps working.
+const PUB_NEW = PUB_OLD.replace("({ ok: false })", "({ ok: true, value: {} })");
+const REFUSE_TEST = `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\ntest("a failed compile refuses the publish", () => {\n  assert.throws(() => publish(() => ({ ok: false })), /compile failed/);\n});\n`;
+const PUB_BASE = { "package.json": '{ "type": "module" }\n', "src/publish.mjs": PUB_BUG, "test/publish.test.mjs": PUB_OLD };
+
+function noteCodes(result) {
+  assert.ok(result.verdict, `no verdict file (exit ${result.code}): ${result.stderr.slice(0, 400)}`);
+  return result.verdict.notes.map((n) => `${n.code}:${n.file}`);
+}
+
+test("shape 1: an edit that only keeps an existing test file working is a COLLATERAL note beside the proven new test", async (t) => {
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/refuse.test.mjs": REFUSE_TEST } });
+  const summary = path.join(sc.root, "summary.md");
+  const r = runGate(sc, "run", ["--summary", summary]);
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), ["COLLATERAL:test/publish.test.mjs"]);
+  assert.deepEqual(r.verdict.files.map((f) => `${f.file}:${f.kind}:${f.proven}`), ["test/publish.test.mjs:collateral:false", "test/refuse.test.mjs:proven:true"]);
+  assert.match(r.stdout, /^RED-FIRST: PASS \(1 new test file\(s\) fail before the fix and pass with it; 1 changed test file\(s\) collateral, not proven here\)/m);
+  assert.match(fs.readFileSync(summary, "utf8"), /publish\.test\.mjs \| node \| no \(collateral\)/);
+});
+
+test("shape 1 alone: a pull request whose only test change is a collateral edit is NEUTRAL, never a PASS", async (t) => {
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW } });
+  const r = runGate(sc, "run");
+  assert.ok(r.verdict, `no verdict file (exit ${r.code}): ${r.stderr.slice(0, 400)}`);
+  assert.deepEqual(codes(r), []);
+  assert.equal(r.verdict.verdict, "NEUTRAL");
+  assert.equal(r.verdict.reason, "NOTHING-TO-PROVE");
+  assert.equal(r.code, 0);
+  assert.doesNotMatch(r.stdout, /^RED-FIRST: PASS/m);
+  assert.match(r.stdout, /^RED-FIRST: NEUTRAL NOTHING-TO-PROVE/m);
+  assert.equal(r.verdict.files[0].proven, false);
+});
+
+test("rubber stamp 1: a test added to an existing file that passes before the fix, with no marker, stays RED and is named", async (t) => {
+  const added = `${PUB_NEW}\ntest("returns a text", () => {\n  assert.equal(typeof publish(compile), "string");\n});\n`;
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": added, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  const reason = r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE");
+  assert.match(reason.detail, /all 2 test\(s\) already pass before the fix; 1 test\(s\) the pull request adds do not fail first: returns a text/);
+  assert.match(reason.detail, /red-first-pin:/);
+});
+
+test("rubber stamp 2: a row added to a table of an existing file adds a test although no line declares one: RED", async (t) => {
+  // The edit holds no `test(` and no assertion; the earlier version's run shows the new name.
+  const table = (rows) => `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst rows = [\n${rows.map((x) => `  ${JSON.stringify(x)},\n`).join("")}];\nfor (const [name, ok] of rows) {\n  test(name, () => {\n    assert.match(publish(() => ({ ok })), /^published/);\n  });\n}\n`;
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": table([["with a good compile", true]]) },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": table([["with a good compile", true], ["with another good compile", true]]) },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: with another good compile/);
+});
+
+test("rubber stamp 3: an assertion changed under an unchanged test name that passes on both sides is RED: a changed test must fail first", async (t) => {
+  const loosened = PUB_NEW.replace("assert.match(publish(compile), /^published/);", "assert.ok(publish(compile).length > 0);");
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": loosened } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /the edit adds no test but changes a test declaration or an assertion \(.*assert\.ok/);
+});
+
+test("a changed file whose earlier version cannot be read is not collateral: RED (NOT-RED-BEFORE) with the cause", async (t) => {
+  // The earlier version imports a fixture the pull request deletes, so it does not load in the tree before the fix.
+  const old = PUB_OLD.replace("import { publish }", 'import "./__fixtures__/env.mjs";\nimport { publish }');
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": old, "test/__fixtures__/env.mjs": "export {};\n" },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/__fixtures__/env.mjs": null },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /earlier version could not be read to compare them \(it does not load/);
+});
+
+// The pin of shape 2: the fix keeps this behaviour, so the test passes before and with the fix.
+const PIN_TEST = 'test("a good compile still publishes", () => {\n  assert.match(publish(() => ({ ok: true })), /^published/);\n});\n';
+
+test("shape 2: a test added to an existing file and declared with red-first-pin is a PIN note beside the proven new test", async (t) => {
+  const pinned = `${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`;
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": pinned, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), ["PIN:test/publish.test.mjs"]);
+  assert.match(r.stdout, /^RED-FIRST: PASS \(1 new test file\(s\) fail before the fix and pass with it; 1 test file\(s\) with declared pins only, not proven here\)/m);
+  // The same pull request without the marker: the added test must fail first.
+  const bare = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": `${PUB_NEW}\n${PIN_TEST}`, "test/refuse.test.mjs": REFUSE_TEST } });
+  assertRed(runGate(bare, "run"), "NOT-RED-BEFORE");
+});
+
+test("shape 2: a pin marker never covers another added test, names a test of the file, and names a test that passes before", async (t) => {
+  const head = (file) => ({ "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": file, "test/refuse.test.mjs": REFUSE_TEST });
+  // one declared pin and one more added test without a marker
+  const two = scenario(t, { base: PUB_BASE, head: head(`${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}\ntest("returns a text", () => {\n  assert.equal(typeof publish(compile), "string");\n});\n`) });
+  const r = runGate(two, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: returns a text/);
+  // a marker that names no test
+  const stray = scenario(t, { base: PUB_BASE, head: head(`${PUB_NEW}\n// red-first-pin: a test that is not here\n${PIN_TEST}`) });
+  assertRed(runGate(stray, "run"), "PIN-MISMATCH");
+  // a marker on a test that fails before the fix
+  const red = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/refuse.test.mjs": REFUSE_TEST.replace(TEST_HEAD, `${TEST_HEAD}// red-first-pin: a failed compile refuses the publish\n`) } });
+  const rr = runGate(red, "run");
+  assertRed(rr, "PIN-MISMATCH");
+  assert.match(rr.verdict.reasons[0].detail, /is failed before the fix/);
+});
+
+test("shape 2: a declared pin that does not pass with the fix is RED (NOT-GREEN-AT-HEAD)", async (t) => {
+  const broken = `${PUB_NEW}\n// red-first-pin: a bad compile still publishes\ntest("a bad compile still publishes", () => {\n  assert.match(publish(() => ({ ok: false })), /^published/);\n});\n`;
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": broken, "test/refuse.test.mjs": REFUSE_TEST } });
+  assertRed(runGate(sc, "run"), "NOT-GREEN-AT-HEAD");
+});
+
+// --- the three pull requests, with the vitest stand-in ----------------------
+
+const AG = "packages/agents";
+const AG_CONFIG = { [`${AG}/vitest.config.mjs`]: "export default {};\n" };
+const passedFile = (rel, suite, titles) => ({ rel, suite, status: "passed", tests: titles.map((title) => ({ title, status: "passed" })) });
+const ASSERT_REJECT = 'AssertionError: promise resolved "{ ok: true }" instead of rejecting\n    at x';
+
+// Pull request A: its fix makes the publisher refuse a failed compile, so it
+// changed the compile mock of an existing test file (the three changed lines
+// below are the pull request's) and added new test files.
+const A_FILE = `${AG}/src/__tests__/publish-git-dir-run-declarations-3924.test.ts`;
+const A_OLD = 'import { describe, expect, it, vi } from "vitest";\n\nvi.mock("../oas-compiler", () => ({\n  compileOasAgentJson: vi.fn(async () => ({ ok: false })),\n}));\n\nimport { publishAgentPackageFromGitDir } from "../verdaccio/client";\n\ndescribe("publish from a git dir", () => {\n  it("carries the run declarations", async () => {\n    expect(await publishAgentPackageFromGitDir({ agentDir: "a" })).toBeTruthy();\n  });\n  it("refuses a malformed declaration", async () => {\n    await expect(publishAgentPackageFromGitDir({ agentDir: "b" })).rejects.toThrow();\n  });\n});\n';
+const A_NEW = A_OLD.replace(
+  'vi.mock("../oas-compiler", () => ({\n  compileOasAgentJson: vi.fn(async () => ({ ok: false })),',
+  '// cinatra#4264: the publisher refuses a failed compile, so the mock compiles.\nvi.mock("../oas-compiler", () => ({\n  compileOasAgentJson: vi.fn(async () => ({ ok: true, value: {} })),',
+);
+const A_TITLES = ["carries the run declarations", "refuses a malformed declaration"];
+const A_REL = "src/__tests__/publish-git-dir-run-declarations-3924.test.ts";
+const A_NEW_REL = "src/__tests__/publish-lifecycle-carry-4264.test.ts";
+const A_FILES = {
+  base: { ...AG_CONFIG, [`${AG}/src/verdaccio/client.ts`]: "export const refuse = false;\n", [A_FILE]: A_OLD },
+  head: { [`${AG}/src/verdaccio/client.ts`]: "export const refuse = true;\n", [`${AG}/src/FIXED`]: "", [A_FILE]: A_NEW, [`${AG}/${A_NEW_REL}`]: "// the new test file\n" },
+};
+const A_QUIET = passedFile(A_REL, "publish from a git dir", A_TITLES);
+const A_RED = { rel: A_NEW_REL, suite: "carry", status: "failed", tests: [{ title: "a failed compile refuses the publish", status: "failed", failure: ASSERT_REJECT }] };
+const A_GREEN = passedFile(A_NEW_REL, "carry", ["a failed compile refuses the publish"]);
+
+test("pull request A (collateral mock edit): PASS with a COLLATERAL note; the earlier version runs once, in the tree before the fix", async (t) => {
+  const r = runVitest(
+    t,
+    {
+      before: { report: vitestReport([A_QUIET, A_RED]), exit: 1 },
+      head: { report: vitestReport([A_QUIET, A_GREEN]), exit: 0 },
+      earlier: { report: vitestReport([A_QUIET]), exit: 0 },
+    },
+    "",
+    A_FILES,
+  );
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), [`COLLATERAL:${A_FILE}`]);
+  assert.deepEqual(r.calls.map((c) => c.phase), ["before", "head", "before"]);
+  const [first, , third] = r.calls;
+  assert.match(first.texts[A_REL], /ok: true, value: \{\}/);
+  assert.deepEqual(Object.keys(third.texts), [A_REL]);
+  assert.match(third.texts[A_REL], /ok: false/, "the third run reads the file's earlier version");
+});
+
+test("pull request A: a test name that only the new version reports makes the edit a new test (NOT-RED-BEFORE)", async (t) => {
+  const grown = passedFile(A_REL, "publish from a git dir", [...A_TITLES, "publishes after a good compile"]);
+  const r = runVitest(
+    t,
+    {
+      before: { report: vitestReport([grown, A_RED]), exit: 1 },
+      head: { report: vitestReport([grown, A_GREEN]), exit: 0 },
+      earlier: { report: vitestReport([A_QUIET]), exit: 0 },
+    },
+    "",
+    A_FILES,
+  );
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /publish from a git dir publishes after a good compile/);
+});
+
+test("pull request A: an earlier version with no readable report is not collateral (NOT-RED-BEFORE)", async (t) => {
+  const r = runVitest(
+    t,
+    {
+      before: { report: vitestReport([A_QUIET, A_RED]), exit: 1 },
+      head: { report: vitestReport([A_QUIET, A_GREEN]), exit: 0 },
+      earlier: { exit: 1 },
+    },
+    "",
+    A_FILES,
+  );
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /its run gave no readable report/);
+});
+
+// Pull request B: it added one pin test to an existing file (the test passes
+// before the fix by design) and a new test file for a new export, whose tests
+// all failed before the fix with the TypeError below, none by an assertion.
+const B_PIN_FILE = `${AG}/src/__tests__/import-agent-core-lifecycle-config.test.ts`;
+const B_PIN_REL = "src/__tests__/import-agent-core-lifecycle-config.test.ts";
+const B_NEW_REL = "src/__tests__/regenerate-declaration-check-4264.test.ts";
+const B_SUITE = "importAgentTemplateCore compiles cinatra.lifecycle";
+const B_PIN_TITLE = "cinatra#4264 A1a: a declared regenerate list is not stored on lifecycleConfig (A1b stores it)";
+const B_OLD = 'import { describe, expect, it } from "vitest";\n\ndescribe("importAgentTemplateCore compiles cinatra.lifecycle", () => {\n  it("stores a declared block", async () => {\n    expect(1).toBe(1);\n  });\n\n  it("a MALFORMED block does not crash the import", async () => {\n    expect(1).toBe(1);\n  });\n});\n';
+const B_ADDED = `  it("${B_PIN_TITLE}", async () => {\n    const regenerate = [{ artifactNode: "file_image", step: "image_flow", noteInput: "prompt" }];\n    await importZip({ lifecycle: { regenerate } });\n    expect(createInput().lifecycleConfig).toBeNull();\n  });\n\n`;
+const bNew = (marker) => B_OLD.replace('  it("a MALFORMED block', `${marker}${B_ADDED}  it("a MALFORMED block`);
+const B_TYPE_ERROR = "TypeError: (0 , __vite_ssr_import_1__.checkRegenerateDeclaration) is not a function\n    at x";
+const B_CONTRACT = `${AG}/src/verdaccio/package-contract.ts`;
+const B_CONTRACT_HEAD = "export const agentLifecycleDeclarationSchema = {};\nexport function checkRegenerateDeclaration(flow) {\n  return { ok: Boolean(flow) };\n}\n";
+const bFiles = (marker, contract) => ({
+  base: { ...AG_CONFIG, [B_CONTRACT]: "export const agentLifecycleDeclarationSchema = {};\n", [B_PIN_FILE]: B_OLD },
+  head: { [B_CONTRACT]: contract, [`${AG}/src/FIXED`]: "", [B_PIN_FILE]: bNew(marker), [`${AG}/${B_NEW_REL}`]: 'import { checkRegenerateDeclaration } from "../verdaccio/package-contract";\n' },
+});
+const B_OLD_TITLES = ["stores a declared block", "a MALFORMED block does not crash the import"];
+const B_CHECKS = ["accepts a wired declaration", "refuses an unknown step"];
+const B_AT_HEAD = [B_OLD_TITLES[0], B_PIN_TITLE, B_OLD_TITLES[1]];
+const bSpec = () => ({
+  before: {
+    report: vitestReport([
+      passedFile(B_PIN_REL, B_SUITE, B_AT_HEAD),
+      { rel: B_NEW_REL, suite: "checkRegenerateDeclaration", status: "failed", tests: B_CHECKS.map((title) => ({ title, status: "failed", failure: B_TYPE_ERROR })) },
+    ]),
+    exit: 1,
+  },
+  head: { report: vitestReport([passedFile(B_PIN_REL, B_SUITE, B_AT_HEAD), passedFile(B_NEW_REL, "checkRegenerateDeclaration", B_CHECKS)]), exit: 0 },
+  earlier: { report: vitestReport([passedFile(B_PIN_REL, B_SUITE, B_OLD_TITLES)]), exit: 0 },
+});
+const B_MARKER = "  // red-first-pin: a declared regenerate list is not stored on lifecycleConfig\n";
+
+test("pull request B as it was pushed: the new export's TypeError is the right reason now; the undeclared pin test is the one reason left", async (t) => {
+  const r = runVitest(t, bSpec(), "", bFiles("", B_CONTRACT_HEAD));
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.deepEqual(codes(r), ["NOT-RED-BEFORE"]);
+  assert.equal(r.verdict.reasons[0].file, B_PIN_FILE);
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: .*a declared regenerate list is not stored/);
+  assert.equal(r.verdict.files.find((f) => f.file === `${AG}/${B_NEW_REL}`).proven, true);
+});
+
+test("pull request B with its pin declared: PASS, the new export file proven with a note, the pin a PIN note", async (t) => {
+  const r = runVitest(t, bSpec(), "", bFiles(B_MARKER, B_CONTRACT_HEAD));
+  assertPass(r);
+  assert.deepEqual(noteCodes(r).sort(), [`ADDED-BY-FIX:${AG}/${B_NEW_REL}`, `PIN:${B_PIN_FILE}`]);
+  assert.match(r.verdict.notes.find((n) => n.code === "ADDED-BY-FIX").detail, /the export checkRegenerateDeclaration is not there yet/);
+});
+
+test("pull request B's TypeError without the export on the fix side is still RED (WRONG-REASON)", async (t) => {
+  // Same reports, but the fix side does not add checkRegenerateDeclaration.
+  const r = runVitest(t, bSpec(), "", bFiles(B_MARKER, "export const agentLifecycleDeclarationSchema = { strict: false };\n"));
+  assertRed(r, "WRONG-REASON");
+});
+
+// Pull request C: a new test file imports, at its top, a module the fix adds;
+// before the fix the file does not load, with the runner's message below.
+const C_TEST = "scripts/extensions/__tests__/agent-hitl-screen-schema.test.mjs";
+const C_MODULE = "scripts/extensions/agent-hitl-screen-schema.mjs";
+const cFiles = (module) => ({
+  base: { "vitest.config.mjs": "export default {};\n", "scripts/extensions/index.mjs": "export {};\n" },
+  head: { [module]: "export const schema = {};\n", "src/FIXED": "", [C_TEST]: 'import { schema } from "../agent-hitl-screen-schema.mjs";\n' },
+});
+const cSpec = () => ({
+  before: { report: vitestReport([{ rel: C_TEST, status: "failed", message: `Cannot find module '../agent-hitl-screen-schema.mjs' imported from <cwd>/${C_TEST}`, tests: [] }]), exit: 1 },
+  head: { report: vitestReport([passedFile(C_TEST, "schema", ["accepts a screen", "refuses an unknown key"])]), exit: 0 },
+});
+
+test("pull request C (a new test file of a module the fix adds): the load error names that module, so the file is proven with a note", async (t) => {
+  const r = runVitest(t, cSpec(), "", cFiles(C_MODULE));
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), [`ADDED-BY-FIX:${C_TEST}`]);
+  assert.ok(r.verdict.notes[0].detail.includes(`the module ${C_MODULE} is not there yet`), r.verdict.notes[0].detail);
+});
+
+test("pull request C's load error when the fix side adds another module is still RED (LOAD-ERROR)", async (t) => {
+  assertRed(runVitest(t, cSpec(), "", cFiles("scripts/extensions/agent-hitl-screen-render.mjs")), "LOAD-ERROR");
+});
+
+// --- units -------------------------------------------------------------------
+
+test("pins: red-first-pin lines are read like markers; an empty one is dropped", async () => {
+  const { readPins, readMarkers } = await gateModule();
+  const source = "// red-first-pin: keeps the old answer\n/* red-first-pin:  stays null */\n// red-first-pin:\n// red-first-expect: boom\n";
+  assert.deepEqual(readPins(source), ["keeps the old answer", "stays null"]);
+  assert.deepEqual(readMarkers(source), ["boom"]);
+});
+
+test("evidence: the name a not-a-function text calls, the exports of added lines, and the modules a text misses", async () => {
+  const { missingCallable, exportNames, missingModules, parseRangeDiff, changedTestLine, addedByFix } = await gateModule();
+  assert.equal(missingCallable("TypeError: (0 , __vite_ssr_import_1__.checkRegenerateDeclaration) is not a function"), "checkRegenerateDeclaration");
+  assert.equal(missingCallable("TypeError: calc.sum is not a function"), "sum");
+  assert.equal(missingCallable("TypeError: Widget is not a constructor"), "Widget");
+  assert.equal(missingCallable("TypeError: (0 , _mod.default) is not a function"), null);
+  assert.equal(missingCallable("TypeError: rows[0] is not a function"), null);
+  assert.equal(missingCallable("Error: calc.sum is not a function"), null, "only a TypeError that starts the text");
+  assert.equal(missingCallable("TypeError: Cannot read properties of undefined (reading 'sum')"), null);
+  assert.deepEqual(
+    exportNames(["export function a() {}", "export async function* b() {}", "  export const c = 1;", "export class D {}", "export { e, f as g, type H };", "exports.i = 1;", "module.exports.j = 2;", "export default function k() {}", "export type L = string;", "export interface M {}", "const n = 1;"]),
+    ["a", "b", "c", "D", "e", "g", "i", "j"],
+  );
+  assert.deepEqual(missingModules("Error: Cannot find module '../x.mjs' imported from /t/test/a.test.mjs"), [{ spec: "../x.mjs", importer: "/t/test/a.test.mjs" }]);
+  assert.deepEqual(missingModules('Failed to resolve import "./y" from "src/a.test.ts". Does the file exist?'), [{ spec: "./y", importer: "src/a.test.ts" }]);
+  assert.deepEqual(missingModules("Failed to load url /src/z.ts (resolved id: /src/z.ts) in /t/src/a.test.ts. Does the file exist?"), [{ spec: "/src/z.ts", importer: "/t/src/a.test.ts" }]);
+  const diff = parseRangeDiff(
+    'diff --git a/src/a.mjs b/src/a.mjs\nindex 1..2 100644\n--- a/src/a.mjs\n+++ b/src/a.mjs\n@@ -1 +1,2 @@\n-export function old() {}\n+export function old(x) {}\n+export function fresh() {}\ndiff --git "a/src/q\\"uote.mjs" "b/src/q\\"uote.mjs"\n--- "a/src/q\\"uote.mjs"\n+++ "b/src/q\\"uote.mjs"\n@@ -0,0 +1 @@\n+export function hidden() {}\n',
+  );
+  assert.deepEqual([...diff.keys()], ["src/a.mjs"]);
+  assert.deepEqual(diff.get("src/a.mjs"), { added: ["export function old(x) {}", "export function fresh() {}"], removed: ["export function old() {}"] });
+  // changed lines of a test file: declarations and assertions count, comments and other calls do not
+  assert.equal(changedTestLine(["// expect(a).toBe(1) in a comment", ' * it("x")', "  compile: vi.fn(async () => ({ ok: true })),", "const hit = /x/.test(name);"]), null);
+  for (const line of ['  it("x", () => {});', "test.each(rows)('x', fn);", "describe.skip(`x`, fn);", "  expect(a).toBe(1);", "  assert.equal(a, 1);", "    .toEqual({ a: 1 });", "  await expect(p).rejects.toThrow();", "/* note */ expect(a).toBe(1);"]) {
+    assert.equal(changedTestLine([line]), line, line);
+  }
+  const ctx = { exports: () => new Set(["sum"]), addedFix: new Set(["src/sum.ts", "lib/kit/index.mjs"]), roots: ["/t"], runnerDir: "pkg" };
+  assert.equal(addedByFix("TypeError: calc.sum is not a function", "test/a.test.mjs", ctx), "the export sum");
+  assert.equal(addedByFix("TypeError: calc.total is not a function", "test/a.test.mjs", ctx), null);
+  assert.equal(addedByFix("SyntaxError: The requested module '../src/calc.mjs' does not provide an export named 'sum'", "test/a.test.mjs", ctx), "the export sum");
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.js' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), "the module src/sum.ts");
+  assert.equal(addedByFix("Error: Cannot find module '../lib/kit' imported from /elsewhere/a.test.mjs", "test/a.test.mjs", ctx), "the module lib/kit/index.mjs");
+  assert.equal(addedByFix("Error: Cannot find module '../../outside.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), null);
+  assert.equal(addedByFix("Error: Cannot find package 'left-pad' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), null);
+});
+
+test("judgeFile without a context judges as before: no earlier version read means no collateral, and no evidence means WRONG-REASON", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const quiet = [{ name: "a", status: "passed", text: null, assertion: false }];
+  const changed = judgeFile({ file: "t.test.mjs", status: "M" }, ok(quiet), ok(quiet));
+  assert.deepEqual(changed.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.equal(changed.kind, null);
+  const thrown = [{ name: "a", status: "failed", text: "TypeError: calc.sum is not a function", assertion: false }];
+  assert.deepEqual(judgeFile({ file: "t.test.mjs" }, ok(thrown), ok(quiet)).reasons.map((r) => r.code), ["WRONG-REASON"]);
+});
+
+test("README: the red-first section names the notes, the pin marker and the NEUTRAL outcome", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const section = readme.slice(readme.indexOf("## red-first-gate"), readme.indexOf("## Developing in this repo"));
+  for (const word of ["`COLLATERAL`", "`PIN`", "`ADDED-BY-FIX`", "`PIN-MISMATCH`", "red-first-pin:", "`NEUTRAL`", "NOTHING-TO-PROVE"]) {
+    assert.ok(section.includes(word), `the README section does not name ${word}`);
+  }
+});
+
+test("judgeFile: every way an earlier version is unreadable keeps the file NOT-RED-BEFORE, and an unreadable diff counts as a changed test", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests, more = {}) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests, ...more } });
+  const quiet = [{ name: "a", status: "passed", text: null, assertion: false }];
+  const judge = (context) => judgeFile({ file: "t.test.mjs", status: "M" }, ok(quiet), ok(quiet), context);
+  const cases = [
+    [{ run: "timeout" }, /its run did not finish in time/],
+    [{ run: "no-report" }, /its run gave no readable report/],
+    [{ run: "stopped" }, /its run gave no readable report/],
+    [{ run: "ok", result: null }, /it is not in the runner's report/],
+    [ok([], { loaded: false, loadError: "Cannot find module x" }), /it does not load: Cannot find module x/],
+    [ok(quiet, { fileError: "late failure" }), /its run reports a file error: late failure/],
+    [ok([{ name: "a", status: "weird", text: null, assertion: false }]), /its report gives an unknown status/],
+  ];
+  for (const [earlier, why] of cases) {
+    const judged = judge({ earlier, changedTestLine: null });
+    assert.deepEqual(judged.reasons.map((r) => r.code), ["NOT-RED-BEFORE"], String(why));
+    assert.match(judged.reasons[0].detail, why);
+    assert.equal(judged.kind, null);
+    assert.deepEqual(judged.notes, []);
+  }
+  // the earlier version read, the same tests, no changed test line: collateral
+  const collateral = judge({ earlier: ok(quiet), changedTestLine: null });
+  assert.deepEqual([collateral.reasons.length, collateral.kind, collateral.proven, collateral.notes[0].code], [0, "collateral", false, "COLLATERAL"]);
+  // the same, but the file's diff could not be read (rangeReader says so): a changed test
+  const unread = judge({ earlier: ok(quiet), changedTestLine: "the file's diff is not readable" });
+  assert.deepEqual(unread.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.match(unread.reasons[0].detail, /the file's diff is not readable/);
+  // a skipped test of the earlier version still counts as a test of that name
+  const skipped = judge({ earlier: ok([{ name: "a", status: "skipped", text: null, assertion: false }]), changedTestLine: null });
+  assert.equal(skipped.kind, "collateral");
+  // a collateral file must stay green: a test that passed before and is skipped with the fix is RED
+  const lost = judgeFile({ file: "t.test.mjs", status: "M" }, ok([...quiet, { name: "b", status: "passed", text: null, assertion: false }]), ok([...quiet, { name: "b", status: "skipped", text: null, assertion: false }]), {
+    earlier: ok([...quiet, { name: "b", status: "passed", text: null, assertion: false }]),
+    changedTestLine: null,
+  });
+  assert.deepEqual(lost.reasons.map((r) => r.code), ["NOT-GREEN-AT-HEAD"]);
+  assert.match(lost.reasons[0].detail, /passed before the fix but did not pass with it: b/);
+});
+
+test("judgeFile: pins in a new file, pins alone, a pin on a skipped test, and pins in a file that does not load before the fix", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const t = (name, status = "passed") => ({ name, status, text: status === "failed" ? "AssertionError: x" : null, assertion: status === "failed" });
+  // a new file whose tests are all declared pins: a PIN note, not proven
+  const all = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a", "keeps b"] }, ok([t("keeps a"), t("keeps b")]), ok([t("keeps a"), t("keeps b")]));
+  assert.deepEqual([all.reasons.length, all.kind, all.proven, all.notes[0].code], [0, "pins", false, "PIN"]);
+  // one test of the new file is not named by a pin: it must fail first
+  const part = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("does b")]), ok([t("keeps a"), t("does b")]));
+  assert.deepEqual(part.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.match(part.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: does b/);
+  // a pin beside a red test: the file is proven by the red test, the pin is checked
+  const beside = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("does b", "failed")]), ok([t("keeps a"), t("does b")]));
+  assert.deepEqual([beside.reasons.length, beside.kind, beside.proven], [0, "proven", true]);
+  // a pin on a test that is skipped before the fix is not a pin that passes
+  const skipped = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a", "skipped"), t("does b", "failed")]), ok([t("keeps a"), t("does b")]));
+  assert.deepEqual(skipped.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  // one marker names one test: a text that is in two test names (a describe name, a short word) is refused
+  const broad = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps"] }, ok([t("keeps a"), t("keeps b")]), ok([t("keeps a"), t("keeps b")]));
+  assert.deepEqual(broad.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  assert.match(broad.reasons[0].detail, /is in more than one test name of the file/);
+  // the same name reported twice (two projects run the file) is one test name
+  const twice = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("keeps a")]), ok([t("keeps a"), t("keeps a")]));
+  assert.deepEqual([twice.reasons.length, twice.kind], [0, "pins"]);
+  // a file that does not load before the fix cannot hold a passing pin, also with evidence of what the fix adds
+  const unloaded = { run: "ok", result: { loaded: false, loadError: "Cannot find module '../src/sum.mjs'", loadText: "Cannot find module '../src/sum.mjs'", fileError: null, tests: [] } };
+  const withPin = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, unloaded, ok([t("keeps a")]), { addedByFix: () => "the module src/sum.mjs" });
+  assert.deepEqual(withPin.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  const noPin = judgeFile({ file: "n.test.mjs", status: "A" }, unloaded, ok([t("keeps a")]), { addedByFix: () => "the module src/sum.mjs" });
+  assert.deepEqual([noPin.reasons.length, noPin.kind, noPin.notes[0].code], [0, "proven", "ADDED-BY-FIX"]);
+  // a file that loads with the fix but passes no test there is not proven by the load error
+  const empty = judgeFile({ file: "n.test.mjs", status: "A" }, unloaded, ok([t("keeps a", "skipped")]), { addedByFix: () => "the module src/sum.mjs" });
+  assert.deepEqual(empty.reasons.map((r) => `${r.code}:${r.phase}`), ["NOT-COLLECTED:head"]);
+});
+
+test("pins alone: a pull request whose only test change is a declared pin is NEUTRAL, never a PASS", async (t) => {
+  const pinned = `${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`;
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": pinned } });
+  const r = runGate(sc, "run");
+  assert.ok(r.verdict, `no verdict file (exit ${r.code}): ${r.stderr.slice(0, 400)}`);
+  assert.deepEqual([codes(r).length, r.verdict.verdict, r.code], [0, "NEUTRAL", 0]);
+  assert.deepEqual(noteCodes(r), ["PIN:test/publish.test.mjs"]);
+  assert.doesNotMatch(r.stdout, /^RED-FIRST: PASS/m);
+});
+
+test("judgeFile: a declared pin beside a red test must pass with the fix too; the range diff reads a path with a space", async () => {
+  const { judgeFile, parseRangeDiff } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const t = (name, status = "passed") => ({ name, status, text: status === "failed" ? "AssertionError: x" : null, assertion: status === "failed" });
+  // the file is red first by "does b"; its pin "keeps a" passes before the fix but is skipped with it
+  const lost = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("does b", "failed")]), ok([t("keeps a", "skipped"), t("does b")]));
+  assert.deepEqual(lost.reasons.map((r) => `${r.code}:${r.phase}`), ["NOT-GREEN-AT-HEAD:head"]);
+  assert.match(lost.reasons[0].detail, /or is a declared pin, but did not pass with it: keeps a/);
+  assert.equal(lost.proven, false);
+  // git ends the file lines of a path with a space with a tab
+  const diff = parseRangeDiff("diff --git a/src/my file.mjs b/src/my file.mjs\n--- a/src/my file.mjs\t\n+++ b/src/my file.mjs\t\n@@ -0,0 +1 @@\n+export const one = 1;\n");
+  assert.deepEqual([...diff.keys()], ["src/my file.mjs"]);
+  assert.deepEqual(diff.get("src/my file.mjs").added, ["export const one = 1;"]);
 });
