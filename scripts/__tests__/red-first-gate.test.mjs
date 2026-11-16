@@ -1932,10 +1932,11 @@ test("finding 4: an earlier version that changes a tracked test-side file is RED
 
 test("second review 1: a template interpolation with a brace in a string and a nested template exposes no export", async () => {
   const { exportsOf } = await gateModule();
-  // a closing brace inside a string of the interpolation must not end it
-  assert.deepEqual([...exportsOf('const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n')], ["ready"]);
-  // a regular expression and a comment inside an interpolation are read as code there
-  assert.deepEqual([...exportsOf("const a = `${ /`/.test(x) ? \"{\" : '}' /* } ` */ }\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+  // a closing brace inside a string of the interpolation must not end it; the scan and the plain
+  // brace count disagree on the template's end, so the file gives no exports at all (fail closed)
+  assert.deepEqual([...exportsOf('const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n')], []);
+  // a regular expression and a comment inside an interpolation are read as code there; the same disagreement
+  assert.deepEqual([...exportsOf("const a = `${ /`/.test(x) ? \"{\" : '}' /* } ` */ }\nexport function ghost() {}\n`;\nexport const real = 1;\n")], []);
   // nested templates with interpolations of their own
   assert.deepEqual([...exportsOf("const a = `x ${ `y ${ { z: 1 }.z } ` } w\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
 });
@@ -1991,4 +1992,39 @@ test("second review 5: an earlier version that rewrites its own test file during
   const changed = r.verdict.reasons.find((x) => x.code === "TEST-CHANGED");
   assert.equal(changed.phase, "earlier");
   assert.equal(changed.file, "test/publish.test.mjs");
+});
+
+// ---------------------------------------------------------------------------
+// The fold reading: a slash the scanner cannot read for sure gives no exports.
+// ---------------------------------------------------------------------------
+
+// A fix-side module whose template holds the text of an export, and a new test
+// that calls that name only before the fix: a TypeError that must never count
+// as what the fix adds.
+const DECOY_BASE = "const decoy = `\nexport function ghost() {}\n`;\nexport function ready() { return false; }\n";
+const DECOY_TEST = `${TEST_HEAD}import * as api from "../src/m.mjs";\n\ntest("ready before the call", () => {\n  if (!api.ready()) api.ghost();\n  assert.ok(true);\n});\n`;
+function decoyScenario(t, headModule) {
+  return scenario(t, { base: { "package.json": '{ "type": "module" }\n', "src/m.mjs": DECOY_BASE }, head: { "src/m.mjs": headModule, "test/m.test.mjs": DECOY_TEST } });
+}
+
+test("fold 1: a division after an object literal in an interpolation is not read as a regular expression that exposes an export (RED, not ADDED-BY-FIX)", async (t) => {
+  const head = 'const decoy = `${ {} / {a: 1 / 2}.a + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n';
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+test("fold 2: a regular expression after `)` in an interpolation, read as a division, exposes no export (RED, not ADDED-BY-FIX)", async (t) => {
+  const head = 'const a = false;\nconst b = "";\nconst decoy = `${ (() => { if (a) /}x/.test(b); })() + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n';
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+test("fold 3: a slash the scanner cannot read for sure gives no exports, at the top level too; a plain division does not", async () => {
+  const { exportsOf } = await gateModule();
+  // a regular expression after `)` at the top level, read as a division, would open a template
+  assert.deepEqual([...exportsOf('const a = false;\nif (a) /`/.test("");\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n')], []);
+  // a division after `)` or `]` with no other slash on its line is no regular expression: read as before
+  assert.deepEqual([...exportsOf("const half = (a + b) / 2;\nconst q = xs[0] / 3;\nexport const real = half / q;\n")], ["real"]);
 });

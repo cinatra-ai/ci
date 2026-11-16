@@ -432,13 +432,35 @@ export function codeText(source, keepQuotes = false) {
   return scanCode(String(source), 0, keepQuotes, false).out;
 }
 
+// The end of a template literal by a plain count of `${`, `{` and `}` (the
+// reading of earlier versions); a second opinion on scanCode's end.
+function braceEnd(s, i) {
+  let depth = 0;
+  for (let j = i + 1; j < s.length; j += 1) {
+    const d = s[j];
+    if (d === "\\") j += 1;
+    else if (d === "$" && s[j + 1] === "{") {
+      depth += 1;
+      j += 1;
+    } else if (depth && d === "{") depth += 1;
+    else if (depth && d === "}") depth -= 1;
+    else if (!depth && d === "`") return j + 1;
+  }
+  return s.length;
+}
+
 // Scans code from `start`; inner: the code of a template's `${...}`, which
-// ends at its unmatched `}`. Returns the code text and the end offset.
+// ends at its unmatched `}`. Returns the code text, the end offset and
+// `unsure`: the scan met a slash after `}`, `)` or `]` that a later slash on
+// its line could close as a regular expression (a division or a regular
+// expression: the scanner cannot tell), or a template whose end differs
+// from the plain brace count. An unsure text is never evidence (exportsOf).
 function scanCode(s, start, keepQuotes, inner) {
   const blank = (t) => t.replace(/[^\n]/g, " ");
   let out = "";
   let prev = "";
   let depth = 0;
+  let unsure = false;
   let i = start;
   while (i < s.length) {
     const c = s[i];
@@ -467,11 +489,15 @@ function scanCode(s, start, keepQuotes, inner) {
         }
         if (c === "`") {
           // the interpolation's code, up to its own closing brace
-          if (d === "$" && s[j + 1] === "{") j = scanCode(s, j + 2, false, true).end - 1;
-          else if (d === "`") break;
+          if (d === "$" && s[j + 1] === "{") {
+            const sub = scanCode(s, j + 2, false, true);
+            unsure ||= sub.unsure;
+            j = sub.end - 1;
+          } else if (d === "`") break;
         } else if (d === c || d === "\n") break;
       }
       const end = Math.min(j + 1, s.length);
+      if (c === "`" && braceEnd(s, i) !== end) unsure = true;
       const literal = s.slice(i, end);
       out += keepQuotes && c !== "`" && literal.length > 1 && literal.endsWith(c) ? `${c}${blank(literal.slice(1, -1))}${c}` : blank(literal);
       prev = c;
@@ -480,6 +506,10 @@ function scanCode(s, start, keepQuotes, inner) {
     }
     // A slash starts a regular expression after an operator or a bracket, or
     // after a keyword such as `return` (not after a name or a closing bracket).
+    if (c === "/" && "})]".includes(prev)) {
+      const e = s.indexOf("\n", i + 1);
+      if (s.slice(i + 1, e < 0 ? s.length : e).includes("/")) unsure = true;
+    }
     if (c === "/" && (prev === "" || "(,=:[!&|?{};+-*%<>~^".includes(prev) || (/[\w$]/.test(prev) && afterKeyword(out)))) {
       let j = i + 1;
       let inClass = false;
@@ -497,19 +527,29 @@ function scanCode(s, start, keepQuotes, inner) {
     }
     if (inner && c === "{") depth += 1;
     else if (inner && c === "}") {
-      if (depth === 0) return { out, end: i + 1 };
+      if (depth === 0) return { out, end: i + 1, unsure };
       depth -= 1;
     }
     out += c;
     if (!/\s/.test(c)) prev = c;
     i += 1;
   }
-  return { out, end: s.length };
+  return { out, end: s.length, unsure };
 }
 
-// The value exports of a whole script (code only, see codeText).
+// The value exports of a whole script (code only, see codeText); none when
+// the scan is unsure (fail closed: such a file is never evidence).
 export function exportsOf(source) {
-  return new Set(exportNames(codeText(source).split("\n")));
+  const scan = scanCode(String(source), 0, false, false);
+  return scan.unsure ? new Set() : new Set(exportNames(scan.out.split("\n")));
+}
+
+// Every name any line of a script declares as an export, comments and
+// strings included: the merge base's names of a file whose scan is unsure
+// (a superset, so a name hidden there is never new at the head).
+function exportsAnyLine(source) {
+  const s = String(source);
+  return scanCode(s, 0, false, false).unsure ? new Set(exportNames(s.split("\n"))) : new Set();
 }
 
 // The static imports of a test file: [{ spec, names, whole }]. names: the
@@ -1634,7 +1674,10 @@ function rangeReader(repo, plan) {
       byFile = new Map();
       const scripts = plan.fixSide.filter((path) => SCRIPT_EXT_RE.test(path));
       const before = new Set();
-      for (const path of scripts) for (const name of exportsOf(blob(plan.mergeBase, path) ?? "")) before.add(name);
+      for (const path of scripts) {
+        const text = blob(plan.mergeBase, path) ?? "";
+        for (const name of [...exportsOf(text), ...exportsAnyLine(text)]) before.add(name);
+      }
       for (const path of scripts.filter(evidencePath)) {
         const head = blob(plan.head, path);
         if (head === null) continue;

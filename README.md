@@ -2363,7 +2363,11 @@ codes alone.
   import, `require`) from a relative path, and that module's head version
   exports `<name>` as a value (`export function|class|const|let|var|enum
   <name>`, `export { <name> }` or `exports.<name> =`, read outside comments
-  and strings; never `export declare` or a `.d.ts` file) while no fix-side
+  and strings; never `export declare` or a `.d.ts` file; a script in which
+  the scan cannot tell a division from a regular expression, a `/` after
+  `}`, `)` or `]` with another `/` later on its line, or in which a
+  template's end by the scan differs from a plain count of its braces,
+  exports nothing here) while no fix-side
   script exported it at the merge base (a moved export is not new); or a
   runner's module-not-found error (`Cannot find module`, `Failed to resolve
   import`, `Failed to load url`, at the start of the error, never inside
@@ -2389,7 +2393,8 @@ codes alone.
   (by name and count), no changed line of the file declares a test or states
   an assertion (`it`, `test`, `describe`, `expect...`, `assert...`, `.should`,
   `.rejects`, `.resolves`, a `.toBe(`-style matcher; comment lines apart), and
-  every test of the new version passes before the fix and with it. An edit
+  every test of the new version that is not skipped passes before the fix
+  and with it (a skipped test is not checked). An edit
   that the fix does not need (the earlier version also passes with the fix)
   is `NOT-RED-BEFORE`, whatever its lines say. An earlier version that cannot
   be run and read, whose runner's exit contradicts its report, or whose run
