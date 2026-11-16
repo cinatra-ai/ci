@@ -18,17 +18,21 @@
 //   4. passes only when every new test file loads, collects tests and fails at
 //      least one test for the right reason before the fix (an assertion, the
 //      text of a `red-first-expect:` marker in the file, or a failure that names
-//      an export or a module the fix side adds), and with the fix loads,
-//      passes, and passes every occurrence of every test that failed before.
+//      an export or a module the fix side adds and the test file itself
+//      imports from that module), and with the fix loads, passes, and passes
+//      every occurrence of every test that failed before.
 // A test file with no failing test before the fix makes no red-first claim in
 // two cases only, each a note (not proven here), never a proof:
-//   - COLLATERAL: a changed file whose earlier version reports the same tests
-//     (run in the tree before the fix) and whose edit touches no test
-//     declaration and no assertion line;
-//   - PIN: every test the pull request adds to the file is named by a
-//     `red-first-pin:` marker, and passes before the fix and with it.
-// With such notes and at least one proven file the run is a PASS; with notes
-// only it is NEUTRAL (nothing to prove, exit 0), never a PASS.
+//   - COLLATERAL: a changed file whose earlier version, run in the tree WITH
+//     the fix, reports the same tests and fails (the fix breaks it, the edit
+//     keeps it working), and whose edit touches no test declaration and no
+//     assertion line;
+//   - PIN: every test the pull request adds to the file is named by its own
+//     `red-first-pin:` marker that the pull request adds, names one test
+//     occurrence, and passes before the fix and with it; in a changed file the
+//     edit only adds lines and the earlier version passes with the fix.
+// A run is a PASS only with at least one proven file; with notes only it is
+// RED (NOTHING-PROVEN): a green job always has a proven file.
 // Anything it cannot read or prove ends RED with a named reason. A pull request
 // without a new test, with no change besides tests, or whose new tests all
 // match --exclude, is a SKIP (exit 3 in `run`), never a pass. New tests that
@@ -45,7 +49,7 @@
 //                           [--test-support <globs>] [--timeout-seconds <n>]
 //                           [--job-started <epoch s> --job-minutes <n>]
 //                           [--verdict <file>] [--summary <file>]
-// Exit codes: plan 0 (decided: run or skip); run 0 PASS or NEUTRAL, 1 RED,
+// Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED,
 // 3 SKIP, 130/143 stopped by SIGINT/SIGTERM; 2 usage or internal error (both
 // modes).
 //
@@ -101,16 +105,28 @@ const ASSERTION_TEXT_RE = /^(?:AssertionError|JestAssertionError)\b/;
 const NOT_CALLABLE_RE = /^TypeError: (.+?) is not a (?:function|constructor)(?![A-Za-z])/;
 const TRAILING_NAME_RE = /([A-Za-z_$][\w$]*)[\s)]*$/;
 const CALLEE_MAX = 300;
-const NO_EXPORT_RE = /does not provide an export named ['"]([A-Za-z_$][\w$]*)['"]/;
+// A runner's error text only: at the start of the text or right after an
+// error name (`Error: `, `Error [ERR_MODULE_NOT_FOUND]: `, `SyntaxError: `),
+// never inside other words (a message that prints such a text).
+const AT_ERROR = String.raw`(?:^|(?<=(?:^|[\s>])[A-Za-z]*Error(?: \[[A-Z_]+\])?: ))`;
+const NO_EXPORT_RE = new RegExp(`${AT_ERROR}The requested module ['"][^'"]+['"] does not provide an export named ['"]([A-Za-z_$][\\w$]*)['"]`);
+// kind "vite": a path from the vite root (`/src/x.ts`); other absolute paths
+// count only inside the tree.
 const MISSING_MODULE_RES = [
-  /Cannot find (?:module|package) ['"]([^'"]+)['"](?: imported from ['"]?([^\s'"]+))?/g,
-  /Failed to resolve import ['"]([^'"]+)['"] from ['"]([^'"]+)['"]/g,
-  /Failed to load url (\S+) \(resolved id: [^)]*\)(?: in (\S+?)\.? Does)?/g,
+  { re: new RegExp(`${AT_ERROR}Cannot find (?:module|package) ['"]([^'"]+)['"](?: imported from ['"]?([^\\s'"]+))?`, "g"), kind: "node" },
+  { re: new RegExp(`${AT_ERROR}Failed to resolve import ['"]([^'"]+)['"] from ['"]([^'"]+)['"]`, "g"), kind: "node" },
+  { re: new RegExp(`${AT_ERROR}Failed to load url (\\S+) \\(resolved id: [^)]*\\)(?: in (\\S+?)\\.? Does)?`, "g"), kind: "vite" },
 ];
+// A path that is test code by its place or name, though the range lists it on
+// the fix side: never evidence of what the fix adds. A declaration file holds
+// types, never a value.
+const TEST_PLACE_RE = /(^|\/)(?:tests?|__tests__|specs?|__mocks__|mocks?|fixtures?|__fixtures__|test-?utils|testing|e2e)\//i;
+const TEST_NAME_RE = /(?:^|[-_.])(?:tests?|specs?|mocks?|fixtures?|stubs?|fakes?)(?:[-_.]|$)/i;
+const DECLARATION_FILE_RE = /\.d\.[cm]?ts$/;
 // Exports a script declares on one line: `export function f`, `export class
-// C`, `export const c`, `export { a, b as c }`, `exports.f =`. Types are not
-// values and `export default` has no name of its own: neither is read.
-const EXPORT_DECL_RE = /^\s*export\s+(?:declare\s+)?(?:async\s+)?(?:function\s*\*?\s*|(?:abstract\s+)?class\s+|(?:const|let|var|enum)\s+)([A-Za-z_$][\w$]*)/;
+// C`, `export const c`, `export { a, b as c }`, `exports.f =`. Types, `export
+// declare` (no value) and `export default` (no name of its own) are not read.
+const EXPORT_DECL_RE = /^\s*export\s+(?:async\s+)?(?:function\s*\*?\s*|(?:abstract\s+)?class\s+|(?:const|let|var|enum)\s+)([A-Za-z_$][\w$]*)/;
 const EXPORT_LIST_RE = /^\s*export\s*\{([^}]*)\}/;
 const CJS_EXPORT_RE = /^\s*(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=/;
 const NAME_RE = /^[A-Za-z_$][\w$]*$/;
@@ -387,14 +403,151 @@ export function missingCallable(text) {
   return name && name !== "default" ? name : null;
 }
 
-// The modules a text reports as not found: [{ spec, importer }].
+// The modules a text reports as not found: [{ spec, importer, kind }].
 export function missingModules(text) {
   const found = [];
   const t = normalizeText(text);
-  for (const re of MISSING_MODULE_RES) {
-    for (const match of t.matchAll(re)) found.push({ spec: match[1], importer: match[2] ?? null });
+  for (const { re, kind } of MISSING_MODULE_RES) {
+    for (const match of t.matchAll(re)) found.push({ spec: match[1], importer: match[2] ?? null, kind });
   }
   return found;
+}
+
+const REGEX_KEYWORD_RE = /(?:^|[^\w$.])(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
+// Whether the code read so far ends with such a keyword (a bounded look back).
+function afterKeyword(out) {
+  let k = out.length;
+  while (k > 0 && /\s/.test(out[k - 1])) k -= 1;
+  return REGEX_KEYWORD_RE.test(out.slice(Math.max(0, k - 11), k));
+}
+// The source as code only, at the same offsets: comments, template literals,
+// regular-expression literals and the contents of quoted strings become
+// spaces (line breaks kept); with keepQuotes a quoted string keeps its quote
+// characters, so an import specifier's place can be found and read from the
+// source. A text inside a comment or a string never reads as an export or an
+// import.
+export function codeText(source, keepQuotes = false) {
+  const s = String(source);
+  const blank = (t) => t.replace(/[^\n]/g, " ");
+  let out = "";
+  let prev = "";
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    const n = s[i + 1];
+    if (c === "/" && n === "/") {
+      const e = s.indexOf("\n", i);
+      const end = e < 0 ? s.length : e;
+      out += blank(s.slice(i, end));
+      i = end;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      const e = s.indexOf("*/", i + 2);
+      const end = e < 0 ? s.length : e + 2;
+      out += blank(s.slice(i, end));
+      i = end;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      let depth = 0;
+      for (; j < s.length; j += 1) {
+        const d = s[j];
+        if (d === "\\") {
+          j += 1;
+          continue;
+        }
+        if (c === "`") {
+          if (d === "$" && s[j + 1] === "{") {
+            depth += 1;
+            j += 1;
+          } else if (depth && d === "{") depth += 1;
+          else if (depth && d === "}") depth -= 1;
+          else if (!depth && d === "`") break;
+        } else if (d === c || d === "\n") break;
+      }
+      const end = Math.min(j + 1, s.length);
+      const literal = s.slice(i, end);
+      out += keepQuotes && c !== "`" && literal.length > 1 && literal.endsWith(c) ? `${c}${blank(literal.slice(1, -1))}${c}` : blank(literal);
+      prev = c;
+      i = end;
+      continue;
+    }
+    // A slash starts a regular expression after an operator or a bracket, or
+    // after a keyword such as `return` (not after a name or a closing bracket).
+    if (c === "/" && (prev === "" || "(,=:[!&|?{};+-*%<>~^".includes(prev) || (/[\w$]/.test(prev) && afterKeyword(out)))) {
+      let j = i + 1;
+      let inClass = false;
+      for (; j < s.length && s[j] !== "\n"; j += 1) {
+        if (s[j] === "\\") j += 1;
+        else if (s[j] === "[") inClass = true;
+        else if (s[j] === "]") inClass = false;
+        else if (s[j] === "/" && !inClass) break;
+      }
+      const end = Math.min(j + 1, s.length);
+      out += blank(s.slice(i, end));
+      prev = "/";
+      i = end;
+      continue;
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i += 1;
+  }
+  return out;
+}
+
+// The value exports of a whole script (code only, see codeText).
+export function exportsOf(source) {
+  return new Set(exportNames(codeText(source).split("\n")));
+}
+
+// The static imports of a test file: [{ spec, names, whole }]. names: the
+// exported names it imports by name; whole: it binds the whole module (a
+// namespace, a default import, `require` of the module), so any export may be
+// called through it. `import type` binds no value and is not read.
+export function importsOf(source) {
+  const src = String(source);
+  const t = codeText(src, true);
+  // The specifier of a match, read from the source at its masked place.
+  const at = (m, group) => src.slice(m.indices[group][0], m.indices[group][1]);
+  const found = [];
+  const named = (list) => {
+    const names = new Set();
+    for (const part of list.split(",")) {
+      const item = part.trim();
+      if (!item || /^type\s/.test(item)) continue;
+      const name = item.split(/\s+as\s+/)[0].trim();
+      if (NAME_RE.test(name)) names.add(name);
+    }
+    return names;
+  };
+  for (const m of t.matchAll(/(?<![\w$.])import\s+(?!type\s)([\w$*{}\s,]*?)\s*from\s*(["'])([^"'\n]+)\2/dg)) {
+    const clause = m[1];
+    const braces = /\{([^}]*)\}/.exec(clause);
+    const rest = clause.replace(/\{[^}]*\}/, "").replace(/,/g, " ").trim();
+    found.push({ spec: at(m, 3), names: braces ? named(braces[1]) : new Set(), whole: rest.length > 0 });
+  }
+  for (const m of t.matchAll(/(?<![\w$.])import\s*(["'])([^"'\n]+)\1/dg)) found.push({ spec: at(m, 2), names: new Set(), whole: false });
+  for (const m of t.matchAll(/(?<![\w$.])(?:const|let|var)\s+(\{[^}]*\}|[A-Za-z_$][\w$]*)\s*=\s*require\(\s*(["'])([^"'\n]+)\2\s*\)/dg)) {
+    const braces = /^\{([^}]*)\}$/.exec(m[1]);
+    found.push({ spec: at(m, 3), names: braces ? named(braces[1].replace(/:\s*[\w$]+/g, "")) : new Set(), whole: !braces });
+  }
+  return found;
+}
+
+// A relative import of `file`, as a repository path, or null.
+function importPath(spec, file) {
+  if (!(spec.startsWith("./") || spec.startsWith("../"))) return null;
+  const n = posix.normalize(posix.join(posix.dirname(file), spec));
+  return n && n !== "." && n !== ".." && !n.startsWith("../") && !n.startsWith("/") ? n : null;
+}
+
+// A fix-side path that can be evidence of what the fix adds: a script, not a
+// declaration file, not test code by its place or name.
+export function evidencePath(path) {
+  return SCRIPT_EXT_RE.test(path) && !DECLARATION_FILE_RE.test(path) && !TEST_PLACE_RE.test(path) && !TEST_NAME_RE.test(posix.basename(path).replace(SCRIPT_EXT_RE, ""));
 }
 
 // The names the added lines of one script export, less the names its removed
@@ -457,7 +610,7 @@ export function parseRangeDiff(text) {
 // Repository paths a missing-module text may mean: an absolute path inside the
 // tree, a path from the repository root or the runner's folder (vite writes
 // `/src/x.ts`), or a relative specifier from its importer or the test file.
-function moduleCandidates({ spec, importer }, file, roots, runnerDir) {
+function moduleCandidates({ spec, importer, kind }, file, roots, runnerDir) {
   const out = [];
   const push = (p) => {
     const n = posix.normalize(p);
@@ -467,8 +620,9 @@ function moduleCandidates({ spec, importer }, file, roots, runnerDir) {
   if (name.startsWith("/")) {
     const inside = relativeIn(name, roots);
     if (inside) push(inside);
-    push(name.replace(/^\/+/, ""));
-    if (runnerDir) push(posix.join(runnerDir, name.replace(/^\/+/, "")));
+    // Only vite writes a path from its root; any other absolute path outside
+    // the tree is not a path of the repository.
+    else if (kind === "vite") push(posix.join(runnerDir || ".", name.replace(/^\/+/, "")));
   } else if (name.startsWith("./") || name.startsWith("../")) {
     const from = importer ? relativeIn(importer.replace(/^file:\/\//, ""), roots) : null;
     if (from) push(posix.join(posix.dirname(from), name));
@@ -489,16 +643,33 @@ function addedModule(candidate, added) {
 }
 
 // What a failure text before the fix names that the fix side adds: an export
-// (a call of it, or a named import of it) or a module. Returns a description
-// for the note, or null: no evidence, so the failure is judged as before.
-export function addedByFix(text, file, { exports, addedFix, roots = [], runnerDir = "" }) {
+// (a call of it, or a named import of it) or a module. The evidence is bound
+// to the test file's own static imports: the export is new in the very module
+// the test file imports it from (or imports whole), and the module is one the
+// test file imports, outside the test file's folder. Returns a description for
+// the note, or null: no evidence, so the failure is judged as before.
+//   source        the test file's text at the head;
+//   exportsByFile () => Map(path -> names the fix side newly exports there);
+//   addedFix      the evidence paths the range adds (plan.addedFix).
+export function addedByFix(text, file, { source = "", exportsByFile = () => new Map(), addedFix = new Set(), roots = [], runnerDir = "" }) {
   const t = normalizeText(text);
+  const imports = importsOf(source)
+    .map((im) => ({ ...im, path: importPath(im.spec, file) }))
+    .filter((im) => im.path);
   const name = missingCallable(t) ?? NO_EXPORT_RE.exec(t)?.[1] ?? null;
-  if (name && exports().has(name)) return `the export ${name}`;
+  if (name) {
+    const map = exportsByFile();
+    for (const im of imports.filter((x) => x.names.has(name) || x.whole)) {
+      const hit = addedModule(im.path, new Set(map.keys()));
+      if (hit && map.get(hit).has(name)) return `the export ${name}`;
+    }
+  }
+  const own = posix.dirname(file);
   for (const missing of missingModules(t)) {
     for (const candidate of moduleCandidates(missing, file, roots, runnerDir)) {
       const hit = addedModule(candidate, addedFix);
-      if (hit) return `the module ${hit}`;
+      if (!hit || posix.dirname(hit) === own) continue;
+      if (imports.some((im) => addedModule(im.path, new Set([hit])))) return `the module ${hit}`;
     }
   }
   return null;
@@ -738,6 +909,7 @@ function addedTests(tests, earlier) {
 // null when its tests were read.
 function earlierUnreadable(earlier) {
   if (!earlier) return "it was not run";
+  if (earlier.run === "contradicts") return `its runner's exit does not match its report (${earlier.detail})`;
   if (earlier.run !== "ok") return earlier.run === "timeout" ? "its run did not finish in time" : "its run gave no readable report";
   const r = earlier.result;
   if (!r) return "it is not in the runner's report";
@@ -753,9 +925,12 @@ function earlierUnreadable(earlier) {
 // context (all optional; without it the file is judged by assertions and
 // markers alone):
 //   earlier         the run of a changed file's earlier version in the tree
-//                   before the fix ({ run, result }), for its test names;
+//                   with the fix ({ run, result }): its test names, and
+//                   whether the fix breaks it;
 //   changedTestLine the first changed line of the file's edit that declares a
 //                   test or states an assertion, or null;
+//   pureAddition    the file's edit only adds lines (no line removed or
+//                   changed);
 //   addedByFix      (text) => what the text names that the fix side adds.
 // Returns the reasons, the notes (a file that makes no red-first claim, or
 // that is red because of what the fix adds), `proven`, and `kind`: "proven",
@@ -792,12 +967,13 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
       const failed = ran.filter((t) => t.status === "failed");
       const stray = pins.find((p, i) => !r.tests.some((t) => normalizeText(t.name).includes(wantedPins[i])));
       // One marker names one test: a text that is in several test names (a
-      // suite name, a short word) would declare tests the author did not name.
-      const broad = pins.find((p, i) => new Set(r.tests.filter((t) => normalizeText(t.name).includes(wantedPins[i])).map((t) => t.name)).size > 1);
+      // suite name, a short word), or a name reported more than once (two
+      // tests of one title, two projects), would declare more than one test.
+      const broad = pins.find((p, i) => r.tests.filter((t) => normalizeText(t.name).includes(wantedPins[i])).length > 1);
       const notPinned = r.tests.find((t) => pinned(t) && t.status !== "passed");
       if (ran.length === 0) add("NOT-COLLECTED", "before", "no test ran (none collected, or all skipped)");
       else if (stray !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${stray}" is in no test name of the file`);
-      else if (broad !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${broad}" is in more than one test name of the file: write one marker for each test`);
+      else if (broad !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${broad}" is in more than one test name of the file, or in a name the report gives more than once: write one marker for each test, under a name of its own`);
       else if (notPinned) add("PIN-MISMATCH", "before", `${notPinned.name} is declared with red-first-pin: but is ${notPinned.status} before the fix (a pin passes before the fix and with it)`);
       else if (failed.length === 0) {
         // No red-first claim is possible here. The file is settled without a
@@ -806,16 +982,32 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         const why = status === "A" ? null : earlierUnreadable(context.earlier);
         const added = status === "A" ? r.tests : why ? [] : addedTests(r.tests, context.earlier.result.tests);
         const undeclared = added.filter((t) => !pinned(t));
+        // The earlier version run in the tree with the fix: its failed tests.
+        const brokenByFix = why || status === "A" ? [] : context.earlier.result.tests.filter((t) => t.status === "failed");
+        const offAdded = status === "A" ? undefined : pins.find((p, i) => !added.some((t) => normalizeText(t.name).includes(wantedPins[i])));
         if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})`);
         else if (undeclared.length) {
           const names = undeclared.slice(0, 3).map((t) => t.name).join(" | ");
           add("NOT-RED-BEFORE", "before", `${base}; ${undeclared.length} test(s) the pull request adds do not fail first: ${names} (a test that pins behaviour the fix keeps is declared with a red-first-pin: <test name> line)`);
         } else if (added.length) {
-          noClaim = { code: "PIN", kind: "pins", detail: `${added.length} test(s) the pull request adds are declared with red-first-pin: and pass before the fix and with it; the file has no other new test: not proven here` };
+          if (offAdded !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${offAdded}" names a test the pull request does not add to the file`);
+          else if (status !== "A" && !context.pureAddition) {
+            add("NOT-RED-BEFORE", "before", `${base}; the edit declares pins but also changes or removes lines of the file: pins are declared only in an edit that adds lines (a change to an existing test must fail first)`);
+          } else if (brokenByFix.length) {
+            add("NOT-RED-BEFORE", "before", `${base}; the file's earlier version fails with the fix (${clip(brokenByFix.map((t) => t.name).slice(0, 3).join(" | "), 160)}), so the added lines also keep existing tests working: pins are declared only beside existing tests that pass with the fix unchanged`);
+          } else {
+            noClaim = { code: "PIN", kind: "pins", detail: `${added.length} test(s) the pull request adds are each declared by a red-first-pin: marker it adds and pass before the fix and with it; the file has no other new or changed test: not proven here` };
+          }
         } else if (context.changedTestLine) {
           add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test but changes a test declaration or an assertion (${clip(context.changedTestLine, 120)}): a changed test must fail first`);
+        } else if (!brokenByFix.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test and the file's earlier version also passes with the fix, so the fix does not need the edit: a changed test must fail first`);
         } else {
-          noClaim = { code: "COLLATERAL", kind: "collateral", detail: `the edit adds no test and changes no test declaration or assertion line, and all ${ran.length} test(s) pass before the fix and with it: not a new test, not proven here` };
+          noClaim = {
+            code: "COLLATERAL",
+            kind: "collateral",
+            detail: `the file's earlier version fails with the fix (${clip(brokenByFix.map((t) => t.name).slice(0, 3).join(" | "), 160)}); the edit adds no test, changes no test declaration or assertion line, and all ${ran.length} test(s) pass before the fix and with it: it keeps an existing test file working, not a new test, not proven here`,
+          };
         }
         if (noClaim) {
           mustPass = r.tests.filter((t) => t.status === "passed");
@@ -1111,9 +1303,14 @@ export function planRange({ repo = process.cwd(), base, head, exclude = "", test
   // target may be fix side, or a gitlink): the test that runs would not be the
   // pull request's test file, so run refuses them (NOT-A-FILE).
   const notFiles = c.testSide.filter((e) => e.status !== "D" && !REGULAR_MODES.has(modes.get(e.path))).map((e) => e.path);
-  // The fix-side paths the range adds: a module only the head has.
+  // The fix-side paths the range adds: a module only the head has. Only a
+  // regular file that can be evidence counts (not a symlink, whose target may
+  // be test side or outside, not a declaration file, not test code).
   const fixSide = new Set(c.fixSide);
-  const addedFix = entries.filter((e) => e.status === "A" && fixSide.has(e.path)).map((e) => e.path).sort(byPath);
+  const addedFix = entries
+    .filter((e) => e.status === "A" && fixSide.has(e.path) && REGULAR_MODES.has(modes.get(e.path)) && evidencePath(e.path))
+    .map((e) => e.path)
+    .sort(byPath);
   const plan = { base, head, mergeBase, testSupport, setupPaths, notFiles, addedFix, ...c };
   if (c.newTests.length + c.excluded.length === 0) {
     return { ...plan, verdict: "skip", reason: "NO-NEW-TESTS", detail: "the pull request adds or changes no test file" };
@@ -1355,9 +1552,11 @@ async function runPhase(phase, tree, files, plan, opts, reportDir, { skipInstall
 }
 
 // A changed test file with no failing test before the fix: its earlier version
-// (the merge base's) is run in the tree before the fix, after both phases, to
-// read the names of its tests. Only a stop of the gate is a reason of its own;
-// a file whose earlier version cannot be read stays NOT-RED-BEFORE.
+// (the merge base's) is run in the tree WITH the fix, after both phases, to
+// read the names of its tests and whether the fix breaks it. A stop of the
+// gate and a test-side file the run changed are reasons of their own; a file
+// whose earlier version cannot be read, or whose runner's exit contradicts its
+// report, stays NOT-RED-BEFORE.
 function quietBefore(entry) {
   const r = entry?.run === "ok" ? entry.result : null;
   if (!r || !r.loaded || r.fileError || r.tests.some((t) => !KNOWN_STATUS.has(t.status))) return false;
@@ -1373,30 +1572,60 @@ async function runEarlier(repo, plan, tree, quiet, opts, work) {
     return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest" };
   });
   const run = await runPhase("earlier", tree, files, plan, opts, join(work, "reports"), { skipInstall: true, swapped: paths });
-  return { perFile: run.perFile, reasons: run.reasons.filter((r) => r.code === "STOPPED") };
+  // A runner that exits non-zero (or reports success: false) although every
+  // file of its report passed, or exits 0 although one failed, is not read.
+  for (const inv of run.invocations) {
+    const entries = inv.files.map((file) => run.perFile.get(file));
+    const failed = entries.some((e) => e?.run === "ok" && e.result && (!e.result.loaded || e.result.fileError || e.result.tests.some((t) => t.status === "failed")));
+    // A failure must end the runner non-zero; no failure, with exit 0 and no
+    // success: false.
+    const agrees = failed ? inv.res.status !== 0 && inv.res.status !== null : inv.res.status === 0 && !inv.reportFailed;
+    if (!agrees) {
+      const detail = `${inv.label} ${exitText(inv.res)}${inv.reportFailed ? " (report success: false)" : ""} although its report shows ${failed ? "a failure" : "no failure"}`;
+      for (const file of inv.files) run.perFile.set(file, { run: "contradicts", detail });
+    }
+  }
+  return { perFile: run.perFile, reasons: run.reasons.filter((r) => r.code === "STOPPED" || r.code === "TEST-CHANGED") };
 }
 
-// What the fix side adds, read once from the range's diff when a judgement
-// first asks: the names its scripts newly export, and per changed test file
-// the first changed line that declares a test or states an assertion.
+// What the fix side adds, read once when a judgement first asks: per fix-side
+// script, the names its whole head version exports (code only) that no
+// fix-side script exported at the merge base (so a moved or reworded export
+// is not new); per changed test file, the first changed line that declares a
+// test or states an assertion, its added lines and whether it only adds.
 function rangeReader(repo, plan) {
   let files = null;
-  let names = null;
+  let byFile = null;
   const read = () => {
     files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
     return files;
   };
+  const blob = (rev, path) => {
+    const r = git(repo, ["cat-file", "blob", `${rev}:${path}`], { allowFail: true });
+    return r.status === 0 ? r.stdout : null;
+  };
   return {
-    exports() {
-      if (names) return names;
-      names = new Set();
-      for (const path of plan.fixSide) {
-        const diff = SCRIPT_EXT_RE.test(path) ? read().get(path) : null;
-        if (!diff) continue;
-        const gone = new Set(exportNames(diff.removed));
-        for (const name of exportNames(diff.added)) if (!gone.has(name)) names.add(name);
+    exportsByFile() {
+      if (byFile) return byFile;
+      byFile = new Map();
+      const scripts = plan.fixSide.filter((path) => SCRIPT_EXT_RE.test(path));
+      const before = new Set();
+      for (const path of scripts) for (const name of exportsOf(blob(plan.mergeBase, path) ?? "")) before.add(name);
+      for (const path of scripts.filter(evidencePath)) {
+        const head = blob(plan.head, path);
+        if (head === null) continue;
+        const fresh = new Set([...exportsOf(head)].filter((name) => !before.has(name)));
+        if (fresh.size) byFile.set(path, fresh);
       }
-      return names;
+      return byFile;
+    },
+    // The added lines of a file's edit, or null when its diff is not readable.
+    addedLines(path) {
+      return read().get(path)?.added ?? null;
+    },
+    pureAddition(path) {
+      const diff = read().get(path);
+      return Boolean(diff) && diff.removed.every((line) => !line.trim());
     },
     // A changed file whose diff is not readable here counts as touched.
     testLine(path) {
@@ -1461,9 +1690,15 @@ async function runGateIn(opts) {
     // The new test's bytes from the head commit (a regular file, checked by
     // plan), never through the file system.
     const statusOf = new Map(plan.testSide.map((e) => [e.path, e.status]));
+    const range = rangeReader(repo, plan);
+    const sources = new Map();
     const files = plan.newTests.map((file) => {
       const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
-      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source), pins: readPins(source), status: statusOf.get(file) ?? "A" };
+      sources.set(file, source);
+      // Pins only from the lines the pull request adds: a marker the file
+      // already had declares nothing (an unreadable diff declares nothing).
+      const added = range.addedLines(file);
+      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source), pins: added ? readPins(added.join("\n")) : [], status: statusOf.get(file) ?? "A" };
     });
     const phases = {};
     for (const phase of ["before", "head"]) {
@@ -1478,14 +1713,14 @@ async function runGateIn(opts) {
 
     // Only a file that is a regular file on both sides (status M) has an
     // earlier version to run; a type change (a link before) is never compared.
+    // It runs in the tree with the fix (installed, its own run finished).
     let earlier = null;
     const quiet = phases.before && phases.head && !stopState.signal ? files.filter((f) => f.status === "M" && quietBefore(phases.before.perFile.get(f.file))) : [];
     if (quiet.length) {
-      earlier = await runEarlier(repo, plan, trees.before, quiet, opts, work.path);
+      earlier = await runEarlier(repo, plan, trees.head, quiet, opts, work.path);
       reasons.push(...earlier.reasons);
     }
 
-    const range = rangeReader(repo, plan);
     const roots = rootsOf(trees.before);
     const addedFix = new Set(plan.addedFix);
     const fileNotes = [];
@@ -1494,7 +1729,8 @@ async function runGateIn(opts) {
       const context = {
         earlier: earlier?.perFile.get(f.file),
         changedTestLine: quiet.includes(f) ? range.testLine(f.file) : null,
-        addedByFix: (text) => addedByFix(text, f.file, { exports: range.exports, addedFix, roots, runnerDir: f.runner === "vitest" ? vitestDir(trees.before, f.file) : "" }),
+        pureAddition: f.status === "A" || range.pureAddition(f.file),
+        addedByFix: (text) => addedByFix(text, f.file, { source: sources.get(f.file), exportsByFile: range.exportsByFile, addedFix, roots, runnerDir: f.runner === "vitest" ? vitestDir(trees.before, f.file) : "" }),
       };
       const judged = judgeFile(f, phases.before?.perFile.get(f.file), phases.head?.perFile.get(f.file), context);
       reasons.push(...judged.reasons);
@@ -1524,12 +1760,16 @@ async function runGateIn(opts) {
     }
     if (!reasons.length && result.files.length > 0 && result.files.every((f) => f.kind)) {
       // Proven files decide a PASS. Collateral edits and declared pins alone
-      // prove nothing: the run is NEUTRAL, never a PASS.
+      // prove nothing: the run fails closed, so a green job always has a
+      // proven file.
       if (result.files.some((f) => f.proven)) result.verdict = "PASS";
       else {
-        result.verdict = "NEUTRAL";
-        result.reason = "NOTHING-TO-PROVE";
-        result.detail = `no test file of the pull request makes a red-first claim: ${result.files.length} changed test file(s) are collateral edits or declared pins`;
+        reasons.push({
+          code: "NOTHING-PROVEN",
+          phase: null,
+          file: null,
+          detail: `no test file of the pull request is proven red before the fix and green with it: its ${result.files.length} test file(s) are notes only (collateral edits or declared pins), which prove nothing; add a test that fails before the fix`,
+        });
       }
     }
     return result;
@@ -1595,10 +1835,10 @@ function emit(result, opts) {
   let headline;
   if (result.mode === "plan") headline = `RED-FIRST PLAN: ${result.verdict}${result.reason ? ` ${result.reason}` : ""}: ${result.detail}`;
   else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.filter((f) => f.proven).length} new test file(s) fail before the fix and pass with it${notProven})`;
-  else if (result.verdict === "SKIP" || result.verdict === "NEUTRAL") headline = `RED-FIRST: ${result.verdict} ${result.reason}: ${result.detail}`;
+  else if (result.verdict === "SKIP") headline = `RED-FIRST: ${result.verdict} ${result.reason}: ${result.detail}`;
   else headline = `RED-FIRST: RED (${result.reasons.length} reason(s))`;
   say(headline);
-  if (gha && (result.verdict === "SKIP" || result.verdict === "NEUTRAL")) say(`::notice title=red-first ${result.verdict}::${escapeData(`${result.reason}: ${result.detail}`)}`);
+  if (gha && result.verdict === "SKIP") say(`::notice title=red-first ${result.verdict}::${escapeData(`${result.reason}: ${result.detail}`)}`);
 
   if (opts.verdict) writeFileSync(opts.verdict, `${JSON.stringify(result, null, 2)}\n`);
   if (opts.githubOutput && result.mode === "plan") {
@@ -1715,10 +1955,9 @@ export async function main(argv) {
     const result = await runGate(opts);
     emit(result, opts);
     if (stopState.signal) return stopCode(stopState.signal);
-    // NEUTRAL: every changed test file is a collateral edit or declared pins;
-    // the job is green and its headline, notices and verdict say that nothing
-    // was proven.
-    if (result.verdict === "PASS" || result.verdict === "NEUTRAL") return 0;
+    // Only a PASS (at least one proven file) is green; notes alone are RED
+    // (NOTHING-PROVEN).
+    if (result.verdict === "PASS") return 0;
     return result.verdict === "SKIP" ? 3 : 1;
   } catch (error) {
     // Any error, not only a GateError, is exit 2 with its message (the
