@@ -16,11 +16,15 @@ name: red-first-gate
 # Two jobs. `plan` reads the pull request range and decides run or skip (no new
 # test, no change besides tests, or only excluded tests: the reason is in its
 # summary). `red-first` runs only on a plan verdict of run and exits 0 only
-# when every new test file outside `exclude` was proven red before the fix and
-# green with it; anything it cannot read or prove fails it with a named reason
-# (scripts/red-first-gate.mjs). So a pull request without new tests shows
-# `red-first` as skipped, never as success. New tests that match `exclude`
-# beside other new tests are listed as notices: they are not proven here.
+# when at least one new test file outside `exclude` was proven red before the
+# fix and green with it, and every other one is proven or listed as a notice
+# that makes no red-first claim (a collateral edit the fix needs, or tests
+# declared with a `red-first-pin:` marker); notices alone fail it
+# (NOTHING-PROVEN), and anything it cannot read or prove fails it with a named
+# reason (scripts/red-first-gate.mjs). So a pull request without new tests
+# shows `red-first` as skipped, never as success. New tests that match
+# `exclude` beside other new tests are listed as notices: they are not proven
+# here.
 # Linux or macOS runners only: the steps run in bash.
 on:
   workflow_call:
@@ -148,6 +152,13 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ inputs.node_version }}
+
+      # The gate reads the fix side's exports and the tests' imports with the
+      # TypeScript parser of its own lockfile (no other runtime dependency).
+      - name: Install the gate's parser
+        shell: bash
+        working-directory: .red-first-gate
+        run: npm ci --include=dev --ignore-scripts --no-audit --no-fund
 
       - name: Red before the fix, green with it
         shell: bash

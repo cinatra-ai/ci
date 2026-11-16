@@ -252,18 +252,45 @@ test("repeat case (3): a test file that never loads is RED (LOAD-ERROR), never c
   assert.match(r.verdict.reasons.find((x) => x.code === "LOAD-ERROR").detail, /Cannot find module|ERR_MODULE_NOT_FOUND/);
 });
 
-test("repeat case (3): a test file that loads only with the fix is RED: a load error before is not a red-first failure", async (t) => {
+const SUM_FILE_TEST = `${TEST_HEAD}import { sum } from "../src/sum.mjs";\n\ntest("sum adds", () => {\n  assert.equal(sum(1, 2), 3);\n});\n`;
+
+test("repeat case (3): a test file that loads only with the fix is proven only when the load error names a module the fix adds", async (t) => {
   const sc = scenario(t, {
     base: BASE,
-    head: {
-      "src/calc.mjs": CALC_FIX,
-      "src/sum.mjs": 'export { add as sum } from "./calc.mjs";\n',
-      "test/sum.test.mjs": `${TEST_HEAD}import { sum } from "../src/sum.mjs";\n\ntest("sum adds", () => {\n  assert.equal(sum(1, 2), 3);\n});\n`,
-    },
+    head: { "src/calc.mjs": CALC_FIX, "src/sum.mjs": 'export { add as sum } from "./calc.mjs";\n', "test/sum.test.mjs": SUM_FILE_TEST },
   });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.notes.map((n) => `${n.code}:${n.file}`), ["ADDED-BY-FIX:test/sum.test.mjs"]);
+  assert.match(r.verdict.notes[0].detail, /the module src\/sum\.mjs is not there yet/);
+});
+
+test("repeat case (3): a load error before the fix that names nothing the fix adds stays RED (LOAD-ERROR), also when the file loads with the fix", async (t) => {
+  // The file throws while it loads unless the fix is there: no module and no
+  // export of the fix side is named, so this is not a red-first failure.
+  const guarded = `${TEST_HEAD}import { existsSync } from "node:fs";\nimport { add } from "../src/calc.mjs";\n\nif (!existsSync(new URL("../src/FIXED", import.meta.url))) throw new Error("the setup is not ready");\ntest("add sums two numbers", () => {\n  assert.equal(add(1, 2), 3);\n});\n`;
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "src/FIXED": "", "test/calc.test.mjs": guarded } });
   const r = runGate(sc, "run");
   assertRed(r, "LOAD-ERROR");
   assert.deepEqual(r.verdict.reasons.map((x) => `${x.code}:${x.phase}`), ["LOAD-ERROR:before"]);
+});
+
+test("a module that exists before the fix is no evidence: a load error naming it stays RED (LOAD-ERROR)", async (t) => {
+  // src/sum.mjs is there before the fix and the fix changes it; the test file
+  // imports a path beside it that nothing adds.
+  const sc = scenario(t, {
+    base: { ...BASE, "src/sum.mjs": "export const sum = (a, b) => a - b;\n" },
+    head: { "src/sum.mjs": "export const sum = (a, b) => a + b;\n", "test/sum.test.mjs": SUM_FILE_TEST.replace("../src/sum.mjs", "../src/sums.mjs") },
+  });
+  assertRed(runGate(sc, "run"), "LOAD-ERROR");
+});
+
+test("a named import of an export the fix adds: the load error before names it, and the file is proven", async (t) => {
+  const named = `${TEST_HEAD}import { sum } from "../src/calc.mjs";\n\ntest("sum adds", () => {\n  assert.equal(sum(1, 2), 3);\n});\n`;
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n`, "test/sum.test.mjs": named } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.match(r.verdict.notes[0].detail, /the export sum is not there yet/);
 });
 
 test("a module the fix adds: imported inside the test with a marker, the failure before is a test failure and is proven", async (t) => {
@@ -300,15 +327,40 @@ test("a marker that matches the failure text proves a non-assertion failure", as
   assertPass(runGate(sc, "run"));
 });
 
-test("a non-assertion failure without a marker is RED (WRONG-REASON)", async (t) => {
-  const sumTest = `${TEST_HEAD}import * as calc from "../src/calc.mjs";\n\ntest("sum adds", () => {\n  assert.equal(calc.sum(1, 2), 3);\n});\n`;
+const SUM_CALL_TEST = `${TEST_HEAD}import * as calc from "../src/calc.mjs";\n\ntest("sum adds", () => {\n  assert.equal(calc.sum(1, 2), 3);\n});\n`;
+
+test("a call of an export the fix adds fails before with a TypeError that names it: proven without a marker, with a note", async (t) => {
   const sc = scenario(t, {
     base: BASE,
-    head: { "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n`, "test/sum.test.mjs": sumTest },
+    head: { "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n`, "test/sum.test.mjs": SUM_CALL_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.notes.map((n) => n.code), ["ADDED-BY-FIX"]);
+  assert.match(r.verdict.notes[0].detail, /the export sum is not there yet/);
+});
+
+test("a non-assertion failure without a marker is RED (WRONG-REASON) when it names nothing the fix adds", async (t) => {
+  // The fix adds the export sum. The test fails before with a TypeError about
+  // a helper of its own (tools.format), which the fix does not add.
+  const unrelated = `${TEST_HEAD}import { existsSync } from "node:fs";\nimport * as calc from "../src/calc.mjs";\n\nconst tools = existsSync(new URL("../src/FIXED", import.meta.url)) ? { format: (n) => n } : {};\ntest("sum adds", () => {\n  assert.equal(tools.format(calc.sum(1, 2)), 3);\n});\n`;
+  const sc = scenario(t, {
+    base: { ...BASE, "src/calc.mjs": `${CALC_BUG}export function sum(a, b) {\n  return a + b;\n}\n` },
+    head: { "src/calc.mjs": `${CALC_FIX}export function sum(a, b) {\n  return a + b;\n}\nexport function total(list) {\n  return list.length;\n}\n`, "src/FIXED": "", "test/sum.test.mjs": unrelated },
   });
   const r = runGate(sc, "run");
   assertRed(r, "WRONG-REASON");
-  assert.match(r.verdict.reasons.find((x) => x.code === "WRONG-REASON").detail, /TypeError/);
+  assert.match(r.verdict.reasons.find((x) => x.code === "WRONG-REASON").detail, /TypeError: tools\.format is not a function/);
+});
+
+test("an export whose line the fix only changes is not a new export: the TypeError stays RED (WRONG-REASON)", async (t) => {
+  // calc.sum exists before the fix as a number, so the call throws; the fix
+  // rewrites that export line. Nothing is added: no evidence.
+  const sc = scenario(t, {
+    base: { ...BASE, "src/calc.mjs": `${CALC_BUG}export const sum = 0;\n` },
+    head: { "src/calc.mjs": `${CALC_BUG}export const sum = (a, b) => a + b;\n`, "test/sum.test.mjs": SUM_CALL_TEST },
+  });
+  assertRed(runGate(sc, "run"), "WRONG-REASON");
 });
 
 test("a fix that does not make the new test pass is RED (NOT-GREEN-AT-HEAD)", async (t) => {
@@ -578,8 +630,12 @@ const args = process.argv.slice(2);
 const spec = JSON.parse(readFileSync(process.env.FAKE_VITEST_SPEC, "utf8"));
 const cwd = process.cwd();
 const phase = existsSync(join(cwd, "src", "FIXED")) ? "head" : "before";
-appendFileSync(process.env.FAKE_VITEST_LOG, JSON.stringify({ phase, cwd, args }) + "\\n");
-const step = spec[phase];
+const log = process.env.FAKE_VITEST_LOG;
+const prior = existsSync(log) ? readFileSync(log, "utf8").split("\\n").filter((l) => l && JSON.parse(l).phase === phase).length : 0;
+const texts = Object.fromEntries(args.filter((a) => !a.startsWith("-") && a !== "run" && existsSync(join(cwd, a))).map((a) => [a, readFileSync(join(cwd, a), "utf8")]));
+appendFileSync(log, JSON.stringify({ phase, cwd, args, texts }) + "\\n");
+// The second run in the tree with the fix is the run of the earlier versions.
+const step = phase === "head" && prior > 0 && spec.earlier ? spec.earlier : spec[phase];
 const out = args.find((a) => a.startsWith("--outputFile.json="));
 if (out && step.report) writeFileSync(out.slice("--outputFile.json=".length), JSON.stringify(step.report).replaceAll("<cwd>", cwd));
 process.exit(step.exit ?? 0);
@@ -596,9 +652,9 @@ function vitestReport(files, { success } = {}) {
       status: f.status,
       message: f.message ?? "",
       assertionResults: (f.tests ?? []).map((x) => ({
-        ancestorTitles: ["calc"],
+        ancestorTitles: [f.suite ?? "calc"],
         title: x.title,
-        fullName: `calc ${x.title}`,
+        fullName: `${f.suite ?? "calc"} ${x.title}`,
         status: x.status,
         failureMessages: x.failure ? [x.failure] : [],
       })),
@@ -613,8 +669,8 @@ const ASSERT_FAIL = "AssertionError: expected -1 to be 3 // Object.is equality\n
 const GOOD_BEFORE = vitestReport([{ rel: "src/calc.test.ts", status: "failed", tests: [{ title: "adds", status: "failed", failure: ASSERT_FAIL }] }]);
 const GOOD_HEAD = vitestReport([{ rel: "src/calc.test.ts", status: "passed", tests: [{ title: "adds", status: "passed" }] }]);
 
-function runVitest(t, spec, vitestTail = "") {
-  const sc = scenario(t, { base: V_BASE, head: V_HEAD });
+function runVitest(t, spec, vitestTail = "", files = { base: V_BASE, head: V_HEAD }) {
+  const sc = scenario(t, files);
   const fake = path.join(sc.root, "fake-vitest.mjs");
   const specFile = path.join(sc.root, "fake-spec.json");
   const log = path.join(sc.root, "fake-log.jsonl");
@@ -1252,4 +1308,1205 @@ test("S1c README: the red-first Inputs table lists every workflow input, in one 
   for (let i = start + 2; i < lines.length && lines[i].startsWith("|"); i += 1) names.push(/^\| `([a-z_]+)` \|/.exec(lines[i])?.[1]);
   const wf = load(fs.readFileSync(WORKFLOW, "utf8"));
   assert.deepEqual(names.sort(), Object.keys(wf.on.workflow_call.inputs).sort());
+});
+
+// ---------------------------------------------------------------------------
+// Honest shapes that make no red-first claim, and the tests that still must
+// fail first. The first block runs real node:test files; the second rebuilds,
+// with the vitest stand-in, the test-side changes and the report texts of
+// three pull requests that the gate judged RED.
+// ---------------------------------------------------------------------------
+
+// A publisher that ignores a failed compile (the bug), and refuses it (the fix).
+const PUB_BUG = 'export function publish(compile) {\n  const result = compile();\n  return result.ok ? "published with a compile" : "published";\n}\n';
+const PUB_FIX = 'export function publish(compile) {\n  const result = compile();\n  if (!result.ok) throw new Error("compile failed");\n  return "published";\n}\n';
+// The existing test file: its compile stub fails, which the bug tolerates.
+const PUB_OLD = `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst compile = () => ({ ok: false });\n\ntest("publishes the package", () => {\n  assert.match(publish(compile), /^published/);\n});\n`;
+// The collateral edit: only the stub changes, so the old test keeps working.
+const PUB_NEW = PUB_OLD.replace("({ ok: false })", "({ ok: true, value: {} })");
+const REFUSE_TEST = `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\ntest("a failed compile refuses the publish", () => {\n  assert.throws(() => publish(() => ({ ok: false })), /compile failed/);\n});\n`;
+const PUB_BASE = { "package.json": '{ "type": "module" }\n', "src/publish.mjs": PUB_BUG, "test/publish.test.mjs": PUB_OLD };
+
+function noteCodes(result) {
+  assert.ok(result.verdict, `no verdict file (exit ${result.code}): ${result.stderr.slice(0, 400)}`);
+  return result.verdict.notes.map((n) => `${n.code}:${n.file}`);
+}
+
+test("shape 1: an edit that only keeps an existing test file working is a COLLATERAL note beside the proven new test", async (t) => {
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/refuse.test.mjs": REFUSE_TEST } });
+  const summary = path.join(sc.root, "summary.md");
+  const r = runGate(sc, "run", ["--summary", summary]);
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), ["COLLATERAL:test/publish.test.mjs"]);
+  assert.deepEqual(r.verdict.files.map((f) => `${f.file}:${f.kind}:${f.proven}`), ["test/publish.test.mjs:collateral:false", "test/refuse.test.mjs:proven:true"]);
+  assert.match(r.stdout, /^RED-FIRST: PASS \(1 new test file\(s\) fail before the fix and pass with it; 1 changed test file\(s\) collateral, not proven here\)/m);
+  assert.match(fs.readFileSync(summary, "utf8"), /publish\.test\.mjs \| node \| no \(collateral\)/);
+});
+
+test("shape 1 alone: a pull request whose only test change is a collateral edit proves nothing: RED (NOTHING-PROVEN), the note kept", async (t) => {
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOTHING-PROVEN");
+  assert.deepEqual(codes(r), ["NOTHING-PROVEN"]);
+  assert.match(r.verdict.reasons[0].detail, /notes only .* which prove nothing; add a test that fails before the fix/);
+  assert.deepEqual(noteCodes(r), ["COLLATERAL:test/publish.test.mjs"]);
+  assert.deepEqual(r.verdict.files.map((f) => `${f.kind}:${f.proven}`), ["collateral:false"]);
+  assert.doesNotMatch(r.stdout, /NEUTRAL/);
+});
+
+test("rubber stamp 1: a test added to an existing file that passes before the fix, with no marker, stays RED and is named", async (t) => {
+  const added = `${PUB_NEW}\ntest("returns a text", () => {\n  assert.equal(typeof publish(compile), "string");\n});\n`;
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": added, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  const reason = r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE");
+  assert.match(reason.detail, /all 2 test\(s\) already pass before the fix; 1 test\(s\) the pull request adds do not fail first: returns a text/);
+  assert.match(reason.detail, /red-first-pin:/);
+});
+
+test("rubber stamp 2: a row added to a table of an existing file adds a test although no line declares one: RED", async (t) => {
+  // The edit holds no `test(` and no assertion; the earlier version's run shows the new name.
+  const table = (rows) => `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst rows = [\n${rows.map((x) => `  ${JSON.stringify(x)},\n`).join("")}];\nfor (const [name, ok] of rows) {\n  test(name, () => {\n    assert.match(publish(() => ({ ok })), /^published/);\n  });\n}\n`;
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": table([["with a good compile", true]]) },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": table([["with a good compile", true], ["with another good compile", true]]) },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: with another good compile/);
+});
+
+test("rubber stamp 3: an assertion changed under an unchanged test name that passes on both sides is RED: a changed test must fail first", async (t) => {
+  const loosened = PUB_NEW.replace("assert.match(publish(compile), /^published/);", "assert.ok(publish(compile).length > 0);");
+  const sc = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": loosened } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /the edit adds no test but changes a test declaration or an assertion \(.*assert\.ok/);
+});
+
+test("a changed file whose earlier version cannot be read is not collateral: RED (NOT-RED-BEFORE) with the cause", async (t) => {
+  // The earlier version imports a fixture the pull request deletes, so it does not load in the tree before the fix.
+  const old = PUB_OLD.replace("import { publish }", 'import "./__fixtures__/env.mjs";\nimport { publish }');
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": old, "test/__fixtures__/env.mjs": "export {};\n" },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/__fixtures__/env.mjs": null },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /earlier version could not be read to compare them \(it does not load/);
+});
+
+// Shape 2 adds to a file whose tests already pass with the fix (no collateral edit).
+const PIN_BASE = { ...PUB_BASE, "test/publish.test.mjs": PUB_NEW };
+// The pin of shape 2: the fix keeps this behaviour, so the test passes before and with the fix.
+const PIN_TEST = 'test("a good compile still publishes", () => {\n  assert.match(publish(() => ({ ok: true })), /^published/);\n});\n';
+
+test("shape 2: a test added to an existing file and declared with red-first-pin is a PIN note beside the proven new test", async (t) => {
+  const pinned = `${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`;
+  const sc = scenario(t, { base: PIN_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": pinned, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), ["PIN:test/publish.test.mjs"]);
+  assert.match(r.stdout, /^RED-FIRST: PASS \(1 new test file\(s\) fail before the fix and pass with it; 1 test file\(s\) with declared pins only, not proven here\)/m);
+  // The same pull request without the marker: the added test must fail first.
+  const bare = scenario(t, { base: PIN_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": `${PUB_NEW}\n${PIN_TEST}`, "test/refuse.test.mjs": REFUSE_TEST } });
+  assertRed(runGate(bare, "run"), "NOT-RED-BEFORE");
+});
+
+test("shape 2: a pin marker never covers another added test, names a test of the file, and names a test that passes before", async (t) => {
+  const head = (file) => ({ "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": file, "test/refuse.test.mjs": REFUSE_TEST });
+  // one declared pin and one more added test without a marker
+  const two = scenario(t, { base: PIN_BASE, head: head(`${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}\ntest("returns a text", () => {\n  assert.equal(typeof publish(compile), "string");\n});\n`) });
+  const r = runGate(two, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: returns a text/);
+  // a marker that names no test
+  const stray = scenario(t, { base: PIN_BASE, head: head(`${PUB_NEW}\n// red-first-pin: a test that is not here\n${PIN_TEST}`) });
+  assertRed(runGate(stray, "run"), "PIN-MISMATCH");
+  // a marker on a test that fails before the fix
+  const red = scenario(t, { base: PUB_BASE, head: { "src/publish.mjs": PUB_FIX, "test/refuse.test.mjs": REFUSE_TEST.replace(TEST_HEAD, `${TEST_HEAD}// red-first-pin: a failed compile refuses the publish\n`) } });
+  const rr = runGate(red, "run");
+  assertRed(rr, "PIN-MISMATCH");
+  assert.match(rr.verdict.reasons[0].detail, /is failed before the fix/);
+});
+
+test("shape 2: a declared pin that does not pass with the fix is RED (NOT-GREEN-AT-HEAD)", async (t) => {
+  const broken = `${PUB_NEW}\n// red-first-pin: a bad compile still publishes\ntest("a bad compile still publishes", () => {\n  assert.match(publish(() => ({ ok: false })), /^published/);\n});\n`;
+  const sc = scenario(t, { base: PIN_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": broken, "test/refuse.test.mjs": REFUSE_TEST } });
+  assertRed(runGate(sc, "run"), "NOT-GREEN-AT-HEAD");
+});
+
+// --- the three pull requests, with the vitest stand-in ----------------------
+
+const AG = "packages/agents";
+const AG_CONFIG = { [`${AG}/vitest.config.mjs`]: "export default {};\n" };
+const passedFile = (rel, suite, titles) => ({ rel, suite, status: "passed", tests: titles.map((title) => ({ title, status: "passed" })) });
+const ASSERT_REJECT = 'AssertionError: promise resolved "{ ok: true }" instead of rejecting\n    at x';
+
+// Pull request A: its fix makes the publisher refuse a failed compile, so it
+// changed the compile mock of an existing test file (the three changed lines
+// below are the pull request's) and added new test files.
+const A_FILE = `${AG}/src/__tests__/publish-git-dir-run-declarations-3924.test.ts`;
+const A_OLD = 'import { describe, expect, it, vi } from "vitest";\n\nvi.mock("../oas-compiler", () => ({\n  compileOasAgentJson: vi.fn(async () => ({ ok: false })),\n}));\n\nimport { publishAgentPackageFromGitDir } from "../verdaccio/client";\n\ndescribe("publish from a git dir", () => {\n  it("carries the run declarations", async () => {\n    expect(await publishAgentPackageFromGitDir({ agentDir: "a" })).toBeTruthy();\n  });\n  it("refuses a malformed declaration", async () => {\n    await expect(publishAgentPackageFromGitDir({ agentDir: "b" })).rejects.toThrow();\n  });\n});\n';
+const A_NEW = A_OLD.replace(
+  'vi.mock("../oas-compiler", () => ({\n  compileOasAgentJson: vi.fn(async () => ({ ok: false })),',
+  '// cinatra#4264: the publisher refuses a failed compile, so the mock compiles.\nvi.mock("../oas-compiler", () => ({\n  compileOasAgentJson: vi.fn(async () => ({ ok: true, value: {} })),',
+);
+const A_TITLES = ["carries the run declarations", "refuses a malformed declaration"];
+const A_REL = "src/__tests__/publish-git-dir-run-declarations-3924.test.ts";
+const A_NEW_REL = "src/__tests__/publish-lifecycle-carry-4264.test.ts";
+const A_FILES = {
+  base: { ...AG_CONFIG, [`${AG}/src/verdaccio/client.ts`]: "export const refuse = false;\n", [A_FILE]: A_OLD },
+  head: { [`${AG}/src/verdaccio/client.ts`]: "export const refuse = true;\n", [`${AG}/src/FIXED`]: "", [A_FILE]: A_NEW, [`${AG}/${A_NEW_REL}`]: "// the new test file\n" },
+};
+const A_QUIET = passedFile(A_REL, "publish from a git dir", A_TITLES);
+const A_RED = { rel: A_NEW_REL, suite: "carry", status: "failed", tests: [{ title: "a failed compile refuses the publish", status: "failed", failure: ASSERT_REJECT }] };
+const A_GREEN = passedFile(A_NEW_REL, "carry", ["a failed compile refuses the publish"]);
+// The earlier version (compile mock { ok: false }) run with the fix: the publisher refuses, so it fails.
+const A_EARLIER = {
+  rel: A_REL,
+  suite: "publish from a git dir",
+  status: "failed",
+  tests: [{ title: A_TITLES[0], status: "failed", failure: "Error: compile failed\n    at x" }, { title: A_TITLES[1], status: "passed" }],
+};
+
+test("pull request A (collateral mock edit): PASS with a COLLATERAL note; the earlier version runs once, in the tree with the fix, and fails there", async (t) => {
+  const r = runVitest(
+    t,
+    {
+      before: { report: vitestReport([A_QUIET, A_RED]), exit: 1 },
+      head: { report: vitestReport([A_QUIET, A_GREEN]), exit: 0 },
+      earlier: { report: vitestReport([A_EARLIER]), exit: 1 },
+    },
+    "",
+    A_FILES,
+  );
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), [`COLLATERAL:${A_FILE}`]);
+  assert.match(r.verdict.notes[0].detail, /earlier version fails with the fix \(publish from a git dir carries the run declarations\)/);
+  assert.deepEqual(r.calls.map((c) => c.phase), ["before", "head", "head"]);
+  const [first, , third] = r.calls;
+  assert.match(first.texts[A_REL], /ok: true, value: \{\}/);
+  assert.deepEqual(Object.keys(third.texts), [A_REL]);
+  assert.match(third.texts[A_REL], /ok: false/, "the third run reads the file's earlier version");
+});
+
+test("pull request A: a test name that only the new version reports makes the edit a new test (NOT-RED-BEFORE)", async (t) => {
+  const grown = passedFile(A_REL, "publish from a git dir", [...A_TITLES, "publishes after a good compile"]);
+  const r = runVitest(
+    t,
+    {
+      before: { report: vitestReport([grown, A_RED]), exit: 1 },
+      head: { report: vitestReport([grown, A_GREEN]), exit: 0 },
+      earlier: { report: vitestReport([A_EARLIER]), exit: 1 },
+    },
+    "",
+    A_FILES,
+  );
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /publish from a git dir publishes after a good compile/);
+});
+
+test("pull request A: an earlier version with no readable report is not collateral (NOT-RED-BEFORE)", async (t) => {
+  const r = runVitest(
+    t,
+    {
+      before: { report: vitestReport([A_QUIET, A_RED]), exit: 1 },
+      head: { report: vitestReport([A_QUIET, A_GREEN]), exit: 0 },
+      earlier: { exit: 1 },
+    },
+    "",
+    A_FILES,
+  );
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /its run gave no readable report/);
+});
+
+// Pull request B: it added one pin test to an existing file (the test passes
+// before the fix by design) and a new test file for a new export, whose tests
+// all failed before the fix with the TypeError below, none by an assertion.
+const B_PIN_FILE = `${AG}/src/__tests__/import-agent-core-lifecycle-config.test.ts`;
+const B_PIN_REL = "src/__tests__/import-agent-core-lifecycle-config.test.ts";
+const B_NEW_REL = "src/__tests__/regenerate-declaration-check-4264.test.ts";
+const B_SUITE = "importAgentTemplateCore compiles cinatra.lifecycle";
+const B_PIN_TITLE = "cinatra#4264 A1a: a declared regenerate list is not stored on lifecycleConfig (A1b stores it)";
+const B_OLD = 'import { describe, expect, it } from "vitest";\n\ndescribe("importAgentTemplateCore compiles cinatra.lifecycle", () => {\n  it("stores a declared block", async () => {\n    expect(1).toBe(1);\n  });\n\n  it("a MALFORMED block does not crash the import", async () => {\n    expect(1).toBe(1);\n  });\n});\n';
+const B_ADDED = `  it("${B_PIN_TITLE}", async () => {\n    const regenerate = [{ artifactNode: "file_image", step: "image_flow", noteInput: "prompt" }];\n    await importZip({ lifecycle: { regenerate } });\n    expect(createInput().lifecycleConfig).toBeNull();\n  });\n\n`;
+const bNew = (marker) => B_OLD.replace('  it("a MALFORMED block', `${marker}${B_ADDED}  it("a MALFORMED block`);
+const B_TYPE_ERROR = "TypeError: (0 , __vite_ssr_import_1__.checkRegenerateDeclaration) is not a function\n    at x";
+const B_CONTRACT = `${AG}/src/verdaccio/package-contract.ts`;
+const B_CONTRACT_HEAD = "export const agentLifecycleDeclarationSchema = {};\nexport function checkRegenerateDeclaration(flow) {\n  return { ok: Boolean(flow) };\n}\n";
+const bFiles = (marker, contract) => ({
+  base: { ...AG_CONFIG, [B_CONTRACT]: "export const agentLifecycleDeclarationSchema = {};\n", [B_PIN_FILE]: B_OLD },
+  head: { [B_CONTRACT]: contract, [`${AG}/src/FIXED`]: "", [B_PIN_FILE]: bNew(marker), [`${AG}/${B_NEW_REL}`]: 'import { checkRegenerateDeclaration } from "../verdaccio/package-contract";\n' },
+});
+const B_OLD_TITLES = ["stores a declared block", "a MALFORMED block does not crash the import"];
+const B_CHECKS = ["accepts a wired declaration", "refuses an unknown step"];
+const B_AT_HEAD = [B_OLD_TITLES[0], B_PIN_TITLE, B_OLD_TITLES[1]];
+const bSpec = () => ({
+  before: {
+    report: vitestReport([
+      passedFile(B_PIN_REL, B_SUITE, B_AT_HEAD),
+      { rel: B_NEW_REL, suite: "checkRegenerateDeclaration", status: "failed", tests: B_CHECKS.map((title) => ({ title, status: "failed", failure: B_TYPE_ERROR })) },
+    ]),
+    exit: 1,
+  },
+  head: { report: vitestReport([passedFile(B_PIN_REL, B_SUITE, B_AT_HEAD), passedFile(B_NEW_REL, "checkRegenerateDeclaration", B_CHECKS)]), exit: 0 },
+  earlier: { report: vitestReport([passedFile(B_PIN_REL, B_SUITE, B_OLD_TITLES)]), exit: 0 },
+});
+const B_MARKER = "  // red-first-pin: a declared regenerate list is not stored on lifecycleConfig\n";
+
+test("pull request B as it was pushed: the new export's TypeError is the right reason now; the undeclared pin test is the one reason left", async (t) => {
+  const r = runVitest(t, bSpec(), "", bFiles("", B_CONTRACT_HEAD));
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.deepEqual(codes(r), ["NOT-RED-BEFORE"]);
+  assert.equal(r.verdict.reasons[0].file, B_PIN_FILE);
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: .*a declared regenerate list is not stored/);
+  assert.equal(r.verdict.files.find((f) => f.file === `${AG}/${B_NEW_REL}`).proven, true);
+});
+
+test("pull request B with its pin declared: PASS, the new export file proven with a note, the pin a PIN note", async (t) => {
+  const r = runVitest(t, bSpec(), "", bFiles(B_MARKER, B_CONTRACT_HEAD));
+  assertPass(r);
+  assert.deepEqual(noteCodes(r).sort(), [`ADDED-BY-FIX:${AG}/${B_NEW_REL}`, `PIN:${B_PIN_FILE}`]);
+  assert.match(r.verdict.notes.find((n) => n.code === "ADDED-BY-FIX").detail, /the export checkRegenerateDeclaration is not there yet/);
+});
+
+test("pull request B's TypeError without the export on the fix side is still RED (WRONG-REASON)", async (t) => {
+  // Same reports, but the fix side does not add checkRegenerateDeclaration.
+  const r = runVitest(t, bSpec(), "", bFiles(B_MARKER, "export const agentLifecycleDeclarationSchema = { strict: false };\n"));
+  assertRed(r, "WRONG-REASON");
+});
+
+// Pull request C: a new test file imports, at its top, a module the fix adds;
+// before the fix the file does not load, with the runner's message below.
+const C_TEST = "scripts/extensions/__tests__/agent-hitl-screen-schema.test.mjs";
+const C_MODULE = "scripts/extensions/agent-hitl-screen-schema.mjs";
+const cFiles = (module) => ({
+  base: { "vitest.config.mjs": "export default {};\n", "scripts/extensions/index.mjs": "export {};\n" },
+  head: { [module]: "export const schema = {};\n", "src/FIXED": "", [C_TEST]: 'import { schema } from "../agent-hitl-screen-schema.mjs";\n' },
+});
+const cSpec = () => ({
+  before: { report: vitestReport([{ rel: C_TEST, status: "failed", message: `Cannot find module '../agent-hitl-screen-schema.mjs' imported from <cwd>/${C_TEST}`, tests: [] }]), exit: 1 },
+  head: { report: vitestReport([passedFile(C_TEST, "schema", ["accepts a screen", "refuses an unknown key"])]), exit: 0 },
+});
+
+test("pull request C (a new test file of a module the fix adds): the load error names that module, so the file is proven with a note", async (t) => {
+  const r = runVitest(t, cSpec(), "", cFiles(C_MODULE));
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), [`ADDED-BY-FIX:${C_TEST}`]);
+  assert.ok(r.verdict.notes[0].detail.includes(`the module ${C_MODULE} is not there yet`), r.verdict.notes[0].detail);
+});
+
+test("pull request C's load error when the fix side adds another module is still RED (LOAD-ERROR)", async (t) => {
+  assertRed(runVitest(t, cSpec(), "", cFiles("scripts/extensions/agent-hitl-screen-render.mjs")), "LOAD-ERROR");
+});
+
+// --- units -------------------------------------------------------------------
+
+test("pins: red-first-pin lines are read like markers; an empty one is dropped", async () => {
+  const { readPins, readMarkers } = await gateModule();
+  const source = "// red-first-pin: keeps the old answer\n/* red-first-pin:  stays null */\n// red-first-pin:\n// red-first-expect: boom\n";
+  assert.deepEqual(readPins(source), ["keeps the old answer", "stays null"]);
+  assert.deepEqual(readMarkers(source), ["boom"]);
+});
+
+test("evidence: the name a not-a-function text calls, the exports of added lines, and the modules a text misses", async () => {
+  const { missingCallable, exportNames, missingModules, parseRangeDiff, changedTestLine, addedByFix } = await gateModule();
+  assert.equal(missingCallable("TypeError: (0 , __vite_ssr_import_1__.checkRegenerateDeclaration) is not a function"), "checkRegenerateDeclaration");
+  assert.equal(missingCallable("TypeError: calc.sum is not a function"), "sum");
+  assert.equal(missingCallable("TypeError: Widget is not a constructor"), "Widget");
+  assert.equal(missingCallable("TypeError: (0 , _mod.default) is not a function"), null);
+  assert.equal(missingCallable("TypeError: rows[0] is not a function"), null);
+  assert.equal(missingCallable("Error: calc.sum is not a function"), null, "only a TypeError that starts the text");
+  assert.equal(missingCallable("TypeError: Cannot read properties of undefined (reading 'sum')"), null);
+  assert.deepEqual(
+    exportNames(["export function a() {}", "export async function* b() {}", "  export const c = 1;", "export class D {}", "export { e, f as g, type H };", "exports.i = 1;", "module.exports.j = 2;", "export default function k() {}", "export type L = string;", "export interface M {}", "const n = 1;"]),
+    ["a", "b", "c", "D", "e", "g", "i", "j"],
+  );
+  assert.deepEqual(missingModules("Error: Cannot find module '../x.mjs' imported from /t/test/a.test.mjs"), [{ spec: "../x.mjs", importer: "/t/test/a.test.mjs", kind: "node" }]);
+  assert.deepEqual(missingModules('Failed to resolve import "./y" from "src/a.test.ts". Does the file exist?'), [{ spec: "./y", importer: "src/a.test.ts", kind: "node" }]);
+  assert.deepEqual(missingModules("Failed to load url /src/z.ts (resolved id: /src/z.ts) in /t/src/a.test.ts. Does the file exist?"), [{ spec: "/src/z.ts", importer: "/t/src/a.test.ts", kind: "vite" }]);
+  const diff = parseRangeDiff(
+    'diff --git a/src/a.mjs b/src/a.mjs\nindex 1..2 100644\n--- a/src/a.mjs\n+++ b/src/a.mjs\n@@ -1 +1,2 @@\n-export function old() {}\n+export function old(x) {}\n+export function fresh() {}\ndiff --git "a/src/q\\"uote.mjs" "b/src/q\\"uote.mjs"\n--- "a/src/q\\"uote.mjs"\n+++ "b/src/q\\"uote.mjs"\n@@ -0,0 +1 @@\n+export function hidden() {}\n',
+  );
+  assert.deepEqual([...diff.keys()], ["src/a.mjs"]);
+  assert.deepEqual(diff.get("src/a.mjs"), { added: ["export function old(x) {}", "export function fresh() {}"], removed: ["export function old() {}"] });
+  // changed lines of a test file: declarations and assertions count, comments and other calls do not
+  assert.equal(changedTestLine(["// expect(a).toBe(1) in a comment", ' * it("x")', "  compile: vi.fn(async () => ({ ok: true })),", "const hit = /x/.test(name);"]), null);
+  for (const line of ['  it("x", () => {});', "test.each(rows)('x', fn);", "describe.skip(`x`, fn);", "  expect(a).toBe(1);", "  assert.equal(a, 1);", "    .toEqual({ a: 1 });", "  await expect(p).rejects.toThrow();", "/* note */ expect(a).toBe(1);"]) {
+    assert.equal(changedTestLine([line]), line, line);
+  }
+  const source = 'import * as calc from "../src/calc.mjs";\nimport { sum } from "../src/calc.mjs";\nimport { x } from "../src/sum.js";\nimport kit from "../lib/kit";\n';
+  const ctx = { source, exportsByFile: () => new Map([["src/calc.mjs", new Set(["sum"])]]), addedFix: new Set(["src/sum.ts", "lib/kit/index.mjs"]), roots: ["/t"], runnerDir: "pkg" };
+  assert.equal(addedByFix("TypeError: calc.sum is not a function", "test/a.test.mjs", ctx), "the export sum");
+  assert.equal(addedByFix("TypeError: calc.total is not a function", "test/a.test.mjs", ctx), null);
+  assert.equal(addedByFix("SyntaxError: The requested module '../src/calc.mjs' does not provide an export named 'sum'", "test/a.test.mjs", ctx), "the export sum");
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.js' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), "the module src/sum.ts");
+  assert.equal(addedByFix("Error: Cannot find module '../lib/kit' imported from /elsewhere/a.test.mjs", "test/a.test.mjs", ctx), "the module lib/kit/index.mjs");
+  assert.equal(addedByFix("Error: Cannot find module '../../outside.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), null);
+  assert.equal(addedByFix("Error: Cannot find package 'left-pad' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), null);
+});
+
+// Finding 3 of the review: what the fix adds is bound to the test file's own imports and to code.
+test("evidence is bound: the export is new in the module the test file imports it from, the module is one the test file imports", async () => {
+  const { addedByFix, exportNames, exportsOf, importsOf, missingModules, evidencePath } = await gateModule();
+  // an export declared without a value, or in a declaration file, is no value
+  assert.deepEqual(exportNames(["export declare function ghost(): void;", "export declare const c: number;"]), []);
+  assert.equal(evidencePath("src/types.d.ts"), false);
+  assert.equal(evidencePath("src/sum.ts"), true);
+  // test code on the fix side by its place or name is never evidence
+  for (const p of ["test/support.mjs", "src/__mocks__/x.ts", "tests/helpers/a.mjs", "src/test-utils/a.ts", "src/sum.fixture.ts", "src/mock-server.ts"]) assert.equal(evidencePath(p), false, p);
+  // an export inside a comment, a template literal or a string is not an export
+  assert.deepEqual([...exportsOf("/*\nexport function ghost() {}\n*/\nconst t = `\nexport function phantom() {}\n`;\nconst s = 'export function spook() {}';\nexport function real() {}\n")], ["real"]);
+  assert.deepEqual([...exportsOf("a = /['\"]/; b = 1;\nexport const real = 1;\n")], ["real"]);
+  // a regular expression after a keyword that holds a backtick: never a template that would expose a later one
+  assert.deepEqual([...exportsOf("function f(x) {\n  return /`/.test(x);\n}\nconst t = `\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+  assert.deepEqual([...exportsOf("function f(x) {\n  return /a+b/.test(x);\n}\nconst t = `\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+  // a division is not a regular expression
+  assert.deepEqual([...exportsOf("const half = total / 2;\nexport const real = half / 1;\n")], ["real"]);
+  // imports: named, namespace, default, side effect, require; type imports bind no value
+  assert.deepEqual(
+    importsOf('import { a, b as c, type T } from "./m";\nimport * as ns from "./n";\nimport d from "./d";\nimport "./side";\nimport type { X } from "./types";\nconst { e } = require("./r");\nconst whole = require("./w");\n// import { ghost } from "./g";\n').map((x) => `${x.spec}:${[...x.names].join(",")}:${x.whole}`),
+    ["./m:a,b:false", "./n::true", "./d::true", "./side::false", "./r:e:false", "./w::true"],
+  );
+  // an import written inside a string or a template literal binds nothing
+  assert.deepEqual(importsOf('const s = \'import { ghost } from "../src/g"\';\nconst u = `import * as all from "../src/g"`;\n'), []);
+  // a missing-module text inside another message is not the runner's error
+  assert.deepEqual(missingModules(`Error: helper printed "Cannot find module './x.mjs'"`), []);
+  assert.equal(missingModules("Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/t/src/x.mjs' imported from /t/test/a.test.mjs").length, 1);
+  const map = new Map([["src/other.mjs", new Set(["ghost"])], ["src/calc.mjs", new Set(["sum"])]]);
+  const base = { exportsByFile: () => map, addedFix: new Set(["src/sum.mjs", "test/support.mjs"]), roots: ["/t"], runnerDir: "" };
+  // the TypeError names an export that another module adds, not the module the test imports it from
+  assert.equal(addedByFix("TypeError: helper.ghost is not a function", "test/a.test.mjs", { ...base, source: 'import * as helper from "../src/helper.mjs";\n' }), null);
+  // the export's module bound by a named import: evidence; the same name imported from elsewhere: none
+  assert.equal(addedByFix("TypeError: (0 , __vite_ssr_import_1__.sum) is not a function", "test/a.test.mjs", { ...base, source: 'import { sum } from "../src/calc.mjs";\n' }), "the export sum");
+  assert.equal(addedByFix("TypeError: (0 , __vite_ssr_import_1__.sum) is not a function", "test/a.test.mjs", { ...base, source: 'import { sum } from "../src/math.mjs";\n' }), null);
+  // the added module must be one the test file imports
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", { ...base, source: 'import "../src/other.mjs";\n' }), null);
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", { ...base, source: 'import { s } from "../src/sum.mjs";\n' }), "the module src/sum.mjs");
+  // an absolute path outside the tree is not mapped into it
+  assert.equal(addedByFix("Error: Cannot find module '/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", { ...base, source: 'import { s } from "../src/sum.mjs";\n' }), null);
+  // a module in the test file's own folder is not evidence
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/src/a.test.mjs", "src/a.test.mjs", { ...base, source: 'import { s } from "./sum.mjs";\n' }), null);
+});
+
+test("judgeFile without a context judges as before: no earlier version read means no collateral, and no evidence means WRONG-REASON", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const quiet = [{ name: "a", status: "passed", text: null, assertion: false }];
+  const changed = judgeFile({ file: "t.test.mjs", status: "M" }, ok(quiet), ok(quiet));
+  assert.deepEqual(changed.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.equal(changed.kind, null);
+  const thrown = [{ name: "a", status: "failed", text: "TypeError: calc.sum is not a function", assertion: false }];
+  assert.deepEqual(judgeFile({ file: "t.test.mjs" }, ok(thrown), ok(quiet)).reasons.map((r) => r.code), ["WRONG-REASON"]);
+});
+
+test("README: the red-first section names the notes, the pin marker and the NOTHING-PROVEN outcome, and never a NEUTRAL green", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const section = readme.slice(readme.indexOf("## red-first-gate"), readme.indexOf("## Developing in this repo"));
+  for (const word of ["`COLLATERAL`", "`PIN`", "`ADDED-BY-FIX`", "`PIN-MISMATCH`", "red-first-pin:", "`NOTHING-PROVEN`"]) {
+    assert.ok(section.includes(word), `the README section does not name ${word}`);
+  }
+  assert.doesNotMatch(section, /NEUTRAL|NOTHING-TO-PROVE/);
+  assert.match(section, /green only when at least one new test file is proven/);
+});
+
+test("judgeFile: every way an earlier version is unreadable keeps the file NOT-RED-BEFORE, and an unreadable diff counts as a changed test", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests, more = {}) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests, ...more } });
+  const quiet = [{ name: "a", status: "passed", text: null, assertion: false }];
+  const judge = (context) => judgeFile({ file: "t.test.mjs", status: "M" }, ok(quiet), ok(quiet), context);
+  const cases = [
+    [{ run: "timeout" }, /its run did not finish in time/],
+    [{ run: "no-report" }, /its run gave no readable report/],
+    [{ run: "stopped" }, /its run gave no readable report/],
+    [{ run: "ok", result: null }, /it is not in the runner's report/],
+    [ok([], { loaded: false, loadError: "Cannot find module x" }), /it does not load: Cannot find module x/],
+    [ok(quiet, { fileError: "late failure" }), /its run reports a file error: late failure/],
+    [ok([{ name: "a", status: "weird", text: null, assertion: false }]), /its report gives an unknown status/],
+  ];
+  for (const [earlier, why] of cases) {
+    const judged = judge({ earlier, changedTestLine: null });
+    assert.deepEqual(judged.reasons.map((r) => r.code), ["NOT-RED-BEFORE"], String(why));
+    assert.match(judged.reasons[0].detail, why);
+    assert.equal(judged.kind, null);
+    assert.deepEqual(judged.notes, []);
+  }
+  // the earlier version read with the fix: the same tests, one fails there (the fix breaks it), no changed test line: collateral
+  const broken = [{ name: "a", status: "failed", text: "AssertionError: x", assertion: true }];
+  const collateral = judge({ earlier: ok(broken), changedTestLine: null });
+  assert.deepEqual([collateral.reasons.length, collateral.kind, collateral.proven, collateral.notes[0].code], [0, "collateral", false, "COLLATERAL"]);
+  // the earlier version also passes with the fix: the fix does not need the edit, so it is not collateral
+  const unneeded = judge({ earlier: ok(quiet), changedTestLine: null });
+  assert.deepEqual(unneeded.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.match(unneeded.reasons[0].detail, /earlier version also passes with the fix, so the fix does not need the edit/);
+  // a runner whose exit contradicts its report is not read
+  const contra = judge({ earlier: { run: "contradicts", detail: "vitest in pkg exited 1 although its report shows no failure" }, changedTestLine: null });
+  assert.match(contra.reasons[0].detail, /its runner's exit does not match its report \(vitest in pkg exited 1/);
+  // the same, but the file's diff could not be read (rangeReader says so): a changed test
+  const unread = judge({ earlier: ok(broken), changedTestLine: "the file's diff is not readable" });
+  assert.deepEqual(unread.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.match(unread.reasons[0].detail, /the file's diff is not readable/);
+  // a skipped test of the earlier version still counts as a test of that name
+  const az = ok([...quiet, { name: "z", status: "passed", text: null, assertion: false }]);
+  const skipped = judgeFile({ file: "t.test.mjs", status: "M" }, az, az, { earlier: ok([{ name: "a", status: "skipped", text: null, assertion: false }, { name: "z", status: "failed", text: "AssertionError: x", assertion: true }]), changedTestLine: null });
+  assert.equal(skipped.kind, "collateral");
+  // a collateral file must stay green: a test that passed before and is skipped with the fix is RED
+  const lost = judgeFile({ file: "t.test.mjs", status: "M" }, ok([...quiet, { name: "b", status: "passed", text: null, assertion: false }]), ok([...quiet, { name: "b", status: "skipped", text: null, assertion: false }]), {
+    earlier: ok([...broken, { name: "b", status: "passed", text: null, assertion: false }]),
+    changedTestLine: null,
+  });
+  assert.deepEqual(lost.reasons.map((r) => r.code), ["NOT-GREEN-AT-HEAD"]);
+  assert.match(lost.reasons[0].detail, /passed before the fix but did not pass with it: b/);
+});
+
+test("judgeFile: pins in a new file, pins alone, a pin on a skipped test, and pins in a file that does not load before the fix", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const t = (name, status = "passed") => ({ name, status, text: status === "failed" ? "AssertionError: x" : null, assertion: status === "failed" });
+  // a new file whose tests are all declared pins: a PIN note, not proven
+  const all = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a", "keeps b"] }, ok([t("keeps a"), t("keeps b")]), ok([t("keeps a"), t("keeps b")]));
+  assert.deepEqual([all.reasons.length, all.kind, all.proven, all.notes[0].code], [0, "pins", false, "PIN"]);
+  // one test of the new file is not named by a pin: it must fail first
+  const part = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("does b")]), ok([t("keeps a"), t("does b")]));
+  assert.deepEqual(part.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.match(part.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: does b/);
+  // a pin beside a red test: the file is proven by the red test, the pin is checked
+  const beside = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("does b", "failed")]), ok([t("keeps a"), t("does b")]));
+  assert.deepEqual([beside.reasons.length, beside.kind, beside.proven], [0, "proven", true]);
+  // a pin on a test that is skipped before the fix is not a pin that passes
+  const skipped = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a", "skipped"), t("does b", "failed")]), ok([t("keeps a"), t("does b")]));
+  assert.deepEqual(skipped.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  // one marker names one test: a text that is in two test names (a describe name, a short word) is refused
+  const broad = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps"] }, ok([t("keeps a"), t("keeps b")]), ok([t("keeps a"), t("keeps b")]));
+  assert.deepEqual(broad.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  assert.match(broad.reasons[0].detail, /is in more than one test name of the file/);
+  // one marker names one test occurrence: a name reported twice (two tests of one title, two projects) is refused
+  const twice = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("keeps a")]), ok([t("keeps a"), t("keeps a")]));
+  assert.deepEqual(twice.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  assert.match(twice.reasons[0].detail, /or in a name the report gives more than once/);
+  // a file that does not load before the fix cannot hold a passing pin, also with evidence of what the fix adds
+  const unloaded = { run: "ok", result: { loaded: false, loadError: "Cannot find module '../src/sum.mjs'", loadText: "Cannot find module '../src/sum.mjs'", fileError: null, tests: [] } };
+  const withPin = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, unloaded, ok([t("keeps a")]), { addedByFix: () => "the module src/sum.mjs" });
+  assert.deepEqual(withPin.reasons.map((r) => r.code), ["PIN-MISMATCH"]);
+  const noPin = judgeFile({ file: "n.test.mjs", status: "A" }, unloaded, ok([t("keeps a")]), { addedByFix: () => "the module src/sum.mjs" });
+  assert.deepEqual([noPin.reasons.length, noPin.kind, noPin.notes[0].code], [0, "proven", "ADDED-BY-FIX"]);
+  // a file that loads with the fix but passes no test there is not proven by the load error
+  const empty = judgeFile({ file: "n.test.mjs", status: "A" }, unloaded, ok([t("keeps a", "skipped")]), { addedByFix: () => "the module src/sum.mjs" });
+  assert.deepEqual(empty.reasons.map((r) => `${r.code}:${r.phase}`), ["NOT-COLLECTED:head"]);
+});
+
+test("pins alone: a pull request whose only test change is a declared pin proves nothing: RED (NOTHING-PROVEN)", async (t) => {
+  const pinned = `${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`;
+  const sc = scenario(t, { base: PIN_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": pinned } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOTHING-PROVEN");
+  assert.deepEqual(codes(r), ["NOTHING-PROVEN"]);
+  assert.deepEqual(noteCodes(r), ["PIN:test/publish.test.mjs"]);
+});
+
+test("judgeFile: a declared pin beside a red test must pass with the fix too; the range diff reads a path with a space", async () => {
+  const { judgeFile, parseRangeDiff } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const t = (name, status = "passed") => ({ name, status, text: status === "failed" ? "AssertionError: x" : null, assertion: status === "failed" });
+  // the file is red first by "does b"; its pin "keeps a" passes before the fix but is skipped with it
+  const lost = judgeFile({ file: "n.test.mjs", status: "A", pins: ["keeps a"] }, ok([t("keeps a"), t("does b", "failed")]), ok([t("keeps a", "skipped"), t("does b")]));
+  assert.deepEqual(lost.reasons.map((r) => `${r.code}:${r.phase}`), ["NOT-GREEN-AT-HEAD:head"]);
+  assert.match(lost.reasons[0].detail, /or is a declared pin, but did not pass with it: keeps a/);
+  assert.equal(lost.proven, false);
+  // git ends the file lines of a path with a space with a tab
+  const diff = parseRangeDiff("diff --git a/src/my file.mjs b/src/my file.mjs\n--- a/src/my file.mjs\t\n+++ b/src/my file.mjs\t\n@@ -0,0 +1 @@\n+export const one = 1;\n");
+  assert.deepEqual([...diff.keys()], ["src/my file.mjs"]);
+  assert.deepEqual(diff.get("src/my file.mjs").added, ["export const one = 1;"]);
+});
+
+// ---------------------------------------------------------------------------
+// Findings 1, 2, 3 and 4 of the review: shapes that must stay RED.
+// ---------------------------------------------------------------------------
+
+// A test file that passes before the fix and with it, unchanged by the fix.
+const KEEP_OLD = `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst compile = () => ({ ok: true, value: {} });\nconst expected = /^published/;\n\ntest("publishes the package", () => {\n  assert.match(publish(compile), expected);\n});\n`;
+
+test("finding 1: a changed expected value on a line with no assertion word, which the fix does not need, is RED (NOT-RED-BEFORE)", async (t) => {
+  const vacuous = KEEP_OLD.replace("const expected = /^published/;", "const expected = /./;");
+  const sc = scenario(t, { base: { ...PUB_BASE, "test/publish.test.mjs": KEEP_OLD }, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": vacuous, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.equal(r.verdict.reasons[0].file, "test/publish.test.mjs");
+  assert.match(r.verdict.reasons[0].detail, /earlier version also passes with the fix, so the fix does not need the edit/);
+});
+
+test("finding 1: a mock edit the fix does not need (the earlier version passes with the fix) is RED, also beside a proven file", async (t) => {
+  const mocked = KEEP_OLD.replace("({ ok: true, value: {} })", "({ ok: true, value: { extra: 1 } })");
+  const sc = scenario(t, { base: { ...PUB_BASE, "test/publish.test.mjs": KEEP_OLD }, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": mocked, "test/refuse.test.mjs": REFUSE_TEST } });
+  assertRed(runGate(sc, "run"), "NOT-RED-BEFORE");
+});
+
+test("finding 2: a marker the file already had declares nothing: a new test of that name must fail first", async (t) => {
+  const withMarker = `${PUB_NEW}// red-first-pin: a good compile still publishes\n`;
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": withMarker },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": `${withMarker}\n${PIN_TEST}`, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /1 test\(s\) the pull request adds do not fail first: a good compile still publishes/);
+});
+
+test("finding 2: one marker for two added tests of one name is PIN-MISMATCH", async (t) => {
+  const twice = `${PUB_NEW}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}${PIN_TEST}`;
+  const sc = scenario(t, { base: PIN_BASE, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": twice, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "PIN-MISMATCH");
+  assert.match(r.verdict.reasons[0].detail, /in a name the report gives more than once/);
+});
+
+test("finding 2: a pin beside an edit of an existing test (lines changed, not only added) is RED", async (t) => {
+  const edited = `${KEEP_OLD.replace("const expected = /^published/;", "const expected = /./;")}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`;
+  const sc = scenario(t, { base: { ...PUB_BASE, "test/publish.test.mjs": KEEP_OLD }, head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": edited, "test/refuse.test.mjs": REFUSE_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /declares pins but also changes or removes lines of the file/);
+});
+
+test("finding 2: pins added only by inserted lines to a file whose earlier version the fix breaks are RED", async (t) => {
+  // Inserted lines only (nothing removed) make the old test pass with the fix.
+  const inserted = PUB_OLD.replace("const compile = () => ({ ok: false });\n", "const compile = () => ({ ok: false });\nconst good = () => ({ ok: true });\n").replace(
+    'test("publishes the package", () => {\n',
+    'test("publishes the package", () => {\n  assert.match(publish(good), /^published/);\n  return;\n',
+  );
+  const sc = scenario(t, {
+    base: PUB_BASE,
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": `${inserted}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons[0].detail, /earlier version fails with the fix .* pins are declared only beside existing tests that pass with the fix unchanged/);
+});
+
+test("finding 3: a tests-only pull request whose new helper the range lists on the fix side is not proven by its load error (LOAD-ERROR)", async (t) => {
+  const helperTest = `${TEST_HEAD}import { two } from "./support.mjs";\n\ntest("two is two", () => {\n  assert.equal(two(), 2);\n});\n`;
+  const sc = scenario(t, { base: PUB_BASE, head: { "test/a.test.mjs": helperTest, "test/support.mjs": "export const two = () => 2;\n" } });
+  const r = runGate(sc, "run");
+  assertRed(r, "LOAD-ERROR");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+test("finding 3: pull request B's TypeError when the export moved from another fix-side module, or is added to a module the test does not import: RED (WRONG-REASON)", async (t) => {
+  const OTHER = `${AG}/src/verdaccio/other.ts`;
+  const moved = bFiles(B_MARKER, B_CONTRACT_HEAD);
+  moved.base[OTHER] = "export function checkRegenerateDeclaration(flow) {\n  return { ok: Boolean(flow) };\n}\n";
+  moved.head[OTHER] = "export const left = 1;\n";
+  assertRed(runVitest(t, bSpec(), "", moved), "WRONG-REASON");
+  const elsewhere = bFiles(B_MARKER, "export const agentLifecycleDeclarationSchema = { strict: true };\n");
+  elsewhere.head[OTHER] = "export function checkRegenerateDeclaration(flow) {\n  return { ok: Boolean(flow) };\n}\n";
+  assertRed(runVitest(t, bSpec(), "", elsewhere), "WRONG-REASON");
+});
+
+test("finding 4: an earlier version whose runner exit contradicts its report is not collateral (NOT-RED-BEFORE)", async (t) => {
+  const spec = (earlier) => ({ before: { report: vitestReport([A_QUIET, A_RED]), exit: 1 }, head: { report: vitestReport([A_QUIET, A_GREEN]), exit: 0 }, earlier });
+  // a failing report with exit 0
+  const zero = runVitest(t, spec({ report: vitestReport([A_EARLIER]), exit: 0 }), "", A_FILES);
+  assertRed(zero, "NOT-RED-BEFORE");
+  assert.match(zero.verdict.reasons[0].detail, /its runner's exit does not match its report \(vitest in packages\/agents exited 0 \(report success: false\) although its report shows a failure\)/);
+  // an all-passing report with exit 1
+  const one = runVitest(t, spec({ report: vitestReport([A_QUIET]), exit: 1 }), "", A_FILES);
+  assertRed(one, "NOT-RED-BEFORE");
+  assert.match(one.verdict.reasons[0].detail, /exited 1 although its report shows no failure/);
+});
+
+test("finding 4: an earlier version that changes a tracked test-side file is RED (TEST-CHANGED in the earlier run)", async (t) => {
+  const writes = PUB_OLD.replace("import { publish }", 'import { writeFileSync } from "node:fs";\nwriteFileSync(new URL("./__fixtures__/state.txt", import.meta.url), "changed");\nimport { publish }');
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": writes, "test/__fixtures__/state.txt": "clean" },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "TEST-CHANGED");
+  assert.equal(r.verdict.reasons.find((x) => x.code === "TEST-CHANGED").phase, "earlier");
+});
+
+// ---------------------------------------------------------------------------
+// The second review: shapes that still gave a false green.
+// ---------------------------------------------------------------------------
+
+test("second review 1: a template interpolation with a brace in a string and a nested template exposes no export", async () => {
+  const { exportsOf } = await gateModule();
+  // a closing brace inside a string of the interpolation does not end it
+  assert.deepEqual([...exportsOf('const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n')], ["ready"]);
+  // a regular expression and a comment inside an interpolation are read as code there
+  assert.deepEqual([...exportsOf("const a = `${ /`/.test(x) ? \"{\" : '}' /* } ` */ }\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+  // nested templates with interpolations of their own
+  assert.deepEqual([...exportsOf("const a = `x ${ `y ${ { z: 1 }.z } ` } w\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+});
+
+// A table of existing tests: each row is one test of the file.
+const ROWS_TEST = (rows, extra = "") =>
+  `${TEST_HEAD}import { publish } from "../src/publish.mjs";\n\nconst rows = [\n${rows.map((x) => `  ${JSON.stringify(x)},\n`).join("")}];\n${extra}for (const [name, ok] of rows) {\n  test(name, () => {\n    assert.match(publish(() => ({ ok })), /^published/);\n  });\n}\n`;
+
+test("second review 2: an edit that removes the test the fix breaks is not collateral: RED, also beside a proven file", async (t) => {
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": ROWS_TEST([["with a good compile", true], ["with a failed compile", false]]) },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": ROWS_TEST([["with a good compile", true]]), "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /the edit removes 1 test\(s\) of the file's earlier version: with a failed compile/);
+});
+
+test("second review 3: a pin beside added lines that drop an existing test is RED", async (t) => {
+  const two = [["with a good compile", true], ["with another good compile", true]];
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": ROWS_TEST(two) },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": `${ROWS_TEST(two, "rows.pop();\n")}\n// red-first-pin: a good compile still publishes\n${PIN_TEST}`, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /the edit removes 1 test\(s\) of the file's earlier version: with another good compile/);
+});
+
+test("second review 4: an import that names its extension is that file, never a folder's index or another script of its stem", async () => {
+  const { addedByFix } = await gateModule();
+  const map = new Map([["src/pkg/index.mjs", new Set(["ghost"])]]);
+  const ctx = { source: 'import * as api from "../src/pkg.mjs";\n', exportsByFile: () => map, addedFix: new Set(["src/pkg/index.mjs"]), roots: ["/t"], runnerDir: "" };
+  assert.equal(addedByFix("TypeError: api.ghost is not a function", "test/a.test.mjs", ctx), null);
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/pkg.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", ctx), null);
+  // without the extension the folder's index is the module
+  const bare = { ...ctx, source: 'import * as api from "../src/pkg";\n' };
+  assert.equal(addedByFix("TypeError: api.ghost is not a function", "test/a.test.mjs", bare), "the export ghost");
+  // a named extension stands only for its TypeScript source (x.mjs -> x.mts), not for x.js
+  const stem = { ...ctx, source: 'import { s } from "../src/sum.mjs";\n', addedFix: new Set(["src/sum.js"]) };
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", stem), null);
+  assert.equal(addedByFix("Error: Cannot find module '/t/src/sum.mjs' imported from /t/test/a.test.mjs", "test/a.test.mjs", { ...stem, addedFix: new Set(["src/sum.mts"]) }), "the module src/sum.mts");
+});
+
+test("second review 5: an earlier version that rewrites its own test file during its run is RED (TEST-CHANGED in the earlier run)", async (t) => {
+  const writesSelf = PUB_OLD.replace("import { publish }", 'import { writeFileSync } from "node:fs";\nwriteFileSync(new URL(import.meta.url), "// rewritten\\n");\nimport { publish }');
+  const sc = scenario(t, {
+    base: { ...PUB_BASE, "test/publish.test.mjs": writesSelf },
+    head: { "src/publish.mjs": PUB_FIX, "test/publish.test.mjs": PUB_NEW, "test/refuse.test.mjs": REFUSE_TEST },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "TEST-CHANGED");
+  const changed = r.verdict.reasons.find((x) => x.code === "TEST-CHANGED");
+  assert.equal(changed.phase, "earlier");
+  assert.equal(changed.file, "test/publish.test.mjs");
+});
+
+// ---------------------------------------------------------------------------
+// The fold reading: a slash the scanner cannot read for sure gives no exports.
+// ---------------------------------------------------------------------------
+
+// A fix-side module whose template holds the text of an export, and a new test
+// that calls that name only before the fix: a TypeError that must never count
+// as what the fix adds.
+const DECOY_BASE = "const decoy = `\nexport function ghost() {}\n`;\nexport function ready() { return false; }\n";
+const DECOY_TEST = `${TEST_HEAD}import * as api from "../src/m.mjs";\n\ntest("ready before the call", () => {\n  if (!api.ready()) api.ghost();\n  assert.ok(true);\n});\n`;
+function decoyScenario(t, headModule) {
+  return scenario(t, { base: { "package.json": '{ "type": "module" }\n', "src/m.mjs": DECOY_BASE }, head: { "src/m.mjs": headModule, "test/m.test.mjs": DECOY_TEST } });
+}
+
+test("fold 1: a division after an object literal in an interpolation is not read as a regular expression that exposes an export (RED, not ADDED-BY-FIX)", async (t) => {
+  const head = 'const decoy = `${ {} / {a: 1 / 2}.a + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n';
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+test("fold 2: a regular expression after `)` in an interpolation, read as a division, exposes no export (RED, not ADDED-BY-FIX)", async (t) => {
+  const head = 'const a = false;\nconst b = "";\nconst decoy = `${ (() => { if (a) /}x/.test(b); })() + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n';
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+test("fold 3: a regular expression after `)` at the top level is read as one; a plain division as a division", async () => {
+  const { exportsOf } = await gateModule();
+  // a regular expression after `)` at the top level, read as a division, would open a template
+  assert.deepEqual([...exportsOf('const a = false;\nif (a) /`/.test("");\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n')], ["ready"]);
+  // a division after `)` or `]` with no other slash on its line is no regular expression: read as before
+  assert.deepEqual([...exportsOf("const half = (a + b) / 2;\nconst q = xs[0] / 3;\nexport const real = half / q;\n")], ["real"]);
+});
+
+// ---------------------------------------------------------------------------
+// The fold2 reading: every slash the scanner reads, at every start position.
+// ---------------------------------------------------------------------------
+
+test("fold2 1: a division after a postfix ++ is not read as a regular expression that exposes an export (RED, not ADDED-BY-FIX)", async (t) => {
+  const head = "let n = 0;\nconst decoy = n++ / `x/\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n";
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+// Each source below exports exactly `ready` when JavaScript reads it; the text
+// `export function ghost` sits in a template. For every start position of a
+// slash (each punctuator, ++ and --, names, keywords and names that look like
+// keywords, a line start after a line break, at the top level and inside an
+// interpolation), the reader must read exactly { ready } or say it is unsure,
+// so that it never reports a fresh `ghost` at the head and never hides
+// `ready` at the merge base.
+const SLASH_DIVISIONS = [
+  "n++", "n--", "x", "x.y", "of", "yield", "await", "let", "async", "get", "_$", "1", "1.5", "0x1f", "\"s\"", "'s'", "`t`", "(a)",
+  "a[0]", "({})", "[]", "x\n", "n++\n", "(a)\n", "this", "null", "true", "x.return", "x.of", "x.in", "x.typeof", "x!", "f<T>",
+  "x !", "a > b", "x. return", "this.#return", "\u00e9in", "x\u00e9in", "x ! ", "x. default", "o.debugger", "x .in",
+];
+const SLASH_REGEX_STARTS = [
+  "", "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "~", "^", "*", "%", "<", ">", "+", "-", "==", "===", "!=", "<=", ">=",
+  "=>", "&&", "||", "??", "**", "<<", ">>", ">>>", "+=", "-=", "*=", "/=", "a ?", "a ? b :", "return", "typeof", "instanceof", "in",
+  "new", "delete", "void", "throw", "case", "do", "else", "yield", "await", "of", "let", "}", ")", "]", "if (a)", "while (a)", "{}",
+  "x\n", ";\n", "/a/", "a /", "default", "export default", "debugger\n", "break\n", "continue\n", "++", "--", "let v = ++",
+  "x. return", "this.#return", "\u00e9in", "x !", "<p>", "=> ", "!", "a = !", "return !",
+];
+function decoySources() {
+  const out = [];
+  const ghost = "\nexport function ghost() {}\n";
+  const tail = "export function ready() { return true; }\n";
+  for (const d of SLASH_DIVISIONS) {
+    // a division by a template that holds the decoy
+    out.push(`let n = 0, x = 1, a = [1];\nconst decoy = ${d} / \`x/${ghost}\`;\n${tail}`);
+    out.push(`const decoy = \`\${ ${d} / \`x/${ghost}\` }\`;\n${tail}`);
+    out.push(`const decoy = ${d} / 2 / \`x/${ghost}\`;\n${tail}`);
+    // a division and a comment that holds a backtick, then the decoy in a template
+    out.push(`const q = ${d} / 2 // note \` /\nconst t = \`${ghost}\`;\n${tail}`);
+    out.push(`const q = ${d} / 2 /* note \` */;\nconst t = \`${ghost}\`;\n${tail}`);
+  }
+  for (const r of SLASH_REGEX_STARTS) {
+    // a regular expression (or what may be one) whose text holds a backtick, a quote or a brace, then a template that holds the decoy
+    for (const re of ["/`/", "/'/", '/"/', "/[`]/", "/\\`/", "/}/", "/{/", "/x+/"]) {
+      out.push(`const r = ${r} ${re}.source;\nconst t = \`${ghost}\`;\n${tail}`);
+      out.push(`const decoy = \`\${ ${r} ${re}.source }${ghost}\`;\n${tail}`);
+    }
+  }
+  return out;
+}
+
+test("fold2 2: for every start position of a slash, the reader reads exactly the real exports or is unsure (a generated set)", async () => {
+  const { exportsOf, readExports } = await gateModule();
+  const sources = decoySources();
+  assert.ok(sources.length > 900, `only ${sources.length} sources`);
+  const misread = [];
+  let unsure = 0;
+  for (const src of sources) {
+    const read = readExports(src);
+    if (read.unsure) {
+      unsure += 1;
+      assert.deepEqual([...exportsOf(src)], [], "an unsure reading gives no exports");
+    } else if ([...read.names].join(",") !== "ready") misread.push(`${JSON.stringify(src.slice(0, 70))} -> ${[...read.names].join(",")}`);
+  }
+  assert.deepEqual(misread, []);
+  // the set is not vacuous: many sources are valid and read, the invalid ones (an unclosed `(` and the like) are unsure
+  assert.ok(unsure > 100 && sources.length - unsure > 400, `${unsure} of ${sources.length} unsure`);
+});
+
+test("fold2 3: plain code keeps its exports: divisions, regular expressions without quotes or braces, ++ and keywords", async () => {
+  const { exportsOf } = await gateModule();
+  for (const src of [
+    "const half = (a + b) / 2;\nconst q = xs[0] / 3;\nn++;\nconst r = n++ / 2;\nexport const real = half / q;\n",
+    "const ok = /^[a-z]+$/i.test(name);\nfunction f(x) { return /\\d+/.exec(x); }\nexport const real = ok && f;\n",
+    "const parts = path.split(/[\\\\/]/);\nconst t = `a ${parts.length} b`;\nexport function real() { return t; }\n",
+  ]) {
+    assert.deepEqual([...exportsOf(src)], [src.match(/export (?:const|function) (\w+)/)[1]], src);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The fold3 reading: every reviewer input of the slash class, plus JSX and a
+// hashbang line, by name; each must read its real exports or be unsure.
+// ---------------------------------------------------------------------------
+
+const READER_INPUTS = [
+  // pre-2 finding 1, the fold reading (A, B), the fold2 reading, the fold3 reading (1, 2, 3, out of scope)
+  ['const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n', ["ready"]],
+  ['const decoy = `${ {} / {a: 1 / 2}.a + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n', ["ready"]],
+  ['const a = false;\nconst b = "";\nconst decoy = `${ (() => { if (a) /}x/.test(b); })() + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n', ["ready"]],
+  ['const a = false;\nif (a) /`/.test("");\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n', ["ready"]],
+  ["let n = 0;\nconst decoy = n++ / `x/\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n", ["ready"]],
+  ["let of = 1; const decoy = of / `x/\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n", ["ready"]],
+  ["export default /`/;\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["function f() { debugger\n/`/.test(x); }\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["for (;;) { break\n/`/.test(x); }\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["for (;;) { continue\n/`/.test(x); }\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["let v = ++ /`/.lastIndex;\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["const x = { return: 4 }, a = [1];\nconst q = x. return / a[/*] / 1;\nexport function ghost() {}\n*/ 0]; /y/;\n", []],
+  ["class C { #return = 4; m(a) { return this.#return / a[/*] / 1;\nexport function ghost() {}\n*/ 0]; } }\n", []],
+  ["const \u00e9in = 4, a = [1];\nconst q = \u00e9in / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", []],
+  ["const q = x ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", []],
+  ["const a = <p>`</p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</p><i></i>;\n", []],
+  ["#!/usr/bin/env -S node --title=`\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  // a hashbang line before plain code keeps the exports
+  ["#!/usr/bin/env node\nexport const real = 1;\n", ["real"]],
+  // the fold4 reading: an escaped name that ends like a keyword, TypeScript's `!` after a comment, a regular
+  // expression or `1.`, and a JSX closing tag with a space
+  ["const \\u{61}in = 4, a = 1;\nconst q = \\u{61}in / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["const \\u{61}in = 4, a = 1;\nconst q = \\u{61}in / a + /x'/ + ' + `';\nexport function real() {}\n// `\n", ["real"]],
+  ["const \\u{61}return = 4, a = 1;\nconst q = \\u{61}return / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["const a = 1, x = 2;\nconst q = x /**/! / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", [], "m.ts"],
+  ["const a = 1;\nconst q = /re/! / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", [], "m.ts"],
+  ["const a = 1;\nconst q = 1.! / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", [], "m.ts"],
+  ["const a = <p>x`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>x`</ p>;\n", [], "m.tsx"],
+  ["const a = <p>x`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>x`</ p>;\n", [], "m.jsx"],
+  ["const \\u{61}in = 4, a = [1];\nconst q = \\u{61}in / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", []],
+  ["const \\u{61}in = 4;\nexport const real = \\u{61}in / 2 / 1;\n", ["real"]],
+  ["const x = 4, a = [1];\nconst q = x /* c */ ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", [], "m.ts"],
+  ["const a = [1];\nconst q = /x/ ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", [], "m.ts"],
+  ["const a = [1];\nconst q = 1. ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", [], "m.ts"],
+  ["const a = <p>`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</ p><i></i>;\n", [], "m.jsx"],
+  ["const a = <p>`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</ p><i></i>;\n", []],
+  // the same JSX text as valid JSX (one root per expression)
+  ["const a = <p>`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</ p>;\nexport const real = 1;\n", ["real"], "m.jsx"],
+  ["const a = <p>`</p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</p>;\nexport const real = 1;\n", ["real"]],
+];
+
+test("fold3 1: every reviewer input of the slash class, JSX text and a hashbang line: the real exports or unsure, never ghost", async () => {
+  const { readExports, exportsOf } = await gateModule();
+  const wrong = [];
+  for (const [src, real, path] of READER_INPUTS) {
+    const read = readExports(src, path);
+    const names = [...read.names].sort();
+    if (exportsOf(src, path).has("ghost") || (!read.unsure && names.join(",") !== [...real].sort().join(","))) wrong.push(`${JSON.stringify(src.slice(0, 60))} -> ${names.join(",")} unsure=${read.unsure}`);
+  }
+  assert.deepEqual(wrong, []);
+  // the plain hashbang file is read, not unsure
+  assert.equal(readExports("#!/usr/bin/env node\nexport const real = 1;\n").unsure, false);
+});
+
+test("fold3 2: the fold3 reviewer's default input ends RED, not ADDED-BY-FIX", async (t) => {
+  const head = "export default /`/;\nconst t = `\nexport function ghost() {}\n`;\n// `\nexport function ready() { return true; }\n";
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold4 reading: the exports and imports are read by the TypeScript
+// parser; a file it does not read cleanly is unsure.
+// ---------------------------------------------------------------------------
+
+test("fold4 1: the parser reads every valid reviewer input as JavaScript does (the real exports, never unsure); the invalid JSX ones are unsure", async () => {
+  const { readExports } = await gateModule();
+  // two JSX elements side by side without a parent (`<p>...</p><i></i>`) are a syntax error
+  const invalid = ([src]) => /<\/ ?p><i><\/i>/.test(src);
+  assert.deepEqual(READER_INPUTS.filter((x) => !invalid(x) && readExports(x[0], x[2]).unsure).map(([src]) => JSON.stringify(src.slice(0, 40))), []);
+  assert.deepEqual(READER_INPUTS.filter((x) => invalid(x) && !readExports(x[0], x[2]).unsure).map(([src]) => JSON.stringify(src.slice(0, 40))), []);
+  assert.equal(READER_INPUTS.filter(invalid).length, 3);
+});
+
+test("fold4 2: TypeScript and JSX shapes: value exports only, type and declare and default exports apart; a syntax error is unsure", async () => {
+  const { readExports, exportsOf, importsOf } = await gateModule();
+  const ts = "export interface I { a: number }\nexport type T = 1;\nexport declare const d: number;\nexport const real: number = 1;\nexport enum E { A }\nexport default function main() {}\nexport { real as alias, type I as J };\nexport const { x, y: [z] } = { x: 1, y: [2] };\nnamespace N { export const inner = 1; }\nexports.cjs = 1;\n";
+  assert.deepEqual([...exportsOf(ts, "src/m.ts")].sort(), ["E", "alias", "cjs", "real", "x", "z"]);
+  assert.deepEqual([...exportsOf("export const C = () => <div>{`x`}</div>;\n", "src/c.tsx")], ["C"]);
+  // a syntax error: unsure, no exports at the head
+  assert.equal(readExports("export const real = (;\n", "src/m.ts").unsure, true);
+  assert.deepEqual([...exportsOf("export const real = (;\n", "src/m.ts")], []);
+  // imports by the parser: TypeScript's import-equals and a type-only element; a file that does not parse imports nothing
+  assert.deepEqual(
+    importsOf('import x = require("./y");\nimport { type A, b } from "./m";\nconst t: string = `${1}`;\n', "test/a.test.ts").map((i) => `${i.spec}:${[...i.names].join(",")}:${i.whole}`),
+    ["./m:b:false", "./y::true"],
+  );
+  assert.deepEqual(importsOf('import { a } from "./m";\nconst x = (;\n', "test/a.test.ts"), []);
+});
+
+test("fold4 3: the fold4 reviewer's escaped-name input ends RED, not ADDED-BY-FIX", async (t) => {
+  const head = "const \\u{61}in = 4, a = 1;\nconst q = \\u{61}in / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n// `\n";
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold5 reading: HTML-like comments, the merge base the parser does not
+// read cleanly, namespaces and `export import`, a function without a body.
+// ---------------------------------------------------------------------------
+
+test("fold5 1: an HTML-like comment outside a literal makes the file unsure; inside a string it does not", async () => {
+  const { readExports, exportsOf, importsOf } = await gateModule();
+  for (const [src, path] of [
+    ["var a = 1, b = 2;\nvar t = a <!-- b; exports.ghost = function () {};\n", "src/m.cjs"],
+    ["var a = 1;\n  --> exports.ghost = function () {};\n", "src/m.cjs"],
+    ["var a = 1, b = 2;\nvar t = a <!-- b; exports.ghost = function () {};\n", ""],
+  ]) {
+    assert.equal(readExports(src, path).unsure, true, src);
+    assert.deepEqual([...exportsOf(src, path)], [], src);
+  }
+  assert.deepEqual(importsOf('var a = 1, b = 2;\nvar t = a <!-- b; const { ghost } = require("./m");\n', "test/a.test.cjs"), []);
+  // in a string, a template, a regular expression or JSX text it is text
+  const plain = 'const html = "<!-- x -->";\nconst t = `\n--> y`;\nconst r = /<!--/;\nexport const real = 1;\n';
+  assert.equal(readExports(plain, "src/m.mjs").unsure, false);
+  assert.deepEqual([...exportsOf(plain, "src/m.mjs")], ["real"]);
+});
+
+test("fold5 2: a merge base the parser does not read cleanly hides no export the head reads (nothing is fresh then)", async () => {
+  const { freshExports } = await gateModule();
+  const run = (base, head, path = "src/m.cjs") => [...(freshExports([path], () => base, () => head).get(path) ?? [])].sort();
+  // the fold5 reviewer's input: an HTML-like comment line at the merge base, dropped at the head
+  assert.deepEqual(run("<!-- kept\nvar a = 1; exports.real = function () { return a; };\n", "var a = 1; exports.real = function () { return a; };\n"), []);
+  // a legacy octal at the merge base (a syntax error to the parser), an export not at a line start
+  assert.deepEqual(run("var mode = 0755; exports.real = 1;\n", "var mode = 493; exports.real = 1;\n"), []);
+  // a destructured export and a list over several lines behind a syntax error; an escaped name
+  assert.deepEqual(run("export const { real } = { real: 1 }; const x = (;\n", "export const { real } = { real: 1 };\n", "src/m.mjs"), []);
+  assert.deepEqual(run("export {\n  real,\n};\nconst real = 1; const x = (;\n", "export {\n  real,\n};\nconst real = 1;\n", "src/m.mjs"), []);
+  assert.deepEqual(run("export const \\u0072eal = 1; const x = (;\n", "export const real = 1;\n", "src/m.mjs"), []);
+  // a clean merge base keeps the exact reading: a new name is fresh
+  assert.deepEqual(run("export const old = 1;\n", "export const old = 1;\nexport function added() {}\n", "src/m.mjs"), ["added"]);
+  // a merge base with a syntax error: no name is fresh, also one its text never spells
+  assert.deepEqual(run("export const old = (;\n", "export const old = 1;\nexport function added() {}\n", "src/m.mjs"), []);
+});
+
+test("fold5 3/4: a namespace, a module and `export import` are value exports; a function without a body is not", async () => {
+  const { exportsOf, freshExports } = await gateModule();
+  const ts = "export namespace parse { export const v = 1; }\nexport module M { export const w = 1; }\nnamespace N { export const y = 1; }\nexport import alias = N.y;\nexport declare namespace D { const z: number; }\ndeclare module \"x\" {}\nexport function ghost(): void;\nexport function over(a: string): void;\nexport function over(a: unknown) {}\nexport const real = 1;\n";
+  assert.deepEqual([...exportsOf(ts, "src/p.ts")].sort(), ["M", "alias", "over", "parse", "real"]);
+  // the fold5 reviewer's input: a namespace at the merge base, a function at the head: not fresh
+  assert.deepEqual([...(freshExports(["src/p.ts"], () => "export namespace parse { export const v = 1; }\n", () => "export function parse() { return 1; }\n").get("src/p.ts") ?? [])], []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold6 reading: an unsure merge base yields no fresh export at all; the
+// CommonJS export forms are read (or make the file unsure).
+// ---------------------------------------------------------------------------
+
+test("fold6 1: an unsure merge base with an escaped string export name: nothing is fresh", async () => {
+  const { freshExports } = await gateModule();
+  for (const base of ['// <!--\nconst x = 1;\nexport { x as "re\\x61l" };\n', '// <!--\nconst x = 1;\nexport { x as "re\\al" };\n']) {
+    assert.deepEqual([...(freshExports(["src/m.mjs"], () => base, () => "export function real() { return 1; }\n").get("src/m.mjs") ?? [])], [], base);
+  }
+});
+
+test("fold6 2: CommonJS exports: module.exports object keys, element access, defineProperty; other forms are unsure", async () => {
+  const { readExports, freshExports } = await gateModule();
+  const read = (src) => {
+    const r = readExports(src, "src/m.cjs");
+    return `${[...r.names].sort().join(",")}${r.unsure ? " unsure" : ""}`;
+  };
+  assert.equal(read('const a = 1;\nmodule.exports = { a, b: 1, "c": 2, 3: 4, d() {}, get e() { return 1; } };\n'), "3,a,b,c,d,e");
+  assert.equal(read('exports["x"] = 1;\nmodule.exports["y"] = 2;\nmodule.exports.z = 3;\nexports.w = 4;\n'), "w,x,y,z");
+  assert.equal(read('Object.defineProperty(exports, "p", { value: 1 });\nObject.defineProperty(module.exports, "q", { get() { return 1; } });\n'), "p,q");
+  assert.equal(read("module.exports = ({ a: 1 });\n"), "a");
+  // forms whose names the parser cannot read: unsure
+  for (const src of ["const f = () => 1;\nmodule.exports = f;\n", "const o = {};\nmodule.exports = { ...o, a: 1 };\n", "const k = 'a';\nmodule.exports = { [k]: 1 };\n", "const k = 'a';\nexports[k] = 1;\n", "const k = 'a';\nObject.defineProperty(exports, k, { value: 1 });\n"]) {
+    assert.match(read(src), / unsure$/, src);
+  }
+  // the fold6 reviewer's out-of-scope inputs: a clean merge base that exports `real` by such a form; the head moves it
+  const head = "exports.real = function () { return 1; };\n";
+  for (const base of ["module.exports = { real: 1 };\n", 'exports["real"] = 1;\n', 'Object.defineProperty(exports, "real", { value: 1 });\n']) {
+    assert.deepEqual([...(freshExports(["src/m.cjs"], () => base, () => head).get("src/m.cjs") ?? [])], [], base);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The fold7 reading: the CommonJS reading is deny-by-default. Every use of
+// `exports`, `module`, an export helper, a top-level `this` or `export =`
+// that is not a recognised top-level statement makes the script unsure.
+// ---------------------------------------------------------------------------
+
+const FOLD7_BASES = [
+  ["Object.assign(module.exports, { real: 1 });\n", "src/m.cjs"],
+  ["const e = module.exports;\ne.real = 1;\n", "src/m.cjs"],
+  ["const e = exports;\ne.real = 1;\n", "src/m.cjs"],
+  ["exports.real ||= 1;\n", "src/m.cjs"],
+  ["exports.real ??= 1;\n", "src/m.cjs"],
+  ["exports.real &&= 1;\n", "src/m.cjs"],
+  ['module["exports"].real = 1;\n', "src/m.cjs"],
+  ['module["exports"] = { real: 1 };\n', "src/m.cjs"],
+  ["Object.defineProperties(exports, { real: { value: 1 } });\n", "src/m.cjs"],
+  ['Reflect.defineProperty(exports, "real", { value: 1 });\n', "src/m.cjs"],
+  ["({ real: exports.real } = { real: 1 });\n", "src/m.cjs"],
+  ["this.real = 1;\n", "src/m.cjs"],
+  ['Object.assign(exports, require("./x"));\n', "src/m.cjs"],
+  ['__exportStar(require("./x"), exports);\n', "src/m.cjs"],
+  ["export = { real: 1 };\n", "src/m.cts"],
+];
+
+test("fold7 1: every fold7 merge-base form is unsure or read, so a moved export is never fresh", async () => {
+  const { readExports, freshExports } = await gateModule();
+  const head = "exports.real = function () { return 1; };\n";
+  const wrong = [];
+  for (const [base, path] of FOLD7_BASES) {
+    const read = readExports(base, path);
+    if (!read.unsure && !read.names.has("real")) wrong.push(`${JSON.stringify(base)} read clean without real`);
+    const fresh = [...(freshExports([path], () => base, () => head).get(path) ?? [])];
+    if (fresh.includes("real")) wrong.push(`${JSON.stringify(base)} -> real fresh`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+// Every node kind the reading denies, in every place: a target (`exports`, `module.exports`, `module["exports"]`, an alias,
+// a top-level `this`, a helper) under every assignment operator and helper call, at the top level, in a block, in a
+// function, in an arrow function and in a class; each must leave the script unsure (or read `real`).
+function fold7Sources() {
+  const targets = ["exports", "module.exports", 'module["exports"]', "e", "this"];
+  const writes = (t) => [
+    `${t}.real = 1;`, `${t}["real"] = 1;`, `${t}.real ||= 1;`, `${t}.real ??= 1;`, `${t}.real &&= 1;`, `${t}.real += 1;`,
+    `Object.assign(${t}, { real: 1 });`, `Object.defineProperties(${t}, { real: { value: 1 } });`, `Reflect.defineProperty(${t}, "real", { value: 1 });`,
+    `({ real: ${t}.real } = { real: 1 });`, `[${t}.real] = [1];`, `__exportStar({ real: 1 }, ${t});`, `__export({ real: 1 }, ${t});`,
+  ];
+  const places = [(x) => x, (x) => `if (true) { ${x} }`, (x) => `(function () { ${x} })();`, (x) => `(() => { ${x} })();`, (x) => `class K { static { ${x} } }`];
+  const out = [];
+  for (const t of targets) {
+    const alias = t === "e" ? "const e = module.exports;\n" : "";
+    // inside a function or a class, `this` is not the module's (no export there): only the places that keep it
+    const at = t === "this" ? [places[0], places[1], places[3]] : places;
+    for (const w of writes(t)) for (const place of at) out.push(`${alias}${place(w)}\n`);
+  }
+  return out;
+}
+
+test("fold7 2: a generated set over the denied node kinds: never a clean reading without the export", async () => {
+  const { readExports } = await gateModule();
+  const sources = fold7Sources();
+  assert.ok(sources.length > 290, `only ${sources.length} sources`);
+  const wrong = sources.filter((src) => {
+    const read = readExports(src, "src/m.cjs");
+    return !read.unsure && !read.names.has("real");
+  });
+  assert.deepEqual(wrong, []);
+});
+
+test("fold7 3: the recognised statements still read clean; names that only look alike are no references", async () => {
+  const { readExports } = await gateModule();
+  const read = (src, path = "src/m.cjs") => {
+    const r = readExports(src, path);
+    return `${[...r.names].sort().join(",")}${r.unsure ? " unsure" : ""}`;
+  };
+  // a typical compiled CommonJS file
+  assert.equal(read('"use strict";\nObject.defineProperty(exports, "__esModule", { value: true });\nexports.b = exports.a = void 0;\nconst a = 1;\nexports.a = a;\nfunction b() { return this; }\nexports.b = b;\n'), "__esModule,a,b");
+  assert.equal(read('module.exports.x = 1;\nmodule.exports["y"] = 2;\nmodule.exports = ({ z: 3 });\n'), "x,y,z");
+  // a property or a key named like them is no reference
+  assert.equal(read("const o = { exports: 1, module: 2 };\nconst p = o.exports + o.module;\nexport const real = p;\n", "src/m.mjs"), "real");
+  // a shadowing parameter or an assignment inside a function: unsure
+  assert.equal(read("function f(exports) { exports.x = 1; }\nexports.real = 1;\n"), "real unsure");
+  assert.equal(read("function f() { exports.x = 1; }\nf();\n"), " unsure");
+  // a class's computed member names and heritage are evaluated outside its body: a `this` there is the module's
+  for (const src of ["class A { [this.k] = 1; }\n", "class A extends (this.B) {}\n", "class A { [this.k]() {} }\n", "const g = () => this;\n"]) assert.equal(read(src), " unsure", src);
+  for (const src of ["class A { x = this; }\n", "function f() { return this; }\n", "class A { m() { class B { [this.k] = 1; } } }\n"]) assert.equal(read(src), "", src);
+});
+
+// ---------------------------------------------------------------------------
+// The fold8 reading: CommonJS exports are built at run time, so at the merge
+// base only an ES module is read; a CommonJS script there yields no fresh
+// export at all. The head keeps the recognised-statement reading.
+// ---------------------------------------------------------------------------
+
+const FOLD8_BASES = [
+  'const o = { get [(this.real = function () { return 1; }, "k")]() { return 0; } };\n',
+  'class A { static get [(this.real = 1, "k")]() {} }\n',
+  'const o = { set [(this.real = 1, "k")](v) {} };\n',
+  "require.cache[__filename].exports.real = function () { return 1; };\n",
+  "arguments[0].real = function () { return 1; };\n",
+  "arguments[2].exports = { real() {} };\n",
+  'eval("exports").real = function () { return 1; };\n',
+  "exports.__proto__ = { real: function () { return 1; } };\n",
+  "module.exports = { __proto__: { real() { return 1; } } };\n",
+];
+
+// The fresh names of one fix-side script; package: the root package.json's text (none when undefined).
+async function freshOf(path, base, head, pkg) {
+  const { freshExports } = await gateModule();
+  const read = (p) => (p === path ? base : p === "package.json" && pkg !== undefined ? pkg : null);
+  return [...(freshExports([path], read, () => head).get(path) ?? [])].sort();
+}
+const typed = (type) => JSON.stringify({ type });
+
+test("fold8 1: every fold8 merge-base input yields no fresh export, as .cjs, .js without a package type, .ts and .mjs", async () => {
+  const head = "export function real() { return 1; }\nexports.real = real;\n";
+  const wrong = [];
+  for (const base of FOLD8_BASES) for (const path of ["src/m.cjs", "src/m.js", "src/m.ts", "src/m.mjs"]) {
+    if ((await freshOf(path, base, head)).includes("real")) wrong.push(`${path}: ${JSON.stringify(base)}`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("fold8 2: the head reading: a getter or setter's computed-key `this` and a `__proto__` target or key are unsure", async () => {
+  const { readExports } = await gateModule();
+  for (const src of [...FOLD8_BASES.slice(0, 3), ...FOLD8_BASES.slice(7), 'exports["__proto__"] = {};\n', 'Object.defineProperty(exports, "__proto__", { value: {} });\n']) {
+    assert.equal(readExports(src, "src/m.cjs").unsure, true, src);
+  }
+  // a computed key inside a method body is the method's `this`, not the module's
+  assert.equal(readExports("class A { m() { return { [this.k]: 1 }; } }\nexports.a = 1;\n", "src/m.cjs").unsure, false);
+});
+
+test("fold8 3: at the merge base only a pure ES module is read", async () => {
+  const head = "export const a = 1;\nexport function real() { return 1; }\n";
+  const esm = "export const a = 1;\n";
+  // an ES module: its static exports are read exactly, so `real` is new and `a` is not
+  assert.deepEqual(await freshOf("src/m.mjs", esm, head), ["real"]);
+  assert.deepEqual(await freshOf("src/m.js", esm, head, typed("module")), ["real"]);
+  assert.deepEqual(await freshOf("src/m.ts", esm, head), ["real"]);
+  assert.deepEqual(await freshOf("src/m.mjs", 'import { b } from "./b.mjs";\nexport { b as c };\nexport const a = 1;\n', head), ["real"]);
+  // a moved export stays not new; an absent or empty base script exports nothing
+  assert.deepEqual(await freshOf("src/m.mjs", "export function real() { return 0; }\n", head), ["a"]);
+  assert.deepEqual(await freshOf("src/m.mjs", null, head), ["a", "real"]);
+  assert.deepEqual(await freshOf("src/m.mjs", "// nothing yet\n", head), ["a", "real"]);
+  // not read: CommonJS by extension or package type, no static import or export, `export =`, `import x = require`,
+  // `export * from`, a reference to exports, module, require, arguments, eval or a module-level `this`, a broken package.json
+  for (const [path, base, pkg] of [
+    ["src/m.cjs", esm], ["src/m.cts", esm], ["src/m.js", esm, typed("commonjs")], ["src/m.ts", esm, typed("commonjs")],
+    ["src/m.mjs", "const a = 1;\n"], ["src/m.js", "exports.a = 1;\n"], ["src/m.cts", "export = { a: 1 };\n"],
+    ["src/m.ts", 'import x = require("./x");\nexport const a = 1;\n'], ["src/m.mjs", 'export * from "./x.mjs";\nexport const a = 1;\n'],
+    ["src/m.mjs", "export const a = 1;\nexports.b = 1;\n"],
+    ["src/m.mjs", 'import { createRequire } from "node:module";\nconst require = createRequire(import.meta.url);\nexport const a = 1;\n'],
+    ["src/m.mjs", "export const a = 1;\nconst t = this;\n"], ["src/m.mjs", "export const a = arguments;\n"], ["src/m.js", esm, "{"],
+  ]) {
+    assert.deepEqual(await freshOf(path, base, head, pkg), [], `${path} ${pkg ?? ""}: ${base}`);
+  }
+});
+
+// Every CommonJS export form the readings met, under every module kind, with and without static ES syntax beside it.
+test("fold8 4: a generated set: a CommonJS export at the merge base never makes a name fresh", async () => {
+  const forms = [...FOLD7_BASES.map(([b]) => b), ...FOLD8_BASES, "exports.real = 1;\n", "module.exports = { real: 1 };\n", "module.exports.real = 1;\n", 'Object.defineProperty(exports, "real", { value: 1 });\n'];
+  const kinds = [["src/m.cjs"], ["src/m.cts"], ["src/m.js", typed("commonjs")], ["src/m.js"], ["src/m.ts"], ["src/m.mjs"], ["src/m.js", typed("module")]];
+  const beside = ["", 'import "node:fs";\n', "export const other = 1;\n"];
+  const head = "export function real() { return 1; }\n";
+  let n = 0;
+  const wrong = [];
+  for (const form of forms) for (const [path, pkg] of kinds) for (const pre of beside) {
+    n += 1;
+    if ((await freshOf(path, pre + form, head, pkg)).includes("real")) wrong.push(`${path} ${pkg ?? ""}: ${JSON.stringify(pre + form)}`);
+  }
+  assert.ok(n > 500, `only ${n}`);
+  assert.deepEqual(wrong, []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold9 reading: under a transpiler or a test runner an ES module can
+// write its own export object, so at the merge base an ES module is read only
+// without a namespace import, a dynamic import(), an import of node:module or
+// module, and any identifier that starts with `__vi`.
+// ---------------------------------------------------------------------------
+
+const FOLD9_BASES = [
+  'import * as self from "./m";\nObject.assign(self, { real() { return 1; } });\nexport const a = 1;\n',
+  "export const a = 1;\n__vite_ssr_exports__.real = function () { return 1; };\n",
+  'import { createRequire } from "node:module";\nconst r = createRequire(__filename);\nr.cache[__filename].exports.real = function () { return 1; };\nexport const a = 1;\n',
+];
+
+test("fold9 1: the fold9 merge-base inputs yield no fresh export, as .ts, .js, .mjs and .js of type module", async () => {
+  const head = "export const a = 1;\nexport function real() { return 1; }\n";
+  const wrong = [];
+  for (const base of FOLD9_BASES) for (const [path, pkg] of [["src/m.ts"], ["src/m.js"], ["src/m.mjs"], ["src/m.js", typed("module")]]) {
+    if ((await freshOf(path, base, head, pkg)).includes("real")) wrong.push(`${path}: ${JSON.stringify(base)}`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("fold9 2: the allow-list: a namespace import, a dynamic import(), node:module or module, a `__vi` name make the base unsure; other imports do not", async () => {
+  const head = "export const a = 1;\nexport function real() { return 1; }\n";
+  for (const base of [
+    'import * as fs from "node:fs";\nexport const a = 1;\n',
+    'import d, * as ns from "./x.mjs";\nexport const a = 1;\n',
+    'export const a = 1;\nconst m = await import("./m.mjs");\n',
+    'import { createRequire as cr } from "module";\nexport const a = 1;\n',
+    'import m from "node:module";\nexport const a = 1;\n',
+    'export { createRequire } from "node:module";\nexport const a = 1;\n',
+    "export const a = 1;\nconst o = { x: __vi_import_0__ };\n",
+    "export const a = 1;\nconst o = {};\no.__vite_ssr_import_meta__ = 1;\n",
+  ]) {
+    assert.deepEqual(await freshOf("src/m.mjs", base, head), [], base);
+  }
+  for (const base of ['import { readFileSync } from "node:fs";\nimport d from "./d.mjs";\nexport const a = 1;\n', 'export * as ns from "./x.mjs";\nexport const a = 1;\n', "export const a = 1;\nconst vi = 1;\n"]) {
+    assert.deepEqual(await freshOf("src/m.mjs", base, head), ["real"], base);
+  }
 });

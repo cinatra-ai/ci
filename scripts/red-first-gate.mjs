@@ -16,9 +16,23 @@
 //      repository's own runner (node:test or vitest), reading machine reports
 //      (a node:test reporter, the vitest JSON report), never exit codes alone;
 //   4. passes only when every new test file loads, collects tests and fails at
-//      least one test for the right reason before the fix (an assertion, or the
-//      text of a `red-first-expect:` marker in the file), and with the fix loads,
-//      passes, and passes every occurrence of every test that failed before.
+//      least one test for the right reason before the fix (an assertion, the
+//      text of a `red-first-expect:` marker in the file, or a failure that names
+//      an export or a module the fix side adds and the test file itself
+//      imports from that module), and with the fix loads, passes, and passes
+//      every occurrence of every test that failed before.
+// A test file with no failing test before the fix makes no red-first claim in
+// two cases only, each a note (not proven here), never a proof:
+//   - COLLATERAL: a changed file whose earlier version, run in the tree WITH
+//     the fix, reports the same tests and fails (the fix breaks it, the edit
+//     keeps it working), and whose edit touches no test declaration and no
+//     assertion line;
+//   - PIN: every test the pull request adds to the file is named by its own
+//     `red-first-pin:` marker that the pull request adds, names one test
+//     occurrence, and passes before the fix and with it; in a changed file the
+//     edit only adds lines and the earlier version passes with the fix.
+// A run is a PASS only with at least one proven file; with notes only it is
+// RED (NOTHING-PROVEN): a green job always has a proven file.
 // Anything it cannot read or prove ends RED with a named reason. A pull request
 // without a new test, with no change besides tests, or whose new tests all
 // match --exclude, is a SKIP (exit 3 in `run`), never a pass. New tests that
@@ -35,14 +49,16 @@
 //                           [--test-support <globs>] [--timeout-seconds <n>]
 //                           [--job-started <epoch s> --job-minutes <n>]
 //                           [--verdict <file>] [--summary <file>]
-// Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED, 3 SKIP,
-// 130/143 stopped by SIGINT/SIGTERM; 2 usage or internal error (both modes).
+// Exit codes: plan 0 (decided: run or skip); run 0 PASS, 1 RED,
+// 3 SKIP, 130/143 stopped by SIGINT/SIGTERM; 2 usage or internal error (both
+// modes).
 //
 // Node built-ins, git and bash; Linux or macOS.
 // ---------------------------------------------------------------------------
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 // Test files: JavaScript and TypeScript only (.js .jsx .ts .tsx .mjs .cjs .mts
@@ -81,7 +97,46 @@ const STOP_GRACE_MS = 5000;
 const CLEANUP_GIT_MS = 30_000;
 const NODE_TEST_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["']node:test["']/;
 const MARKER_RE = /red-first-expect:[ \t]*(.*?)[ \t]*(?:\*\/[ \t]*)?$/;
+const PIN_RE = /red-first-pin:[ \t]*(.*?)[ \t]*(?:\*\/[ \t]*)?$/;
 const ASSERTION_TEXT_RE = /^(?:AssertionError|JestAssertionError)\b/;
+// A failure before the fix that names what the fix adds. A call of something
+// that is not there yet: the name is the last identifier of the callee
+// (`calc.sum`, `(0 , __vite_ssr_import_1__.sum)`). A named import that is not
+// there yet. A module that is not there yet, as node and vite word it.
+const NOT_CALLABLE_RE = /^TypeError: (.+?) is not a (?:function|constructor)(?![A-Za-z])/;
+const TRAILING_NAME_RE = /([A-Za-z_$][\w$]*)[\s)]*$/;
+const CALLEE_MAX = 300;
+// A runner's error text only: at the start of the text or right after an
+// error name (`Error: `, `Error [ERR_MODULE_NOT_FOUND]: `, `SyntaxError: `),
+// never inside other words (a message that prints such a text).
+const AT_ERROR = String.raw`(?:^|(?<=(?:^|[\s>])[A-Za-z]*Error(?: \[[A-Z_]+\])?: ))`;
+const NO_EXPORT_RE = new RegExp(`${AT_ERROR}The requested module ['"][^'"]+['"] does not provide an export named ['"]([A-Za-z_$][\\w$]*)['"]`);
+// kind "vite": a path from the vite root (`/src/x.ts`); other absolute paths
+// count only inside the tree.
+const MISSING_MODULE_RES = [
+  { re: new RegExp(`${AT_ERROR}Cannot find (?:module|package) ['"]([^'"]+)['"](?: imported from ['"]?([^\\s'"]+))?`, "g"), kind: "node" },
+  { re: new RegExp(`${AT_ERROR}Failed to resolve import ['"]([^'"]+)['"] from ['"]([^'"]+)['"]`, "g"), kind: "node" },
+  { re: new RegExp(`${AT_ERROR}Failed to load url (\\S+) \\(resolved id: [^)]*\\)(?: in (\\S+?)\\.? Does)?`, "g"), kind: "vite" },
+];
+// A path that is test code by its place or name, though the range lists it on
+// the fix side: never evidence of what the fix adds. A declaration file holds
+// types, never a value.
+const TEST_PLACE_RE = /(^|\/)(?:tests?|__tests__|specs?|__mocks__|mocks?|fixtures?|__fixtures__|test-?utils|testing|e2e)\//i;
+const TEST_NAME_RE = /(?:^|[-_.])(?:tests?|specs?|mocks?|fixtures?|stubs?|fakes?)(?:[-_.]|$)/i;
+const DECLARATION_FILE_RE = /\.d\.[cm]?ts$/;
+// Exports a script declares on one line: `export function f`, `export class
+// C`, `export const c`, `export { a, b as c }`, `exports.f =`. Types, `export
+// declare` (no value) and `export default` (no name of its own) are not read.
+const EXPORT_DECL_RE = /^\s*export\s+(?:async\s+)?(?:function\s*\*?\s*|(?:abstract\s+)?class\s+|(?:const|let|var|enum)\s+)([A-Za-z_$][\w$]*)/;
+const EXPORT_LIST_RE = /^\s*export\s*\{([^}]*)\}/;
+const CJS_EXPORT_RE = /^\s*(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=/;
+const NAME_RE = /^[A-Za-z_$][\w$]*$/;
+// A line that declares a test or states an assertion: it/test/describe (with
+// .each, .skip, ...), expect..., assert..., .should, .rejects, .resolves and
+// the matcher calls (.toBe(, .not.toEqual(, ...). Read on the changed lines
+// of a test file; a method call such as `re.test(` is not a declaration.
+const TEST_LINE_RE =
+  /(?<![.\w$])(?:it|test|describe|suite|specify|bench)\s*(?:\.\s*[A-Za-z]+\s*)*(?:\(|`)|(?<![.\w$])(?:expect|assert)[A-Za-z]*\s*[.(]|\.\s*(?:should|rejects|resolves)\b|\.\s*(?:not\s*\.\s*)?to(?:Be|Equal|StrictEqual|Have|Contain|Match|Throw|Satisfy|Include)[A-Za-z]*\s*\(/;
 const REPORTER = join(dirname(fileURLToPath(import.meta.url)), "red-first-reporter.mjs");
 export const DEFAULT_VITEST = "npx --no-install vitest run";
 // The statuses the vitest JSON report uses; any other value makes the report
@@ -324,6 +379,575 @@ export function readMarkers(source) {
   return markers;
 }
 
+// `red-first-pin: <text>` lines: each names, by a part of its full name, a test
+// that passes before the fix on purpose (it pins behaviour the fix keeps).
+export function readPins(source) {
+  const pins = [];
+  for (const line of String(source).split(/\r?\n/)) {
+    const match = PIN_RE.exec(line);
+    // A pin that is empty once normalized would name every test.
+    if (match && normalizeText(match[1])) pins.push(match[1].trim());
+  }
+  return pins;
+}
+
+// ---------------------------------------------------------------------------
+// What the fix adds, and what an edit of a test file touches
+// ---------------------------------------------------------------------------
+
+// The name a `TypeError: ... is not a function` (or constructor) text calls.
+export function missingCallable(text) {
+  const match = NOT_CALLABLE_RE.exec(normalizeText(text));
+  // A callee longer than any real name is not read.
+  if (!match || match[1].length > CALLEE_MAX) return null;
+  const name = TRAILING_NAME_RE.exec(match[1])?.[1] ?? null;
+  return name && name !== "default" ? name : null;
+}
+
+// The modules a text reports as not found: [{ spec, importer, kind }].
+export function missingModules(text) {
+  const found = [];
+  const t = normalizeText(text);
+  for (const { re, kind } of MISSING_MODULE_RES) {
+    for (const match of t.matchAll(re)) found.push({ spec: match[1], importer: match[2] ?? null, kind });
+  }
+  return found;
+}
+
+// The scripts' exports and imports are read with the TypeScript parser (the
+// `typescript` package of this repository's lockfile, installed beside the
+// gate), never with a hand scanner: a regular expression, a division, a
+// template, JSX text and a comment are told apart by the grammar.
+let tsParser;
+function typescript() {
+  if (tsParser === undefined) {
+    try {
+      tsParser = createRequire(import.meta.url)("typescript");
+    } catch {
+      throw new Error("the TypeScript parser is not installed beside the gate: run `npm ci` in the gate's checkout");
+    }
+  }
+  return tsParser;
+}
+
+// The script kind of a path (a path-less source reads as JavaScript, which
+// also parses JSX).
+function scriptKind(ts, path) {
+  if (/\.d\.[cm]?ts$/.test(path) || /\.[cm]?ts$/.test(path)) return ts.ScriptKind.TS;
+  if (/\.tsx$/.test(path)) return ts.ScriptKind.TSX;
+  if (/\.jsx$/.test(path)) return ts.ScriptKind.JSX;
+  return ts.ScriptKind.JS;
+}
+
+// The literal tokens of a parsed file (strings, templates, regular
+// expressions, JSX text): [start, end) offsets.
+function literalRanges(ts, file) {
+  const ranges = [];
+  const visit = (node) => {
+    if (ts.isStringLiteralLike(node) || ts.isTemplateLiteralToken(node) || ts.isRegularExpressionLiteral(node) || ts.isJsxText(node)) ranges.push([node.getStart(file), node.end]);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return ranges;
+}
+
+// The offsets of the HTML-like comments of a text (`<!--` anywhere, `-->` at
+// a line start after spaces or tabs only), which a CommonJS script may hold
+// and the parser reads as code. A plain scan, not a pattern over the markup.
+const LINE_BREAKS = "\n\r\u2028\u2029";
+function htmlCommentOffsets(text) {
+  const at = [];
+  for (let i = text.indexOf("<!--"); i !== -1; i = text.indexOf("<!--", i + 4)) at.push(i);
+  for (let i = text.indexOf("-->"); i !== -1; i = text.indexOf("-->", i + 3)) {
+    let j = i - 1;
+    while (j >= 0 && (text[j] === " " || text[j] === "\t")) j -= 1;
+    if (j < 0 || LINE_BREAKS.includes(text[j])) at.push(i);
+  }
+  return at;
+}
+
+// The parsed source, and whether the parser may not read it as JavaScript
+// does: a syntax error, or an HTML-like comment outside a literal.
+function parse(source, path = "") {
+  const ts = typescript();
+  const text = String(source);
+  const file = ts.createSourceFile(path || "source.js", text, ts.ScriptTarget.Latest, true, scriptKind(ts, path));
+  let unsure = file.parseDiagnostics.length > 0;
+  const comments = unsure ? [] : htmlCommentOffsets(text);
+  if (comments.length) {
+    const ranges = literalRanges(ts, file);
+    if (comments.some((at) => !ranges.some(([start, end]) => at >= start && at < end))) unsure = true;
+  }
+  return { ts, file, unsure };
+}
+
+const hasModifier = (ts, node, kind) => (ts.canHaveModifiers(node) ? ts.getModifiers(node) ?? [] : []).some((m) => m.kind === kind);
+
+// The names a binding (a name or a destructuring pattern) declares.
+function bindingNames(ts, name, out) {
+  if (ts.isIdentifier(name)) out.push(name.text);
+  else for (const element of name.elements) if (!ts.isOmittedExpression(element)) bindingNames(ts, element.name, out);
+}
+
+// The CommonJS reading is deny-by-default: every reference to `exports`,
+// `module`, `__exportStar` or `__export`, every top-level `this` and every
+// `export =` makes the script unsure, unless the reference is part of one of
+// the recognised top-level statements below, whose whole shape is read.
+const CJS_WATCHED = new Set(["exports", "module", "__exportStar", "__export"]);
+
+// `exports` or `module.exports`: the identifier nodes it references, or null.
+function exportsObject(ts, node) {
+  if (ts.isIdentifier(node) && node.text === "exports") return [node];
+  if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "module" && node.name.text === "exports") return [node.expression];
+  return null;
+}
+
+// A string or number literal as a name (an identifier too, for an object
+// literal's key); else null.
+function keyName(ts, key, identifier = false) {
+  return key && ((identifier && ts.isIdentifier(key)) || ts.isStringLiteralLike(key) || ts.isNumericLiteral(key)) ? key.text : null;
+}
+
+// `exports.<n>`, `exports["<n>"]`, `module.exports.<n>`, `module.exports["<n>"]`:
+// { name, refs }, or null.
+function exportsTarget(ts, node) {
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return null;
+  const refs = exportsObject(ts, node.expression);
+  if (!refs) return null;
+  const name = ts.isPropertyAccessExpression(node) ? node.name.text : keyName(ts, node.argumentExpression);
+  return name === null || name === "__proto__" ? null : { name, refs };
+}
+
+// The recognised CommonJS statements of a script's top level, each read as a
+// whole: `T = value` and chains `T1 = T2 = value` with T an exports target,
+// `module.exports = { ... }` (an object literal, also in parentheses, with plain keys: names,
+// strings, numbers, shorthand, methods, accessors; no spread, no computed
+// key) and `Object.defineProperty(exports or module.exports, "<n>", ...)`.
+// Returns the names and the identifier nodes these statements account for.
+function commonJsStatements(ts, file) {
+  const names = [];
+  const accounted = new Set();
+  for (const statement of file.statements) {
+    if (!ts.isExpressionStatement(statement)) continue;
+    const expression = statement.expression;
+    if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const whole = exportsObject(ts, expression.left);
+      let value = expression.right;
+      while (ts.isParenthesizedExpression(value)) value = value.expression;
+      if (whole && !ts.isIdentifier(expression.left) && ts.isObjectLiteralExpression(value)) {
+        const keys = value.properties.map((p) => (ts.isShorthandPropertyAssignment(p) ? p.name.text : ts.isSpreadAssignment(p) ? null : keyName(ts, p.name, true)));
+        if (keys.every((k) => k !== null && k !== "__proto__")) {
+          names.push(...keys);
+          for (const ref of whole) accounted.add(ref);
+        }
+        continue;
+      }
+      let node = expression;
+      while (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const target = exportsTarget(ts, node.left);
+        if (!target) break;
+        names.push(target.name);
+        for (const ref of target.refs) accounted.add(ref);
+        node = node.right;
+      }
+    } else if (
+      ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) && ts.isIdentifier(expression.expression.expression)
+      && expression.expression.expression.text === "Object" && expression.expression.name.text === "defineProperty" && expression.arguments.length >= 2
+    ) {
+      const refs = exportsObject(ts, expression.arguments[0]);
+      const name = keyName(ts, expression.arguments[1]);
+      if (refs && name !== null && name !== "__proto__") {
+        names.push(name);
+        for (const ref of refs) accounted.add(ref);
+      }
+    }
+  }
+  return { names, accounted };
+}
+
+// An identifier that names a property, a member or a label rather than
+// referencing a binding.
+function notAReference(ts, node) {
+  const parent = node.parent;
+  if (!parent) return false;
+  if ((ts.isPropertyAccessExpression(parent) || ts.isQualifiedName(parent)) && (parent.name === node || parent.right === node)) return true;
+  if ((ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent) || ts.isPropertyDeclaration(parent) || ts.isPropertySignature(parent) || ts.isMethodSignature(parent) || ts.isGetAccessorDeclaration(parent) || ts.isSetAccessorDeclaration(parent) || ts.isEnumMember(parent) || ts.isJsxAttribute(parent)) && parent.name === node) return true;
+  if (ts.isBindingElement(parent) && parent.propertyName === node) return true;
+  return ts.isLabeledStatement(parent) || ts.isBreakOrContinueStatement(parent);
+}
+
+// Whether a script holds a CommonJS or module-object use the reading does not
+// account for (see CJS_WATCHED).
+function unreadCommonJs(ts, file, accounted, watched = CJS_WATCHED) {
+  let found = false;
+  const visit = (node) => {
+    if (found) return;
+    if (ts.isIdentifier(node) && watched.has(node.text) && !accounted.has(node) && !notAReference(ts, node)) found = true;
+    else if (node.kind === ts.SyntaxKind.ThisKeyword && moduleThis(ts, node)) found = true;
+    else if (ts.isExportAssignment(node) && node.isExportEquals) found = true;
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+// Whether a `this` is the module's: no enclosing non-arrow function and no
+// enclosing class, except the member or class whose computed name, decorator
+// or heritage clause holds it (those are evaluated outside that member's or
+// class's body: `class A { get [this.k]() {} }`, `class A extends this.B {}`,
+// `({ set [this.k](v) {} })`).
+function moduleThis(ts, node) {
+  const outside = new Set();
+  for (let p = node.parent; p; p = p.parent) {
+    if (ts.isComputedPropertyName(p) || ts.isDecorator(p) || ts.isHeritageClause(p)) {
+      let owner = p.parent;
+      if (ts.isParameter(owner)) owner = owner.parent;
+      outside.add(owner);
+      if (owner.parent && ts.isClassLike(owner.parent)) outside.add(owner.parent);
+    }
+    if (outside.has(p)) continue;
+    if ((ts.isFunctionLike(p) && !ts.isArrowFunction(p)) || ts.isClassLike(p)) return false;
+  }
+  return true;
+}
+
+// The value exports of a whole script by the parser: an exported function
+// with a body, class, variable, enum, namespace or `import x =` declaration
+// (not `declare`, not a type), an `export { ... }` list (not `type` names,
+// not `default`), `export * as`, and the recognised CommonJS statements;
+// unsure when the parser reports a syntax error or an HTML-like comment, or
+// the script uses `exports`, `module`, a top-level `this`, an export helper
+// or `export =` in any other way.
+export function readExports(source, path = "") {
+  const { ts, file, unsure: parseUnsure } = parse(source, path);
+  const names = moduleExports(ts, file);
+  const cjs = commonJsStatements(ts, file);
+  for (const name of cjs.names) names.add(name);
+  return { names, unsure: parseUnsure || unreadCommonJs(ts, file, cjs.accounted) };
+}
+
+// The ES module export names of a parsed script (see readExports).
+function moduleExports(ts, file) {
+  const names = new Set();
+  for (const statement of file.statements) {
+    if (ts.isExportDeclaration(statement)) {
+      if (statement.isTypeOnly) continue;
+      const clause = statement.exportClause;
+      if (clause && ts.isNamedExports(clause)) {
+        for (const element of clause.elements) if (!element.isTypeOnly && element.name.text !== "default") names.add(element.name.text);
+      } else if (clause && ts.isNamespaceExport(clause)) names.add(clause.name.text);
+      continue;
+    }
+    if (!hasModifier(ts, statement, ts.SyntaxKind.ExportKeyword) || hasModifier(ts, statement, ts.SyntaxKind.DeclareKeyword) || hasModifier(ts, statement, ts.SyntaxKind.DefaultKeyword)) continue;
+    // a function needs a body (a signature alone is no value); a namespace or module of a plain name and
+    // `export import x = ...` are values
+    if (ts.isFunctionDeclaration(statement) && statement.name && statement.body) names.add(statement.name.text);
+    else if ((ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement)) && statement.name) names.add(statement.name.text);
+    else if (ts.isModuleDeclaration(statement) && ts.isIdentifier(statement.name)) names.add(statement.name.text);
+    else if (ts.isImportEqualsDeclaration(statement) && !statement.isTypeOnly) names.add(statement.name.text);
+    else if (ts.isVariableStatement(statement)) {
+      const list = [];
+      for (const declaration of statement.declarationList.declarations) bindingNames(ts, declaration.name, list);
+      for (const name of list) names.add(name);
+    }
+  }
+  return names;
+}
+
+// At the merge base only an ES module is read, because CommonJS exports are
+// built at run time and no static reading of them is complete. A script there
+// is unsure (it may export any name) unless it is a pure ES module: not a
+// `.cjs` or `.cts` file, not under a package.json whose type is "commonjs"
+// (packageType: the nearest one's type, "" when none, null when it does not
+// parse), at least one static `import` or `export` statement, no `export =`,
+// no `import x = require(...)`, no `export * from` (its names are another
+// file's), and no reference at all to `exports`, `module`, `require`,
+// `arguments`, `eval`, an export helper or a module-level `this`. A
+// transpiler or a test runner (TypeScript to CommonJS, vitest) can still let
+// an ES module write its own export object, so the reading allows only a
+// module without a namespace import (`import * as`), a dynamic `import()`,
+// an import from `node:module` or `module`, and any identifier that starts
+// with `__vi` (`__vite_ssr_exports__`, `__vi_import_0__`). The reading is
+// static; a file that sets its exports through runtime tricks is outside
+// it. An empty script exports nothing.
+const BASE_WATCHED = new Set([...CJS_WATCHED, "require", "arguments", "eval"]);
+export function readBaseExports(source, path = "", packageType = "") {
+  const { ts, file, unsure } = parse(source, path);
+  const none = (u) => ({ names: new Set(), unsure: u });
+  if (unsure) return none(true);
+  if (!file.statements.length) return none(false);
+  if (/\.c[jt]s$/.test(path) || (!/\.m[jt]s$/.test(path) && (packageType === null || packageType === "commonjs"))) return none(true);
+  let isModule = false;
+  for (const statement of file.statements) {
+    if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference)) return none(true);
+    if (ts.isExportAssignment(statement) && statement.isExportEquals) return none(true);
+    if (ts.isExportDeclaration(statement) && !statement.exportClause && !statement.isTypeOnly) return none(true);
+    if (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement) || ts.isExportAssignment(statement) || hasModifier(ts, statement, ts.SyntaxKind.ExportKeyword)) isModule = true;
+  }
+  if (!isModule || unreadCommonJs(ts, file, new Set(), BASE_WATCHED) || runtimeExportRoad(ts, file)) return none(true);
+  return { names: moduleExports(ts, file), unsure: false };
+}
+
+// Whether an ES module holds one of the roads by which a transpiler or a test
+// runner lets it write its own export object (see readBaseExports).
+const MODULE_SPECIFIERS = new Set(["node:module", "module"]);
+function runtimeExportRoad(ts, file) {
+  for (const statement of file.statements) {
+    const spec = (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement)) && statement.moduleSpecifier;
+    if (spec && ts.isStringLiteralLike(spec) && MODULE_SPECIFIERS.has(spec.text)) return true;
+    const bindings = ts.isImportDeclaration(statement) && statement.importClause?.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) return true;
+  }
+  let found = false;
+  const visit = (node) => {
+    if (found) return;
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) found = true;
+    else if ((ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) && /^#?__vi/.test(node.text)) found = true;
+    else ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+// The type field of the package.json nearest to a path in a version: "" when
+// there is none or it names no type, null when it does not parse.
+function nearestPackageType(read, path) {
+  const parts = path.split("/").slice(0, -1);
+  for (let n = parts.length; n >= 0; n -= 1) {
+    const text = read([...parts.slice(0, n), "package.json"].join("/"));
+    if (text === null || text === undefined) continue;
+    try {
+      const type = JSON.parse(text)?.type;
+      return typeof type === "string" ? type : "";
+    } catch {
+      return null;
+    }
+  }
+  return "";
+}
+
+// The value exports of a whole script; none when the parser reports a syntax
+// error (fail closed: such a file is never evidence).
+export function exportsOf(source, path = "") {
+  const read = readExports(source, path);
+  return read.unsure ? new Set() : read.names;
+}
+
+// Per fix-side evidence script, the names its whole head version exports that
+// no fix-side script exported at the merge base (so a moved export is not
+// new): Map(path -> names). base(path) and head(path) give a version's text,
+// or null. When any fix-side script of the merge base is not read cleanly as
+// an ES module (readBaseExports), nothing is fresh (that script may export
+// any name).
+export function freshExports(fixSide, base, head) {
+  const byFile = new Map();
+  const scripts = fixSide.filter((path) => SCRIPT_EXT_RE.test(path));
+  const before = new Set();
+  for (const path of scripts) {
+    const text = base(path);
+    if (text === null || text === undefined) continue;
+    const read = readBaseExports(text, path, /\.m[jt]s$/.test(path) ? "" : nearestPackageType(base, path));
+    if (read.unsure) return byFile;
+    for (const name of read.names) before.add(name);
+  }
+  for (const path of scripts.filter(evidencePath)) {
+    const text = head(path);
+    if (text === null) continue;
+    const fresh = new Set([...exportsOf(text, path)].filter((name) => !before.has(name)));
+    if (fresh.size) byFile.set(path, fresh);
+  }
+  return byFile;
+}
+
+// The static imports of a test file: [{ spec, names, whole }]. names: the
+// exported names it imports by name; whole: it binds the whole module (a
+// namespace, a default import, `require` of the module), so any export may be
+// called through it. `import type` binds no value and is not read. A file the
+// parser does not read cleanly imports nothing here (no evidence).
+export function importsOf(source, path = "") {
+  const { ts, file, unsure } = parse(source, path);
+  if (unsure) return [];
+  const found = [];
+  const requireOf = (node) =>
+    node && ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "require" && node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0]) ? node.arguments[0].text : null;
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
+    const clause = statement.importClause;
+    if (clause?.isTypeOnly) continue;
+    const names = new Set();
+    let whole = Boolean(clause?.name);
+    const bindings = clause?.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) whole = true;
+    else if (bindings) for (const element of bindings.elements) if (!element.isTypeOnly) names.add((element.propertyName ?? element.name).text);
+    found.push({ spec: statement.moduleSpecifier.text, names, whole });
+  }
+  const visit = (node) => {
+    if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference) && ts.isStringLiteralLike(node.moduleReference.expression)) {
+      found.push({ spec: node.moduleReference.expression.text, names: new Set(), whole: true });
+    } else if (ts.isVariableDeclaration(node)) {
+      const spec = requireOf(node.initializer);
+      if (spec !== null && ts.isIdentifier(node.name)) found.push({ spec, names: new Set(), whole: true });
+      else if (spec !== null && ts.isObjectBindingPattern(node.name)) {
+        const names = new Set();
+        for (const element of node.name.elements) {
+          const key = element.propertyName ?? element.name;
+          if (ts.isIdentifier(key)) names.add(key.text);
+        }
+        found.push({ spec, names, whole: false });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+// A relative import of `file`, as a repository path, or null.
+function importPath(spec, file) {
+  if (!(spec.startsWith("./") || spec.startsWith("../"))) return null;
+  const n = posix.normalize(posix.join(posix.dirname(file), spec));
+  return n && n !== "." && n !== ".." && !n.startsWith("../") && !n.startsWith("/") ? n : null;
+}
+
+// A fix-side path that can be evidence of what the fix adds: a script, not a
+// declaration file, not test code by its place or name.
+export function evidencePath(path) {
+  return SCRIPT_EXT_RE.test(path) && !DECLARATION_FILE_RE.test(path) && !TEST_PLACE_RE.test(path) && !TEST_NAME_RE.test(posix.basename(path).replace(SCRIPT_EXT_RE, ""));
+}
+
+// The names the added lines of one script export, less the names its removed
+// lines exported (a changed line is not a new export).
+export function exportNames(lines) {
+  const names = [];
+  for (const line of lines) {
+    const decl = EXPORT_DECL_RE.exec(line)?.[1] ?? CJS_EXPORT_RE.exec(line)?.[1];
+    if (decl) names.push(decl);
+    const list = EXPORT_LIST_RE.exec(line)?.[1];
+    if (list === undefined) continue;
+    for (const part of list.split(",")) {
+      const item = part.trim();
+      if (!item || /^type\s/.test(item)) continue;
+      const name = item.split(/\s+as\s+/).pop().trim();
+      if (NAME_RE.test(name) && name !== "default") names.push(name);
+    }
+  }
+  return names;
+}
+
+function isCommentLine(line) {
+  const t = line.trim();
+  if (t.startsWith("//")) return true;
+  if (!(t.startsWith("/*") || t.startsWith("*"))) return false;
+  const end = t.indexOf("*/");
+  return end < 0 || !t.slice(end + 2).trim();
+}
+
+// The first changed line (added or removed, comments apart) of a test file's
+// edit that declares a test or states an assertion, or null.
+export function changedTestLine(lines) {
+  return lines.find((line) => !isCommentLine(line) && TEST_LINE_RE.test(line)) ?? null;
+}
+
+// A unified diff with no context lines, per path: { added: [...], removed:
+// [...] }. A path git writes quoted (unusual characters) is left out: what
+// is not read here is never evidence.
+export function parseRangeDiff(text) {
+  const files = new Map();
+  let current = null;
+  let header = false;
+  for (const line of String(text).split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      header = true;
+      current = null;
+    } else if (header) {
+      if (line.startsWith("+++ b/")) {
+        current = { added: [], removed: [] };
+        files.set(line.slice(6).replace(/\t$/, ""), current);
+      } else if (line.startsWith("@@")) header = false;
+    } else if (current) {
+      if (line.startsWith("+")) current.added.push(line.slice(1));
+      else if (line.startsWith("-")) current.removed.push(line.slice(1));
+    }
+  }
+  return files;
+}
+
+// Repository paths a missing-module text may mean: an absolute path inside the
+// tree, a path from the repository root or the runner's folder (vite writes
+// `/src/x.ts`), or a relative specifier from its importer or the test file.
+function moduleCandidates({ spec, importer, kind }, file, roots, runnerDir) {
+  const out = [];
+  const push = (p) => {
+    const n = posix.normalize(p);
+    if (n && n !== "." && !n.startsWith("../") && n !== ".." && !n.startsWith("/")) out.push(n);
+  };
+  const name = spec.replace(/^file:\/\//, "");
+  if (name.startsWith("/")) {
+    const inside = relativeIn(name, roots);
+    if (inside) push(inside);
+    // Only vite writes a path from its root; any other absolute path outside
+    // the tree is not a path of the repository.
+    else if (kind === "vite") push(posix.join(runnerDir || ".", name.replace(/^\/+/, "")));
+  } else if (name.startsWith("./") || name.startsWith("../")) {
+    const from = importer ? relativeIn(importer.replace(/^file:\/\//, ""), roots) : null;
+    if (from) push(posix.join(posix.dirname(from), name));
+    push(posix.join(posix.dirname(file), name));
+  }
+  return out;
+}
+
+// The TypeScript sources an import that names a script's extension may load.
+const TS_SOURCE_EXT = { ".js": [".ts", ".tsx"], ".jsx": [".tsx"], ".mjs": [".mts"], ".cjs": [".cts"] };
+
+// The added script a module path means. Without an extension: that path with
+// any script extension, or its folder's index. With one: that very file, or
+// only its TypeScript source (x.js -> x.ts), never an index or another script.
+function addedModule(candidate, added) {
+  if (added.has(candidate)) return candidate;
+  const ext = SCRIPT_EXT_RE.exec(candidate)?.[0];
+  const stem = candidate.replace(SCRIPT_EXT_RE, "");
+  for (const path of added) {
+    const own = SCRIPT_EXT_RE.exec(path);
+    if (!own) continue;
+    const name = path.slice(0, own.index);
+    if (ext ? name === stem && (TS_SOURCE_EXT[ext] ?? []).includes(own[0]) : name === candidate || name === `${candidate}/index`) return path;
+  }
+  return null;
+}
+
+// What a failure text before the fix names that the fix side adds: an export
+// (a call of it, or a named import of it) or a module. The evidence is bound
+// to the test file's own static imports: the export is new in the very module
+// the test file imports it from (or imports whole), and the module is one the
+// test file imports, outside the test file's folder. Returns a description for
+// the note, or null: no evidence, so the failure is judged as before.
+//   source        the test file's text at the head;
+//   exportsByFile () => Map(path -> names the fix side newly exports there);
+//   addedFix      the evidence paths the range adds (plan.addedFix).
+export function addedByFix(text, file, { source = "", exportsByFile = () => new Map(), addedFix = new Set(), roots = [], runnerDir = "" }) {
+  const t = normalizeText(text);
+  const imports = importsOf(source, file)
+    .map((im) => ({ ...im, path: importPath(im.spec, file) }))
+    .filter((im) => im.path);
+  const name = missingCallable(t) ?? NO_EXPORT_RE.exec(t)?.[1] ?? null;
+  if (name) {
+    const map = exportsByFile();
+    for (const im of imports.filter((x) => x.names.has(name) || x.whole)) {
+      const hit = addedModule(im.path, new Set(map.keys()));
+      if (hit && map.get(hit).has(name)) return `the export ${name}`;
+    }
+  }
+  const own = posix.dirname(file);
+  for (const missing of missingModules(t)) {
+    for (const candidate of moduleCandidates(missing, file, roots, runnerDir)) {
+      const hit = addedModule(candidate, addedFix);
+      if (!hit || posix.dirname(hit) === own) continue;
+      if (imports.some((im) => addedModule(im.path, new Set([hit])))) return `the module ${hit}`;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Reports
 // ---------------------------------------------------------------------------
@@ -407,6 +1031,8 @@ export function parseVitestReport(report, treeRoot) {
     const result = {
       loaded,
       loadError: loaded ? null : message ? firstLine(message) : `the runner reports the file as ${entry.status}`,
+      // the whole message, for the reading of what the fix adds
+      loadText: loaded ? null : normalizeText(message),
       fileError,
       tests,
     };
@@ -416,6 +1042,7 @@ export function parseVitestReport(report, treeRoot) {
     if (seen) {
       result.loaded = seen.loaded && result.loaded;
       result.loadError = seen.loadError ?? result.loadError;
+      result.loadText = seen.loadText ?? result.loadText;
       result.fileError = seen.fileError ?? result.fileError;
       result.tests = [...seen.tests, ...result.tests];
     }
@@ -503,7 +1130,7 @@ export function parseNodeReport(text, fileArg) {
   const result = tests.map((t) => ({ name: t.path.join(" > "), status: t.status, text: t.text, assertion: t.assertion }));
   if (wrapper && !wrapper.ok) {
     const why = firstErrorLine(stderr.join("")) ?? wrapper.text;
-    if (result.length === 0) return { loaded: false, loadError: clip(why), fileError: null, tests: result };
+    if (result.length === 0) return { loaded: false, loadError: clip(why), loadText: normalizeText(`${stderr.join("")} ${wrapper.text}`), fileError: null, tests: result };
     return { loaded: true, loadError: null, fileError: clip(why), tests: result };
   }
   return { loaded: true, loadError: null, fileError: null, tests: result };
@@ -536,39 +1163,150 @@ function actual(failed) {
     .join(" | ");
 }
 
+// The tests of `tests` that `earlier` does not report, by name and count (two
+// tests of one name in the new list against one in the earlier list: one is
+// added).
+function addedTests(tests, earlier) {
+  const left = new Map();
+  for (const t of earlier) left.set(t.name, (left.get(t.name) ?? 0) + 1);
+  const added = [];
+  for (const t of tests) {
+    const n = left.get(t.name) ?? 0;
+    if (n > 0) left.set(t.name, n - 1);
+    else added.push(t);
+  }
+  return added;
+}
+
+// Why the run of a changed test file's earlier version cannot be compared, or
+// null when its tests were read.
+function earlierUnreadable(earlier) {
+  if (!earlier) return "it was not run";
+  if (earlier.run === "contradicts") return `its runner's exit does not match its report (${earlier.detail})`;
+  if (earlier.run !== "ok") return earlier.run === "timeout" ? "its run did not finish in time" : "its run gave no readable report";
+  const r = earlier.result;
+  if (!r) return "it is not in the runner's report";
+  if (r.tests?.some((t) => !KNOWN_STATUS.has(t.status))) return "its report gives an unknown status";
+  if (!r.loaded) return `it does not load: ${r.loadError}`;
+  if (r.fileError) return `its run reports a file error: ${r.fileError}`;
+  return null;
+}
+
 // before / head: { run: "ok" | "no-report" | "timeout", result } or undefined
 // when the phase did not run. Reasons for no-report, timeout and a stopped
 // install are recorded where they happen; this adds the per-file reasons.
-export function judgeFile({ file, markers = [] }, before, head) {
+// context (all optional; without it the file is judged by assertions and
+// markers alone):
+//   earlier         the run of a changed file's earlier version in the tree
+//                   with the fix ({ run, result }): its test names, and
+//                   whether the fix breaks it;
+//   changedTestLine the first changed line of the file's edit that declares a
+//                   test or states an assertion, or null;
+//   pureAddition    the file's edit only adds lines (no line removed or
+//                   changed);
+//   addedByFix      (text) => what the text names that the fix side adds.
+// Returns the reasons, the notes (a file that makes no red-first claim, or
+// that is red because of what the fix adds), `proven`, and `kind`: "proven",
+// "collateral", "pins" or null (not settled: a reason says why).
+export function judgeFile({ file, markers = [], pins = [], status = "A" }, before, head, context = {}) {
   const reasons = [];
+  const notes = [];
   const add = (code, phase, detail) => reasons.push({ code, phase, file, detail: clip(detail, 400) });
-  let failedBefore = [];
+  let mustPass = [];
   let beforeTests = [];
   let beforeOk = false;
   let headOk = false;
+  let noClaim = null;
+  let evidence = null;
   const unknown = (r) => r?.tests?.find((t) => !KNOWN_STATUS.has(t.status));
+  const wantedPins = pins.map((p) => normalizeText(p));
+  const pinned = (t) => wantedPins.some((p) => normalizeText(t.name).includes(p));
+  const fromFix = (text) => (text ? (context.addedByFix?.(text) ?? null) : null);
 
   if (before?.run === "ok") {
     const r = before.result;
     if (!r) add("NOT-COLLECTED", "before", "the file is not in the runner's report (outside the runner's include, or filtered out)");
     else if (unknown(r)) add("NO-REPORT", "before", `the report gives the unknown status ${JSON.stringify(unknown(r).status)} for ${unknown(r).name}`);
-    else if (!r.loaded) add("LOAD-ERROR", "before", r.loadError);
-    else if (r.fileError) add("FILE-ERROR", "before", r.fileError);
+    else if (!r.loaded) {
+      // A file that does not load is red for the right reason only when the
+      // load error names an export or a module the fix side adds.
+      evidence = fromFix(r.loadText ?? r.loadError);
+      if (!evidence) add("LOAD-ERROR", "before", r.loadError);
+      else if (pins.length) add("PIN-MISMATCH", "before", "the file does not load before the fix, so a test declared with red-first-pin: cannot pass there");
+      else beforeOk = true;
+    } else if (r.fileError) add("FILE-ERROR", "before", r.fileError);
     else {
       const ran = r.tests.filter((t) => t.status !== "skipped");
       const failed = ran.filter((t) => t.status === "failed");
+      const stray = pins.find((p, i) => !r.tests.some((t) => normalizeText(t.name).includes(wantedPins[i])));
+      // One marker names one test: a text that is in several test names (a
+      // suite name, a short word), or a name reported more than once (two
+      // tests of one title, two projects), would declare more than one test.
+      const broad = pins.find((p, i) => r.tests.filter((t) => normalizeText(t.name).includes(wantedPins[i])).length > 1);
+      const notPinned = r.tests.find((t) => pinned(t) && t.status !== "passed");
       if (ran.length === 0) add("NOT-COLLECTED", "before", "no test ran (none collected, or all skipped)");
-      else if (failed.length === 0) add("NOT-RED-BEFORE", "before", `all ${ran.length} test(s) already pass before the fix`);
-      else {
-        failedBefore = failed;
+      else if (stray !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${stray}" is in no test name of the file`);
+      else if (broad !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${broad}" is in more than one test name of the file, or in a name the report gives more than once: write one marker for each test, under a name of its own`);
+      else if (notPinned) add("PIN-MISMATCH", "before", `${notPinned.name} is declared with red-first-pin: but is ${notPinned.status} before the fix (a pin passes before the fix and with it)`);
+      else if (failed.length === 0) {
+        // No red-first claim is possible here. The file is settled without a
+        // proof only as a collateral edit or as declared pins; else it is RED.
+        const base = `all ${ran.length} test(s) already pass before the fix`;
+        const why = status === "A" ? null : earlierUnreadable(context.earlier);
+        const added = status === "A" ? r.tests : why ? [] : addedTests(r.tests, context.earlier.result.tests);
+        const undeclared = added.filter((t) => !pinned(t));
+        // The earlier version run in the tree with the fix: its failed tests.
+        const brokenByFix = why || status === "A" ? [] : context.earlier.result.tests.filter((t) => t.status === "failed");
+        const offAdded = status === "A" ? undefined : pins.find((p, i) => !added.some((t) => normalizeText(t.name).includes(wantedPins[i])));
+        // The earlier version's tests that the new version no longer reports
+        // (by name and count): a collateral edit and a pin keep every one.
+        const dropped = why || status === "A" ? [] : addedTests(context.earlier.result.tests, r.tests);
+        if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})`);
+        else if (dropped.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${dropped.length} test(s) of the file's earlier version: ${dropped.slice(0, 3).map((t) => t.name).join(" | ")} (a collateral edit or a pin keeps every existing test)`);
+        } else if (undeclared.length) {
+          const names = undeclared.slice(0, 3).map((t) => t.name).join(" | ");
+          add("NOT-RED-BEFORE", "before", `${base}; ${undeclared.length} test(s) the pull request adds do not fail first: ${names} (a test that pins behaviour the fix keeps is declared with a red-first-pin: <test name> line)`);
+        } else if (added.length) {
+          if (offAdded !== undefined) add("PIN-MISMATCH", "before", `marker red-first-pin: "${offAdded}" names a test the pull request does not add to the file`);
+          else if (status !== "A" && !context.pureAddition) {
+            add("NOT-RED-BEFORE", "before", `${base}; the edit declares pins but also changes or removes lines of the file: pins are declared only in an edit that adds lines (a change to an existing test must fail first)`);
+          } else if (brokenByFix.length) {
+            add("NOT-RED-BEFORE", "before", `${base}; the file's earlier version fails with the fix (${clip(brokenByFix.map((t) => t.name).slice(0, 3).join(" | "), 160)}), so the added lines also keep existing tests working: pins are declared only beside existing tests that pass with the fix unchanged`);
+          } else {
+            noClaim = { code: "PIN", kind: "pins", detail: `${added.length} test(s) the pull request adds are each declared by a red-first-pin: marker it adds and pass before the fix and with it; the file has no other new or changed test: not proven here` };
+          }
+        } else if (context.changedTestLine) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test but changes a test declaration or an assertion (${clip(context.changedTestLine, 120)}): a changed test must fail first`);
+        } else if (!brokenByFix.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test and the file's earlier version also passes with the fix, so the fix does not need the edit: a changed test must fail first`);
+        } else {
+          noClaim = {
+            code: "COLLATERAL",
+            kind: "collateral",
+            detail: `the file's earlier version fails with the fix (${clip(brokenByFix.map((t) => t.name).slice(0, 3).join(" | "), 160)}); the edit adds no test, changes no test declaration or assertion line, and all ${ran.length} test(s) pass before the fix and with it: it keeps an existing test file working, not a new test, not proven here`,
+          };
+        }
+        if (noClaim) {
+          mustPass = r.tests.filter((t) => t.status === "passed");
+          beforeTests = r.tests;
+        }
+      } else {
+        mustPass = [...failed, ...r.tests.filter(pinned)];
         beforeTests = r.tests;
         const texts = failed.map((t) => normalizeText(t.text));
         const wanted = markers.map((m) => normalizeText(m));
         const unmatched = markers.filter((m, i) => !texts.some((x) => x.includes(wanted[i])));
-        const right = failed.filter((t, i) => t.assertion || wanted.some((m) => texts[i].includes(m)));
+        const stated = failed.filter((t, i) => t.assertion || wanted.some((m) => texts[i].includes(m)));
         if (unmatched.length) add("TEXT-MISMATCH", "before", `marker "${unmatched[0]}" is in no failure text; actual: ${actual(failed)}`);
-        else if (right.length === 0) add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
-        else beforeOk = true;
+        else if (stated.length) beforeOk = true;
+        else {
+          // No assertion and no marker text: red for the right reason only
+          // when a failure names an export or a module the fix side adds.
+          evidence = failed.map((t) => fromFix(t.text)).find(Boolean) ?? null;
+          if (evidence) beforeOk = true;
+          else add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
+        }
       }
     }
   }
@@ -585,14 +1323,20 @@ export function judgeFile({ file, markers = [] }, before, head) {
       if (failed.length) add("NOT-GREEN-AT-HEAD", "head", `${failed.length} test(s) do not pass with the fix: ${actual(failed)}`);
       else if (passed.length === 0) add("NOT-COLLECTED", "head", "no test passed with the fix (none collected, or all skipped)");
       else {
-        const short = notPassedAtHead(failedBefore, beforeTests, r.tests);
+        const short = notPassedAtHead(mustPass, beforeTests, r.tests);
         if (short.length) {
-          add("NOT-GREEN-AT-HEAD", "head", `failed before the fix but did not pass with it: ${short.slice(0, 3).join(" | ")}`);
+          const what = noClaim ? "passed before the fix but did not pass with it" : pins.length ? "failed before the fix, or is a declared pin, but did not pass with it" : "failed before the fix but did not pass with it";
+          add("NOT-GREEN-AT-HEAD", "head", `${what}: ${short.slice(0, 3).join(" | ")}`);
         } else headOk = true;
       }
     }
   }
-  return { reasons, proven: beforeOk && headOk && reasons.length === 0 };
+  const clean = headOk && reasons.length === 0;
+  const proven = beforeOk && clean;
+  const settled = Boolean(noClaim) && clean;
+  if (settled) notes.push({ code: noClaim.code, phase: "before", file, detail: noClaim.detail });
+  if (proven && evidence) notes.push({ code: "ADDED-BY-FIX", phase: "before", file, detail: `red before the fix because ${evidence} is not there yet: the fix side adds it, and the file passes with the fix` });
+  return { reasons, notes, proven, kind: proven ? "proven" : settled ? noClaim.kind : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -837,7 +1581,15 @@ export function planRange({ repo = process.cwd(), base, head, exclude = "", test
   // target may be fix side, or a gitlink): the test that runs would not be the
   // pull request's test file, so run refuses them (NOT-A-FILE).
   const notFiles = c.testSide.filter((e) => e.status !== "D" && !REGULAR_MODES.has(modes.get(e.path))).map((e) => e.path);
-  const plan = { base, head, mergeBase, testSupport, setupPaths, notFiles, ...c };
+  // The fix-side paths the range adds: a module only the head has. Only a
+  // regular file that can be evidence counts (not a symlink, whose target may
+  // be test side or outside, not a declaration file, not test code).
+  const fixSide = new Set(c.fixSide);
+  const addedFix = entries
+    .filter((e) => e.status === "A" && fixSide.has(e.path) && REGULAR_MODES.has(modes.get(e.path)) && evidencePath(e.path))
+    .map((e) => e.path)
+    .sort(byPath);
+  const plan = { base, head, mergeBase, testSupport, setupPaths, notFiles, addedFix, ...c };
   if (c.newTests.length + c.excluded.length === 0) {
     return { ...plan, verdict: "skip", reason: "NO-NEW-TESTS", detail: "the pull request adds or changes no test file" };
   }
@@ -945,7 +1697,10 @@ function timeText(opts, byJob) {
   return byJob ? `the job's time budget (timeout_minutes less ${JOB_RESERVE_SECONDS}s for the verdict)` : `${opts.timeoutSeconds}s`;
 }
 
-async function runPhase(phase, tree, files, plan, opts, reportDir) {
+// swapped: test files this phase runs in their earlier version (the phase
+// "earlier"); they differ from the head on purpose. skipInstall: the tree was
+// installed by an earlier phase.
+async function runPhase(phase, tree, files, plan, opts, reportDir, { skipInstall = false, swapped = [] } = {}) {
   const reasons = [];
   const perFile = new Map();
   const invocations = [];
@@ -967,7 +1722,7 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     for (const file of pending) perFile.set(file, { run: "timeout" });
     return { stop: true, reasons, perFile, invocations };
   };
-  if (opts.install) {
+  if (opts.install && !skipInstall) {
     const stop = outOfTime("the install", []);
     if (stop) return stop;
     const left = allowance(opts);
@@ -1067,10 +1822,88 @@ async function runPhase(phase, tree, files, plan, opts, reportDir) {
     for (const file of list) perFile.set(file, { run: "ok", result: parsed.files.get(file) ?? null });
     invocations.push({ label: `vitest in ${where}`, files: list, res, reportFailed: parsed.success === false });
   }
-  for (const file of changedTestSide(tree, plan)) {
+  // A swapped file differs from the head on purpose: it must still be the
+  // merge base's version after the run.
+  const moved = swapped.length ? nulList(git(tree, ["diff", "--name-only", "--no-renames", "-z", plan.mergeBase, "--", ...swapped]).stdout) : [];
+  for (const file of [...new Set([...changedTestSide(tree, plan).filter((p) => !swapped.includes(p)), ...moved])].sort(byPath)) {
     reasons.push({ code: "TEST-CHANGED", phase, file, detail: "the test run changed this tracked test-side file" });
   }
   return { stop: false, reasons, perFile, invocations };
+}
+
+// A changed test file with no failing test before the fix: its earlier version
+// (the merge base's) is run in the tree WITH the fix, after both phases, to
+// read the names of its tests and whether the fix breaks it. A stop of the
+// gate and a test-side file the run changed are reasons of their own; a file
+// whose earlier version cannot be read, or whose runner's exit contradicts its
+// report, stays NOT-RED-BEFORE.
+function quietBefore(entry) {
+  const r = entry?.run === "ok" ? entry.result : null;
+  if (!r || !r.loaded || r.fileError || r.tests.some((t) => !KNOWN_STATUS.has(t.status))) return false;
+  const ran = r.tests.filter((t) => t.status !== "skipped");
+  return ran.length > 0 && ran.every((t) => t.status === "passed");
+}
+
+async function runEarlier(repo, plan, tree, quiet, opts, work) {
+  const paths = quiet.map((f) => f.file);
+  git(tree, ["checkout", plan.mergeBase, `--pathspec-from-file=${writePathspec(join(work, "take.lst"), paths)}`, "--pathspec-file-nul"]);
+  const files = paths.map((file) => {
+    const source = git(repo, ["cat-file", "blob", `${plan.mergeBase}:${file}`]).stdout;
+    return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest" };
+  });
+  const run = await runPhase("earlier", tree, files, plan, opts, join(work, "reports"), { skipInstall: true, swapped: paths });
+  // A runner that exits non-zero (or reports success: false) although every
+  // file of its report passed, or exits 0 although one failed, is not read.
+  for (const inv of run.invocations) {
+    const entries = inv.files.map((file) => run.perFile.get(file));
+    const failed = entries.some((e) => e?.run === "ok" && e.result && (!e.result.loaded || e.result.fileError || e.result.tests.some((t) => t.status === "failed")));
+    // A failure must end the runner non-zero; no failure, with exit 0 and no
+    // success: false.
+    const agrees = failed ? inv.res.status !== 0 && inv.res.status !== null : inv.res.status === 0 && !inv.reportFailed;
+    if (!agrees) {
+      const detail = `${inv.label} ${exitText(inv.res)}${inv.reportFailed ? " (report success: false)" : ""} although its report shows ${failed ? "a failure" : "no failure"}`;
+      for (const file of inv.files) run.perFile.set(file, { run: "contradicts", detail });
+    }
+  }
+  return { perFile: run.perFile, reasons: run.reasons.filter((r) => r.code === "STOPPED" || r.code === "TEST-CHANGED") };
+}
+
+// What the fix side adds, read once when a judgement first asks: per fix-side
+// script, the names its whole head version exports (code only) that no
+// fix-side script exported at the merge base (so a moved or reworded export
+// is not new); per changed test file, the first changed line that declares a
+// test or states an assertion, its added lines and whether it only adds.
+function rangeReader(repo, plan) {
+  let files = null;
+  let byFile = null;
+  const read = () => {
+    files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    return files;
+  };
+  const blob = (rev, path) => {
+    const r = git(repo, ["cat-file", "blob", `${rev}:${path}`], { allowFail: true });
+    return r.status === 0 ? r.stdout : null;
+  };
+  return {
+    exportsByFile() {
+      if (byFile) return byFile;
+      byFile = freshExports(plan.fixSide, (path) => blob(plan.mergeBase, path), (path) => blob(plan.head, path));
+      return byFile;
+    },
+    // The added lines of a file's edit, or null when its diff is not readable.
+    addedLines(path) {
+      return read().get(path)?.added ?? null;
+    },
+    pureAddition(path) {
+      const diff = read().get(path);
+      return Boolean(diff) && diff.removed.every((line) => !line.trim());
+    },
+    // A changed file whose diff is not readable here counts as touched.
+    testLine(path) {
+      const diff = read().get(path);
+      return diff ? changedTestLine([...diff.added, ...diff.removed]) : "the file's diff is not readable";
+    },
+  };
 }
 
 function budgetResult(error, mergeBase = null) {
@@ -1098,6 +1931,8 @@ async function runGateIn(opts) {
   if (plan.verdict === "skip") {
     return { mode: "run", verdict: "SKIP", reason: plan.reason, detail: plan.detail, mergeBase: plan.mergeBase ?? null, reasons: [], notes: [], files: [] };
   }
+  // the parser is loaded before any test of the pull request runs (they could change its files)
+  typescript();
   const repo = opts.repo ?? process.cwd();
   const reasons = [];
   // New tests that match --exclude beside other new tests: listed, not proven,
@@ -1127,9 +1962,16 @@ async function runGateIn(opts) {
 
     // The new test's bytes from the head commit (a regular file, checked by
     // plan), never through the file system.
+    const statusOf = new Map(plan.testSide.map((e) => [e.path, e.status]));
+    const range = rangeReader(repo, plan);
+    const sources = new Map();
     const files = plan.newTests.map((file) => {
       const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
-      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source) };
+      sources.set(file, source);
+      // Pins only from the lines the pull request adds: a marker the file
+      // already had declares nothing (an unreadable diff declares nothing).
+      const added = range.addedLines(file);
+      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source), pins: added ? readPins(added.join("\n")) : [], status: statusOf.get(file) ?? "A" };
     });
     const phases = {};
     for (const phase of ["before", "head"]) {
@@ -1142,12 +1984,32 @@ async function runGateIn(opts) {
       reasons.push({ code: "STOPPED", phase: null, file: null, detail: `the gate was stopped by ${stopState.signal}` });
     }
 
+    // Only a file that is a regular file on both sides (status M) has an
+    // earlier version to run; a type change (a link before) is never compared.
+    // It runs in the tree with the fix (installed, its own run finished).
+    let earlier = null;
+    const quiet = phases.before && phases.head && !stopState.signal ? files.filter((f) => f.status === "M" && quietBefore(phases.before.perFile.get(f.file))) : [];
+    if (quiet.length) {
+      earlier = await runEarlier(repo, plan, trees.head, quiet, opts, work.path);
+      reasons.push(...earlier.reasons);
+    }
+
+    const roots = rootsOf(trees.before);
+    const addedFix = new Set(plan.addedFix);
+    const fileNotes = [];
     const headReasonFiles = new Set();
     for (const f of files) {
-      const judged = judgeFile(f, phases.before?.perFile.get(f.file), phases.head?.perFile.get(f.file));
+      const context = {
+        earlier: earlier?.perFile.get(f.file),
+        changedTestLine: quiet.includes(f) ? range.testLine(f.file) : null,
+        pureAddition: f.status === "A" || range.pureAddition(f.file),
+        addedByFix: (text) => addedByFix(text, f.file, { source: sources.get(f.file), exportsByFile: range.exportsByFile, addedFix, roots, runnerDir: f.runner === "vitest" ? vitestDir(trees.before, f.file) : "" }),
+      };
+      const judged = judgeFile(f, phases.before?.perFile.get(f.file), phases.head?.perFile.get(f.file), context);
       reasons.push(...judged.reasons);
+      fileNotes.push(...judged.notes);
       for (const r of judged.reasons) if (r.phase === "head") headReasonFiles.add(f.file);
-      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, proven: judged.proven });
+      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, pins: f.pins, proven: judged.proven, kind: judged.kind });
     }
     for (const inv of phases.head?.invocations ?? []) {
       if ((inv.res.status !== 0 || inv.reportFailed) && !inv.files.some((file) => headReasonFiles.has(file))) {
@@ -1156,20 +2018,39 @@ async function runGateIn(opts) {
       }
     }
     for (const f of result.files) {
-      if (reasons.some((r) => r.file === f.file || r.file === null)) f.proven = false;
-    }
-    // Safety net: a file that is not proven always carries a reason.
-    if (!reasons.length) {
-      for (const f of result.files) {
-        if (!f.proven) reasons.push({ code: "NOT-PROVEN", phase: null, file: f.file, detail: "the file was not proven red before the fix and green with it" });
+      if (reasons.some((r) => r.file === f.file || r.file === null)) {
+        f.proven = false;
+        f.kind = null;
       }
     }
-    if (!reasons.length && result.files.length > 0 && result.files.every((f) => f.proven)) result.verdict = "PASS";
+    // A note belongs to a file that is settled (proven, collateral or pins).
+    notes.push(...fileNotes.filter((n) => result.files.some((f) => f.file === n.file && f.kind)));
+    // Safety net: a file that is not settled always carries a reason.
+    if (!reasons.length) {
+      for (const f of result.files) {
+        if (!f.kind) reasons.push({ code: "NOT-PROVEN", phase: null, file: f.file, detail: "the file was not proven red before the fix and green with it" });
+      }
+    }
+    if (!reasons.length && result.files.length > 0 && result.files.every((f) => f.kind)) {
+      // Proven files decide a PASS. Collateral edits and declared pins alone
+      // prove nothing: the run fails closed, so a green job always has a
+      // proven file.
+      if (result.files.some((f) => f.proven)) result.verdict = "PASS";
+      else {
+        reasons.push({
+          code: "NOTHING-PROVEN",
+          phase: null,
+          file: null,
+          detail: `no test file of the pull request is proven red before the fix and green with it: its ${result.files.length} test file(s) are notes only (collateral edits or declared pins), which prove nothing; add a test that fails before the fix`,
+        });
+      }
+    }
     return result;
   } catch (error) {
     if (!(error instanceof BudgetError)) throw error;
     reasons.push({ code: "TIMEOUT", phase: null, file: null, detail: error.message });
     for (const f of result.files) f.proven = false;
+    for (const f of result.files) f.kind = null;
     result.verdict = "RED";
     return result;
   } finally {
@@ -1220,14 +2101,17 @@ function emit(result, opts) {
     say(`NOTE ${reasonLine(r)}`);
     if (gha) say(`::notice file=${escapeProperty(r.file)},title=${escapeProperty(`red-first ${r.code}`)}::${escapeData(reasonLine(r))}`);
   }
-  const notProven = notes.length ? `; ${notes.length} excluded new test file(s) not proven here` : "";
+  const count = (code) => notes.filter((n) => n.code === code).length;
+  let notProven = count("EXCLUDED") ? `; ${count("EXCLUDED")} excluded new test file(s) not proven here` : "";
+  if (count("COLLATERAL")) notProven += `; ${count("COLLATERAL")} changed test file(s) collateral, not proven here`;
+  if (count("PIN")) notProven += `; ${count("PIN")} test file(s) with declared pins only, not proven here`;
   let headline;
   if (result.mode === "plan") headline = `RED-FIRST PLAN: ${result.verdict}${result.reason ? ` ${result.reason}` : ""}: ${result.detail}`;
-  else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.length} new test file(s) fail before the fix and pass with it${notProven})`;
-  else if (result.verdict === "SKIP") headline = `RED-FIRST: SKIP ${result.reason}: ${result.detail}`;
+  else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.filter((f) => f.proven).length} new test file(s) fail before the fix and pass with it${notProven})`;
+  else if (result.verdict === "SKIP") headline = `RED-FIRST: ${result.verdict} ${result.reason}: ${result.detail}`;
   else headline = `RED-FIRST: RED (${result.reasons.length} reason(s))`;
   say(headline);
-  if (gha && result.verdict === "SKIP") say(`::notice title=red-first SKIP::${escapeData(`${result.reason}: ${result.detail}`)}`);
+  if (gha && result.verdict === "SKIP") say(`::notice title=red-first ${result.verdict}::${escapeData(`${result.reason}: ${result.detail}`)}`);
 
   if (opts.verdict) writeFileSync(opts.verdict, `${JSON.stringify(result, null, 2)}\n`);
   if (opts.githubOutput && result.mode === "plan") {
@@ -1240,7 +2124,7 @@ function emit(result, opts) {
     }
     if (result.files?.length) {
       lines.push("| test file | runner | proven |", "| --- | --- | --- |");
-      for (const f of result.files) lines.push(`| ${cell(f.file)} | ${f.runner} | ${f.proven ? "yes" : "no"} |`);
+      for (const f of result.files) lines.push(`| ${cell(f.file)} | ${f.runner} | ${f.proven ? "yes" : f.kind ? `no (${f.kind})` : "no"} |`);
       lines.push("");
     }
     for (const r of result.reasons ?? []) lines.push(`- \`${r.code}\` ${cell(r.phase ?? "")} ${r.file ? cell(r.file) : ""}: ${cell(r.detail)}`);
@@ -1344,6 +2228,8 @@ export async function main(argv) {
     const result = await runGate(opts);
     emit(result, opts);
     if (stopState.signal) return stopCode(stopState.signal);
+    // Only a PASS (at least one proven file) is green; notes alone are RED
+    // (NOTHING-PROVEN).
     if (result.verdict === "PASS") return 0;
     return result.verdict === "SKIP" ? 3 : 1;
   } catch (error) {

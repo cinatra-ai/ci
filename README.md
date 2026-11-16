@@ -59,7 +59,9 @@ out of the reusable workflow to avoid a caller cancelling its own called job.
 - **Reusable gate workflows** (`.github/workflows/*.yml`) — org-wide quality
   controls that any cinatra-ai repo can wire in through a thin caller.
 - **Gate scripts** (`scripts/*.mjs`) — the standalone Node engines; zero
-  runtime npm dependencies.
+  runtime npm dependencies, except `red-first-gate`, which reads scripts
+  with the `typescript` parser of this repository's lockfile (its workflow
+  runs `npm ci` in the gate's checkout).
 - **Shared config** (`config/`) — profiles, baselines, and JSON config files
   consumed by the gate engines.
 
@@ -2354,7 +2356,88 @@ codes alone.
   least one test and fail at least one test by an assertion (`AssertionError`),
   or by the text of a `red-first-expect: <text>` marker line in the file. A
   marker text must appear in a test failure of that file (ANSI and whitespace
-  normalized, case-sensitive); a load error never counts.
+  normalized, case-sensitive).
+- **What the fix adds**: a failure before the fix is also the right reason,
+  without a marker, when its text names something only the fix side provides:
+  a `TypeError: ... <name> is not a function` (or `is not a constructor`) or
+  a `does not provide an export named '<name>'`, when the test file itself
+  imports `<name>` (by name, or the whole module: a namespace, a default
+  import, `require`) from a relative path, and that module's head version
+  exports `<name>` as a value, read by the TypeScript parser: a top-level
+  exported function with a body, class, `const`, `let` or `var` binding
+  (destructured too), `enum`, `namespace` or `module`, `export import
+  <name> =`, `export { <name> }`, `export * as <name>`, or a top-level
+  CommonJS statement: `exports.<name> = ...` and chains of such
+  assignments, `exports["<name>"] =` (also on `module.exports`),
+  `module.exports = { ... }` with plain keys, and
+  `Object.defineProperty(exports, "<name>", ...)`; never `export
+  declare`, `export default`, a type or a `.d.ts` file. A script with a
+  syntax error, with an HTML-like comment (`<!--`, or `-->` at a line
+  start) outside a literal, or with any other use of `exports`, `module`,
+  a module-level `this`, an `__exportStar` or `__export` helper, a
+  `__proto__` name, or `export =` exports nothing here. At the merge base
+  only ES modules are read: when any fix-side script of the merge base is
+  not a pure ES module (a `.cjs` or `.cts` file, a file under a
+  package.json of type `commonjs`, a file with no static `import` or
+  `export`, or one with `export =`, `import x = require()`, `export *
+  from`, a namespace import, a dynamic `import()`, an import from
+  `node:module` or `module`, any reference to `exports`, `module`,
+  `require`, `arguments`, `eval` or a module-level `this`, or an
+  identifier that starts with `__vi`), or is unsure as above, no export
+  counts as new; the merge-base reading is static; a file that sets its
+  exports through runtime tricks is outside it)
+  while no fix-side
+  script exported it at the merge base (a moved export is not new); or a
+  runner's module-not-found error (`Cannot find module`, `Failed to resolve
+  import`, `Failed to load url`, at the start of the error, never inside
+  another message) whose path is a regular file the fix side adds, that the
+  test file imports by a relative path, and that is outside the test file's
+  folder. The test file's static `import` declarations, `import x =
+  require()` and `require()` bindings are read by the same parser (a test
+  file with a syntax error imports nothing here). An import path without an extension means that path with a script
+  extension or its folder's `index`; a path with an extension means that very
+  file, or only its TypeScript source (`x.js` for `x.ts`). A fix-side path
+  that is test code by its place or name (`test/`,
+  `tests/`, `spec/`, `mocks/`, `fixtures/`, `test-utils/`, `e2e/` folders, or
+  a `test`, `spec`, `mock`, `fixture`, `stub` or `fake` name part) is never
+  such evidence, and an absolute path outside the checkout counts only as a
+  vite root path. Such a file is proven and carries the notice
+  `ADDED-BY-FIX`. This is the one case in which a file that does not load
+  before the fix is proven; any other load error stays `LOAD-ERROR`, and any
+  other failure without an assertion stays `WRONG-REASON`.
+- **No red-first claim** (a notice, not a proof): a test file in which no test
+  fails before the fix is `NOT-RED-BEFORE`, except in two cases.
+  `COLLATERAL`: a changed file that the fix breaks and the edit keeps
+  working. The gate runs the file's earlier version (the merge base's) in the
+  tree WITH the fix; the edit is collateral only when that earlier version
+  fails there (the fix needs the edit), both versions report the same tests
+  (by name and count), no changed line of the file declares a test or states
+  an assertion (`it`, `test`, `describe`, `expect...`, `assert...`, `.should`,
+  `.rejects`, `.resolves`, a `.toBe(`-style matcher; comment lines apart), and
+  every test of the new version that is not skipped passes before the fix
+  and with it (a skipped test is not checked). An edit
+  that the fix does not need (the earlier version also passes with the fix)
+  is `NOT-RED-BEFORE`, whatever its lines say. An earlier version that cannot
+  be run and read, whose runner's exit contradicts its report, or whose run
+  changes a tracked test-side file (`TEST-CHANGED`) is not collateral, and a
+  renamed or moved test file is a new file to the gate. Review a collateral
+  edit as a change to an existing test: the gate shows that the fix needs
+  it, not that it keeps the test's strength.
+  `PIN`: every test the pull request adds to the file is named by a
+  `red-first-pin: <part of the test's full name>` marker line that the pull
+  request adds (a marker the file already had declares nothing), and passes
+  before the fix and with it: a test that pins behaviour the fix keeps. One
+  marker names one test occurrence: a marker that names no test, a test the
+  pull request does not add, more than one test, or a name the report gives
+  more than once, or a test that does not pass before the fix, is
+  `PIN-MISMATCH`; an added test without a marker must fail first. In a
+  changed file, pins hold only when the edit only adds lines, the file's
+  earlier version passes with the fix, and the new version still reports
+  every test of the earlier version (by name and count); otherwise the file
+  is `NOT-RED-BEFORE`. Added lines can still weaken an existing test without
+  removing it (an early `return`, for example): the gate does not see that,
+  so review added lines beside pins as a change to an existing test. Markers
+  are part of the diff: review them as you review `red-first-expect:`.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit
@@ -2367,15 +2450,17 @@ codes alone.
   `node:test` report only the final top-level result named like the file is
   the file itself; a test with that name anywhere before it counts as a test.
 - **A module the fix adds**: a test file that imports it at the top does not
-  load before the fix (`LOAD-ERROR`). Import it inside the test (for example
+  load before the fix. It is proven when the load error names that module
+  (see "What the fix adds"). When the runner's text does not name it, import
+  the module inside the test (for example
   `const { sum } = await import("../src/sum.mjs")`) and add a marker with the
   text of the error, such as `red-first-expect: Cannot find module`.
 
 The `red-first` job fails with a named reason: `INSTALL-FAILED`, `NO-REPORT`,
 `NOT-COLLECTED`, `LOAD-ERROR`, `FILE-ERROR`, `NOT-RED-BEFORE`, `WRONG-REASON`,
-`TEXT-MISMATCH`, `NOT-GREEN-AT-HEAD`, `RUNNER-EXIT`, `TEST-CHANGED` (the
+`TEXT-MISMATCH`, `PIN-MISMATCH`, `NOT-GREEN-AT-HEAD`, `RUNNER-EXIT`, `TEST-CHANGED` (the
 install or the run changed a tracked test-side file, staged, committed or not),
-`NOT-A-FILE`, `TIMEOUT`, `STOPPED` or `TREE-MISMATCH`. A pull request without a
+`NOT-A-FILE`, `TIMEOUT`, `STOPPED`, `TREE-MISMATCH` or `NOTHING-PROVEN`. A pull request without a
 new test (`NO-NEW-TESTS`), whose new tests all match `exclude`
 (`EXCLUDED-ONLY`, for example only end-to-end or database tests, with or
 without other changes), or with no change besides tests (`TESTS-ONLY`) skips
@@ -2385,8 +2470,21 @@ never red and never success.
 New tests that match `exclude` beside other new tests are not proven here and
 do not fail the job: each is a notice (`EXCLUDED`) in both jobs, the plan
 output `excluded` counts them, and the other new tests decide. So a `success`
-of the `red-first` job at the head proves the new tests outside `exclude`;
-read the `EXCLUDED` notices (or the plan output) for the rest.
+of the `red-first` job at the head proves at least one new test file outside
+`exclude`, not each of them: the files the job lists as notices (see below)
+are not proven, and the `EXCLUDED` notices (or the plan output) name the
+rest.
+
+`COLLATERAL` and `PIN` files are notices too: they are not proven, the job's
+headline counts them as not proven, and they do not fail the job beside a
+proven file. When every changed test file is such a notice, nothing is
+proven: the job fails with `NOTHING-PROVEN` (the notices stay listed). So the
+`red-first` job is green only when at least one new test file is proven red
+before the fix and green with it, and every other new or changed test file is
+either proven or listed as a notice that makes no red-first claim
+(`EXCLUDED`, `COLLATERAL`, `PIN`); the headline
+(`RED-FIRST: PASS (<n> new test file(s) ...)`), the summary table and the
+notices say which files are proven.
 
 Time: `timeout_minutes` is the job's limit, from 3 to 7200 minutes; the `plan`
 job fails on a value outside that range. The gate stops 120 seconds before the
@@ -2475,8 +2573,9 @@ node scripts/red-first-gate.mjs plan --base <sha> --head <sha>
 node scripts/red-first-gate.mjs run --base <sha> --head <sha> --work /tmp/red-first --install "npm ci"
 ```
 
-`plan` exits 0 when it decides (run or skip); `run` exits 0 on PASS, 1 on RED,
-3 on SKIP and 2 on a usage or internal error (any error, never a crash); a
+`plan` exits 0 when it decides (run or skip); `run` exits 0 on PASS, 1 on
+RED, 3 on SKIP and 2 on a usage or internal error (any error,
+never a crash); a
 stop signal ends `run` with 130 (SIGINT) or 143 (SIGTERM). `--verdict <file>`
 writes the result as JSON. `--job-started <epoch seconds> --job-minutes <n>`
 set the job's time budget (`plan` takes `--job-minutes` alone and checks it);
