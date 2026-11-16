@@ -690,25 +690,31 @@ cp <cinatra>/packages/sdk-extensions/src/test-host-context.mjs \
 ## agent-publish-gate
 
 A standalone Node engine (`scripts/agent-publish-gate.mjs`, Node built-ins only)
-that checks ONE agent pack's flow (`cinatra/oas.json`) against the publish
-contract of cinatra-ai/cinatra#4150: a run is to stop for one person's
-confirmation in front of each step the pack declares with
-`metadata.cinatra.publishes: true` (a later part of that issue). So the pack
-must declare its writing steps and must not keep a confirm step of its own.
+that checks ONE agent pack's flow (`cinatra/oas.json`) against the
+external-write contract of cinatra-ai/cinatra#4150: a run is to stop for one
+person's confirmation in front of each step the pack declares with
+`metadata.cinatra.publishes: true` (a later part of that issue). An external
+write is any create, change or delete of data in a system outside Cinatra;
+sending an email counts. A read changes nothing outside and is no external
+write. The key keeps its name
+`publishes`: `true` means "this step makes an external write". So the pack
+must declare its external-write steps and must not keep a confirm step of its
+own.
 
 | Rule | Refuses |
 |------|---------|
-| `oas.publish-undeclared` | A step with no `publishes` key, unless its kind cannot reach a connector (`StartNode`, `EndNode`, `InputMessageNode`, `OutputMessageNode`, `BranchingNode`) or its `metadata.cinatra.riskClass` is exactly `read_only`. Declare `true` for a step that publishes and `false` for one that writes but does not publish. A step is a component whose kind ends in `Node`, or one that a flow lists in `nodes`, names as `start_node` or reaches as an edge endpoint. A reference resolves in the maps in scope where it is written and where it is used (an edge's own map included), and a reference to a reference is followed. A listed step whose component is not in the file, and a value in those fields that is neither a component nor a reference, are refused too. |
+| `oas.publish-undeclared` | A step with no `publishes` key, unless its kind cannot reach a connector (`StartNode`, `EndNode`, `InputMessageNode`, `OutputMessageNode`, `BranchingNode`) or its `metadata.cinatra.riskClass` is exactly `read_only`. Declare `true` for a step that makes an external write (it creates, changes or deletes data in a system outside Cinatra; sending an email counts) and `false` for any other step. A step is a component whose kind ends in `Node`, or one that a flow lists in `nodes`, names as `start_node` or reaches as an edge endpoint. A reference resolves in the maps in scope where it is written and where it is used (an edge's own map included), and a reference to a reference is followed. A listed step whose component is not in the file, and a value in those fields that is neither a component nor a reference, are refused too. |
 | `oas.publish-malformed` | A `publishes` value that is not a JSON boolean. |
+| `oas.publish-misplaced` | `publishes: true` anywhere but on a component that the root flow lists in `nodes` by a reference to a key of its own `$referenced_components`, where that reference resolves to exactly that component. The core refuses `true` at install (`PUBLISHES_MISPLACED`) on a node inside a nested subflow, on a subflow definition, on the flow root and on a root map component the root flow does not list, since it cannot stop the run in front of that node; mark the top-level node that runs the subflow instead. The gate is stricter than the core on purpose in three cases the core does not read as a publishing step at all, so no stop would be inserted: an inline node in the root `nodes` list, a root map value that is itself a reference, and a listed reference that a nearer `$referenced_components` map resolves to another component. `false` is allowed at any depth. |
 | `oas.publish-reserved-id` | An `id` of any object, a referenced-component key (whatever its value) or a reference that starts with the host's gate prefix `cinatra_publish_gate__`. |
-| `oas.publish-own-gate` | A confirm or approval step of the pack's own in front of a publishing step: an `InputMessageNode` with a control edge into the step (directly or through `BranchingNode`s only), a `requiresApproval` on the step that is not `false`, or a root `hitlScreens` entry beside it, unless the package declares that screen's renderer exactly once with `midRunHitl` `false` or without the key and the screen id has none of the endings that the core's `classifyMidRunHitl` reads as mid-run whatever is declared (`:output`, `-output`, `:list-picker`, `:scrape-schema-review`, `:final-list-review`, `:setup-form`). |
+| `oas.publish-own-gate` | A confirm or approval step of the pack's own in front of a publishing step: an `InputMessageNode` with a control edge into the step (directly or through `BranchingNode`s only), a `requiresApproval` on the step that is not `false`, a `confirmations` key on the step whose value is not an empty list, or a root `hitlScreens` entry in front of it, unless the package declares that screen's renderer exactly once with `midRunHitl` `false` or without the key and the screen id has none of the endings that the core's `classifyMidRunHitl` reads as mid-run whatever is declared (`:output`, `-output`, `:list-picker`, `:scrape-schema-review`, `:final-list-review`, `:setup-form`). A screen is placed on every running step whose `metadata.cinatra.renderer` names it: a component that the root flow, or a subflow that a running step runs, lists in `nodes`, names as `start_node` or reaches as an edge endpoint. A renderer on any other object (a reference, a component no running flow uses, a step of a flow-shaped value that does not run, such as one inside metadata) places nothing. Only these kinds run a subflow: `FlowNode`, `MapNode` and `ParallelMapNode` through `subflow`, `ParallelFlowNode` through `subflows`; a subflow field on any other kind runs nothing. It stands in front of a publishing step when one of those components is inside the step (its subflow included, references followed), or on a control path back from the step up to and including the first `InputMessageNode` and stopping at another publishing step, or inside a step on that path (a subflow it runs). A screen that no component names stands in front of every publishing step. A screen placed only after the step, or only in front of an earlier stop, is no finding. |
 
 A pack with no `cinatra/oas.json` passes and says so; a flow path that exists but cannot be read is an error. A
 package whose `package.json` does not declare `cinatra.kind: "agent"`, an unreadable or non-object file, an unknown
 option and an option whose value is missing or starts with `-` exit 2. Texts name only ids, the package name and an
 unknown option, quoted and cut at 120 characters; never a value the pack wrote.
 
-The gate reads what a pack declares, not what a step does: a writing step declared `riskClass: "read_only"` or
+The gate reads what a pack declares, not what a step does: an external-write step declared `riskClass: "read_only"` or
 `publishes: false`, or a confirm screen declared not mid-run whose id has none of the six endings, passes. The review
 of the pack's own change stays the second check.
 
