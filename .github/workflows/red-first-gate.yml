@@ -153,6 +153,13 @@ jobs:
         with:
           node-version: ${{ inputs.node_version }}
 
+      # The gate reads the fix side's exports and the tests' imports with the
+      # TypeScript parser of its own lockfile (no other runtime dependency).
+      - name: Install the gate's parser
+        shell: bash
+        working-directory: .red-first-gate
+        run: npm ci --include=dev --ignore-scripts --no-audit --no-fund
+
       - name: Red before the fix, green with it
         shell: bash
         env:

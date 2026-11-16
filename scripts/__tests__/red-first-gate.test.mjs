@@ -1650,7 +1650,7 @@ test("evidence: the name a not-a-function text calls, the exports of added lines
 
 // Finding 3 of the review: what the fix adds is bound to the test file's own imports and to code.
 test("evidence is bound: the export is new in the module the test file imports it from, the module is one the test file imports", async () => {
-  const { addedByFix, exportNames, exportsOf, importsOf, missingModules, codeText, evidencePath } = await gateModule();
+  const { addedByFix, exportNames, exportsOf, importsOf, missingModules, evidencePath } = await gateModule();
   // an export declared without a value, or in a declaration file, is no value
   assert.deepEqual(exportNames(["export declare function ghost(): void;", "export declare const c: number;"]), []);
   assert.equal(evidencePath("src/types.d.ts"), false);
@@ -1659,9 +1659,10 @@ test("evidence is bound: the export is new in the module the test file imports i
   for (const p of ["test/support.mjs", "src/__mocks__/x.ts", "tests/helpers/a.mjs", "src/test-utils/a.ts", "src/sum.fixture.ts", "src/mock-server.ts"]) assert.equal(evidencePath(p), false, p);
   // an export inside a comment, a template literal or a string is not an export
   assert.deepEqual([...exportsOf("/*\nexport function ghost() {}\n*/\nconst t = `\nexport function phantom() {}\n`;\nconst s = 'export function spook() {}';\nexport function real() {}\n")], ["real"]);
-  assert.equal(codeText("a = /['\"]/; b = 1;"), "a =       ; b = 1;");
-  // a regular expression after a keyword is not code: its backtick opens no template that would expose a later one
+  assert.deepEqual([...exportsOf("a = /['\"]/; b = 1;\nexport const real = 1;\n")], ["real"]);
+  // a regular expression after a keyword that holds a backtick: never a template that would expose a later one
   assert.deepEqual([...exportsOf("function f(x) {\n  return /`/.test(x);\n}\nconst t = `\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
+  assert.deepEqual([...exportsOf("function f(x) {\n  return /a+b/.test(x);\n}\nconst t = `\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
   // a division is not a regular expression
   assert.deepEqual([...exportsOf("const half = total / 2;\nexport const real = half / 1;\n")], ["real"]);
   // imports: named, namespace, default, side effect, require; type imports bind no value
@@ -1932,11 +1933,10 @@ test("finding 4: an earlier version that changes a tracked test-side file is RED
 
 test("second review 1: a template interpolation with a brace in a string and a nested template exposes no export", async () => {
   const { exportsOf } = await gateModule();
-  // a closing brace inside a string of the interpolation must not end it; the scan and the plain
-  // brace count disagree on the template's end, so the file gives no exports at all (fail closed)
-  assert.deepEqual([...exportsOf('const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n')], []);
-  // a regular expression and a comment inside an interpolation are read as code there; the same disagreement
-  assert.deepEqual([...exportsOf("const a = `${ /`/.test(x) ? \"{\" : '}' /* } ` */ }\nexport function ghost() {}\n`;\nexport const real = 1;\n")], []);
+  // a closing brace inside a string of the interpolation does not end it
+  assert.deepEqual([...exportsOf('const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n')], ["ready"]);
+  // a regular expression and a comment inside an interpolation are read as code there
+  assert.deepEqual([...exportsOf("const a = `${ /`/.test(x) ? \"{\" : '}' /* } ` */ }\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
   // nested templates with interpolations of their own
   assert.deepEqual([...exportsOf("const a = `x ${ `y ${ { z: 1 }.z } ` } w\nexport function ghost() {}\n`;\nexport const real = 1;\n")], ["real"]);
 });
@@ -2021,10 +2021,492 @@ test("fold 2: a regular expression after `)` in an interpolation, read as a divi
   assert.deepEqual(r.verdict.notes, []);
 });
 
-test("fold 3: a slash the scanner cannot read for sure gives no exports, at the top level too; a plain division does not", async () => {
+test("fold 3: a regular expression after `)` at the top level is read as one; a plain division as a division", async () => {
   const { exportsOf } = await gateModule();
   // a regular expression after `)` at the top level, read as a division, would open a template
-  assert.deepEqual([...exportsOf('const a = false;\nif (a) /`/.test("");\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n')], []);
+  assert.deepEqual([...exportsOf('const a = false;\nif (a) /`/.test("");\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n')], ["ready"]);
   // a division after `)` or `]` with no other slash on its line is no regular expression: read as before
   assert.deepEqual([...exportsOf("const half = (a + b) / 2;\nconst q = xs[0] / 3;\nexport const real = half / q;\n")], ["real"]);
+});
+
+// ---------------------------------------------------------------------------
+// The fold2 reading: every slash the scanner reads, at every start position.
+// ---------------------------------------------------------------------------
+
+test("fold2 1: a division after a postfix ++ is not read as a regular expression that exposes an export (RED, not ADDED-BY-FIX)", async (t) => {
+  const head = "let n = 0;\nconst decoy = n++ / `x/\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n";
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+// Each source below exports exactly `ready` when JavaScript reads it; the text
+// `export function ghost` sits in a template. For every start position of a
+// slash (each punctuator, ++ and --, names, keywords and names that look like
+// keywords, a line start after a line break, at the top level and inside an
+// interpolation), the reader must read exactly { ready } or say it is unsure,
+// so that it never reports a fresh `ghost` at the head and never hides
+// `ready` at the merge base.
+const SLASH_DIVISIONS = [
+  "n++", "n--", "x", "x.y", "of", "yield", "await", "let", "async", "get", "_$", "1", "1.5", "0x1f", "\"s\"", "'s'", "`t`", "(a)",
+  "a[0]", "({})", "[]", "x\n", "n++\n", "(a)\n", "this", "null", "true", "x.return", "x.of", "x.in", "x.typeof", "x!", "f<T>",
+  "x !", "a > b", "x. return", "this.#return", "\u00e9in", "x\u00e9in", "x ! ", "x. default", "o.debugger", "x .in",
+];
+const SLASH_REGEX_STARTS = [
+  "", "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "~", "^", "*", "%", "<", ">", "+", "-", "==", "===", "!=", "<=", ">=",
+  "=>", "&&", "||", "??", "**", "<<", ">>", ">>>", "+=", "-=", "*=", "/=", "a ?", "a ? b :", "return", "typeof", "instanceof", "in",
+  "new", "delete", "void", "throw", "case", "do", "else", "yield", "await", "of", "let", "}", ")", "]", "if (a)", "while (a)", "{}",
+  "x\n", ";\n", "/a/", "a /", "default", "export default", "debugger\n", "break\n", "continue\n", "++", "--", "let v = ++",
+  "x. return", "this.#return", "\u00e9in", "x !", "<p>", "=> ", "!", "a = !", "return !",
+];
+function decoySources() {
+  const out = [];
+  const ghost = "\nexport function ghost() {}\n";
+  const tail = "export function ready() { return true; }\n";
+  for (const d of SLASH_DIVISIONS) {
+    // a division by a template that holds the decoy
+    out.push(`let n = 0, x = 1, a = [1];\nconst decoy = ${d} / \`x/${ghost}\`;\n${tail}`);
+    out.push(`const decoy = \`\${ ${d} / \`x/${ghost}\` }\`;\n${tail}`);
+    out.push(`const decoy = ${d} / 2 / \`x/${ghost}\`;\n${tail}`);
+    // a division and a comment that holds a backtick, then the decoy in a template
+    out.push(`const q = ${d} / 2 // note \` /\nconst t = \`${ghost}\`;\n${tail}`);
+    out.push(`const q = ${d} / 2 /* note \` */;\nconst t = \`${ghost}\`;\n${tail}`);
+  }
+  for (const r of SLASH_REGEX_STARTS) {
+    // a regular expression (or what may be one) whose text holds a backtick, a quote or a brace, then a template that holds the decoy
+    for (const re of ["/`/", "/'/", '/"/', "/[`]/", "/\\`/", "/}/", "/{/", "/x+/"]) {
+      out.push(`const r = ${r} ${re}.source;\nconst t = \`${ghost}\`;\n${tail}`);
+      out.push(`const decoy = \`\${ ${r} ${re}.source }${ghost}\`;\n${tail}`);
+    }
+  }
+  return out;
+}
+
+test("fold2 2: for every start position of a slash, the reader reads exactly the real exports or is unsure (a generated set)", async () => {
+  const { exportsOf, readExports } = await gateModule();
+  const sources = decoySources();
+  assert.ok(sources.length > 900, `only ${sources.length} sources`);
+  const misread = [];
+  let unsure = 0;
+  for (const src of sources) {
+    const read = readExports(src);
+    if (read.unsure) {
+      unsure += 1;
+      assert.deepEqual([...exportsOf(src)], [], "an unsure reading gives no exports");
+    } else if ([...read.names].join(",") !== "ready") misread.push(`${JSON.stringify(src.slice(0, 70))} -> ${[...read.names].join(",")}`);
+  }
+  assert.deepEqual(misread, []);
+  // the set is not vacuous: many sources are valid and read, the invalid ones (an unclosed `(` and the like) are unsure
+  assert.ok(unsure > 100 && sources.length - unsure > 400, `${unsure} of ${sources.length} unsure`);
+});
+
+test("fold2 3: plain code keeps its exports: divisions, regular expressions without quotes or braces, ++ and keywords", async () => {
+  const { exportsOf } = await gateModule();
+  for (const src of [
+    "const half = (a + b) / 2;\nconst q = xs[0] / 3;\nn++;\nconst r = n++ / 2;\nexport const real = half / q;\n",
+    "const ok = /^[a-z]+$/i.test(name);\nfunction f(x) { return /\\d+/.exec(x); }\nexport const real = ok && f;\n",
+    "const parts = path.split(/[\\\\/]/);\nconst t = `a ${parts.length} b`;\nexport function real() { return t; }\n",
+  ]) {
+    assert.deepEqual([...exportsOf(src)], [src.match(/export (?:const|function) (\w+)/)[1]], src);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The fold3 reading: every reviewer input of the slash class, plus JSX and a
+// hashbang line, by name; each must read its real exports or be unsure.
+// ---------------------------------------------------------------------------
+
+const READER_INPUTS = [
+  // pre-2 finding 1, the fold reading (A, B), the fold2 reading, the fold3 reading (1, 2, 3, out of scope)
+  ['const decoy = `${\n  "}" + `\nexport function ghost() {}\n`\n}`;\nexport function ready() { return true; }\n', ["ready"]],
+  ['const decoy = `${ {} / {a: 1 / 2}.a + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n', ["ready"]],
+  ['const a = false;\nconst b = "";\nconst decoy = `${ (() => { if (a) /}x/.test(b); })() + "`" }\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n', ["ready"]],
+  ['const a = false;\nif (a) /`/.test("");\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n', ["ready"]],
+  ["let n = 0;\nconst decoy = n++ / `x/\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n", ["ready"]],
+  ["let of = 1; const decoy = of / `x/\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n", ["ready"]],
+  ["export default /`/;\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["function f() { debugger\n/`/.test(x); }\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["for (;;) { break\n/`/.test(x); }\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["for (;;) { continue\n/`/.test(x); }\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["let v = ++ /`/.lastIndex;\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["const x = { return: 4 }, a = [1];\nconst q = x. return / a[/*] / 1;\nexport function ghost() {}\n*/ 0]; /y/;\n", []],
+  ["class C { #return = 4; m(a) { return this.#return / a[/*] / 1;\nexport function ghost() {}\n*/ 0]; } }\n", []],
+  ["const \u00e9in = 4, a = [1];\nconst q = \u00e9in / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", []],
+  ["const q = x ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", []],
+  ["const a = <p>`</p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</p><i></i>;\n", []],
+  ["#!/usr/bin/env -S node --title=`\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  // a hashbang line before plain code keeps the exports
+  ["#!/usr/bin/env node\nexport const real = 1;\n", ["real"]],
+  // the fold4 reading: an escaped name that ends like a keyword, TypeScript's `!` after a comment, a regular
+  // expression or `1.`, and a JSX closing tag with a space
+  ["const \\u{61}in = 4, a = 1;\nconst q = \\u{61}in / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["const \\u{61}in = 4, a = 1;\nconst q = \\u{61}in / a + /x'/ + ' + `';\nexport function real() {}\n// `\n", ["real"]],
+  ["const \\u{61}return = 4, a = 1;\nconst q = \\u{61}return / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", []],
+  ["const a = 1, x = 2;\nconst q = x /**/! / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", [], "m.ts"],
+  ["const a = 1;\nconst q = /re/! / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", [], "m.ts"],
+  ["const a = 1;\nconst q = 1.! / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\n// `\n", [], "m.ts"],
+  ["const a = <p>x`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>x`</ p>;\n", [], "m.tsx"],
+  ["const a = <p>x`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>x`</ p>;\n", [], "m.jsx"],
+  ["const \\u{61}in = 4, a = [1];\nconst q = \\u{61}in / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", []],
+  ["const \\u{61}in = 4;\nexport const real = \\u{61}in / 2 / 1;\n", ["real"]],
+  ["const x = 4, a = [1];\nconst q = x /* c */ ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", [], "m.ts"],
+  ["const a = [1];\nconst q = /x/ ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", [], "m.ts"],
+  ["const a = [1];\nconst q = 1. ! / a[/*] / 1;\nexport function ghost() {}\n*/ 0];\n", [], "m.ts"],
+  ["const a = <p>`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</ p><i></i>;\n", [], "m.jsx"],
+  ["const a = <p>`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</ p><i></i>;\n", []],
+  // the same JSX text as valid JSX (one root per expression)
+  ["const a = <p>`</ p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</ p>;\nexport const real = 1;\n", ["real"], "m.jsx"],
+  ["const a = <p>`</p>;\nconst t = `\nexport function ghost() {}\n`;\nconst b = <p>`</p>;\nexport const real = 1;\n", ["real"]],
+];
+
+test("fold3 1: every reviewer input of the slash class, JSX text and a hashbang line: the real exports or unsure, never ghost", async () => {
+  const { readExports, exportsOf } = await gateModule();
+  const wrong = [];
+  for (const [src, real, path] of READER_INPUTS) {
+    const read = readExports(src, path);
+    const names = [...read.names].sort();
+    if (exportsOf(src, path).has("ghost") || (!read.unsure && names.join(",") !== [...real].sort().join(","))) wrong.push(`${JSON.stringify(src.slice(0, 60))} -> ${names.join(",")} unsure=${read.unsure}`);
+  }
+  assert.deepEqual(wrong, []);
+  // the plain hashbang file is read, not unsure
+  assert.equal(readExports("#!/usr/bin/env node\nexport const real = 1;\n").unsure, false);
+});
+
+test("fold3 2: the fold3 reviewer's default input ends RED, not ADDED-BY-FIX", async (t) => {
+  const head = "export default /`/;\nconst t = `\nexport function ghost() {}\n`;\n// `\nexport function ready() { return true; }\n";
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold4 reading: the exports and imports are read by the TypeScript
+// parser; a file it does not read cleanly is unsure.
+// ---------------------------------------------------------------------------
+
+test("fold4 1: the parser reads every valid reviewer input as JavaScript does (the real exports, never unsure); the invalid JSX ones are unsure", async () => {
+  const { readExports } = await gateModule();
+  // two JSX elements side by side without a parent (`<p>...</p><i></i>`) are a syntax error
+  const invalid = ([src]) => /<\/ ?p><i><\/i>/.test(src);
+  assert.deepEqual(READER_INPUTS.filter((x) => !invalid(x) && readExports(x[0], x[2]).unsure).map(([src]) => JSON.stringify(src.slice(0, 40))), []);
+  assert.deepEqual(READER_INPUTS.filter((x) => invalid(x) && !readExports(x[0], x[2]).unsure).map(([src]) => JSON.stringify(src.slice(0, 40))), []);
+  assert.equal(READER_INPUTS.filter(invalid).length, 3);
+});
+
+test("fold4 2: TypeScript and JSX shapes: value exports only, type and declare and default exports apart; a syntax error is unsure", async () => {
+  const { readExports, exportsOf, importsOf } = await gateModule();
+  const ts = "export interface I { a: number }\nexport type T = 1;\nexport declare const d: number;\nexport const real: number = 1;\nexport enum E { A }\nexport default function main() {}\nexport { real as alias, type I as J };\nexport const { x, y: [z] } = { x: 1, y: [2] };\nnamespace N { export const inner = 1; }\nexports.cjs = 1;\n";
+  assert.deepEqual([...exportsOf(ts, "src/m.ts")].sort(), ["E", "alias", "cjs", "real", "x", "z"]);
+  assert.deepEqual([...exportsOf("export const C = () => <div>{`x`}</div>;\n", "src/c.tsx")], ["C"]);
+  // a syntax error: unsure, no exports at the head
+  assert.equal(readExports("export const real = (;\n", "src/m.ts").unsure, true);
+  assert.deepEqual([...exportsOf("export const real = (;\n", "src/m.ts")], []);
+  // imports by the parser: TypeScript's import-equals and a type-only element; a file that does not parse imports nothing
+  assert.deepEqual(
+    importsOf('import x = require("./y");\nimport { type A, b } from "./m";\nconst t: string = `${1}`;\n', "test/a.test.ts").map((i) => `${i.spec}:${[...i.names].join(",")}:${i.whole}`),
+    ["./m:b:false", "./y::true"],
+  );
+  assert.deepEqual(importsOf('import { a } from "./m";\nconst x = (;\n', "test/a.test.ts"), []);
+});
+
+test("fold4 3: the fold4 reviewer's escaped-name input ends RED, not ADDED-BY-FIX", async (t) => {
+  const head = "const \\u{61}in = 4, a = 1;\nconst q = \\u{61}in / a + /x'/ + ' + `';\nconst t = `\nexport function ghost() {}\n`;\nexport function ready() { return true; }\n// `\n";
+  const r = runGate(decoyScenario(t, head), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.notes, []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold5 reading: HTML-like comments, the merge base the parser does not
+// read cleanly, namespaces and `export import`, a function without a body.
+// ---------------------------------------------------------------------------
+
+test("fold5 1: an HTML-like comment outside a literal makes the file unsure; inside a string it does not", async () => {
+  const { readExports, exportsOf, importsOf } = await gateModule();
+  for (const [src, path] of [
+    ["var a = 1, b = 2;\nvar t = a <!-- b; exports.ghost = function () {};\n", "src/m.cjs"],
+    ["var a = 1;\n  --> exports.ghost = function () {};\n", "src/m.cjs"],
+    ["var a = 1, b = 2;\nvar t = a <!-- b; exports.ghost = function () {};\n", ""],
+  ]) {
+    assert.equal(readExports(src, path).unsure, true, src);
+    assert.deepEqual([...exportsOf(src, path)], [], src);
+  }
+  assert.deepEqual(importsOf('var a = 1, b = 2;\nvar t = a <!-- b; const { ghost } = require("./m");\n', "test/a.test.cjs"), []);
+  // in a string, a template, a regular expression or JSX text it is text
+  const plain = 'const html = "<!-- x -->";\nconst t = `\n--> y`;\nconst r = /<!--/;\nexport const real = 1;\n';
+  assert.equal(readExports(plain, "src/m.mjs").unsure, false);
+  assert.deepEqual([...exportsOf(plain, "src/m.mjs")], ["real"]);
+});
+
+test("fold5 2: a merge base the parser does not read cleanly hides no export the head reads (nothing is fresh then)", async () => {
+  const { freshExports } = await gateModule();
+  const run = (base, head, path = "src/m.cjs") => [...(freshExports([path], () => base, () => head).get(path) ?? [])].sort();
+  // the fold5 reviewer's input: an HTML-like comment line at the merge base, dropped at the head
+  assert.deepEqual(run("<!-- kept\nvar a = 1; exports.real = function () { return a; };\n", "var a = 1; exports.real = function () { return a; };\n"), []);
+  // a legacy octal at the merge base (a syntax error to the parser), an export not at a line start
+  assert.deepEqual(run("var mode = 0755; exports.real = 1;\n", "var mode = 493; exports.real = 1;\n"), []);
+  // a destructured export and a list over several lines behind a syntax error; an escaped name
+  assert.deepEqual(run("export const { real } = { real: 1 }; const x = (;\n", "export const { real } = { real: 1 };\n", "src/m.mjs"), []);
+  assert.deepEqual(run("export {\n  real,\n};\nconst real = 1; const x = (;\n", "export {\n  real,\n};\nconst real = 1;\n", "src/m.mjs"), []);
+  assert.deepEqual(run("export const \\u0072eal = 1; const x = (;\n", "export const real = 1;\n", "src/m.mjs"), []);
+  // a clean merge base keeps the exact reading: a new name is fresh
+  assert.deepEqual(run("export const old = 1;\n", "export const old = 1;\nexport function added() {}\n", "src/m.mjs"), ["added"]);
+  // a merge base with a syntax error: no name is fresh, also one its text never spells
+  assert.deepEqual(run("export const old = (;\n", "export const old = 1;\nexport function added() {}\n", "src/m.mjs"), []);
+});
+
+test("fold5 3/4: a namespace, a module and `export import` are value exports; a function without a body is not", async () => {
+  const { exportsOf, freshExports } = await gateModule();
+  const ts = "export namespace parse { export const v = 1; }\nexport module M { export const w = 1; }\nnamespace N { export const y = 1; }\nexport import alias = N.y;\nexport declare namespace D { const z: number; }\ndeclare module \"x\" {}\nexport function ghost(): void;\nexport function over(a: string): void;\nexport function over(a: unknown) {}\nexport const real = 1;\n";
+  assert.deepEqual([...exportsOf(ts, "src/p.ts")].sort(), ["M", "alias", "over", "parse", "real"]);
+  // the fold5 reviewer's input: a namespace at the merge base, a function at the head: not fresh
+  assert.deepEqual([...(freshExports(["src/p.ts"], () => "export namespace parse { export const v = 1; }\n", () => "export function parse() { return 1; }\n").get("src/p.ts") ?? [])], []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold6 reading: an unsure merge base yields no fresh export at all; the
+// CommonJS export forms are read (or make the file unsure).
+// ---------------------------------------------------------------------------
+
+test("fold6 1: an unsure merge base with an escaped string export name: nothing is fresh", async () => {
+  const { freshExports } = await gateModule();
+  for (const base of ['// <!--\nconst x = 1;\nexport { x as "re\\x61l" };\n', '// <!--\nconst x = 1;\nexport { x as "re\\al" };\n']) {
+    assert.deepEqual([...(freshExports(["src/m.mjs"], () => base, () => "export function real() { return 1; }\n").get("src/m.mjs") ?? [])], [], base);
+  }
+});
+
+test("fold6 2: CommonJS exports: module.exports object keys, element access, defineProperty; other forms are unsure", async () => {
+  const { readExports, freshExports } = await gateModule();
+  const read = (src) => {
+    const r = readExports(src, "src/m.cjs");
+    return `${[...r.names].sort().join(",")}${r.unsure ? " unsure" : ""}`;
+  };
+  assert.equal(read('const a = 1;\nmodule.exports = { a, b: 1, "c": 2, 3: 4, d() {}, get e() { return 1; } };\n'), "3,a,b,c,d,e");
+  assert.equal(read('exports["x"] = 1;\nmodule.exports["y"] = 2;\nmodule.exports.z = 3;\nexports.w = 4;\n'), "w,x,y,z");
+  assert.equal(read('Object.defineProperty(exports, "p", { value: 1 });\nObject.defineProperty(module.exports, "q", { get() { return 1; } });\n'), "p,q");
+  assert.equal(read("module.exports = ({ a: 1 });\n"), "a");
+  // forms whose names the parser cannot read: unsure
+  for (const src of ["const f = () => 1;\nmodule.exports = f;\n", "const o = {};\nmodule.exports = { ...o, a: 1 };\n", "const k = 'a';\nmodule.exports = { [k]: 1 };\n", "const k = 'a';\nexports[k] = 1;\n", "const k = 'a';\nObject.defineProperty(exports, k, { value: 1 });\n"]) {
+    assert.match(read(src), / unsure$/, src);
+  }
+  // the fold6 reviewer's out-of-scope inputs: a clean merge base that exports `real` by such a form; the head moves it
+  const head = "exports.real = function () { return 1; };\n";
+  for (const base of ["module.exports = { real: 1 };\n", 'exports["real"] = 1;\n', 'Object.defineProperty(exports, "real", { value: 1 });\n']) {
+    assert.deepEqual([...(freshExports(["src/m.cjs"], () => base, () => head).get("src/m.cjs") ?? [])], [], base);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The fold7 reading: the CommonJS reading is deny-by-default. Every use of
+// `exports`, `module`, an export helper, a top-level `this` or `export =`
+// that is not a recognised top-level statement makes the script unsure.
+// ---------------------------------------------------------------------------
+
+const FOLD7_BASES = [
+  ["Object.assign(module.exports, { real: 1 });\n", "src/m.cjs"],
+  ["const e = module.exports;\ne.real = 1;\n", "src/m.cjs"],
+  ["const e = exports;\ne.real = 1;\n", "src/m.cjs"],
+  ["exports.real ||= 1;\n", "src/m.cjs"],
+  ["exports.real ??= 1;\n", "src/m.cjs"],
+  ["exports.real &&= 1;\n", "src/m.cjs"],
+  ['module["exports"].real = 1;\n', "src/m.cjs"],
+  ['module["exports"] = { real: 1 };\n', "src/m.cjs"],
+  ["Object.defineProperties(exports, { real: { value: 1 } });\n", "src/m.cjs"],
+  ['Reflect.defineProperty(exports, "real", { value: 1 });\n', "src/m.cjs"],
+  ["({ real: exports.real } = { real: 1 });\n", "src/m.cjs"],
+  ["this.real = 1;\n", "src/m.cjs"],
+  ['Object.assign(exports, require("./x"));\n', "src/m.cjs"],
+  ['__exportStar(require("./x"), exports);\n', "src/m.cjs"],
+  ["export = { real: 1 };\n", "src/m.cts"],
+];
+
+test("fold7 1: every fold7 merge-base form is unsure or read, so a moved export is never fresh", async () => {
+  const { readExports, freshExports } = await gateModule();
+  const head = "exports.real = function () { return 1; };\n";
+  const wrong = [];
+  for (const [base, path] of FOLD7_BASES) {
+    const read = readExports(base, path);
+    if (!read.unsure && !read.names.has("real")) wrong.push(`${JSON.stringify(base)} read clean without real`);
+    const fresh = [...(freshExports([path], () => base, () => head).get(path) ?? [])];
+    if (fresh.includes("real")) wrong.push(`${JSON.stringify(base)} -> real fresh`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+// Every node kind the reading denies, in every place: a target (`exports`, `module.exports`, `module["exports"]`, an alias,
+// a top-level `this`, a helper) under every assignment operator and helper call, at the top level, in a block, in a
+// function, in an arrow function and in a class; each must leave the script unsure (or read `real`).
+function fold7Sources() {
+  const targets = ["exports", "module.exports", 'module["exports"]', "e", "this"];
+  const writes = (t) => [
+    `${t}.real = 1;`, `${t}["real"] = 1;`, `${t}.real ||= 1;`, `${t}.real ??= 1;`, `${t}.real &&= 1;`, `${t}.real += 1;`,
+    `Object.assign(${t}, { real: 1 });`, `Object.defineProperties(${t}, { real: { value: 1 } });`, `Reflect.defineProperty(${t}, "real", { value: 1 });`,
+    `({ real: ${t}.real } = { real: 1 });`, `[${t}.real] = [1];`, `__exportStar({ real: 1 }, ${t});`, `__export({ real: 1 }, ${t});`,
+  ];
+  const places = [(x) => x, (x) => `if (true) { ${x} }`, (x) => `(function () { ${x} })();`, (x) => `(() => { ${x} })();`, (x) => `class K { static { ${x} } }`];
+  const out = [];
+  for (const t of targets) {
+    const alias = t === "e" ? "const e = module.exports;\n" : "";
+    // inside a function or a class, `this` is not the module's (no export there): only the places that keep it
+    const at = t === "this" ? [places[0], places[1], places[3]] : places;
+    for (const w of writes(t)) for (const place of at) out.push(`${alias}${place(w)}\n`);
+  }
+  return out;
+}
+
+test("fold7 2: a generated set over the denied node kinds: never a clean reading without the export", async () => {
+  const { readExports } = await gateModule();
+  const sources = fold7Sources();
+  assert.ok(sources.length > 290, `only ${sources.length} sources`);
+  const wrong = sources.filter((src) => {
+    const read = readExports(src, "src/m.cjs");
+    return !read.unsure && !read.names.has("real");
+  });
+  assert.deepEqual(wrong, []);
+});
+
+test("fold7 3: the recognised statements still read clean; names that only look alike are no references", async () => {
+  const { readExports } = await gateModule();
+  const read = (src, path = "src/m.cjs") => {
+    const r = readExports(src, path);
+    return `${[...r.names].sort().join(",")}${r.unsure ? " unsure" : ""}`;
+  };
+  // a typical compiled CommonJS file
+  assert.equal(read('"use strict";\nObject.defineProperty(exports, "__esModule", { value: true });\nexports.b = exports.a = void 0;\nconst a = 1;\nexports.a = a;\nfunction b() { return this; }\nexports.b = b;\n'), "__esModule,a,b");
+  assert.equal(read('module.exports.x = 1;\nmodule.exports["y"] = 2;\nmodule.exports = ({ z: 3 });\n'), "x,y,z");
+  // a property or a key named like them is no reference
+  assert.equal(read("const o = { exports: 1, module: 2 };\nconst p = o.exports + o.module;\nexport const real = p;\n", "src/m.mjs"), "real");
+  // a shadowing parameter or an assignment inside a function: unsure
+  assert.equal(read("function f(exports) { exports.x = 1; }\nexports.real = 1;\n"), "real unsure");
+  assert.equal(read("function f() { exports.x = 1; }\nf();\n"), " unsure");
+  // a class's computed member names and heritage are evaluated outside its body: a `this` there is the module's
+  for (const src of ["class A { [this.k] = 1; }\n", "class A extends (this.B) {}\n", "class A { [this.k]() {} }\n", "const g = () => this;\n"]) assert.equal(read(src), " unsure", src);
+  for (const src of ["class A { x = this; }\n", "function f() { return this; }\n", "class A { m() { class B { [this.k] = 1; } } }\n"]) assert.equal(read(src), "", src);
+});
+
+// ---------------------------------------------------------------------------
+// The fold8 reading: CommonJS exports are built at run time, so at the merge
+// base only an ES module is read; a CommonJS script there yields no fresh
+// export at all. The head keeps the recognised-statement reading.
+// ---------------------------------------------------------------------------
+
+const FOLD8_BASES = [
+  'const o = { get [(this.real = function () { return 1; }, "k")]() { return 0; } };\n',
+  'class A { static get [(this.real = 1, "k")]() {} }\n',
+  'const o = { set [(this.real = 1, "k")](v) {} };\n',
+  "require.cache[__filename].exports.real = function () { return 1; };\n",
+  "arguments[0].real = function () { return 1; };\n",
+  "arguments[2].exports = { real() {} };\n",
+  'eval("exports").real = function () { return 1; };\n',
+  "exports.__proto__ = { real: function () { return 1; } };\n",
+  "module.exports = { __proto__: { real() { return 1; } } };\n",
+];
+
+// The fresh names of one fix-side script; package: the root package.json's text (none when undefined).
+async function freshOf(path, base, head, pkg) {
+  const { freshExports } = await gateModule();
+  const read = (p) => (p === path ? base : p === "package.json" && pkg !== undefined ? pkg : null);
+  return [...(freshExports([path], read, () => head).get(path) ?? [])].sort();
+}
+const typed = (type) => JSON.stringify({ type });
+
+test("fold8 1: every fold8 merge-base input yields no fresh export, as .cjs, .js without a package type, .ts and .mjs", async () => {
+  const head = "export function real() { return 1; }\nexports.real = real;\n";
+  const wrong = [];
+  for (const base of FOLD8_BASES) for (const path of ["src/m.cjs", "src/m.js", "src/m.ts", "src/m.mjs"]) {
+    if ((await freshOf(path, base, head)).includes("real")) wrong.push(`${path}: ${JSON.stringify(base)}`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("fold8 2: the head reading: a getter or setter's computed-key `this` and a `__proto__` target or key are unsure", async () => {
+  const { readExports } = await gateModule();
+  for (const src of [...FOLD8_BASES.slice(0, 3), ...FOLD8_BASES.slice(7), 'exports["__proto__"] = {};\n', 'Object.defineProperty(exports, "__proto__", { value: {} });\n']) {
+    assert.equal(readExports(src, "src/m.cjs").unsure, true, src);
+  }
+  // a computed key inside a method body is the method's `this`, not the module's
+  assert.equal(readExports("class A { m() { return { [this.k]: 1 }; } }\nexports.a = 1;\n", "src/m.cjs").unsure, false);
+});
+
+test("fold8 3: at the merge base only a pure ES module is read", async () => {
+  const head = "export const a = 1;\nexport function real() { return 1; }\n";
+  const esm = "export const a = 1;\n";
+  // an ES module: its static exports are read exactly, so `real` is new and `a` is not
+  assert.deepEqual(await freshOf("src/m.mjs", esm, head), ["real"]);
+  assert.deepEqual(await freshOf("src/m.js", esm, head, typed("module")), ["real"]);
+  assert.deepEqual(await freshOf("src/m.ts", esm, head), ["real"]);
+  assert.deepEqual(await freshOf("src/m.mjs", 'import { b } from "./b.mjs";\nexport { b as c };\nexport const a = 1;\n', head), ["real"]);
+  // a moved export stays not new; an absent or empty base script exports nothing
+  assert.deepEqual(await freshOf("src/m.mjs", "export function real() { return 0; }\n", head), ["a"]);
+  assert.deepEqual(await freshOf("src/m.mjs", null, head), ["a", "real"]);
+  assert.deepEqual(await freshOf("src/m.mjs", "// nothing yet\n", head), ["a", "real"]);
+  // not read: CommonJS by extension or package type, no static import or export, `export =`, `import x = require`,
+  // `export * from`, a reference to exports, module, require, arguments, eval or a module-level `this`, a broken package.json
+  for (const [path, base, pkg] of [
+    ["src/m.cjs", esm], ["src/m.cts", esm], ["src/m.js", esm, typed("commonjs")], ["src/m.ts", esm, typed("commonjs")],
+    ["src/m.mjs", "const a = 1;\n"], ["src/m.js", "exports.a = 1;\n"], ["src/m.cts", "export = { a: 1 };\n"],
+    ["src/m.ts", 'import x = require("./x");\nexport const a = 1;\n'], ["src/m.mjs", 'export * from "./x.mjs";\nexport const a = 1;\n'],
+    ["src/m.mjs", "export const a = 1;\nexports.b = 1;\n"],
+    ["src/m.mjs", 'import { createRequire } from "node:module";\nconst require = createRequire(import.meta.url);\nexport const a = 1;\n'],
+    ["src/m.mjs", "export const a = 1;\nconst t = this;\n"], ["src/m.mjs", "export const a = arguments;\n"], ["src/m.js", esm, "{"],
+  ]) {
+    assert.deepEqual(await freshOf(path, base, head, pkg), [], `${path} ${pkg ?? ""}: ${base}`);
+  }
+});
+
+// Every CommonJS export form the readings met, under every module kind, with and without static ES syntax beside it.
+test("fold8 4: a generated set: a CommonJS export at the merge base never makes a name fresh", async () => {
+  const forms = [...FOLD7_BASES.map(([b]) => b), ...FOLD8_BASES, "exports.real = 1;\n", "module.exports = { real: 1 };\n", "module.exports.real = 1;\n", 'Object.defineProperty(exports, "real", { value: 1 });\n'];
+  const kinds = [["src/m.cjs"], ["src/m.cts"], ["src/m.js", typed("commonjs")], ["src/m.js"], ["src/m.ts"], ["src/m.mjs"], ["src/m.js", typed("module")]];
+  const beside = ["", 'import "node:fs";\n', "export const other = 1;\n"];
+  const head = "export function real() { return 1; }\n";
+  let n = 0;
+  const wrong = [];
+  for (const form of forms) for (const [path, pkg] of kinds) for (const pre of beside) {
+    n += 1;
+    if ((await freshOf(path, pre + form, head, pkg)).includes("real")) wrong.push(`${path} ${pkg ?? ""}: ${JSON.stringify(pre + form)}`);
+  }
+  assert.ok(n > 500, `only ${n}`);
+  assert.deepEqual(wrong, []);
+});
+
+// ---------------------------------------------------------------------------
+// The fold9 reading: under a transpiler or a test runner an ES module can
+// write its own export object, so at the merge base an ES module is read only
+// without a namespace import, a dynamic import(), an import of node:module or
+// module, and any identifier that starts with `__vi`.
+// ---------------------------------------------------------------------------
+
+const FOLD9_BASES = [
+  'import * as self from "./m";\nObject.assign(self, { real() { return 1; } });\nexport const a = 1;\n',
+  "export const a = 1;\n__vite_ssr_exports__.real = function () { return 1; };\n",
+  'import { createRequire } from "node:module";\nconst r = createRequire(__filename);\nr.cache[__filename].exports.real = function () { return 1; };\nexport const a = 1;\n',
+];
+
+test("fold9 1: the fold9 merge-base inputs yield no fresh export, as .ts, .js, .mjs and .js of type module", async () => {
+  const head = "export const a = 1;\nexport function real() { return 1; }\n";
+  const wrong = [];
+  for (const base of FOLD9_BASES) for (const [path, pkg] of [["src/m.ts"], ["src/m.js"], ["src/m.mjs"], ["src/m.js", typed("module")]]) {
+    if ((await freshOf(path, base, head, pkg)).includes("real")) wrong.push(`${path}: ${JSON.stringify(base)}`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("fold9 2: the allow-list: a namespace import, a dynamic import(), node:module or module, a `__vi` name make the base unsure; other imports do not", async () => {
+  const head = "export const a = 1;\nexport function real() { return 1; }\n";
+  for (const base of [
+    'import * as fs from "node:fs";\nexport const a = 1;\n',
+    'import d, * as ns from "./x.mjs";\nexport const a = 1;\n',
+    'export const a = 1;\nconst m = await import("./m.mjs");\n',
+    'import { createRequire as cr } from "module";\nexport const a = 1;\n',
+    'import m from "node:module";\nexport const a = 1;\n',
+    'export { createRequire } from "node:module";\nexport const a = 1;\n',
+    "export const a = 1;\nconst o = { x: __vi_import_0__ };\n",
+    "export const a = 1;\nconst o = {};\no.__vite_ssr_import_meta__ = 1;\n",
+  ]) {
+    assert.deepEqual(await freshOf("src/m.mjs", base, head), [], base);
+  }
+  for (const base of ['import { readFileSync } from "node:fs";\nimport d from "./d.mjs";\nexport const a = 1;\n', 'export * as ns from "./x.mjs";\nexport const a = 1;\n', "export const a = 1;\nconst vi = 1;\n"]) {
+    assert.deepEqual(await freshOf("src/m.mjs", base, head), ["real"], base);
+  }
 });

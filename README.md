@@ -59,7 +59,9 @@ out of the reusable workflow to avoid a caller cancelling its own called job.
 - **Reusable gate workflows** (`.github/workflows/*.yml`) — org-wide quality
   controls that any cinatra-ai repo can wire in through a thin caller.
 - **Gate scripts** (`scripts/*.mjs`) — the standalone Node engines; zero
-  runtime npm dependencies.
+  runtime npm dependencies, except `red-first-gate`, which reads scripts
+  with the `typescript` parser of this repository's lockfile (its workflow
+  runs `npm ci` in the gate's checkout).
 - **Shared config** (`config/`) — profiles, baselines, and JSON config files
   consumed by the gate engines.
 
@@ -2361,19 +2363,38 @@ codes alone.
   a `does not provide an export named '<name>'`, when the test file itself
   imports `<name>` (by name, or the whole module: a namespace, a default
   import, `require`) from a relative path, and that module's head version
-  exports `<name>` as a value (`export function|class|const|let|var|enum
-  <name>`, `export { <name> }` or `exports.<name> =`, read outside comments
-  and strings; never `export declare` or a `.d.ts` file; a script in which
-  the scan cannot tell a division from a regular expression, a `/` after
-  `}`, `)` or `]` with another `/` later on its line, or in which a
-  template's end by the scan differs from a plain count of its braces,
-  exports nothing here) while no fix-side
+  exports `<name>` as a value, read by the TypeScript parser: a top-level
+  exported function with a body, class, `const`, `let` or `var` binding
+  (destructured too), `enum`, `namespace` or `module`, `export import
+  <name> =`, `export { <name> }`, `export * as <name>`, or a top-level
+  CommonJS statement: `exports.<name> = ...` and chains of such
+  assignments, `exports["<name>"] =` (also on `module.exports`),
+  `module.exports = { ... }` with plain keys, and
+  `Object.defineProperty(exports, "<name>", ...)`; never `export
+  declare`, `export default`, a type or a `.d.ts` file. A script with a
+  syntax error, with an HTML-like comment (`<!--`, or `-->` at a line
+  start) outside a literal, or with any other use of `exports`, `module`,
+  a module-level `this`, an `__exportStar` or `__export` helper, a
+  `__proto__` name, or `export =` exports nothing here. At the merge base
+  only ES modules are read: when any fix-side script of the merge base is
+  not a pure ES module (a `.cjs` or `.cts` file, a file under a
+  package.json of type `commonjs`, a file with no static `import` or
+  `export`, or one with `export =`, `import x = require()`, `export *
+  from`, a namespace import, a dynamic `import()`, an import from
+  `node:module` or `module`, any reference to `exports`, `module`,
+  `require`, `arguments`, `eval` or a module-level `this`, or an
+  identifier that starts with `__vi`), or is unsure as above, no export
+  counts as new; the merge-base reading is static; a file that sets its
+  exports through runtime tricks is outside it)
+  while no fix-side
   script exported it at the merge base (a moved export is not new); or a
   runner's module-not-found error (`Cannot find module`, `Failed to resolve
   import`, `Failed to load url`, at the start of the error, never inside
   another message) whose path is a regular file the fix side adds, that the
   test file imports by a relative path, and that is outside the test file's
-  folder. An import path without an extension means that path with a script
+  folder. The test file's static `import` declarations, `import x =
+  require()` and `require()` bindings are read by the same parser (a test
+  file with a syntax error imports nothing here). An import path without an extension means that path with a script
   extension or its folder's `index`; a path with an extension means that very
   file, or only its TypeScript source (`x.js` for `x.ts`). A fix-side path
   that is test code by its place or name (`test/`,

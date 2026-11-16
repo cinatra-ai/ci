@@ -58,6 +58,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 // Test files: JavaScript and TypeScript only (.js .jsx .ts .tsx .mjs .cjs .mts
@@ -413,176 +414,382 @@ export function missingModules(text) {
   return found;
 }
 
-const REGEX_KEYWORD_RE = /(?:^|[^\w$.])(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
-// Whether the code read so far ends with such a keyword (a bounded look back).
-function afterKeyword(out) {
-  let k = out.length;
-  while (k > 0 && /\s/.test(out[k - 1])) k -= 1;
-  return REGEX_KEYWORD_RE.test(out.slice(Math.max(0, k - 11), k));
-}
-// The source as code only, at the same offsets: comments, template literals,
-// regular-expression literals and the contents of quoted strings become
-// spaces (line breaks kept); with keepQuotes a quoted string keeps its quote
-// characters, so an import specifier's place can be found and read from the
-// source. A text inside a comment or a string never reads as an export or an
-// import. The code of a template's `${...}` is scanned as code (its strings,
-// comments, regular expressions and nested templates), so that a brace or a
-// backtick inside them never ends it; the whole template is blanked.
-export function codeText(source, keepQuotes = false) {
-  return scanCode(String(source), 0, keepQuotes, false).out;
-}
-
-// The end of a template literal by a plain count of `${`, `{` and `}` (the
-// reading of earlier versions); a second opinion on scanCode's end.
-function braceEnd(s, i) {
-  let depth = 0;
-  for (let j = i + 1; j < s.length; j += 1) {
-    const d = s[j];
-    if (d === "\\") j += 1;
-    else if (d === "$" && s[j + 1] === "{") {
-      depth += 1;
-      j += 1;
-    } else if (depth && d === "{") depth += 1;
-    else if (depth && d === "}") depth -= 1;
-    else if (!depth && d === "`") return j + 1;
+// The scripts' exports and imports are read with the TypeScript parser (the
+// `typescript` package of this repository's lockfile, installed beside the
+// gate), never with a hand scanner: a regular expression, a division, a
+// template, JSX text and a comment are told apart by the grammar.
+let tsParser;
+function typescript() {
+  if (tsParser === undefined) {
+    try {
+      tsParser = createRequire(import.meta.url)("typescript");
+    } catch {
+      throw new Error("the TypeScript parser is not installed beside the gate: run `npm ci` in the gate's checkout");
+    }
   }
-  return s.length;
+  return tsParser;
 }
 
-// Scans code from `start`; inner: the code of a template's `${...}`, which
-// ends at its unmatched `}`. Returns the code text, the end offset and
-// `unsure`: the scan met a slash after `}`, `)` or `]` that a later slash on
-// its line could close as a regular expression (a division or a regular
-// expression: the scanner cannot tell), or a template whose end differs
-// from the plain brace count. An unsure text is never evidence (exportsOf).
-function scanCode(s, start, keepQuotes, inner) {
-  const blank = (t) => t.replace(/[^\n]/g, " ");
-  let out = "";
-  let prev = "";
-  let depth = 0;
-  let unsure = false;
-  let i = start;
-  while (i < s.length) {
-    const c = s[i];
-    const n = s[i + 1];
-    if (c === "/" && n === "/") {
-      const e = s.indexOf("\n", i);
-      const end = e < 0 ? s.length : e;
-      out += blank(s.slice(i, end));
-      i = end;
-      continue;
+// The script kind of a path (a path-less source reads as JavaScript, which
+// also parses JSX).
+function scriptKind(ts, path) {
+  if (/\.d\.[cm]?ts$/.test(path) || /\.[cm]?ts$/.test(path)) return ts.ScriptKind.TS;
+  if (/\.tsx$/.test(path)) return ts.ScriptKind.TSX;
+  if (/\.jsx$/.test(path)) return ts.ScriptKind.JSX;
+  return ts.ScriptKind.JS;
+}
+
+// The literal tokens of a parsed file (strings, templates, regular
+// expressions, JSX text): [start, end) offsets.
+function literalRanges(ts, file) {
+  const ranges = [];
+  const visit = (node) => {
+    if (ts.isStringLiteralLike(node) || ts.isTemplateLiteralToken(node) || ts.isRegularExpressionLiteral(node) || ts.isJsxText(node)) ranges.push([node.getStart(file), node.end]);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return ranges;
+}
+
+// An HTML-like comment (`<!--` anywhere, `-->` at a line start), which a
+// CommonJS script may hold and the parser reads as code; outside a literal.
+const HTML_COMMENT_RE = /<!--|^[ \t]*-->/gm;
+
+// The parsed source, and whether the parser may not read it as JavaScript
+// does: a syntax error, or an HTML-like comment outside a literal.
+function parse(source, path = "") {
+  const ts = typescript();
+  const text = String(source);
+  const file = ts.createSourceFile(path || "source.js", text, ts.ScriptTarget.Latest, true, scriptKind(ts, path));
+  let unsure = file.parseDiagnostics.length > 0;
+  if (!unsure && /<!--|^[ \t]*-->/m.test(text)) {
+    const ranges = literalRanges(ts, file);
+    for (const match of text.matchAll(HTML_COMMENT_RE)) {
+      const at = match.index + match[0].indexOf(match[0].trimStart()[0]);
+      if (!ranges.some(([start, end]) => at >= start && at < end)) unsure = true;
     }
-    if (c === "/" && n === "*") {
-      const e = s.indexOf("*/", i + 2);
-      const end = e < 0 ? s.length : e + 2;
-      out += blank(s.slice(i, end));
-      i = end;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      let j = i + 1;
-      for (; j < s.length; j += 1) {
-        const d = s[j];
-        if (d === "\\") {
-          j += 1;
-          continue;
+  }
+  return { ts, file, unsure };
+}
+
+const hasModifier = (ts, node, kind) => (ts.canHaveModifiers(node) ? ts.getModifiers(node) ?? [] : []).some((m) => m.kind === kind);
+
+// The names a binding (a name or a destructuring pattern) declares.
+function bindingNames(ts, name, out) {
+  if (ts.isIdentifier(name)) out.push(name.text);
+  else for (const element of name.elements) if (!ts.isOmittedExpression(element)) bindingNames(ts, element.name, out);
+}
+
+// The CommonJS reading is deny-by-default: every reference to `exports`,
+// `module`, `__exportStar` or `__export`, every top-level `this` and every
+// `export =` makes the script unsure, unless the reference is part of one of
+// the recognised top-level statements below, whose whole shape is read.
+const CJS_WATCHED = new Set(["exports", "module", "__exportStar", "__export"]);
+
+// `exports` or `module.exports`: the identifier nodes it references, or null.
+function exportsObject(ts, node) {
+  if (ts.isIdentifier(node) && node.text === "exports") return [node];
+  if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "module" && node.name.text === "exports") return [node.expression];
+  return null;
+}
+
+// A string or number literal as a name (an identifier too, for an object
+// literal's key); else null.
+function keyName(ts, key, identifier = false) {
+  return key && ((identifier && ts.isIdentifier(key)) || ts.isStringLiteralLike(key) || ts.isNumericLiteral(key)) ? key.text : null;
+}
+
+// `exports.<n>`, `exports["<n>"]`, `module.exports.<n>`, `module.exports["<n>"]`:
+// { name, refs }, or null.
+function exportsTarget(ts, node) {
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return null;
+  const refs = exportsObject(ts, node.expression);
+  if (!refs) return null;
+  const name = ts.isPropertyAccessExpression(node) ? node.name.text : keyName(ts, node.argumentExpression);
+  return name === null || name === "__proto__" ? null : { name, refs };
+}
+
+// The recognised CommonJS statements of a script's top level, each read as a
+// whole: `T = value` and chains `T1 = T2 = value` with T an exports target,
+// `module.exports = { ... }` (an object literal, also in parentheses, with plain keys: names,
+// strings, numbers, shorthand, methods, accessors; no spread, no computed
+// key) and `Object.defineProperty(exports or module.exports, "<n>", ...)`.
+// Returns the names and the identifier nodes these statements account for.
+function commonJsStatements(ts, file) {
+  const names = [];
+  const accounted = new Set();
+  for (const statement of file.statements) {
+    if (!ts.isExpressionStatement(statement)) continue;
+    const expression = statement.expression;
+    if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const whole = exportsObject(ts, expression.left);
+      let value = expression.right;
+      while (ts.isParenthesizedExpression(value)) value = value.expression;
+      if (whole && !ts.isIdentifier(expression.left) && ts.isObjectLiteralExpression(value)) {
+        const keys = value.properties.map((p) => (ts.isShorthandPropertyAssignment(p) ? p.name.text : ts.isSpreadAssignment(p) ? null : keyName(ts, p.name, true)));
+        if (keys.every((k) => k !== null && k !== "__proto__")) {
+          names.push(...keys);
+          for (const ref of whole) accounted.add(ref);
         }
-        if (c === "`") {
-          // the interpolation's code, up to its own closing brace
-          if (d === "$" && s[j + 1] === "{") {
-            const sub = scanCode(s, j + 2, false, true);
-            unsure ||= sub.unsure;
-            j = sub.end - 1;
-          } else if (d === "`") break;
-        } else if (d === c || d === "\n") break;
+        continue;
       }
-      const end = Math.min(j + 1, s.length);
-      if (c === "`" && braceEnd(s, i) !== end) unsure = true;
-      const literal = s.slice(i, end);
-      out += keepQuotes && c !== "`" && literal.length > 1 && literal.endsWith(c) ? `${c}${blank(literal.slice(1, -1))}${c}` : blank(literal);
-      prev = c;
-      i = end;
-      continue;
-    }
-    // A slash starts a regular expression after an operator or a bracket, or
-    // after a keyword such as `return` (not after a name or a closing bracket).
-    if (c === "/" && "})]".includes(prev)) {
-      const e = s.indexOf("\n", i + 1);
-      if (s.slice(i + 1, e < 0 ? s.length : e).includes("/")) unsure = true;
-    }
-    if (c === "/" && (prev === "" || "(,=:[!&|?{};+-*%<>~^".includes(prev) || (/[\w$]/.test(prev) && afterKeyword(out)))) {
-      let j = i + 1;
-      let inClass = false;
-      for (; j < s.length && s[j] !== "\n"; j += 1) {
-        if (s[j] === "\\") j += 1;
-        else if (s[j] === "[") inClass = true;
-        else if (s[j] === "]") inClass = false;
-        else if (s[j] === "/" && !inClass) break;
+      let node = expression;
+      while (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const target = exportsTarget(ts, node.left);
+        if (!target) break;
+        names.push(target.name);
+        for (const ref of target.refs) accounted.add(ref);
+        node = node.right;
       }
-      const end = Math.min(j + 1, s.length);
-      out += blank(s.slice(i, end));
-      prev = "/";
-      i = end;
-      continue;
+    } else if (
+      ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) && ts.isIdentifier(expression.expression.expression)
+      && expression.expression.expression.text === "Object" && expression.expression.name.text === "defineProperty" && expression.arguments.length >= 2
+    ) {
+      const refs = exportsObject(ts, expression.arguments[0]);
+      const name = keyName(ts, expression.arguments[1]);
+      if (refs && name !== null && name !== "__proto__") {
+        names.push(name);
+        for (const ref of refs) accounted.add(ref);
+      }
     }
-    if (inner && c === "{") depth += 1;
-    else if (inner && c === "}") {
-      if (depth === 0) return { out, end: i + 1, unsure };
-      depth -= 1;
-    }
-    out += c;
-    if (!/\s/.test(c)) prev = c;
-    i += 1;
   }
-  return { out, end: s.length, unsure };
+  return { names, accounted };
 }
 
-// The value exports of a whole script (code only, see codeText); none when
-// the scan is unsure (fail closed: such a file is never evidence).
-export function exportsOf(source) {
-  const scan = scanCode(String(source), 0, false, false);
-  return scan.unsure ? new Set() : new Set(exportNames(scan.out.split("\n")));
+// An identifier that names a property, a member or a label rather than
+// referencing a binding.
+function notAReference(ts, node) {
+  const parent = node.parent;
+  if (!parent) return false;
+  if ((ts.isPropertyAccessExpression(parent) || ts.isQualifiedName(parent)) && (parent.name === node || parent.right === node)) return true;
+  if ((ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent) || ts.isPropertyDeclaration(parent) || ts.isPropertySignature(parent) || ts.isMethodSignature(parent) || ts.isGetAccessorDeclaration(parent) || ts.isSetAccessorDeclaration(parent) || ts.isEnumMember(parent) || ts.isJsxAttribute(parent)) && parent.name === node) return true;
+  if (ts.isBindingElement(parent) && parent.propertyName === node) return true;
+  return ts.isLabeledStatement(parent) || ts.isBreakOrContinueStatement(parent);
 }
 
-// Every name any line of a script declares as an export, comments and
-// strings included: the merge base's names of a file whose scan is unsure
-// (a superset, so a name hidden there is never new at the head).
-function exportsAnyLine(source) {
-  const s = String(source);
-  return scanCode(s, 0, false, false).unsure ? new Set(exportNames(s.split("\n"))) : new Set();
+// Whether a script holds a CommonJS or module-object use the reading does not
+// account for (see CJS_WATCHED).
+function unreadCommonJs(ts, file, accounted, watched = CJS_WATCHED) {
+  let found = false;
+  const visit = (node) => {
+    if (found) return;
+    if (ts.isIdentifier(node) && watched.has(node.text) && !accounted.has(node) && !notAReference(ts, node)) found = true;
+    else if (node.kind === ts.SyntaxKind.ThisKeyword && moduleThis(ts, node)) found = true;
+    else if (ts.isExportAssignment(node) && node.isExportEquals) found = true;
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+// Whether a `this` is the module's: no enclosing non-arrow function and no
+// enclosing class, except the member or class whose computed name, decorator
+// or heritage clause holds it (those are evaluated outside that member's or
+// class's body: `class A { get [this.k]() {} }`, `class A extends this.B {}`,
+// `({ set [this.k](v) {} })`).
+function moduleThis(ts, node) {
+  const outside = new Set();
+  for (let p = node.parent; p; p = p.parent) {
+    if (ts.isComputedPropertyName(p) || ts.isDecorator(p) || ts.isHeritageClause(p)) {
+      let owner = p.parent;
+      if (ts.isParameter(owner)) owner = owner.parent;
+      outside.add(owner);
+      if (owner.parent && ts.isClassLike(owner.parent)) outside.add(owner.parent);
+    }
+    if (outside.has(p)) continue;
+    if ((ts.isFunctionLike(p) && !ts.isArrowFunction(p)) || ts.isClassLike(p)) return false;
+  }
+  return true;
+}
+
+// The value exports of a whole script by the parser: an exported function
+// with a body, class, variable, enum, namespace or `import x =` declaration
+// (not `declare`, not a type), an `export { ... }` list (not `type` names,
+// not `default`), `export * as`, and the recognised CommonJS statements;
+// unsure when the parser reports a syntax error or an HTML-like comment, or
+// the script uses `exports`, `module`, a top-level `this`, an export helper
+// or `export =` in any other way.
+export function readExports(source, path = "") {
+  const { ts, file, unsure: parseUnsure } = parse(source, path);
+  const names = moduleExports(ts, file);
+  const cjs = commonJsStatements(ts, file);
+  for (const name of cjs.names) names.add(name);
+  return { names, unsure: parseUnsure || unreadCommonJs(ts, file, cjs.accounted) };
+}
+
+// The ES module export names of a parsed script (see readExports).
+function moduleExports(ts, file) {
+  const names = new Set();
+  for (const statement of file.statements) {
+    if (ts.isExportDeclaration(statement)) {
+      if (statement.isTypeOnly) continue;
+      const clause = statement.exportClause;
+      if (clause && ts.isNamedExports(clause)) {
+        for (const element of clause.elements) if (!element.isTypeOnly && element.name.text !== "default") names.add(element.name.text);
+      } else if (clause && ts.isNamespaceExport(clause)) names.add(clause.name.text);
+      continue;
+    }
+    if (!hasModifier(ts, statement, ts.SyntaxKind.ExportKeyword) || hasModifier(ts, statement, ts.SyntaxKind.DeclareKeyword) || hasModifier(ts, statement, ts.SyntaxKind.DefaultKeyword)) continue;
+    // a function needs a body (a signature alone is no value); a namespace or module of a plain name and
+    // `export import x = ...` are values
+    if (ts.isFunctionDeclaration(statement) && statement.name && statement.body) names.add(statement.name.text);
+    else if ((ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement)) && statement.name) names.add(statement.name.text);
+    else if (ts.isModuleDeclaration(statement) && ts.isIdentifier(statement.name)) names.add(statement.name.text);
+    else if (ts.isImportEqualsDeclaration(statement) && !statement.isTypeOnly) names.add(statement.name.text);
+    else if (ts.isVariableStatement(statement)) {
+      const list = [];
+      for (const declaration of statement.declarationList.declarations) bindingNames(ts, declaration.name, list);
+      for (const name of list) names.add(name);
+    }
+  }
+  return names;
+}
+
+// At the merge base only an ES module is read, because CommonJS exports are
+// built at run time and no static reading of them is complete. A script there
+// is unsure (it may export any name) unless it is a pure ES module: not a
+// `.cjs` or `.cts` file, not under a package.json whose type is "commonjs"
+// (packageType: the nearest one's type, "" when none, null when it does not
+// parse), at least one static `import` or `export` statement, no `export =`,
+// no `import x = require(...)`, no `export * from` (its names are another
+// file's), and no reference at all to `exports`, `module`, `require`,
+// `arguments`, `eval`, an export helper or a module-level `this`. A
+// transpiler or a test runner (TypeScript to CommonJS, vitest) can still let
+// an ES module write its own export object, so the reading allows only a
+// module without a namespace import (`import * as`), a dynamic `import()`,
+// an import from `node:module` or `module`, and any identifier that starts
+// with `__vi` (`__vite_ssr_exports__`, `__vi_import_0__`). The reading is
+// static; a file that sets its exports through runtime tricks is outside
+// it. An empty script exports nothing.
+const BASE_WATCHED = new Set([...CJS_WATCHED, "require", "arguments", "eval"]);
+export function readBaseExports(source, path = "", packageType = "") {
+  const { ts, file, unsure } = parse(source, path);
+  const none = (u) => ({ names: new Set(), unsure: u });
+  if (unsure) return none(true);
+  if (!file.statements.length) return none(false);
+  if (/\.c[jt]s$/.test(path) || (!/\.m[jt]s$/.test(path) && (packageType === null || packageType === "commonjs"))) return none(true);
+  let isModule = false;
+  for (const statement of file.statements) {
+    if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference)) return none(true);
+    if (ts.isExportAssignment(statement) && statement.isExportEquals) return none(true);
+    if (ts.isExportDeclaration(statement) && !statement.exportClause && !statement.isTypeOnly) return none(true);
+    if (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement) || ts.isExportAssignment(statement) || hasModifier(ts, statement, ts.SyntaxKind.ExportKeyword)) isModule = true;
+  }
+  if (!isModule || unreadCommonJs(ts, file, new Set(), BASE_WATCHED) || runtimeExportRoad(ts, file)) return none(true);
+  return { names: moduleExports(ts, file), unsure: false };
+}
+
+// Whether an ES module holds one of the roads by which a transpiler or a test
+// runner lets it write its own export object (see readBaseExports).
+const MODULE_SPECIFIERS = new Set(["node:module", "module"]);
+function runtimeExportRoad(ts, file) {
+  for (const statement of file.statements) {
+    const spec = (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement)) && statement.moduleSpecifier;
+    if (spec && ts.isStringLiteralLike(spec) && MODULE_SPECIFIERS.has(spec.text)) return true;
+    const bindings = ts.isImportDeclaration(statement) && statement.importClause?.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) return true;
+  }
+  let found = false;
+  const visit = (node) => {
+    if (found) return;
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) found = true;
+    else if ((ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) && /^#?__vi/.test(node.text)) found = true;
+    else ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+// The type field of the package.json nearest to a path in a version: "" when
+// there is none or it names no type, null when it does not parse.
+function nearestPackageType(read, path) {
+  const parts = path.split("/").slice(0, -1);
+  for (let n = parts.length; n >= 0; n -= 1) {
+    const text = read([...parts.slice(0, n), "package.json"].join("/"));
+    if (text === null || text === undefined) continue;
+    try {
+      const type = JSON.parse(text)?.type;
+      return typeof type === "string" ? type : "";
+    } catch {
+      return null;
+    }
+  }
+  return "";
+}
+
+// The value exports of a whole script; none when the parser reports a syntax
+// error (fail closed: such a file is never evidence).
+export function exportsOf(source, path = "") {
+  const read = readExports(source, path);
+  return read.unsure ? new Set() : read.names;
+}
+
+// Per fix-side evidence script, the names its whole head version exports that
+// no fix-side script exported at the merge base (so a moved export is not
+// new): Map(path -> names). base(path) and head(path) give a version's text,
+// or null. When any fix-side script of the merge base is not read cleanly as
+// an ES module (readBaseExports), nothing is fresh (that script may export
+// any name).
+export function freshExports(fixSide, base, head) {
+  const byFile = new Map();
+  const scripts = fixSide.filter((path) => SCRIPT_EXT_RE.test(path));
+  const before = new Set();
+  for (const path of scripts) {
+    const text = base(path);
+    if (text === null || text === undefined) continue;
+    const read = readBaseExports(text, path, /\.m[jt]s$/.test(path) ? "" : nearestPackageType(base, path));
+    if (read.unsure) return byFile;
+    for (const name of read.names) before.add(name);
+  }
+  for (const path of scripts.filter(evidencePath)) {
+    const text = head(path);
+    if (text === null) continue;
+    const fresh = new Set([...exportsOf(text, path)].filter((name) => !before.has(name)));
+    if (fresh.size) byFile.set(path, fresh);
+  }
+  return byFile;
 }
 
 // The static imports of a test file: [{ spec, names, whole }]. names: the
 // exported names it imports by name; whole: it binds the whole module (a
 // namespace, a default import, `require` of the module), so any export may be
-// called through it. `import type` binds no value and is not read.
-export function importsOf(source) {
-  const src = String(source);
-  const t = codeText(src, true);
-  // The specifier of a match, read from the source at its masked place.
-  const at = (m, group) => src.slice(m.indices[group][0], m.indices[group][1]);
+// called through it. `import type` binds no value and is not read. A file the
+// parser does not read cleanly imports nothing here (no evidence).
+export function importsOf(source, path = "") {
+  const { ts, file, unsure } = parse(source, path);
+  if (unsure) return [];
   const found = [];
-  const named = (list) => {
+  const requireOf = (node) =>
+    node && ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "require" && node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0]) ? node.arguments[0].text : null;
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
+    const clause = statement.importClause;
+    if (clause?.isTypeOnly) continue;
     const names = new Set();
-    for (const part of list.split(",")) {
-      const item = part.trim();
-      if (!item || /^type\s/.test(item)) continue;
-      const name = item.split(/\s+as\s+/)[0].trim();
-      if (NAME_RE.test(name)) names.add(name);
+    let whole = Boolean(clause?.name);
+    const bindings = clause?.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) whole = true;
+    else if (bindings) for (const element of bindings.elements) if (!element.isTypeOnly) names.add((element.propertyName ?? element.name).text);
+    found.push({ spec: statement.moduleSpecifier.text, names, whole });
+  }
+  const visit = (node) => {
+    if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference) && ts.isStringLiteralLike(node.moduleReference.expression)) {
+      found.push({ spec: node.moduleReference.expression.text, names: new Set(), whole: true });
+    } else if (ts.isVariableDeclaration(node)) {
+      const spec = requireOf(node.initializer);
+      if (spec !== null && ts.isIdentifier(node.name)) found.push({ spec, names: new Set(), whole: true });
+      else if (spec !== null && ts.isObjectBindingPattern(node.name)) {
+        const names = new Set();
+        for (const element of node.name.elements) {
+          const key = element.propertyName ?? element.name;
+          if (ts.isIdentifier(key)) names.add(key.text);
+        }
+        found.push({ spec, names, whole: false });
+      }
     }
-    return names;
+    ts.forEachChild(node, visit);
   };
-  for (const m of t.matchAll(/(?<![\w$.])import\s+(?!type\s)([\w$*{}\s,]*?)\s*from\s*(["'])([^"'\n]+)\2/dg)) {
-    const clause = m[1];
-    const braces = /\{([^}]*)\}/.exec(clause);
-    const rest = clause.replace(/\{[^}]*\}/, "").replace(/,/g, " ").trim();
-    found.push({ spec: at(m, 3), names: braces ? named(braces[1]) : new Set(), whole: rest.length > 0 });
-  }
-  for (const m of t.matchAll(/(?<![\w$.])import\s*(["'])([^"'\n]+)\1/dg)) found.push({ spec: at(m, 2), names: new Set(), whole: false });
-  for (const m of t.matchAll(/(?<![\w$.])(?:const|let|var)\s+(\{[^}]*\}|[A-Za-z_$][\w$]*)\s*=\s*require\(\s*(["'])([^"'\n]+)\2\s*\)/dg)) {
-    const braces = /^\{([^}]*)\}$/.exec(m[1]);
-    found.push({ spec: at(m, 3), names: braces ? named(braces[1].replace(/:\s*[\w$]+/g, "")) : new Set(), whole: !braces });
-  }
+  visit(file);
   return found;
 }
 
@@ -710,7 +917,7 @@ function addedModule(candidate, added) {
 //   addedFix      the evidence paths the range adds (plan.addedFix).
 export function addedByFix(text, file, { source = "", exportsByFile = () => new Map(), addedFix = new Set(), roots = [], runnerDir = "" }) {
   const t = normalizeText(text);
-  const imports = importsOf(source)
+  const imports = importsOf(source, file)
     .map((im) => ({ ...im, path: importPath(im.spec, file) }))
     .filter((im) => im.path);
   const name = missingCallable(t) ?? NO_EXPORT_RE.exec(t)?.[1] ?? null;
@@ -1671,19 +1878,7 @@ function rangeReader(repo, plan) {
   return {
     exportsByFile() {
       if (byFile) return byFile;
-      byFile = new Map();
-      const scripts = plan.fixSide.filter((path) => SCRIPT_EXT_RE.test(path));
-      const before = new Set();
-      for (const path of scripts) {
-        const text = blob(plan.mergeBase, path) ?? "";
-        for (const name of [...exportsOf(text), ...exportsAnyLine(text)]) before.add(name);
-      }
-      for (const path of scripts.filter(evidencePath)) {
-        const head = blob(plan.head, path);
-        if (head === null) continue;
-        const fresh = new Set([...exportsOf(head)].filter((name) => !before.has(name)));
-        if (fresh.size) byFile.set(path, fresh);
-      }
+      byFile = freshExports(plan.fixSide, (path) => blob(plan.mergeBase, path), (path) => blob(plan.head, path));
       return byFile;
     },
     // The added lines of a file's edit, or null when its diff is not readable.
@@ -1727,6 +1922,8 @@ async function runGateIn(opts) {
   if (plan.verdict === "skip") {
     return { mode: "run", verdict: "SKIP", reason: plan.reason, detail: plan.detail, mergeBase: plan.mergeBase ?? null, reasons: [], notes: [], files: [] };
   }
+  // the parser is loaded before any test of the pull request runs (they could change its files)
+  typescript();
   const repo = opts.repo ?? process.cwd();
   const reasons = [];
   // New tests that match --exclude beside other new tests: listed, not proven,
