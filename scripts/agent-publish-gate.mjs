@@ -177,8 +177,10 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   // is not in the file, are refused; a start node, edge or endpoint whose component is not in the file names
   // nothing that can run. Control edges are kept as predecessor lists.
   const predecessors = new Map();
-  const flowSteps = new Set(); // every component a flow lists, starts at or reaches by an edge (never a reference wrapper)
+  const stepsOf = new Map(); // flow holder -> the components it lists, starts at or reaches by an edge
   for (const holder of flows) {
+    const holderSteps = new Set();
+    stepsOf.set(holder, holderSteps);
     const holderName = nameOf(holder);
     const stepsAt = (field, value, chain) => {
       if (value === undefined) return [];
@@ -187,7 +189,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         return [];
       }
       const found = resolveAll(value, chain);
-      if (field !== "control_flow_connections" && field !== "data_flow_connections") found.forEach((step) => flowSteps.add(step));
+      if (field !== "control_flow_connections" && field !== "data_flow_connections") found.forEach((step) => holderSteps.add(step));
       if (field === "nodes" && found.length === 0) {
         add("oas.publish-undeclared", value.$component_ref, `node ${quoteId(value.$component_ref)} is listed in a flow, but its component is not in the file, so its declaration cannot be read`);
       }
@@ -201,10 +203,29 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         for (const edge of stepsAt(field, entry ?? null, chain)) {
           const at = [...ownMap(edge), ...chain];
           const [froms, tos] = [stepsAt(field, edge[first], at), stepsAt(field, edge[second], at)];
-          [...froms, ...tos].forEach((step) => flowSteps.add(step));
+          [...froms, ...tos].forEach((step) => holderSteps.add(step));
           [...froms, ...tos].forEach(checkNode);
           if (field === "control_flow_connections") for (const to of tos) predecessors.set(to, [...(predecessors.get(to) ?? []), ...froms]);
         }
+      }
+    }
+  }
+
+  // The steps that run: those of the root flow, and of every subflow that a running step runs (its `subflow`, or an
+  // entry of its `subflows`, references followed). A flow-shaped value anywhere else (inside metadata, a subflow
+  // definition no running step runs) runs nothing, so its steps are not here.
+  const flowSteps = new Set();
+  const runningFlows = new Set();
+  const flowQueue = stepsOf.has(flow) ? [flow] : [];
+  while (flowQueue.length > 0) {
+    const holder = flowQueue.shift();
+    if (runningFlows.has(holder)) continue;
+    runningFlows.add(holder);
+    for (const step of stepsOf.get(holder)) {
+      flowSteps.add(step);
+      const runs = [step.subflow, ...(Array.isArray(step.subflows) ? step.subflows : [])].filter(isObject);
+      for (const sub of runs) {
+        for (const target of resolveAll(sub, scopeOf.get(step) ?? [])) if (stepsOf.has(target)) flowQueue.push(target);
       }
     }
   }
@@ -275,8 +296,8 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   }
 
   // Root hitlScreens in front of a publishing step. A screen is placed on every step whose
-  // metadata.cinatra.renderer names it: a component that a flow lists, starts at or reaches by an edge. A renderer
-  // on any other object (a reference wrapper, a component no flow uses, a value inside metadata) places nothing. It stands in front of a publishing step when one of those steps is in
+  // metadata.cinatra.renderer names it: a running step (above). A renderer on any other object (a reference wrapper,
+  // a component no running flow uses, a step of a flow-shaped value that does not run) places nothing. It stands in front of a publishing step when one of those steps is in
   // the step itself (its own subflow included) or on a control path back from the step that ends at the first
   // InputMessageNode (the person's last stop before the write) or at another publishing step. A screen that no
   // step names counts as in front of every publishing step. A screen placed only elsewhere (after the write,

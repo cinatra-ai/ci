@@ -1109,6 +1109,43 @@ test("a screen placed both after and in front of the publishing node is refused,
   assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] })), ["oas.publish-own-gate publish"]);
 });
 
+// Review 2 case: only a flow that runs (the root flow, and a subflow a running step runs) places a screen.
+
+test("a renderer on a step of a flow-shaped value inside metadata does not place a screen: the screen stays unplaced and is refused", () => {
+  const f = declaredPublishPack({ root: { hitlScreens: [DECOY_SCREEN] } });
+  f.metadata.cinatra.decoy = { nodes: [{ component_type: "InputMessageNode", metadata: { cinatra: { renderer: DECOY_SCREEN } } }] };
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: DECOY_SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a renderer on a step of a subflow definition that no running step runs does not place a screen", () => {
+  const f = declaredPublishPack({ root: { hitlScreens: [DECOY_SCREEN] } });
+  const unused = flow([node("u-start", "StartNode", {}), node("u-gate", "InputMessageNode", { renderer: DECOY_SCREEN }), node("u-end", "EndNode")], [
+    ["u-start", "u-gate"],
+    ["u-gate", "u-end"],
+  ]);
+  unused.id = "unused-subflow";
+  f.$referenced_components["unused-subflow"] = unused;
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: DECOY_SCREEN, midRunHitl: true }] })), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a screen placed in a subflow that a running step before the stop runs is still placed there (not refused when after the write)", () => {
+  const f = nestedSendPack({ outer: { publishes: false } });
+  f.$referenced_components.publish = { component_type: "ApiNode", id: "publish", name: "publish", metadata: { cinatra: { ...WRITE, publishes: true } } };
+  f.nodes.splice(2, 0, { $component_ref: "publish" });
+  f.control_flow_connections = [
+    ["start", "read_post"], ["read_post", "publish"], ["publish", "send_flow"], ["send_flow", "end"],
+  ].map(([from, to]) => ({ component_type: "ControlFlowEdge", name: `${from}_${to}`, from_node: { $component_ref: from }, to_node: { $component_ref: to } }));
+  const inside = f.$referenced_components["send-subflow"];
+  inside.$referenced_components["send-gate"] = { component_type: "InputMessageNode", id: "send-gate", name: "send-gate", metadata: { cinatra: { renderer: SCREEN } } };
+  inside.nodes.push({ $component_ref: "send-gate" });
+  f.metadata.cinatra.hitlScreens = [SCREEN];
+  assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] }), []);
+});
+
 test("checkAgentPackage reads the flow and the package's renderers", () => {
   assert.deepEqual(checkAgentPackage(path.join(FIX, "declared-publish")).findings, []);
   assert.deepEqual(rulesOf(checkAgentPackage(path.join(FIX, "kept-confirm-screen")).findings), [
