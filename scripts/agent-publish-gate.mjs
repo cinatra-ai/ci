@@ -32,7 +32,13 @@ const NO_CONNECTOR_KINDS = new Set(["StartNode", "EndNode", "InputMessageNode", 
 // The kinds that run a subflow, and the field that names it.
 const SUBFLOW_KINDS = new Set(["FlowNode", "MapNode", "ParallelMapNode"]);
 const SUBFLOWS_KINDS = new Set(["ParallelFlowNode"]);
+// The renderer the core selects for an InputMessageNode that names none (cinatra-ai/cinatra at 5ea6501c,
+// packages/agents/src/agent-builder-ids.ts:36-47, used at oas-compiler.ts:1928).
+export const SCHEMA_FIELD_FALLBACK_RENDERER_ID = "@cinatra-ai/agent-builder:schema-field-fallback";
 const CORE_MID_RUN_ENDINGS = [":output", "-output", ":list-picker", ":scrape-schema-review", ":final-list-review", ":setup-form"];
+// The riskClass values of a step that asks a person to approve or to send: such a step is a confirm of a later write
+// even with work steps between them.
+const CONFIRM_RISK_CLASSES = new Set(["approval", "test_send"]);
 
 export class GateError extends Error {}
 
@@ -78,6 +84,20 @@ function isNodeKind(kind) {
   return typeof kind === "string" && kind.endsWith("Node");
 }
 
+// A step that does no work between a stop and a later write, so a walk back from the write crosses it: a kind that
+// cannot reach a connector (an InputMessageNode is a stop, never crossed) or a step declared riskClass read_only.
+// A step declared publishes true is another write and is never crossed.
+function isPassThrough(step) {
+  if (readPublishes(step).value === true || step.component_type === "InputMessageNode") return false;
+  return NO_CONNECTOR_KINDS.has(step.component_type) || cinatraOf(step)?.riskClass === "read_only";
+}
+
+// A confirmations value that the host can serve: a list whose every entry is an object that names the host's
+// publish decision (`decision: "publish"`) and no gate renderer of the pack's own. An empty list is allowed.
+function isPublishDecisionList(value) {
+  return Array.isArray(value) && value.every((entry) => isObject(entry) && entry.decision === "publish" && !Object.hasOwn(entry, "gateRenderer"));
+}
+
 // Check one parsed flow. `fieldRenderers` is the package's
 // `cinatra.fieldRenderers` list (it is read for the hitlScreens rule only).
 export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
@@ -92,6 +112,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   };
 
   const keyOf = new WeakMap(); // component -> its key in a $referenced_components map
+  const keysOf = new WeakMap(); // component -> every key it is kept under in a $referenced_components map
   const scopeOf = new WeakMap(); // object -> the $referenced_components maps in scope at it, nearest first
   const nameOf = (component) => keyOf.get(component) ?? (typeof component.id === "string" ? component.id : "(no id)");
   const nodes = []; // node components, in file order
@@ -129,7 +150,10 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
       return;
     }
     if (!isObject(value)) return;
-    if (key !== undefined) keyOf.set(value, key);
+    if (key !== undefined) {
+      keyOf.set(value, key);
+      keysOf.set(value, [...(keysOf.get(value) ?? []), key]);
+    }
     reserved(value.id);
     reserved(value.$component_ref);
     const refs = isObject(value.$referenced_components) ? value.$referenced_components : null;
@@ -269,6 +293,24 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   const publishing = nodes.filter((component) => readPublishes(component).value === true);
   if (publishing.length === 0) return findings;
 
+  // A step and what it holds: every object inside it, references followed.
+  const heldBy = (start) => {
+    const held = new Set();
+    const inside = [start];
+    while (inside.length > 0) {
+      const value = inside.pop();
+      if (Array.isArray(value)) {
+        inside.push(...value);
+        continue;
+      }
+      if (!isObject(value) || held.has(value)) continue;
+      held.add(value);
+      if (typeof value.$component_ref === "string") inside.push(...resolveAll(value, scopeOf.get(value) ?? []));
+      inside.push(...Object.values(value));
+    }
+    return held;
+  };
+
   const ownGate = (name, message) => add("oas.publish-own-gate", name, message);
   for (const step of publishing) {
     const stepName = nameOf(step);
@@ -279,13 +321,19 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         `publishing node ${quoteId(stepName)} declares a metadata.cinatra.requiresApproval that is not false; the host's publish confirmation is to be the one approval in front of it`,
       );
     }
-    if (stepCinatra && Object.hasOwn(stepCinatra, "confirmations") && !(Array.isArray(stepCinatra.confirmations) && stepCinatra.confirmations.length === 0)) {
+    // A confirmations list on the step or on any component it holds (its subflow's steps) may only name the host's
+    // publish decision; an entry with a gate renderer of the pack's own, or any other value, is a confirm road of its own.
+    for (const component of heldBy(step)) {
+      const cinatra = cinatraOf(component);
+      if (!cinatra || !Object.hasOwn(cinatra, "confirmations") || isPublishDecisionList(cinatra.confirmations)) continue;
+      const where = component === step ? `publishing node ${quoteId(stepName)}` : `${quoteId(nameOf(component))} inside publishing node ${quoteId(stepName)}`;
       ownGate(
         stepName,
-        `publishing node ${quoteId(stepName)} declares a metadata.cinatra.confirmations that is not an empty list; the host's publish confirmation is to be the one approval in front of it`,
+        `${where} declares a metadata.cinatra.confirmations that is not a list of entries naming decision "publish" with no gateRenderer; the host's publish confirmation is to be the one approval in front of it`,
       );
+      break;
     }
-    // Walk back from the step through BranchingNodes only.
+    // Walk back from the step across the steps that do no work (isPassThrough), up to the first stop.
     const visited = new Set([step]);
     const queue = [...(predecessors.get(step) ?? [])];
     while (queue.length > 0) {
@@ -298,48 +346,99 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
           gateName,
           `node ${quoteId(gateName)} waits for a person in front of publishing node ${quoteId(stepName)}; the host's publish confirmation is to be the one stop there, so the pack keeps no confirm step of its own`,
         );
-      } else if (before.component_type === "BranchingNode") {
+      } else if (isPassThrough(before)) {
         queue.push(...(predecessors.get(before) ?? []));
       }
     }
   }
 
-  // Root hitlScreens in front of a publishing step. A screen is placed on every step whose
-  // metadata.cinatra.renderer names it: a running step (above). A renderer on any other object (a reference wrapper,
-  // a component no running flow uses, a step of a flow-shaped value that does not run) places nothing. It stands in front of a publishing step when one of those steps is in
-  // the step itself (its own subflow included) or on a control path back from the step that ends at the first
-  // InputMessageNode (the person's last stop before the write) or at another publishing step. A screen that no
-  // step names counts as in front of every publishing step. A screen placed only elsewhere (after the write,
-  // or in front of an earlier stop) is not a confirm step of this write.
+  // Root hitlScreens in front of a publishing step. A screen is placed on every running step (above) by the renderer
+  // the core selects for it (rendererOf). The core evaluates, in JavaScript, on the same JSON.parse output
+  // (cinatra-ai/cinatra at 5ea6501c, packages/agents/src/oas-compiler.ts:1735), for an InputMessageNode with node id `id`
+  // (its key in $referenced_components, :1794, :1841-1847):
+  //   const out0 = ime.outputs?.[0] ?? {}; const field = out0.title ?? out0.id ?? id;                 (:1918-1919)
+  //   ime.metadata?.cinatra?.inputRenderers?.[field] ?? ime.metadata?.cinatra?.renderer ?? SCHEMA_FIELD_FALLBACK_RENDERER_ID
+  //                                                                                                 (:1925-1928)
+  // with SCHEMA_FIELD_FALLBACK_RENDERER_ID = "@cinatra-ai/agent-builder:schema-field-fallback"
+  // (packages/agents/src/agent-builder-ids.ts:36-47); for any other step, metadata.cinatra.renderer (:645, :2036).
+  // rendererOf evaluates the same expressions literally, so prototype keys, non-list outputs and the fallback select
+  // what the core selects. Where the result cannot be known (a component kept under two keys that select differently,
+  // or a selected value that is not a string: a number, boolean, list or object, which a host may turn into the text
+  // String(value)), that text is read as unplaced, never placed. An InputMessageNode with no key in
+  // $referenced_components is no step of the core (it reads localRefs[id] only) and selects nothing. If the selection
+  // throws (a field the core cannot turn into a key), every mid-run screen is refused beside every publishing step. A renderer
+  // on any other object (a reference wrapper, a
+  // component no running flow uses, a step of a flow-shaped value that does not run) places nothing. A placed screen is a confirm of a publishing step when
+  // the step it is placed on is
+  // (1) inside the step itself (its own subflow included), or reaches the step through steps that do no work only
+  //     (isPassThrough, crossed with what they hold); a step that does work ends that walk, but what it runs last
+  //     (the steps in front of the end of its subflow, by the same walk) still reaches the write; or
+  // (2) declared riskClass "approval" or "test_send", and on a control path back from the step that ends at the
+  //     first InputMessageNode or at another publishing step, or inside a step on that path (the wide front).
+  // A screen that no step names counts as in front of every publishing step. Any other screen (after the write, in
+  // front of an earlier stop, or a review that work steps separate from the write) is not a confirm step of this write.
   const rootCinatra = cinatraOf(flow);
   if (rootCinatra && Object.hasOwn(rootCinatra, "hitlScreens")) {
     const screens = rootCinatra.hitlScreens;
     const renderers = Array.isArray(fieldRenderers) ? fieldRenderers.filter(isObject) : [];
-    const placedOn = new Map(); // screen id -> the components that name it as their renderer
+    const placedOn = new Map(); // screen id -> the components whose selected renderer it is
+    const unknownPlace = new Set(); // screen ids whose placement cannot be known: read as unplaced
+    // The core's selection, evaluated literally (the comment above); `id` is one node id the core may use.
+    const selectFor = (component, id) => {
+      if (component.component_type === "InputMessageNode") {
+        const out0 = component.outputs?.[0] ?? {};
+        const field = out0.title ?? out0.id ?? id;
+        return component.metadata?.cinatra?.inputRenderers?.[field] ?? component.metadata?.cinatra?.renderer ?? SCHEMA_FIELD_FALLBACK_RENDERER_ID;
+      }
+      return component.metadata?.cinatra?.renderer;
+    };
+    let selectionThrew = false; // a selection threw: every mid-run screen is refused beside every publishing step
     for (const component of flowSteps) {
       if (typeof component.$component_ref === "string") continue;
-      const renderer = cinatraOf(component)?.renderer;
-      if (typeof renderer === "string") placedOn.set(renderer, [...(placedOn.get(renderer) ?? []), component]);
+      const keys = keysOf.get(component);
+      if (component.component_type === "InputMessageNode" && keys === undefined) continue; // no core step: selects nothing
+      try {
+        const raw = [...new Set((keys ?? [nameOf(component)]).map((id) => selectFor(component, id)))];
+        if (raw.length === 1 && typeof raw[0] === "string") {
+          placedOn.set(raw[0], [...(placedOn.get(raw[0]) ?? []), component]);
+        } else {
+          // Two keys that select differently, or a selection that is not a string: read as unplaced, never placed.
+          for (const v of raw) if (v !== null && v !== undefined) unknownPlace.add(String(v));
+        }
+      } catch {
+        selectionThrew = true;
+      }
     }
+    // (1) The steps whose screen reaches the step through steps that do no work.
+    const confirmFrontOf = (step) => {
+      const front = heldBy(step);
+      const visited = new Set([step]);
+      const queue = [...(predecessors.get(step) ?? [])];
+      while (queue.length > 0) {
+        const before = queue.shift();
+        if (visited.has(before)) continue;
+        visited.add(before);
+        front.add(before);
+        if (readPublishes(before).value === true || before.component_type === "InputMessageNode") continue;
+        if (isPassThrough(before)) {
+          heldBy(before).forEach((value) => front.add(value));
+          queue.push(...(predecessors.get(before) ?? []));
+          continue;
+        }
+        // A step that does work: the walk goes on only from the ends of the subflows it runs.
+        for (const sub of subflowsRunBy(before)) {
+          for (const target of resolveAll(sub, scopeOf.get(before) ?? [])) {
+            const ends = [...(stepsOf.get(target) ?? [])].filter((s) => s.component_type === "EndNode");
+            if (ends.length === 0) heldBy(target).forEach((value) => front.add(value));
+            queue.push(...ends);
+          }
+        }
+      }
+      return front;
+    };
     const inFrontOf = (step) => {
       const front = new Set();
-      // A step and what it holds: every object inside it, references followed.
-      const insideSeen = new Set();
-      const addHeld = (start) => {
-        const inside = [start];
-        while (inside.length > 0) {
-          const value = inside.pop();
-          if (Array.isArray(value)) {
-            inside.push(...value);
-            continue;
-          }
-          if (!isObject(value) || insideSeen.has(value)) continue;
-          insideSeen.add(value);
-          front.add(value);
-          if (typeof value.$component_ref === "string") inside.push(...resolveAll(value, scopeOf.get(value) ?? []));
-          inside.push(...Object.values(value));
-        }
-      };
+      const addHeld = (start) => heldBy(start).forEach((value) => front.add(value));
       addHeld(step);
       // The control paths back from the step, to the first stop or the first other publishing step. What a step
       // on that path holds (a subflow it runs) is in front too; an earlier publishing step's own content is its own.
@@ -358,6 +457,9 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
       return front;
     };
     const fronts = new Map(publishing.map((step) => [step, inFrontOf(step)]));
+    const confirmFronts = new Map(publishing.map((step) => [step, confirmFrontOf(step)]));
+    const confirms = (step, place) =>
+      confirmFronts.get(step).has(place) || (fronts.get(step).has(place) && CONFIRM_RISK_CLASSES.has(cinatraOf(place)?.riskClass));
     const offendingFor = new Map(); // publishing step -> the first offending screen text
     const offendAll = (text) => {
       for (const step of publishing) if (!offendingFor.has(step)) offendingFor.set(step, text);
@@ -382,7 +484,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
         const places = placedOn.get(screen) ?? [];
         for (const step of publishing) {
           if (offendingFor.has(step)) continue;
-          if (places.length === 0 || places.some((place) => fronts.get(step).has(place))) offendingFor.set(step, text);
+          if (places.length === 0 || selectionThrew || unknownPlace.has(screen) || places.some((place) => confirms(step, place))) offendingFor.set(step, text);
         }
       }
     }
