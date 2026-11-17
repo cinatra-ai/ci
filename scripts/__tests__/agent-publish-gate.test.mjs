@@ -12,6 +12,7 @@ import { pathToFileURL } from "node:url";
 import {
   PUBLISH_GATE_ID_PREFIX,
   RULES,
+  SCHEMA_FIELD_FALLBACK_RENDERER_ID,
   checkAgentFlow,
   checkAgentPackage,
   quoteId,
@@ -488,14 +489,53 @@ test("an InputMessageNode that reaches the publishing node only through branchin
   assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate confirm"]);
 });
 
-test("an InputMessageNode with an action between it and the publishing node is not a confirm gate", () => {
+test("an InputMessageNode with a work step between it and the publishing node is not a confirm gate", () => {
+  const f = withConfirmBefore([node("ask_post", "InputMessageNode"), node("save_post", "ApiNode", { ...WRITE, publishes: false })], [
+    ["start", "ask_post"],
+    ["ask_post", "save_post"],
+    ["save_post", "publish"],
+    ["read_post", "end"],
+    ["publish", "end"],
+  ]);
+  assert.deepEqual(checkAgentFlow(f), []);
+});
+
+test("an InputMessageNode with only a read_only step between it and the publishing node is its own confirm gate", () => {
   const f = withConfirmBefore([node("ask_post", "InputMessageNode")], [
     ["start", "ask_post"],
     ["ask_post", "read_post"],
     ["read_post", "publish"],
     ["publish", "end"],
   ]);
-  assert.deepEqual(checkAgentFlow(f), []);
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate ask_post"]);
+});
+
+test("an InputMessageNode that reaches the publishing node through an OutputMessageNode and a read_only step is its own confirm gate", () => {
+  const f = withConfirmBefore([node("confirm", "InputMessageNode"), node("note", "OutputMessageNode")], [
+    ["start", "confirm"],
+    ["confirm", "note"],
+    ["note", "read_post"],
+    ["read_post", "publish"],
+    ["publish", "end"],
+  ]);
+  assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate confirm"]);
+});
+
+test("the walk back from a publishing node does not cross another publishing node, even one declared read_only", () => {
+  const f = flow(
+    [
+      node("start", "StartNode"),
+      node("confirm", "InputMessageNode"),
+      node("first", "ApiNode", { riskClass: "read_only", publishes: true }),
+      node("second", "ApiNode", { ...WRITE, publishes: true }),
+      node("end", "EndNode"),
+    ],
+    [["start", "confirm"], ["confirm", "first"], ["first", "second"], ["second", "end"]],
+  );
+  // The stop is named once, as in front of `first`; `second` has `first` in front of it, not the stop.
+  const findings = checkAgentFlow(f);
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate confirm"]);
+  assert.match(findings[0].message, /"first"/);
 });
 
 test("an InputMessageNode in front of a node declared publishes: false is not refused", () => {
@@ -995,11 +1035,11 @@ test("a mid-run screen placed after the publishing node is no finding", () => {
   assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] }), []);
 });
 
-test("a mid-run screen with steps but no stop between it and the publishing node is refused", () => {
+test("a mid-run screen on an approval step with work steps but no stop between it and the publishing node is refused", () => {
   const f = flow(
     [
       node("start", "StartNode", {}),
-      node("approve", "InputMessageNode", { renderer: SCREEN }),
+      node("approve", "InputMessageNode", { riskClass: "approval", renderer: SCREEN }),
       node("file_recipients", "ApiNode", { ...WRITE, publishes: false }),
       node("publish", "ApiNode", { ...WRITE, publishes: true }),
       node("end", "EndNode"),
@@ -1210,6 +1250,538 @@ test("a screen inside the subflow of a FlowNode after the publishing node is no 
   );
   f.$referenced_components["p-flow"] = gateFlow("p", SCREEN);
   assert.deepEqual(checkAgentFlow(f, { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] }), []);
+});
+
+// ---------------------------------------------------------------------------
+// A review screen is a confirm of a write only in front of it: through steps that do no work, or on an approval or
+// test-send step on the wide front. A confirmations entry may name the host's publish decision.
+
+const MID = { fieldRenderers: [{ id: SCREEN, midRunHitl: true }] };
+
+// start -> gate (names SCREEN) -> between -> publish -> end.
+function screenBefore(gateCinatra, between) {
+  return flow(
+    [
+      node("start", "StartNode", {}),
+      node("gate", "InputMessageNode", { renderer: SCREEN, ...gateCinatra }),
+      node("between", between.kind, between.cinatra),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("end", "EndNode"),
+    ],
+    [["start", "gate"], ["gate", "between"], ["between", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+}
+const WORK_STEP = { kind: "ApiNode", cinatra: { ...WRITE, publishes: false } };
+
+test("a mid-run review screen with a work step between it and the publishing node is no finding", () => {
+  assert.deepEqual(checkAgentFlow(screenBefore({ riskClass: "read_only" }, WORK_STEP), MID), []);
+  assert.deepEqual(checkAgentFlow(screenBefore({}, WORK_STEP), MID), []);
+});
+
+for (const riskClass of ["approval", "test_send"]) {
+  test(`a mid-run screen on a ${riskClass} step with a work step between it and the publishing node is refused`, () => {
+    assert.deepEqual(rulesOf(checkAgentFlow(screenBefore({ riskClass }, WORK_STEP), MID)), ["oas.publish-own-gate publish"]);
+  });
+}
+
+for (const [label, between] of [
+  ["a read_only step", { kind: "ApiNode", cinatra: READ }],
+  ["a BranchingNode", { kind: "BranchingNode" }],
+  ["an OutputMessageNode", { kind: "OutputMessageNode" }],
+]) {
+  test(`a mid-run review screen that reaches the publishing node through ${label} only is refused`, () => {
+    const findings = checkAgentFlow(screenBefore({ riskClass: "read_only" }, between), MID);
+    assert.ok(rulesOf(findings).includes("oas.publish-own-gate publish"), JSON.stringify(findings));
+  });
+}
+
+test("an approval screen in front of an earlier stop is no finding: the wide front ends at the first InputMessageNode", () => {
+  const f = flow(
+    [
+      node("start", "StartNode", {}),
+      node("approve", "InputMessageNode", { riskClass: "approval", renderer: SCREEN }),
+      node("collect", "ApiNode", { ...WRITE, publishes: false }),
+      node("ask", "InputMessageNode", {}),
+      node("save", "ApiNode", { ...WRITE, publishes: false }),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("end", "EndNode"),
+    ],
+    [["start", "approve"], ["approve", "collect"], ["collect", "ask"], ["ask", "save"], ["save", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  assert.deepEqual(checkAgentFlow(f, MID), []);
+});
+
+// start -> prep (a work FlowNode running p-flow) -> publish -> end; p-flow is p-start -> p-gate -> [p-work ->] p-end.
+function workContainerBeforeWrite({ gateCinatra = {}, workInside = false } = {}) {
+  const prep = node("prep", "FlowNode", { publishes: false });
+  prep.comp.subflow = { $component_ref: "p-flow" };
+  const f = flow(
+    [node("start", "StartNode", {}), prep, node("publish", "ApiNode", { ...WRITE, publishes: true }), node("end", "EndNode")],
+    [["start", "prep"], ["prep", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  const inner = [node("p-start", "StartNode", {}), node("p-gate", "InputMessageNode", { renderer: SCREEN, ...gateCinatra })];
+  if (workInside) inner.push(node("p-work", "ApiNode", { ...WRITE, publishes: false }));
+  inner.push(node("p-end", "EndNode"));
+  const ids = inner.map((n) => n.id);
+  const sub = flow(inner, ids.slice(1).map((id, i) => [ids[i], id]));
+  sub.id = "p-flow";
+  f.$referenced_components["p-flow"] = sub;
+  return f;
+}
+
+test("a review screen that a work container runs last, right before its end, stands in front of the next publishing node", () => {
+  assert.deepEqual(rulesOf(checkAgentFlow(workContainerBeforeWrite(), MID)), ["oas.publish-own-gate publish"]);
+});
+
+test("a review screen inside a work container with a work step after it is no finding; an approval one is refused", () => {
+  assert.deepEqual(checkAgentFlow(workContainerBeforeWrite({ workInside: true }), MID), []);
+  assert.deepEqual(rulesOf(checkAgentFlow(workContainerBeforeWrite({ workInside: true, gateCinatra: { riskClass: "approval" } }), MID)), [
+    "oas.publish-own-gate publish",
+  ]);
+});
+
+test("a review screen inside a read_only container crossed by the walk is refused", () => {
+  const f = workContainerBeforeWrite({ workInside: true });
+  f.$referenced_components.prep.metadata.cinatra = { riskClass: "read_only" };
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+// The renderer the core selects for an InputMessageNode: inputRenderers under its output field (outputs[0].title, else
+// outputs[0].id, else the node id), ahead of renderer (cinatra-ai/cinatra packages/agents/src/oas-compiler.ts:1918-1927).
+function inputGate(f, { outputs, inputRenderers, renderer }) {
+  const comp = f.$referenced_components.gate;
+  if (outputs !== undefined) comp.outputs = outputs;
+  const cin = comp.metadata.cinatra;
+  delete cin.renderer;
+  if (renderer !== undefined) cin.renderer = renderer;
+  if (inputRenderers !== undefined) cin.inputRenderers = inputRenderers;
+  return f;
+}
+const OTHER = "@example/publish-agent:other";
+
+for (const [label, outputs, inputRenderers] of [
+  ["outputs[0].title", [{ title: "accountScope" }], { accountScope: SCREEN }],
+  ["outputs[0].id", [{ id: "accountScope" }], { accountScope: SCREEN }],
+  ["the node id (no outputs)", undefined, { gate: SCREEN }],
+]) {
+  test(`a screen selected by an InputMessageNode's inputRenderers under ${label} is placed there: behind a work step it is no finding`, () => {
+    const f = inputGate(screenBefore({ riskClass: "read_only" }, WORK_STEP), { outputs, inputRenderers });
+    assert.deepEqual(checkAgentFlow(f, MID), []);
+  });
+}
+
+test("an inputRenderers value under another key than the output field places nothing: the screen stays unplaced and is refused", () => {
+  const f = inputGate(screenBefore({ riskClass: "read_only" }, WORK_STEP), { outputs: [{ title: "accountScope" }], inputRenderers: { decoy: SCREEN } });
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+test("an inputRenderers value on a step that is not an InputMessageNode places nothing: the screen stays unplaced and is refused", () => {
+  const f = flow(
+    [node("start", "StartNode", {}), node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("later", "ApiNode", { ...WRITE, publishes: false, inputRenderers: { decoy: SCREEN } }), node("end", "EndNode")],
+    [["start", "publish"], ["publish", "later"], ["later", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+test("a renderer that the output field's inputRenderers value overrides places nothing: the screen it names stays unplaced and is refused", () => {
+  const f = inputGate(screenBefore({ riskClass: "read_only" }, WORK_STEP), {
+    outputs: [{ title: "accountScope" }], inputRenderers: { accountScope: OTHER }, renderer: SCREEN,
+  });
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+for (const [label, inputRenderers] of [["no value", { other: OTHER }], ["a null value", { accountScope: null }]]) {
+  test(`a renderer stays selected when inputRenderers has ${label} under the output field`, () => {
+    const f = inputGate(screenBefore({ riskClass: "read_only" }, WORK_STEP), { outputs: [{ title: "accountScope" }], inputRenderers, renderer: SCREEN });
+    assert.deepEqual(checkAgentFlow(f, MID), []);
+  });
+}
+
+// start -> publish -> gate (an InputMessageNode after the write) -> end. The core draws on `gate` the renderer its
+// expression selects; when that is not SCREEN, SCREEN is placed nowhere and is refused beside the write.
+function gateAfterWrite(gateComp) {
+  const f = flow(
+    [node("start", "StartNode", {}), node("publish", "ApiNode", { ...WRITE, publishes: true }), node("gate", "InputMessageNode", {}), node("end", "EndNode")],
+    [["start", "publish"], ["publish", "gate"], ["gate", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  Object.assign(f.$referenced_components.gate, gateComp);
+  return f;
+}
+
+for (const [label, gateComp] of [
+  ["an output field that is a prototype key (the core reads the inherited value, not renderer)",
+    { outputs: [{ title: "constructor" }], metadata: { cinatra: { inputRenderers: {}, renderer: SCREEN } } }],
+  ["outputs that is an object, not a list (the core's outputs?.[0] still reads it)",
+    { outputs: { 0: { title: "actual" } }, metadata: { cinatra: { inputRenderers: { actual: OTHER, gate: SCREEN } } } }],
+  ["inputRenderers that is a list (the core indexes it by the field)",
+    { outputs: [{ title: "0" }], metadata: { cinatra: { inputRenderers: [OTHER], renderer: SCREEN } } }],
+  ["an output field that is a boolean (the core reads the key \"true\")",
+    { outputs: [{ title: true }], metadata: { cinatra: { inputRenderers: { true: OTHER }, renderer: SCREEN } } }],
+  ["an output field that is an object (the core reads the key \"[object Object]\")",
+    { outputs: [{ title: {} }], metadata: { cinatra: { inputRenderers: { "[object Object]": OTHER }, renderer: SCREEN } } }],
+]) {
+  test(`a renderer the core does not select, with ${label}, places nothing: the screen is refused`, () => {
+    assert.deepEqual(rulesOf(checkAgentFlow(gateAfterWrite(gateComp), MID)), ["oas.publish-own-gate publish"]);
+  });
+}
+
+test("an InputMessageNode that selects no renderer is drawn with the core's schema-field fallback: an approval gate there is refused", () => {
+  // start -> gate (approval, no renderer) -> work -> publish -> later (names the fallback) -> end.
+  const f = flow(
+    [node("start", "StartNode", {}), node("gate", "InputMessageNode", { riskClass: "approval" }), node("work", "ApiNode", { ...WRITE, publishes: false }),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }), node("later", "ApiNode", { ...WRITE, publishes: false, renderer: SCHEMA_FIELD_FALLBACK_RENDERER_ID }),
+      node("end", "EndNode")],
+    [["start", "gate"], ["gate", "work"], ["work", "publish"], ["publish", "later"], ["later", "end"]],
+    { hitlScreens: [SCHEMA_FIELD_FALLBACK_RENDERER_ID] },
+  );
+  f.$referenced_components.gate.outputs = [{ title: "answer" }];
+  const findings = checkAgentFlow(f, { fieldRenderers: [{ id: SCHEMA_FIELD_FALLBACK_RENDERER_ID, midRunHitl: true }] });
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate publish"]);
+  assert.equal(SCHEMA_FIELD_FALLBACK_RENDERER_ID, "@cinatra-ai/agent-builder:schema-field-fallback");
+});
+
+// Adds `later`, an InputMessageNode after the write whose renderer is `renderer`: it places that screen after the write,
+// so a test that adds it refuses the screen only through the unplaced reading (not through "placed nowhere").
+function withLaterScreen(f, renderer) {
+  f.$referenced_components.later = { component_type: "InputMessageNode", id: "later", name: "later", outputs: [{ title: "later" }], metadata: { cinatra: { renderer } } };
+  f.nodes.push({ $component_ref: "later" });
+  const edge = f.control_flow_connections.find((e) => e.from_node.$component_ref === "publish");
+  edge.to_node = { $component_ref: "later" };
+  f.control_flow_connections.push({ component_type: "ControlFlowEdge", name: "later_to_end", from_node: { $component_ref: "later" }, to_node: { $component_ref: "end" } });
+  return f;
+}
+
+test("a component kept under two keys that select different renderers is read as unplaced: the screen is refused, also when a step after the write places it", () => {
+  const f = withLaterScreen(inputGate(screenBefore({ riskClass: "read_only" }, WORK_STEP), { inputRenderers: { gate: OTHER, gate2: SCREEN } }), SCREEN);
+  f.$referenced_components.gate2 = f.$referenced_components.gate;
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+test("a selected number is read as unplaced for the screen id it spells: the screen is refused, also when a step after the write places it", () => {
+  const f = withLaterScreen(inputGate(screenBefore({ riskClass: "read_only" }, WORK_STEP), { outputs: [{ title: "f" }], inputRenderers: { f: 5 } }), "5");
+  f.metadata.cinatra.hitlScreens = ["5"];
+  assert.deepEqual(rulesOf(checkAgentFlow(f, { fieldRenderers: [{ id: "5", midRunHitl: true }] })), ["oas.publish-own-gate publish"]);
+});
+
+test("a selected list is read as unplaced for the text it spells: an approval gate selecting [screen] in front of the write is refused", () => {
+  // start -> gate (approval, selects [SCREEN]) -> publish -> later (places SCREEN after the write) -> end.
+  const f = withLaterScreen(flow(
+    [node("start", "StartNode", {}), node("gate", "InputMessageNode", { riskClass: "approval", inputRenderers: { f: [SCREEN] } }),
+      node("publish", "ApiNode", { ...WRITE, publishes: true }), node("end", "EndNode")],
+    [["start", "gate"], ["gate", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  ), SCREEN);
+  f.$referenced_components.gate.outputs = [{ title: "f" }];
+  // `gate` is refused as an approval InputMessageNode in front of the write in any case; `publish` only through [SCREEN].
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate gate", "oas.publish-own-gate publish"]);
+});
+
+test("a selection that throws refuses every mid-run screen beside every publishing step, also one a step after the write places", () => {
+  // start -> publish -> gate (its output field cannot be turned into a key) -> later (places SCREEN after the write) -> end.
+  const f = flow(
+    [node("start", "StartNode", {}), node("publish", "ApiNode", { ...WRITE, publishes: true }),
+      node("gate", "InputMessageNode", { inputRenderers: {} }), node("later", "InputMessageNode", { renderer: SCREEN }), node("end", "EndNode")],
+    [["start", "publish"], ["publish", "gate"], ["gate", "later"], ["later", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  f.$referenced_components.gate.outputs = [{ title: { toString: 1 } }];
+  f.$referenced_components.later.outputs = [{ title: "later" }];
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+test("an InputMessageNode with no key in $referenced_components is no step of the core and places nothing: its screen is refused", () => {
+  // start -> publish -> (inline InputMessageNode naming SCREEN) -> end.
+  const f = flow(
+    [node("start", "StartNode", {}), node("publish", "ApiNode", { ...WRITE, publishes: true }), node("end", "EndNode")],
+    [["start", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  const inline = { component_type: "InputMessageNode", id: "inline", name: "inline", outputs: [{ title: "x" }], metadata: { cinatra: { renderer: SCREEN } } };
+  f.nodes.push(inline);
+  f.control_flow_connections[1].to_node = inline;
+  f.control_flow_connections.push({ component_type: "ControlFlowEdge", name: "inline_to_end", from_node: inline, to_node: { $component_ref: "end" } });
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+test("a screen selected by inputRenderers is placed: in front of the later write only, not in front of an earlier one", () => {
+  // start -> first (publishes) -> gate (screen via inputRenderers) -> branch -> publish -> end. An unplaced screen would be
+  // refused beside both writes; the placed one only beside `publish`.
+  const f = flow(
+    [node("start", "StartNode", {}), node("first", "ApiNode", { ...WRITE, publishes: true }),
+      node("gate", "InputMessageNode", { riskClass: "read_only", inputRenderers: { accountScope: SCREEN, other: 7 } }),
+      node("branch", "BranchingNode"), node("publish", "ApiNode", { ...WRITE, publishes: true }), node("end", "EndNode")],
+    [["start", "first"], ["first", "gate"], ["gate", "branch"], ["branch", "publish"], ["publish", "end"]],
+    { hitlScreens: [SCREEN] },
+  );
+  f.$referenced_components.gate.outputs = [{ title: "accountScope" }];
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate gate", "oas.publish-own-gate publish"]);
+});
+
+test("an inputRenderers value on a step that does not run places nothing: the screen stays unplaced and is refused", () => {
+  const f = declaredPublishPack({ root: { hitlScreens: [SCREEN] } });
+  f.$referenced_components.spare = { component_type: "InputMessageNode", id: "spare", name: "spare", metadata: { cinatra: { inputRenderers: { a: SCREEN } } } };
+  assert.deepEqual(rulesOf(checkAgentFlow(f, MID)), ["oas.publish-own-gate publish"]);
+});
+
+const PUBLISH_DECISION = Object.freeze({ tool: "email_send", decision: "publish", arguments: { to: "/gate/recipients" } });
+
+test("a confirmations list whose entries name the host's publish decision is no finding on a publishing node", () => {
+  assert.deepEqual(checkAgentFlow(declaredPublishPack({ publish: { confirmations: [PUBLISH_DECISION, { ...PUBLISH_DECISION, tool: "b" }] } })), []);
+});
+
+for (const [label, entry] of [
+  ["a publish decision that also names a gateRenderer", { ...PUBLISH_DECISION, gateRenderer: "@example/publish-agent:send-confirmation" }],
+  ["another decision value", { ...PUBLISH_DECISION, decision: "approve" }],
+  ["no decision", { tool: "email_send", arguments: {} }],
+  ["an entry that is not an object", "publish"],
+]) {
+  test(`a confirmations entry with ${label} is refused on a publishing node, also beside a publish decision`, () => {
+    const f = declaredPublishPack({ publish: { confirmations: [PUBLISH_DECISION, entry] } });
+    const findings = checkAgentFlow(f);
+    assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate publish"]);
+    assert.ok(!JSON.stringify(findings).includes("send-confirmation"), "the text names no value the pack wrote");
+  });
+}
+
+test("a confirmations entry with a gate renderer on a step inside the publishing node is refused; a publish decision there is not", () => {
+  const refused = nestedSendPack({ outer: { publishes: true }, inner: { confirmations: [{ tool: "email_send", gateRenderer: "x" }] } });
+  const findings = checkAgentFlow(refused);
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate send_flow"]);
+  assert.match(findings[0].message, /"send" inside publishing node "send_flow"/);
+  assert.deepEqual(checkAgentFlow(nestedSendPack({ outer: { publishes: true }, inner: { confirmations: [PUBLISH_DECISION] } })), []);
+});
+
+// ---------------------------------------------------------------------------
+// The pack shapes that move their own confirm to the host's publish confirmation (cinatra-ai/cinatra#4150): the steps,
+// kinds, riskClass values, renderers and control edges of the real flows (cinatra/oas.json of list-curator-agent 1568a67b, email-outreach-agent d207b189, email-test-delivery-agent 535150c9,
+// email-delivery-agent bf578fce and wordpress-agent b5e980b5), cut to what the rules read, with the write step
+// declared true. `moved` is the pack once its own confirm is gone.
+
+const LC = "@cinatra-ai/list-curator-agent";
+function listCuratorShape({ moved }) {
+  const n = [
+    node("start", "StartNode", {}),
+    node("propose", "ApiNode", READ),
+    node("schema_gate", "InputMessageNode", { riskClass: "read_only", renderer: `${LC}:scrape-schema-review`, requiresApproval: true }),
+    node("schema_answer_wrap", "PluginTemplateNode", { publishes: false }),
+    node("schema_branch", "BranchingNode"),
+    node("schema_declined", "OutputMessageNode"),
+    node("collect", "ApiNode", { riskClass: "write_safe", requiresApproval: false, publishes: false }),
+  ];
+  const c = [["start", "propose"], ["propose", "schema_gate"], ["schema_gate", "schema_answer_wrap"], ["schema_answer_wrap", "schema_branch"],
+    ["schema_branch", "collect"], ["schema_branch", "propose"], ["schema_branch", "schema_declined"], ["schema_declined", "end"]];
+  if (moved) {
+    c.push(["collect", "create"]);
+  } else {
+    n.push(
+      node("list_gate", "InputMessageNode", { riskClass: "approval", renderer: `${LC}:final-list-review`, requiresApproval: true }),
+      node("list_answer_wrap", "PluginTemplateNode", { publishes: false }),
+      node("list_branch", "BranchingNode"),
+    );
+    c.push(["collect", "list_gate"], ["list_gate", "list_answer_wrap"], ["list_answer_wrap", "list_branch"], ["list_branch", "create"], ["list_branch", "collect"]);
+  }
+  n.push(node("create", "ApiNode", { riskClass: "write_safe", requiresApproval: false, publishes: true }), node("summary", "OutputMessageNode"), node("end", "EndNode"));
+  c.push(["create", "summary"], ["summary", "end"]);
+  const screens = [`${LC}:scrape-schema-review`, ...(moved ? [] : [`${LC}:final-list-review`])];
+  return flow(n, c, { hitlScreens: screens });
+}
+
+test("list-curator shape: with its final list review gone, the schema review before collect is no finding", () => {
+  assert.deepEqual(checkAgentFlow(listCuratorShape({ moved: true })), []);
+});
+
+test("list-curator shape: the final list review (riskClass approval) in front of create is still refused", () => {
+  const findings = checkAgentFlow(listCuratorShape({ moved: false }));
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate create"]);
+  assert.match(findings[0].message, /final-list-review/);
+});
+
+// A subflow kept in the root map under `id`, from steps and [from, to] edges.
+function subflowOf(root, id, nodes, control) {
+  const sub = flow(nodes, control);
+  sub.id = id;
+  sub.name = id;
+  root.$referenced_components[id] = sub;
+  return { $component_ref: id };
+}
+function container(id, cinatra) {
+  return node(id, "FlowNode", cinatra);
+}
+
+const EO = "@cinatra-ai/email-outreach-agent";
+const SEND_CONFIRMATION = "@cinatra-ai/email-delivery-agent:send-confirmation";
+const DRAFTS_REVIEW = "@cinatra-ai/email-drafting-agent:email-drafts-review";
+function emailOutreachShape({ moved }) {
+  const recipients = container("recipients_flow", { publishes: false });
+  const context = container("context_offeringContext", { publishes: false });
+  const drafts = container("drafts_flow", { publishes: false });
+  const sender = container("sender_flow", { publishes: true });
+  const f = flow(
+    [node("start", "StartNode", { renderer: `${EO}:setup-form` }), node("context_setup", "ApiNode", { ...WRITE, publishes: false }), recipients, context, drafts, sender,
+      node("campaign_summary", "OutputMessageNode"), node("end", "EndNode")],
+    [["start", "context_setup"], ["context_setup", "recipients_flow"], ["recipients_flow", "context_offeringContext"],
+      ["context_offeringContext", "drafts_flow"], ["drafts_flow", "sender_flow"], ["sender_flow", "campaign_summary"], ["campaign_summary", "end"]],
+    {
+      hitlScreens: [`${EO}:list-picker`, "@cinatra-ai/email-recipient-selection-agent:campaign-recipients-review", "@cinatra-ai/context-selection-agent:context-selector",
+        ...(moved ? [] : [DRAFTS_REVIEW, SEND_CONFIRMATION])],
+    },
+  );
+  recipients.comp.subflow = subflowOf(f, "recipients-subflow", [
+    node("r-start", "StartNode", {}),
+    node("r-scope_gate", "InputMessageNode", { inputRenderers: { accountScope: `${EO}:list-picker` } }),
+    // (its outputs[0].title is accountScope, as in the real flow; set below)
+    node("r-generate", "ApiNode", { ...READ, renderer: "@cinatra-ai/email-recipient-selection-agent:output" }),
+    node("r-review_gate", "InputMessageNode", { riskClass: "read_only", renderer: "@cinatra-ai/email-recipient-selection-agent:campaign-recipients-review" }),
+    node("r-apply", "ApiNode", { riskClass: "recipients_update", publishes: false }),
+    node("r-end", "EndNode"),
+  ], [["r-start", "r-scope_gate"], ["r-scope_gate", "r-generate"], ["r-generate", "r-review_gate"], ["r-review_gate", "r-apply"], ["r-apply", "r-end"]]);
+  f.$referenced_components["recipients-subflow"].$referenced_components["r-scope_gate"].outputs = [{ title: "accountScope" }];
+  context.comp.subflow = subflowOf(f, "context-subflow", [
+    node("c-start", "StartNode", {}),
+    node("c-resolve", "ApiNode", { publishes: false }),
+    node("c-mode", "BranchingNode"),
+    node("c-emit", "OutputMessageNode"),
+    node("c-select_gate", "InputMessageNode", { riskClass: "read_only", renderer: "@cinatra-ai/context-selection-agent:context-selector" }),
+    node("c-finalize", "ApiNode", { publishes: false }),
+    node("c-auto", "ApiNode", { publishes: false }),
+    node("c-end", "EndNode"),
+  ], [["c-start", "c-resolve"], ["c-resolve", "c-mode"], ["c-mode", "c-emit"], ["c-emit", "c-select_gate"], ["c-select_gate", "c-finalize"],
+    ["c-finalize", "c-end"], ["c-mode", "c-auto"], ["c-auto", "c-end"]]);
+  const draftSteps = [
+    node("d-start", "StartNode", {}),
+    node("d-draft", "ApiNode", { riskClass: "draft_create", publishes: false, renderer: "@cinatra-ai/email-drafting-agent:output" }),
+    node("d-read", "ApiNode", READ),
+    node("d-apply", "ApiNode", { riskClass: "draft_update", publishes: false }),
+    node("d-end", "EndNode"),
+  ];
+  const draftEdges = [["d-start", "d-draft"], ["d-draft", "d-read"], ["d-apply", "d-end"]];
+  if (moved) draftEdges.push(["d-read", "d-apply"]);
+  else {
+    draftSteps.push(node("d-approval_gate", "InputMessageNode", { riskClass: "approval", renderer: DRAFTS_REVIEW }));
+    draftEdges.push(["d-read", "d-approval_gate"], ["d-approval_gate", "d-apply"]);
+  }
+  drafts.comp.subflow = subflowOf(f, "drafts-subflow", draftSteps, draftEdges);
+  const sendSteps = [
+    node("s-start", "StartNode", {}),
+    node("s-file_recipients", "ApiNode", { ...WRITE, publishes: false }),
+    node("s-send", "ApiNode", { riskClass: "email_send", publishes: false, ...(moved ? { confirmations: [{ ...PUBLISH_DECISION, tool: "email_outreach_send_initial_start" }] } : {}) }),
+    node("s-end", "EndNode"),
+  ];
+  const sendEdges = [["s-file_recipients", "s-send"], ["s-send", "s-end"]];
+  if (moved) sendEdges.push(["s-start", "s-file_recipients"]);
+  else {
+    sendSteps.push(node("s-approval_gate", "InputMessageNode", { riskClass: "approval", renderer: SEND_CONFIRMATION }));
+    sendEdges.push(["s-start", "s-approval_gate"], ["s-approval_gate", "s-file_recipients"]);
+  }
+  sender.comp.subflow = subflowOf(f, "sender-subflow", sendSteps, sendEdges);
+  return f;
+}
+
+test("email-outreach shape: with its send and drafts approvals gone, the list picker, recipients review and context selector are no finding", () => {
+  assert.deepEqual(checkAgentFlow(emailOutreachShape({ moved: true })), []);
+});
+
+test("email-outreach shape: the send approval inside sender_flow is still refused", () => {
+  const findings = checkAgentFlow(emailOutreachShape({ moved: false }));
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate sender_flow"]);
+});
+
+test("email-outreach shape: the drafts approval alone, inside drafts_flow in front of sender_flow, is still refused", () => {
+  const f = emailOutreachShape({ moved: true });
+  const drafts = f.$referenced_components["drafts-subflow"];
+  drafts.$referenced_components["d-approval_gate"] = { component_type: "InputMessageNode", id: "d-approval_gate", name: "d-approval_gate", metadata: { cinatra: { riskClass: "approval", renderer: DRAFTS_REVIEW } } };
+  drafts.nodes.push({ $component_ref: "d-approval_gate" });
+  drafts.control_flow_connections = [["d-start", "d-draft"], ["d-draft", "d-read"], ["d-read", "d-approval_gate"], ["d-approval_gate", "d-apply"], ["d-apply", "d-end"]]
+    .map(([from, to]) => ({ component_type: "ControlFlowEdge", name: `${from}_${to}`, from_node: { $component_ref: from }, to_node: { $component_ref: to } }));
+  f.metadata.cinatra.hitlScreens.push(DRAFTS_REVIEW);
+  const findings = checkAgentFlow(f);
+  assert.deepEqual(rulesOf(findings), ["oas.publish-own-gate sender_flow"]);
+  assert.match(findings[0].message, /email-drafts-review/);
+});
+
+const ETD = "@cinatra-ai/email-test-delivery-agent:input";
+// start -> test_form_gate -> parse_action -> branch_on_action -(send)-> [resolve ->] perform_test_send -> test_form_gate; default -> summary.
+function emailTestDeliveryShape({ moved, resolveStep = moved }) {
+  const n = [
+    node("start", "StartNode", {}),
+    node("test_form_gate", "InputMessageNode", { riskClass: moved ? "read_only" : "test_send", renderer: ETD, requiresApproval: !moved }),
+    node("parse_action", "ApiNode", READ),
+    node("branch_on_action", "BranchingNode"),
+    node("perform_test_send", "ApiNode", { riskClass: "write", requiresApproval: false, publishes: true }),
+    node("test_summary", "OutputMessageNode"),
+    node("end", "EndNode"),
+  ];
+  const c = [["start", "test_form_gate"], ["test_form_gate", "parse_action"], ["parse_action", "branch_on_action"], ["branch_on_action", "test_summary"],
+    ["test_summary", "end"], ["perform_test_send", "test_form_gate"]];
+  if (resolveStep) {
+    n.push(node("resolve_test_request", "ApiNode", { ...WRITE, publishes: false }));
+    c.push(["branch_on_action", "resolve_test_request"], ["resolve_test_request", "perform_test_send"]);
+  } else {
+    c.push(["branch_on_action", "perform_test_send"]);
+  }
+  return flow(n, c, { hitlScreens: [ETD] });
+}
+
+test("email-test-delivery shape: the form as an input screen, with a work step that resolves the request before the send, is no finding", () => {
+  assert.deepEqual(checkAgentFlow(emailTestDeliveryShape({ moved: true })), []);
+});
+
+test("email-test-delivery shape: the test_send form in front of the send is still refused, also with the resolve step", () => {
+  assert.deepEqual(rulesOf(checkAgentFlow(emailTestDeliveryShape({ moved: false, resolveStep: false }))), [
+    "oas.publish-own-gate test_form_gate",
+    "oas.publish-own-gate perform_test_send",
+  ]);
+  assert.deepEqual(rulesOf(checkAgentFlow(emailTestDeliveryShape({ moved: false, resolveStep: true }))), ["oas.publish-own-gate perform_test_send"]);
+});
+
+test("email-test-delivery shape: a read_only form with only a read_only step and a branch before the send is still refused", () => {
+  assert.ok(rulesOf(checkAgentFlow(emailTestDeliveryShape({ moved: true, resolveStep: false }))).includes("oas.publish-own-gate test_form_gate"));
+});
+
+// start -> prepare -> [approval_gate ->] file_recipients -> send -> summary -> end.
+function emailDeliveryShape({ moved, confirmations }) {
+  const n = [node("start", "StartNode", {}), node("prepare", "ApiNode", READ)];
+  const c = [["start", "prepare"], ["file_recipients", "send"], ["send", "summary"], ["summary", "end"]];
+  if (moved) c.push(["prepare", "file_recipients"]);
+  else {
+    n.push(node("approval_gate", "InputMessageNode", { riskClass: "approval", renderer: SEND_CONFIRMATION, requiresApproval: true }));
+    c.push(["prepare", "approval_gate"], ["approval_gate", "file_recipients"]);
+  }
+  n.push(
+    node("file_recipients", "ApiNode", { ...WRITE, publishes: false }),
+    node("send", "ApiNode", { riskClass: "email_send", requiresApproval: false, publishes: true, renderer: "@cinatra-ai/email-delivery-agent:output", confirmations }),
+    node("summary", "OutputMessageNode"),
+    node("end", "EndNode"),
+  );
+  return flow(n, c, { hitlScreens: moved ? [] : [SEND_CONFIRMATION] });
+}
+
+test("email-delivery shape: with its approval gone and a publish-decision confirmations entry on send, it is no finding", () => {
+  assert.deepEqual(checkAgentFlow(emailDeliveryShape({ moved: true, confirmations: [{ ...PUBLISH_DECISION, tool: "email_outreach_send_initial_start" }] })), []);
+});
+
+test("email-delivery shape: the send-confirmation approval across file_recipients, and a gate-renderer confirmations entry, are still refused", () => {
+  assert.deepEqual(rulesOf(checkAgentFlow(emailDeliveryShape({ moved: false, confirmations: [] }))), ["oas.publish-own-gate send"]);
+  assert.deepEqual(rulesOf(checkAgentFlow(emailDeliveryShape({ moved: true, confirmations: [{ tool: "email_outreach_send_initial_start", gateRenderer: SEND_CONFIRMATION }] }))), [
+    "oas.publish-own-gate send",
+  ]);
+});
+
+test("wordpress shape: the page review gate directly in front of edit is still refused, and the pack passes without it", () => {
+  const shape = (moved) => flow(
+    [node("start", "StartNode", {}), node("compose_change", "ApiNode", READ), node("gather_page_review", "ApiNode", { ...WRITE, publishes: false }),
+      ...(moved ? [] : [node("page_review_gate", "InputMessageNode", { riskClass: "read_only", requiresApproval: true })]),
+      node("edit", "ApiNode", { ...WRITE, publishes: true }), node("end", "EndNode")],
+    [["start", "compose_change"], ["compose_change", "gather_page_review"], ...(moved ? [["gather_page_review", "edit"]] : [["gather_page_review", "page_review_gate"], ["page_review_gate", "edit"]]), ["edit", "end"]],
+  );
+  assert.deepEqual(rulesOf(checkAgentFlow(shape(false))), ["oas.publish-own-gate page_review_gate"]);
+  assert.deepEqual(checkAgentFlow(shape(true)), []);
 });
 
 test("checkAgentPackage reads the flow and the package's renderers", () => {
