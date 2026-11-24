@@ -510,6 +510,68 @@ test("an InputMessageNode with only a read_only step between it and the publishi
   assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate ask_post"]);
 });
 
+// A host review (owner ruling 1204 B: an approved review in the same run comes before the publish card): an
+// InputMessageNode marked metadata.cinatra.artifactReview.targetsInput, which the application draws as its review,
+// with no screen of the pack's own.
+const REVIEW_MARK = { requiresApproval: true, artifactReview: { targetsInput: "reviewTargets" } };
+function reviewBefore(cinatra, extra = {}) {
+  const review = node("review_post", "InputMessageNode", cinatra);
+  Object.assign(review.comp, extra);
+  return withConfirmBefore([review], [
+    ["start", "review_post"],
+    ["review_post", "read_post"],
+    ["read_post", "publish"],
+    ["publish", "end"],
+  ]);
+}
+
+test("a host review step (artifactReview.targetsInput, no own screen) in front of a publishing node is not a confirm gate", () => {
+  assert.deepEqual(checkAgentFlow(reviewBefore(REVIEW_MARK)), []);
+  const direct = withConfirmBefore([node("review_post", "InputMessageNode", REVIEW_MARK)], [
+    ["start", "read_post"],
+    ["read_post", "review_post"],
+    ["review_post", "publish"],
+    ["publish", "end"],
+  ]);
+  assert.deepEqual(checkAgentFlow(direct), []);
+});
+
+test("a plain requiresApproval InputMessageNode in front of a publishing node is still its own confirm gate", () => {
+  assert.deepEqual(rulesOf(checkAgentFlow(reviewBefore({ requiresApproval: true }))), ["oas.publish-own-gate review_post"]);
+});
+
+test("a review marker that is not a non-empty string does not make a host review step", () => {
+  for (const targetsInput of ["", 1, true, null, ["reviewTargets"], { name: "reviewTargets" }]) {
+    const f = reviewBefore({ requiresApproval: true, artifactReview: { targetsInput } });
+    assert.deepEqual(rulesOf(checkAgentFlow(f)), ["oas.publish-own-gate review_post"], JSON.stringify(targetsInput));
+  }
+  assert.deepEqual(rulesOf(checkAgentFlow(reviewBefore({ artifactReview: "reviewTargets" }))), ["oas.publish-own-gate review_post"]);
+});
+
+test("a review-marked step with a screen of the pack's own is still its own confirm gate", () => {
+  const ownScreens = [
+    [{ ...REVIEW_MARK, renderer: "@x/pack:confirm" }, {}],
+    [{ ...REVIEW_MARK, inputRenderers: { reviewDecision: "@x/pack:confirm" } }, {}],
+    [{ ...REVIEW_MARK, inputRenderers: {} }, {}],
+    [{ ...REVIEW_MARK, gateRenderer: "@x/pack:confirm" }, {}],
+    [{ ...REVIEW_MARK, inputMessageSchema: { type: "object", properties: { ok: { type: "boolean", "x-renderer": "@x/pack:confirm" } } } }, {}],
+    [REVIEW_MARK, { inputs: [{ title: "reviewTargets", schema: { type: "object", "x-renderer": "@x/pack:confirm" } }] }],
+  ];
+  for (const [cinatra, extra] of ownScreens) {
+    assert.deepEqual(rulesOf(checkAgentFlow(reviewBefore(cinatra, extra))), ["oas.publish-own-gate review_post"], JSON.stringify([cinatra, extra]));
+  }
+});
+
+test("a review-marked step that a root hitlScreens entry or a package renderer selects is still its own confirm gate", () => {
+  const listed = reviewBefore(REVIEW_MARK);
+  listed.metadata.cinatra.hitlScreens = [SCHEMA_FIELD_FALLBACK_RENDERER_ID];
+  assert.ok(rulesOf(checkAgentFlow(listed, { fieldRenderers: [{ id: SCHEMA_FIELD_FALLBACK_RENDERER_ID, midRunHitl: false }] })).includes("oas.publish-own-gate review_post"));
+  const bound = checkAgentFlow(reviewBefore(REVIEW_MARK), { fieldRenderers: [{ id: SCHEMA_FIELD_FALLBACK_RENDERER_ID, midRunHitl: false }] });
+  assert.deepEqual(rulesOf(bound), ["oas.publish-own-gate review_post"]);
+  // A package renderer the step does not select is no screen of the step.
+  assert.deepEqual(checkAgentFlow(reviewBefore(REVIEW_MARK), { fieldRenderers: [{ id: "@x/pack:draft-confirm", midRunHitl: true }] }), []);
+});
+
 test("an InputMessageNode that reaches the publishing node through an OutputMessageNode and a read_only step is its own confirm gate", () => {
   const f = withConfirmBefore([node("confirm", "InputMessageNode"), node("note", "OutputMessageNode")], [
     ["start", "confirm"],
