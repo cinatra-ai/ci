@@ -33,8 +33,9 @@
 //     edit only adds lines and the earlier version passes with the fix;
 //   - REMOVAL: a changed file whose edit only deletes code (whole tests,
 //     statements, list elements or JSX attributes; no line of code added or
-//     changed, the retained code parsed alike, no pragma line changed, no
-//     assertion of a kept test touched, no kept test lost), where every deleted part
+//     changed, the retained code parsed alike, no pragma line changed or
+//     moved, no assertion of a kept test touched, no case a kept test or
+//     suite reads by name deleted, no kept test lost), where every deleted part
 //     names an identifier or a string that the pull request removes from its
 //     product scripts, and whose tests pass before the fix and with it; it
 //     stands only beside a proven file of the same pull request.
@@ -143,9 +144,13 @@ const NAME_RE = /^[A-Za-z_$][\w$]*$/;
 // the matcher calls (.toBe(, .not.toEqual(, ...). Read on the changed lines
 // of a test file; a method call such as `re.test(` is not a declaration.
 // ASSERTION_RE is its assertion part, the one list of assertion styles the
-// gate knows (the removal reading uses it too).
+// gate knows (the removal reading uses it too, with the names a file imports
+// from an assertion module: assertionLocals). It holds the named Node
+// assertions called bare (`strictEqual(`, `ok(`, ...) and an `assert`
+// member (`t.assert.equal(`).
 const TEST_DECLARATION_SRC = /(?<![.\w$])(?:it|test|describe|suite|specify|bench)\s*(?:\.\s*[A-Za-z]+\s*)*(?:\(|`)/.source;
-const ASSERTION_SRC = /(?<![.\w$])(?:expect|assert)[A-Za-z]*\s*[.(]|\.\s*(?:should|rejects|resolves)\b|\.\s*(?:not\s*\.\s*)?to(?:Be|Equal|StrictEqual|Have|Contain|Match|Throw|Satisfy|Include)[A-Za-z]*\s*\(/.source;
+const NODE_ASSERTIONS = ["strictEqual", "deepStrictEqual", "notStrictEqual", "notDeepStrictEqual", "deepEqual", "notDeepEqual", "equal", "notEqual", "ok", "throws", "rejects", "doesNotThrow", "doesNotReject", "match", "doesNotMatch", "fail", "ifError"];
+const ASSERTION_SRC = `${/(?<![.\w$])(?:expect|assert)[A-Za-z]*\s*[.(]|\.\s*assert\s*[.(]|\.\s*(?:should|rejects|resolves)\b|\.\s*(?:not\s*\.\s*)?to(?:Be|Equal|StrictEqual|Have|Contain|Match|Throw|Satisfy|Include)[A-Za-z]*\s*\(/.source}|(?<![.\\w$])(?:${NODE_ASSERTIONS.join("|")})\\s*\\(`;
 const TEST_LINE_RE = new RegExp(`${TEST_DECLARATION_SRC}|${ASSERTION_SRC}`);
 const ASSERTION_RE = new RegExp(ASSERTION_SRC);
 const REPORTER = join(dirname(fileURLToPath(import.meta.url)), "red-first-reporter.mjs");
@@ -1128,11 +1133,219 @@ function isCallTo(ts, node, test) {
   return root !== null && test(root);
 }
 
-// A test or suite declaration: a call rooted at a test or suite name that is
-// not itself the callee of a call, so `test.each(rows)("title", fn)` is one
-// declaration (the outer call), not two.
-function isDeclaration(ts, node, callees) {
-  return isCallTo(ts, node, (r) => callees.some((set) => set.has(r))) && !(ts.isCallExpression(node.parent) && node.parent.expression === node);
+// The modules whose exports declare tests, the modules whose every binding
+// asserts, and the runner exports that assert.
+const RUNNER_MODULES = new Set(["vitest", "node:test", "@jest/globals", "mocha"]);
+const ASSERT_MODULES = new Set(["node:assert", "node:assert/strict", "assert", "assert/strict", "chai"]);
+const RUNNER_ASSERTIONS = new Set(["assert", "expect", "should", "expectTypeOf", "assertType"]);
+
+// The module a `require("m")` call reads, or null.
+function requiredModule(ts, node) {
+  return node && ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "require" && node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0]) ? node.arguments[0].text : null;
+}
+
+// The identifiers a binding name (an identifier or a destructuring pattern)
+// binds.
+function boundNames(ts, name, out = []) {
+  if (!name) return out;
+  if (ts.isIdentifier(name)) out.push(name);
+  else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+    for (const el of name.elements) if (ts.isBindingElement(el)) boundNames(ts, el.name, out);
+  }
+  return out;
+}
+
+// How a file binds the names a test reading resolves:
+//   runner   local name -> the runner export it is (`test`, `describe`, ...),
+//            for an import (or a require) from a runner module;
+//   runnerNs local names of a whole runner module (`import * as v`);
+//   asserts  local names that assert: every binding from an assertion module,
+//            and a runner's assert, expect, ... exports;
+//   declared every other name the file binds (another import, a variable, a
+//            function, a class, a parameter, ...), at any depth.
+// A name the file binds otherwise is never the runner's: a test call counts
+// only through the runner's binding, or as the bare global when the file
+// neither imports nor declares that name.
+function fileBindings(ts, file) {
+  const runner = new Map();
+  const runnerNs = new Set();
+  const asserts = new Set();
+  const declared = new Set();
+  const handled = new Set();
+  const bind = (local, mod, imported) => {
+    handled.add(local);
+    const name = local.text;
+    if (ASSERT_MODULES.has(mod)) {
+      asserts.add(name);
+      declared.add(name);
+    } else if (RUNNER_MODULES.has(mod) && imported === "*") runnerNs.add(name);
+    else if (RUNNER_MODULES.has(mod) && (TEST_CALLEES.has(imported) || SUITE_CALLEES.has(imported))) runner.set(name, imported);
+    else {
+      if (RUNNER_MODULES.has(mod) && RUNNER_ASSERTIONS.has(imported)) asserts.add(name);
+      declared.add(name);
+    }
+  };
+  nodesWhere(ts, file, (n) => {
+    if (ts.isImportDeclaration(n) && n.importClause && ts.isStringLiteralLike(n.moduleSpecifier)) {
+      const mod = n.moduleSpecifier.text;
+      const clause = n.importClause;
+      if (clause.name) bind(clause.name, mod, mod === "node:test" ? "test" : "default");
+      const named = clause.namedBindings;
+      if (named && ts.isNamespaceImport(named)) bind(named.name, mod, "*");
+      else if (named) for (const s of named.elements) bind(s.name, mod, (s.propertyName ?? s.name).text);
+    } else if (ts.isVariableDeclaration(n) && requiredModule(ts, n.initializer) !== null) {
+      const mod = requiredModule(ts, n.initializer);
+      if (ts.isIdentifier(n.name)) bind(n.name, mod, mod === "node:test" ? "test" : "*");
+      else if (ts.isObjectBindingPattern(n.name)) {
+        for (const el of n.name.elements) {
+          const key = el.propertyName ?? el.name;
+          if (ts.isIdentifier(el.name) && ts.isIdentifier(key) && !el.dotDotDotToken) bind(el.name, mod, key.text);
+        }
+      }
+    }
+    return false;
+  });
+  nodesWhere(ts, file, (n) => {
+    let names = [];
+    if (ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n)) names = boundNames(ts, n.name);
+    else if ((ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isEnumDeclaration(n) || ts.isImportEqualsDeclaration(n)) && n.name) names = [n.name];
+    else if (ts.isImportClause(n) && n.name) names = [n.name];
+    else if (ts.isNamespaceImport(n) || ts.isImportSpecifier(n)) names = [n.name];
+    for (const id of names) if (!handled.has(id)) declared.add(id.text);
+    return false;
+  });
+  for (const name of declared) {
+    runner.delete(name);
+    runnerNs.delete(name);
+  }
+  let assertsRe = null;
+  if (asserts.size) assertsRe = new RegExp(`(?<![.\\w$])(?:${[...asserts].map((a) => a.replace(/\$/g, "\\$")).join("|")})\\s*[.(]`);
+  return { runner, runnerNs, declared, assertsRe };
+}
+
+// What a call's callee is to the runner: "test", "suite" or null, read through
+// the file's bindings (fileBindings). `ns.test(...)` of a whole runner module
+// counts by its member.
+function calleeRole(ts, bindings, node) {
+  if (!ts.isCallExpression(node)) return null;
+  let expr = node.expression;
+  let member = null;
+  for (;;) {
+    if (ts.isPropertyAccessExpression(expr)) {
+      member = expr.name.text;
+      expr = expr.expression;
+    } else if (ts.isCallExpression(expr) || ts.isElementAccessExpression(expr) || ts.isNonNullExpression(expr) || ts.isParenthesizedExpression(expr)) expr = expr.expression;
+    else if (ts.isTaggedTemplateExpression(expr)) expr = expr.tag;
+    else break;
+  }
+  if (!ts.isIdentifier(expr)) return null;
+  const root = expr.text;
+  let exported;
+  if (bindings.runnerNs.has(root)) exported = member;
+  else if (bindings.declared.has(root)) return null;
+  else exported = bindings.runner.get(root) ?? root;
+  return TEST_CALLEES.has(exported) ? "test" : SUITE_CALLEES.has(exported) ? "suite" : null;
+}
+
+// A test or suite declaration: a call whose callee the runner's binding roots
+// (calleeRole) and that is not itself the callee of a call, so
+// `test.each(rows)("title", fn)` is one declaration (the outer call), not
+// two. roles: the roles that count ("test", "suite").
+function isDeclaration(ts, bindings, node, roles) {
+  return roles.includes(calleeRole(ts, bindings, node)) && !(ts.isCallExpression(node.parent) && node.parent.expression === node);
+}
+
+// A call that reads like a test or a suite, by its callee's root name or by
+// the runner's binding: the wide reading for the refusals (a deletion in its
+// title or cases, a deletion inside a kept test).
+function isTestLikeCall(ts, bindings, node, roles = ["test", "suite"]) {
+  if (!ts.isCallExpression(node)) return false;
+  const names = (r) => (roles.includes("test") && TEST_CALLEES.has(r)) || (roles.includes("suite") && SUITE_CALLEES.has(r));
+  return isCallTo(ts, node, names) || roles.includes(calleeRole(ts, bindings, node));
+}
+
+// Whether an identifier is a reference (not a declared name, a property key
+// or a member name).
+function isReference(ts, id) {
+  const p = id.parent;
+  if (!p) return false;
+  if ((ts.isPropertyAccessExpression(p) || ts.isQualifiedName(p)) && p.name === id) return false;
+  if ((ts.isPropertyAssignment(p) || ts.isMethodDeclaration(p) || ts.isPropertyDeclaration(p) || ts.isPropertySignature(p) || ts.isJsxAttribute(p)) && p.name === id) return false;
+  if ((ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isFunctionDeclaration(p) || ts.isFunctionExpression(p) || ts.isClassDeclaration(p) || ts.isClassExpression(p) || ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p)) && p.name === id) return false;
+  if (ts.isBindingElement(p) && (p.name === id || p.propertyName === id)) return false;
+  return true;
+}
+
+// The declarations of the file by name: a variable (its whole declaration),
+// a function or a class.
+function declarationsByName(ts, file) {
+  const out = new Map();
+  const put = (name, node) => out.set(name, [...(out.get(name) ?? []), node]);
+  nodesWhere(ts, file, (n) => {
+    if (ts.isVariableDeclaration(n)) for (const id of boundNames(ts, n.name)) put(id.text, n);
+    else if ((ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n)) && n.name) put(n.name.text, n);
+    return false;
+  });
+  return out;
+}
+
+// The declarations a kept test or suite reads for its cases, through a name:
+// from the arguments of a kept `.each` / `.for` declaration, from the head of
+// a kept loop (or the callee and other arguments of a kept call such as
+// `cases.forEach(fn)`) whose body declares a test, and from the arguments of
+// a kept call of a function of the file that declares a test; then through
+// every name those declarations read, to their own declarations.
+// kept(node): whether a node is retained. Returns [{ node, name }].
+function caseDeclarations(ts, file, bindings, kept) {
+  const decls = declarationsByName(ts, file);
+  const declares = (node) => nodesWhere(ts, node, (n) => isTestLikeCall(ts, bindings, n)).length > 0;
+  const seeds = [];
+  const refsIn = (node) => {
+    if (node) nodesWhere(ts, node, (n) => ts.isIdentifier(n) && isReference(ts, n)).forEach((id) => seeds.push(id.text));
+  };
+  const declaringFunctions = new Set();
+  for (const [name, nodes] of decls) {
+    if (nodes.some((d) => (ts.isFunctionDeclaration(d) ? d.body && declares(d.body) : ts.isVariableDeclaration(d) && d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)) && declares(d.initializer)))) declaringFunctions.add(name);
+  }
+  nodesWhere(ts, file, (n) => {
+    if (!kept(n)) return false;
+    if (ts.isCallExpression(n) && isTestLikeCall(ts, bindings, n) && /\.\s*(?:each|for)\b/.test(file.text.slice(n.expression.getStart(file), n.expression.end))) refsIn(n.expression);
+    else if ((ts.isForOfStatement(n) || ts.isForInStatement(n)) && declares(n.statement)) refsIn(n.expression);
+    else if (ts.isForStatement(n) && declares(n.statement)) {
+      refsIn(n.initializer);
+      refsIn(n.condition);
+    } else if (ts.isCallExpression(n) && !isTestLikeCall(ts, bindings, n)) {
+      const fns = n.arguments.filter((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a));
+      const root = calleeRoot(ts, n.expression);
+      if (fns.some((f) => declares(f.body)) || (root !== null && declaringFunctions.has(root))) {
+        refsIn(n.expression);
+        for (const a of n.arguments) if (!fns.includes(a)) refsIn(a);
+      }
+    }
+    return false;
+  });
+  const out = [];
+  const seen = new Set();
+  while (seeds.length) {
+    const name = seeds.pop();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    for (const d of decls.get(name) ?? []) {
+      out.push({ node: d, name });
+      refsIn(ts.isVariableDeclaration(d) ? d.initializer : d);
+    }
+  }
+  return out;
+}
+
+// The comment lines that hold a pragma, each with its place: the line's index
+// among the comment lines before the first code token (the header), or
+// "code" after it.
+function pragmaPlaces(file, tokens, gaps) {
+  const header = file.text.slice(0, tokens.length ? tokens[0].start : file.text.length);
+  const headerLines = header.split(/\r?\n|\r|\u2028|\u2029/).map((l) => l.trim()).filter(Boolean);
+  const headerAt = headerLines.map((l, i) => (PRAGMA_RE.test(l) ? i : -1)).filter((i) => i >= 0);
+  return pragmaLines(gaps).map((text, k) => ({ text, place: k < headerAt.length ? `header comment line ${headerAt[k] + 1}` : "code" }));
 }
 
 // The code of a node from the file's code tokens, comments left out (a blank
@@ -1152,8 +1365,14 @@ function codeOf(tokens, file, node) {
 
 // Whether a call states an assertion: its callee read with ASSERTION_RE
 // (`expect(`, `assert.equal(`, `x.should.equal(`, `.toBe(`, ...).
-function isAssertionCall(ts, tokens, file, node) {
-  return ts.isCallExpression(node) && ASSERTION_RE.test(`${codeOf(tokens, file, node.expression)}(`);
+function isAssertionCall(ts, tokens, file, node, bindings) {
+  return ts.isCallExpression(node) && asserts(`${codeOf(tokens, file, node.expression)}(`, bindings);
+}
+
+// Whether code states an assertion: ASSERTION_RE, or a call of a name the
+// file imports from an assertion module (fileBindings).
+function asserts(code, bindings) {
+  return ASSERTION_RE.test(code) || Boolean(bindings?.assertsRe?.test(code));
 }
 
 // The test names a deleted declaration registers, as a RegExp over a runner's
@@ -1234,15 +1453,20 @@ function removedByPullRequest(name, word, product) {
 //     version's with some deleted (comments and blanks apart): no line of
 //     code is added or changed;
 //   - the comment lines that hold a pragma (an @ pragma, a red-first marker,
-//     a /// line) are the same lines, in the same order, in both versions;
+//     a /// line) are the same lines, in the same order and in the same
+//     place (pragmaPlaces: in the header, by line, or after the first code),
+//     in both versions;
 //   - the deleted tokens are whole statements, object, array or import list
 //     elements, or JSX attributes (with the commas between list elements);
 //   - the head's syntax tree is the earlier tree less the deleted nodes (the
 //     parser reads the retained code alike);
-//   - deleted code that asserts (ASSERTION_RE: expect, assert, .should,
-//     .rejects, .resolves, the matchers) is a whole test or suite; no deleted
-//     part sits inside an assertion, or in the title or the cases of a test or
-//     suite the file keeps;
+//   - deleted code that asserts (asserts: ASSERTION_RE, with the named Node
+//     assertions, and the names the file binds from an assertion module) is
+//     a whole test or suite, read through the runner's binding (calleeRole),
+//     never a call inside a kept test; no deleted part sits inside an
+//     assertion, in the title or the cases of a test or suite the file keeps,
+//     or in a declaration a kept test or suite reads for its cases
+//     (caseDeclarations);
 //   - every deleted part, and every test it deletes (`test.each(rows)(...)`
 //     is one test), names an identifier or a string that the pull request
 //     removes from the product code (removedByPullRequest), except an import
@@ -1263,11 +1487,19 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   const ts = before.ts;
   const old = codeTokens(ts, before.file);
   const now = codeTokens(ts, after.file);
-  const pragmasBefore = pragmaLines(old.gaps);
-  const pragmasAfter = pragmaLines(now.gaps);
-  const pragmaAt = Array.from({ length: Math.max(pragmasBefore.length, pragmasAfter.length) }, (_, k) => k).find((k) => pragmasBefore[k] !== pragmasAfter[k]);
+  const pragmasBefore = pragmaPlaces(before.file, old.tokens, old.gaps);
+  const pragmasAfter = pragmaPlaces(after.file, now.tokens, now.gaps);
+  const pragmaAt = Array.from({ length: Math.max(pragmasBefore.length, pragmasAfter.length) }, (_, k) => k).find((k) => pragmasBefore[k]?.text !== pragmasAfter[k]?.text);
   if (pragmaAt !== undefined) {
-    return no(`the edit changes the comment pragmas (${clip(pragmasBefore[pragmaAt] ?? "nothing", 80)} becomes ${clip(pragmasAfter[pragmaAt] ?? "nothing", 80)}): a comment line with an @ pragma, a red-first marker or a /// line stays exactly as it was`);
+    return no(`the edit changes the comment pragmas (${clip(pragmasBefore[pragmaAt]?.text ?? "nothing", 80)} becomes ${clip(pragmasAfter[pragmaAt]?.text ?? "nothing", 80)}): a comment line with an @ pragma, a red-first marker or a /// line stays exactly as it was`);
+  }
+  // A pragma also keeps its place: a runner reads some only in the file's
+  // header (before the first code), so one that moves across the first code
+  // or changes its line among the header's comment lines is refused.
+  const movedAt = pragmasBefore.findIndex((p, k) => p.place !== pragmasAfter[k].place);
+  if (movedAt !== -1) {
+    const where = (place) => (place === "code" ? "after the first code" : `at ${place}`);
+    return no(`the edit moves the comment pragma ${clip(pragmasBefore[movedAt].text, 80)} (${where(pragmasBefore[movedAt].place)} before, ${where(pragmasAfter[movedAt].place)} at the head): a pragma keeps its place in the file's header or after its first code`);
   }
   const deleted = deletedTokens(old.tokens, now.tokens, hunks);
   if (typeof deleted === "string") return no(`the edit is not deletion only (${deleted})`);
@@ -1315,6 +1547,16 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   if (shapeBefore.length !== shapeAfter.length || shapeBefore.some((s, k) => s !== shapeAfter[k])) {
     return no("the retained code does not keep its structure: without the deleted parts the parser reads the code around them as other statements or expressions");
   }
+  const bindings = fileBindings(ts, before.file);
+  const unitSet = new Set(units);
+  const kept = (node) => {
+    for (let p = node; p; p = p.parent) if (unitSet.has(p)) return false;
+    return true;
+  };
+  // The declarations a kept test or suite reads for its cases (a kept
+  // `.each(cases)`, a kept loop that declares tests): a deletion in one would
+  // drop a case, and so a test, of a kept declaration.
+  const caseDecls = caseDeclarations(ts, before.file, bindings, kept);
   const names = [];
   const deletedTitles = [];
   let parts = 0;
@@ -1322,20 +1564,27 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   for (const unit of units) {
     const line = before.file.getLineAndCharacterOfPosition(unit.getStart(before.file)).line + 1;
     const kind = removableKind(ts, unit);
-    const declaration = kind === "statement" && ts.isExpressionStatement(unit) && isDeclaration(ts, unit.expression, [TEST_CALLEES, SUITE_CALLEES]);
-    if (!declaration && ASSERTION_RE.test(codeOf(tokens, before.file, unit))) return no(`the deleted code at line ${line} removes an assertion from a test the file keeps`);
+    // A call inside a kept test is never a whole test, and a call counts as a
+    // declaration only through the runner's binding (calleeRole).
+    let inKeptTest = false;
+    for (let p = unit.parent; p; p = p.parent) if (isTestLikeCall(ts, bindings, p, ["test"])) inKeptTest = true;
+    const declaration = !inKeptTest && kind === "statement" && ts.isExpressionStatement(unit) && isDeclaration(ts, bindings, unit.expression, ["test", "suite"]);
+    if (!declaration && asserts(codeOf(tokens, before.file, unit), bindings)) return no(`the deleted code at line ${line} removes an assertion from a test the file keeps`);
     let inBody = false;
     for (let p = unit.parent; p; p = p.parent) {
-      if (isAssertionCall(ts, tokens, before.file, p)) return no(`the deleted code at line ${line} changes an assertion`);
+      if (isAssertionCall(ts, tokens, before.file, p, bindings)) return no(`the deleted code at line ${line} changes an assertion`);
       if (ts.isFunctionLike(p)) inBody = true;
-      else if (!inBody && isCallTo(ts, p, (r) => TEST_CALLEES.has(r) || SUITE_CALLEES.has(r))) return no(`the deleted code at line ${line} changes the title or the cases of a test or suite the file keeps`);
+      else if (!inBody && isTestLikeCall(ts, bindings, p)) return no(`the deleted code at line ${line} changes the title or the cases of a test or suite the file keeps`);
     }
-    for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, n, [TEST_CALLEES]))) {
+    const start = unit.getStart(before.file);
+    const reads = caseDecls.find((c) => start < c.node.end && unit.end > c.node.getStart(before.file));
+    if (reads) return no(`the deleted code at line ${line} is a part of ${reads.name}, which a kept test or suite reads for its cases (a deletion there drops a case of a kept test)`);
+    for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, bindings, n, ["test"]))) {
       tests += 1;
       if (!removed(mentions(ts, call))) return no(`the test deleted at line ${before.file.getLineAndCharacterOfPosition(call.getStart(before.file)).line + 1} names nothing the pull request removes from the product code`);
     }
-    for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, n, [TEST_CALLEES, SUITE_CALLEES]))) {
-      const pattern = declarationPattern(ts, tokens, before.file, call, isCallTo(ts, call, (r) => SUITE_CALLEES.has(r)));
+    for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, bindings, n, ["test", "suite"]))) {
+      const pattern = declarationPattern(ts, tokens, before.file, call, calleeRole(ts, bindings, call) === "suite");
       if (pattern) deletedTitles.push(pattern);
     }
     const name = removed(mentions(ts, unit));

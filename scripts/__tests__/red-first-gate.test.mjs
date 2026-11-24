@@ -2726,3 +2726,93 @@ test("removal review 4: a deleted `test.each(cases)(...)` is one test, and a rem
   assert.ok(r.deletedTitles.some((re) => re.test("removed 1")), String(r.deletedTitles));
   assert.ok(!r.deletedTitles.some((re) => re.test("kept")), String(r.deletedTitles));
 });
+
+// ---------------------------------------------------------------------------
+// Removal edits, second review of PR #138: cases a kept `.each` reads through
+// a name, named Node assertions, a shadowed `test`, and a moved pragma.
+// ---------------------------------------------------------------------------
+
+test("removal review2 1: a deleted element of a collection that a kept `.each` or test loop reads by name is refused", async (t) => {
+  const head = 'import { expect, test, describe } from "vitest";\nimport { current } from "../src/panel";\n';
+  const imp = 'import { removedFeature } from "../src/panel";\n';
+  const cases = [
+    ['const cases = [current, removedFeature];\ntest.each(cases)("works %#", (fn) => {\n  expect(fn()).toBe(1);\n});\n', 'const cases = [current];\ntest.each(cases)("works %#", (fn) => {\n  expect(fn()).toBe(1);\n});\n'],
+    // traced through a second declaration
+    ['const rows = [current, removedFeature];\nconst cases = rows.map((fn) => [fn]);\ndescribe.each(cases)("suite %#", (fn) => {\n  test("works", () => expect(fn()).toBe(1));\n});\n', 'const rows = [current];\nconst cases = rows.map((fn) => [fn]);\ndescribe.each(cases)("suite %#", (fn) => {\n  test("works", () => expect(fn()).toBe(1));\n});\n'],
+    // a loop that declares tests
+    ["const cases = { current, removedFeature };\nfor (const [name, fn] of Object.entries(cases)) {\n  test(name, () => expect(fn()).toBe(1));\n}\n", "const cases = { current };\nfor (const [name, fn] of Object.entries(cases)) {\n  test(name, () => expect(fn()).toBe(1));\n}\n"],
+    ["const cases = [current, removedFeature];\ncases.forEach((fn) => test(String(fn), () => expect(fn()).toBe(1)));\n", "const cases = [current];\ncases.forEach((fn) => test(String(fn), () => expect(fn()).toBe(1)));\n"],
+  ];
+  for (const [before, after] of cases) {
+    const r = await checkRemoval(t, `${head}${imp}${before}`, `${head}${after}`);
+    assert.equal(r.ok, false, `${before}\n${JSON.stringify(r)}`);
+    assert.match(r.why, /a kept test or suite reads for its cases/, before);
+  }
+  // the same deletion where no kept test reads the collection for its cases
+  // (a mock object the kept test hands to the code) is still a removal edit
+  const mock = 'const ports = { current, removedFeature: () => null };\ntest("draws", () => {\n  expect(current(ports)).toBe(1);\n});\n';
+  const ok = await checkRemoval(t, `${head}${mock}`, `${head}${mock.replace(", removedFeature: () => null", "")}`);
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  // a deleted `.each` with its cases is a deleted test, as before
+  const whole = 'const cases = [current];\ntest.each([removedFeature])("old %#", (fn) => expect(fn()).toBe(1));\n';
+  const rw = await checkRemoval(t, `${head}${imp}${whole}`, `${head}${whole.split("\n")[0]}\n`);
+  assert.deepEqual([rw.ok, rw.tests], [true, 1], JSON.stringify(rw));
+});
+
+test("removal review2 2: a deleted named Node assertion (strictEqual, a renamed import, a require, t.assert) of a kept test is refused", async (t) => {
+  const body = (imp, call) => [`${imp}it("x", (t) => {\n  ${call};\n  expect(1).toBe(1);\n});\n`, `${imp}it("x", (t) => {\n  expect(1).toBe(1);\n});\n`];
+  for (const [imp, call] of [
+    ['import { strictEqual } from "node:assert";\n', "strictEqual(removedFeature(), 1)"],
+    ['import { deepStrictEqual } from "node:assert";\n', "deepStrictEqual(removedFeature(), [])"],
+    ['import { ok as truthy } from "node:assert/strict";\n', "truthy(removedFeature())"],
+    ['import * as a from "assert";\n', "a.equal(removedFeature(), 1)"],
+    ['const { notStrictEqual } = require("node:assert");\n', "notStrictEqual(removedFeature(), 1)"],
+    ['import { assert as check } from "vitest";\n', "check.isTrue(removedFeature())"],
+    ["", "t.assert.equal(removedFeature(), 1)"],
+    ["", "throws(() => removedFeature())"],
+  ]) {
+    const [before, after] = body(imp, call);
+    const r = await checkRemoval(t, before, after);
+    assert.equal(r.ok, false, `${call}\n${JSON.stringify(r)}`);
+    assert.match(r.why, /removes an assertion from a test the file keeps/, call);
+  }
+});
+
+test("removal review2 3: a call of a local helper named `test`, or any call inside a kept test, is never a whole test", async (t) => {
+  const line = '  test("legacy", () => expect(removedFeature()).toBe(1));\n';
+  const local = `import { expect, it } from "vitest";\nfunction test(name, fn) {\n  fn();\n}\nit("kept", () => {\n${line}  expect(1).toBe(1);\n});\n`;
+  const r = await checkRemoval(t, local, local.replace(line, ""));
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.why, /removes an assertion from a test the file keeps/);
+  // the global `test` (no import, no local declaration) inside a kept `it`
+  const nested = `it("kept", () => {\n${line}  expect(1).toBe(1);\n});\n`;
+  const rn = await checkRemoval(t, nested, nested.replace(line, ""));
+  assert.equal(rn.ok, false, JSON.stringify(rn));
+  assert.match(rn.why, /removes an assertion from a test the file keeps/);
+  // a `test` imported from elsewhere is not the runner's
+  const top = 'test("legacy", () => expect(removedFeature()).toBe(1));\n';
+  const other = `import { test } from "./helpers";\nimport { it } from "vitest";\n${top}it("kept", () => {});\n`;
+  const ro = await checkRemoval(t, other, other.replace(top, ""));
+  assert.equal(ro.ok, false, JSON.stringify(ro));
+  assert.match(ro.why, /removes an assertion from a test the file keeps/);
+  // the runner's test, imported and renamed, still declares a whole test
+  const renamed = `import { expect, test as check, it } from "vitest";\n${top.replace("test(", "check(")}it("kept", () => {});\n`;
+  const rr = await checkRemoval(t, renamed, renamed.replace(top.replace("test(", "check("), ""));
+  assert.deepEqual([rr.ok, rr.tests], [true, 1], JSON.stringify(rr));
+});
+
+test("removal review2 4: a pragma that moves out of the file header, or changes its place there, is refused", async (t) => {
+  const MOCK = 'vi.mock("@/x/panel", () => ({ loadCapturePair: () => null }));\n';
+  const imp = 'import { it, vi } from "vitest";\n';
+  const body = 'it("x", () => {});\n';
+  const moved = await checkRemoval(t, `// @vitest-environment jsdom\n${imp}${MOCK}${body}`, `${imp}// @vitest-environment jsdom\n${body}`);
+  assert.equal(moved.ok, false, JSON.stringify(moved));
+  assert.match(moved.why, /moves the comment pragma/);
+  const intoHeader = await checkRemoval(t, `${imp}// @vitest-environment jsdom\n${MOCK}${body}`, `// @vitest-environment jsdom\n${imp}${body}`);
+  assert.match(intoHeader.why ?? "", /moves the comment pragma/, JSON.stringify(intoHeader));
+  const reordered = await checkRemoval(t, `// a note\n// @vitest-environment jsdom\n${imp}${MOCK}${body}`, `// @vitest-environment jsdom\n// a note\n${imp}${body}`);
+  assert.match(reordered.why ?? "", /moves the comment pragma/, JSON.stringify(reordered));
+  // the pragma kept in its place, a comment reworded: still a removal edit
+  const kept = await checkRemoval(t, `// @vitest-environment jsdom\n// a note\n${imp}${MOCK}${body}`, `// @vitest-environment jsdom\n// another note\n${imp}${body}`);
+  assert.equal(kept.ok, true, JSON.stringify(kept));
+});
