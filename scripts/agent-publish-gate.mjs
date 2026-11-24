@@ -98,8 +98,33 @@ function isPublishDecisionList(value) {
   return Array.isArray(value) && value.every((entry) => isObject(entry) && entry.decision === "publish" && !Object.hasOwn(entry, "gateRenderer"));
 }
 
+// True when `value` holds an "x-renderer" key at any depth (a field renderer the pack selects in a schema).
+function holdsXRenderer(value, seen = new Set()) {
+  if (value === null || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  if (!Array.isArray(value) && Object.hasOwn(value, "x-renderer")) return true;
+  return Object.values(value).some((child) => holdsXRenderer(child, seen));
+}
+
+// A host review step (owner ruling 1204 B: the application opens its publish card only after a review approved
+// earlier in the same run): an InputMessageNode marked metadata.cinatra.artifactReview.targetsInput with a non-empty
+// string (the marker exactly as the core reads it, cinatra-ai/cinatra packages/agents/src/artifact-binding.ts,
+// readArtifactReviewTargetsInput), which the application draws as its own review, and with no screen of the pack's
+// own: no renderer, inputRenderers or gateRenderer key in its metadata.cinatra, no "x-renderer" key anywhere in it,
+// and no package renderer or root hitlScreens entry that names the renderer the core selects for it when it names
+// none (SCHEMA_FIELD_FALLBACK_RENDERER_ID). Any other InputMessageNode is a confirm step of the pack's own.
+function isHostReview(step, packageScreenIds) {
+  if (step.component_type !== "InputMessageNode") return false;
+  const cinatra = cinatraOf(step);
+  const marker = isObject(cinatra?.artifactReview) ? cinatra.artifactReview.targetsInput : undefined;
+  if (typeof marker !== "string" || marker.length === 0) return false;
+  if (["renderer", "inputRenderers", "gateRenderer"].some((key) => Object.hasOwn(cinatra, key))) return false;
+  if (holdsXRenderer(step)) return false;
+  return !packageScreenIds.has(SCHEMA_FIELD_FALLBACK_RENDERER_ID);
+}
+
 // Check one parsed flow. `fieldRenderers` is the package's
-// `cinatra.fieldRenderers` list (it is read for the hitlScreens rule only).
+// `cinatra.fieldRenderers` list (it is read for the hitlScreens rule and for a host review step).
 export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   if (!isObject(flow)) throw new GateError("the flow is not a JSON object");
   const findings = [];
@@ -312,6 +337,12 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
   };
 
   const ownGate = (name, message) => add("oas.publish-own-gate", name, message);
+  // The screen ids the package names: its renderer ids and the root hitlScreens entries (for isHostReview).
+  const rootScreens = cinatraOf(flow)?.hitlScreens;
+  const packageScreenIds = new Set([
+    ...(Array.isArray(fieldRenderers) ? fieldRenderers.filter(isObject).map((r) => r.id) : []),
+    ...(Array.isArray(rootScreens) ? rootScreens : []),
+  ]);
   for (const step of publishing) {
     const stepName = nameOf(step);
     const stepCinatra = cinatraOf(step);
@@ -341,6 +372,7 @@ export function checkAgentFlow(flow, { fieldRenderers = [] } = {}) {
       if (visited.has(before)) continue;
       visited.add(before);
       if (before.component_type === "InputMessageNode") {
+        if (isHostReview(before, packageScreenIds)) continue; // the application's review, not a confirm of the pack's own
         const gateName = nameOf(before);
         ownGate(
           gateName,
