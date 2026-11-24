@@ -2442,74 +2442,62 @@ codes alone.
   `REMOVAL`: a changed file whose edit only deletes what the same pull request
   removes from the product code (a removed test, or a removed mock or prop of
   something the product code no longer has). The gate reads the two versions
-  of the file with the TypeScript parser and holds all of these: both parse;
-  the head's code is the earlier version's with tokens deleted and none added
-  or changed (comments and blank lines apart; a comment may be reworded, but
-  every comment line that holds an `@...` pragma such as
-  `@vitest-environment jsdom`, a `red-first-` marker or a `/// <...>` line
-  stays exactly as it was, in the same order and in the same place: none is
-  added, changed, removed or moved across the first code of the file, and a
-  pragma in the file's header, before the first code, keeps its line among
-  the header's comment lines, and a pragma after the first code stays on the
-  code that follows it, such as `/* @vite-ignore */` on its `import(...)`:
-  one that moves to other code, or whose code is deleted while the pragma is
-  kept, is refused); the deleted tokens are whole statements,
-  whole elements of an object, an array or an import or export list (with
-  their commas), or whole JSX attributes; the head's syntax tree is the
-  earlier tree less the deleted nodes, so the parser reads the code it keeps
-  alike (a deletion after which two statements join, such as `sink` and
-  `[0].forEach(...)` read as `sink[0].forEach(...)`, is refused); deleted code
-  that asserts (`expect...`, `assert...`, `.should`, `.rejects`, `.resolves`,
-  the matchers such as `.toBe(`, the named Node assertions such as
-  `strictEqual(`, `deepStrictEqual(`, `ok(` or `throws(`, an `assert` member
-  such as `t.assert.equal(`, and any name the file imports or requires from
-  `node:assert`, `node:assert/strict`, `assert`, `chai`, or as `assert` or
-  `expect` from its runner, renamed or not, also through a member such as
-  `require("node:assert").strict`, through `import x = require(...)` or
-  `await import(...)`, through a name bound from such a name such as
-  `const check = assert.strict`, or read in place such as
-  `require("node:assert").strict.equal(`) is a whole test or suite (`it`,
-  `test`, `describe`, ...); a call is a test or suite only through the
-  runner's binding (imported from `vitest`, `node:test`, `@jest/globals` or
-  `mocha`, renamed or not), or as the bare global when the file neither
-  imports nor declares that name: a `test` the file declares itself or
-  imports from elsewhere is not one, and a call inside a test the file keeps
-  is never a whole test. No deleted part sits inside an assertion or in the
-  title or the cases of a test or suite the file keeps, nor in a declaration
-  that a kept test or suite reads for its cases through a name (the
-  arguments of a kept `.each(cases)` or `.for(cases)`, the head of a kept
-  loop such as `for (const c of cases)` or `cases.forEach(...)` whose body
-  declares a test, the arguments of a kept call of a function of the file
-  that declares a test; followed through every name such a declaration reads
-  to the declaration of that name in the same file); every deleted part,
-  and every test it deletes (`test.each(rows)(...)` counts as one test),
-  names an identifier or a string that the pull request removes from
-  its product scripts: a line the pull request deletes from a product script
-  holds it, and no product script the pull request changes holds it at the
-  head (an import of a name the head no longer uses may go with it). A
-  product script is a changed path outside the test side, with a script
-  extension, not a declaration file and not test code by its place or name.
-  Every test of the head version must pass before the fix and with it, and
-  the head reports every test of the earlier version (run in the tree with
-  the fix) except the ones a deleted test or suite declaration registers,
-  one for one: a deleted test stands for one test of its title (a deleted
-  `.each` over a literal list for one per row, over other cases for any
-  number), a deleted suite only for the tests inside it whose title is not a
-  literal, so a kept test of the same title that no longer runs is refused;
-  when the earlier version does not run with the fix (it imports what the
-  fix removes), the parser's reading above stands alone. A known gap: a
-  deleted element of a collection that a kept test reads in its body (not
-  for its cases), such as a mock object it hands to the code or a list it
-  loops over inside the test, is accepted when the element names what the
-  pull request removes (the test keeps its name, so no comparison of test
-  names sees it); and the gate follows cases to a declaration only along the
-  paths named above (not through a function parameter, another file or a
-  computed name). Review such deletions as you review a removed assertion. The
-  file stands only beside a proven file of the same pull request: without
-  one it is `NOT-RED-BEFORE`. A renamed test, a changed assertion or title,
-  a moved line or an added line is not a removal edit and must fail first;
-  when a file is refused, its `NOT-RED-BEFORE` reason says why it is not a
-  removal edit. There is no input that widens this rule.
+  of the file with the TypeScript parser and accepts the edit only when all
+  of these hold.
+  (1) Shape: both versions parse; the head's code is the earlier code with
+  whole statements, whole elements of an object, array, import or export list
+  (with their commas) or whole JSX attributes deleted, and nothing added,
+  changed or moved; the parser reads the kept code alike (a deletion after
+  which `sink` and `[0].forEach(...)` join is refused); comments may change,
+  but a comment line with an `@...` pragma, a `red-first-` marker or a
+  `/// <...>` line stays exactly as it was and where it was (its header line,
+  or the code it precedes).
+  (2) Nothing that asserts goes, except with a whole test or suite: deleted
+  code that asserts (`expect`, `assert`, `.should`, the matchers, the named
+  Node assertions, any name bound from an assertion module, and the
+  asserting exports of the runner however they are reached: named, renamed,
+  aliased, as members such as `require("node:assert").strict` or through a
+  whole-module binding such as `v.expect.assertions(...)`) is refused; and
+  every call, `new` or tagged template in deleted code outside a whole test
+  or suite must be one the gate knows asserts nothing: the runner's mock and
+  hook functions (`vi.*`, `jest.*`, node's `mock`, `beforeEach`, ...), or a
+  name the pull request removes from its product scripts reached from a
+  binding of the repository's own code (a relative or alias import that is
+  not test code by its place or name). Any other call (a helper, a package
+  function such as `screen.getByText`, a parameter, a global), a `throw`, or
+  an `await` of anything but such a call is refused. No deleted part sits in
+  an assertion, in the title or cases of a kept test or suite, or in a
+  declaration a kept test or suite reads for its cases (followed by name in
+  the file).
+  (3) Evidence: every deleted part names an identifier that the pull request
+  deletes from the code of a product script (an identifier token on a deleted
+  line of a product script's earlier version; a comment, a blank line or the
+  text of a string is not evidence) and that no changed product script still
+  holds at the head; an import of a name the head no longer uses may go with
+  it. Every deleted test names such an identifier in its code (body, other
+  arguments, `.each` cases), not in its title, and not a name the file
+  declares itself. A product script is a changed path outside the test side,
+  with a script extension, not a declaration file and not test code by its
+  place or name.
+  (4) Runs: every test of the head passes before the fix and with it; the
+  earlier version runs with the fix (when it does not, for example because
+  it imports what the fix removes, the edit is not a removal edit); and each
+  test its report lists that the head no longer reports is matched one for
+  one to a deleted declaration of that title (a deleted test for one, a
+  `.each` over a literal list for one per row), but only when no kept
+  declaration may register that name, or the head still reports that name
+  as often as the kept declarations of it register at most (a kept title that
+  is not a literal, or a kept declaration in a loop or a helper, may register
+  any number, so a dropped test of a name it may match is refused).
+  A known gap: a deleted element of a collection that a kept test reads in
+  its body (a mock object it hands to the code) is accepted when the element
+  names what the pull request removes; and a test registered from outside
+  the file (an imported helper, a setup global) that shares its name with a
+  deleted declaration is not told apart from it. Review such deletions as you
+  review a removed assertion. The file stands only beside a proven file of
+  the same pull request: without one it is `NOT-RED-BEFORE`. Anything else is
+  not a removal edit and must fail first; a refused file's `NOT-RED-BEFORE`
+  reason says why. There is no input that widens this rule.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit

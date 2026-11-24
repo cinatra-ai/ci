@@ -34,11 +34,13 @@
 //   - REMOVAL: a changed file whose edit only deletes code (whole tests,
 //     statements, list elements or JSX attributes; no line of code added or
 //     changed, the retained code parsed alike, no pragma line changed or
-//     moved, no assertion of a kept test touched, no case a kept test or
-//     suite reads by name deleted, no kept test lost), where every deleted part
-//     names an identifier or a string that the pull request removes from its
-//     product scripts, and whose tests pass before the fix and with it; it
-//     stands only beside a proven file of the same pull request.
+//     moved, no assertion of a kept test touched, no deleted call outside a
+//     whole test that may assert, no case a kept test or suite reads by name
+//     deleted, no kept test lost by the earlier version's run with the fix),
+//     where every deleted part, and every deleted test by its code, names an
+//     identifier that the pull request deletes from the code of its product
+//     scripts, and whose tests pass before the fix and with it; it stands
+//     only beside a proven file of the same pull request.
 // A run is a PASS only with at least one proven file; with notes only it is
 // RED (NOTHING-PROVEN): a green job always has a proven file.
 // Anything it cannot read or prove ends RED with a named reason. A pull request
@@ -1188,9 +1190,16 @@ function fileBindings(ts, file) {
   const asserts = new Set();
   const declared = new Set();
   const handled = new Set();
+  // runnerAll: every local name bound from a runner module -> its export ("*"
+  // for the whole module); imports: every other local name bound from a
+  // module -> the module's specifier.
+  const runnerAll = new Map();
+  const imports = new Map();
   const bind = (local, mod, imported) => {
     handled.add(local);
     const name = local.text;
+    if (RUNNER_MODULES.has(mod)) runnerAll.set(name, imported);
+    else if (!ASSERT_MODULES.has(mod)) imports.set(name, mod);
     if (ASSERT_MODULES.has(mod)) {
       asserts.add(name);
       declared.add(name);
@@ -1230,15 +1239,24 @@ function fileBindings(ts, file) {
     return false;
   });
   // A name bound from a name that asserts, or from one of its members
-  // (`const check = assert.strict`, `const { equal } = assert`), asserts too.
-  const aliasRoot = (expr) => {
-    while (expr && (ts.isParenthesizedExpression(expr) || ts.isAwaitExpression(expr) || ts.isNonNullExpression(expr) || ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr))) expr = expr.expression;
-    return expr && ts.isIdentifier(expr) ? expr.text : null;
+  // (`const check = assert.strict`, `const { equal } = assert`), asserts too;
+  // so does a name bound from an asserting export of a whole runner module
+  // (`const e = v.expect`, `const { expect: e } = v`).
+  const aliasAsserts = (n) => {
+    const chain = memberChain(ts, n.initializer);
+    if (!chain) return false;
+    if (asserts.has(chain.root)) return true;
+    if (!runnerNs.has(chain.root)) return false;
+    if (chain.members.length) return RUNNER_ASSERTIONS.has(chain.members[0]);
+    return ts.isObjectBindingPattern(n.name) && n.name.elements.some((el) => {
+      const key = el.propertyName ?? el.name;
+      return ts.isIdentifier(key) && RUNNER_ASSERTIONS.has(key.text);
+    });
   };
   for (let grown = true; grown; ) {
     grown = false;
     nodesWhere(ts, file, (n) => {
-      if (ts.isVariableDeclaration(n) && asserts.has(aliasRoot(n.initializer))) {
+      if (ts.isVariableDeclaration(n) && aliasAsserts(n)) {
         for (const id of boundNames(ts, n.name)) {
           if (!asserts.has(id.text)) {
             asserts.add(id.text);
@@ -1264,9 +1282,124 @@ function fileBindings(ts, file) {
     runner.delete(name);
     runnerNs.delete(name);
   }
-  let assertsRe = null;
-  if (asserts.size) assertsRe = new RegExp(`(?<![.\\w$])(?:${[...asserts].map((a) => escapeRegExp(a)).join("|")})\\s*[.(]`);
-  return { runner, runnerNs, declared, assertsRe };
+  // A local declaration of a name that is also bound from a module shadows it
+  // somewhere: the name is read as the file's own (neither the runner's nor
+  // a module's).
+  const locals = new Set();
+  nodesWhere(ts, file, (n) => {
+    let names = [];
+    if (ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n)) names = boundNames(ts, n.name);
+    else if ((ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isEnumDeclaration(n)) && n.name) names = [n.name];
+    for (const id of names) if (!handled.has(id)) locals.add(id.text);
+    return false;
+  });
+  for (const name of locals) {
+    runnerAll.delete(name);
+    imports.delete(name);
+  }
+  // An asserting name is read in code as a call or a member of it; the
+  // asserting exports of a whole runner module also through a member
+  // (`v.expect(`, `v.expect.assertions(`, `v["assert"]`).
+  const sources = [];
+  if (asserts.size) sources.push(`(?<![.\\w$])(?:${[...asserts].map((a) => escapeRegExp(a)).join("|")})\\s*[.([]`);
+  if (runnerNs.size) sources.push(`(?<![.\\w$])(?:${[...runnerNs].map((a) => escapeRegExp(a)).join("|")})\\s*(?:\\.\\s*|\\[\\s*["'\\x60])(?:${[...RUNNER_ASSERTIONS].join("|")})(?![\\w$])`);
+  const assertsRe = sources.length ? new RegExp(sources.join("|")) : null;
+  return { runner, runnerNs, declared, assertsRe, asserts, runnerAll, imports, locals };
+}
+
+// The root name and member names of a callee or an initializer: `a.b["c"]`
+// is { root: "a", members: ["b", "c"] }, read through parentheses, `!`, type
+// assertions, `await`, and calls (`a().b` is a member of a). Null when the
+// root is not a name or a member is computed.
+function memberChain(ts, expr) {
+  const members = [];
+  for (;;) {
+    if (!expr) return null;
+    if (ts.isParenthesizedExpression(expr) || ts.isNonNullExpression(expr) || ts.isAsExpression(expr) || ts.isTypeAssertionExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isAwaitExpression(expr)) expr = expr.expression;
+    else if (ts.isPropertyAccessExpression(expr)) {
+      members.unshift(expr.name.text);
+      expr = expr.expression;
+    } else if (ts.isElementAccessExpression(expr)) {
+      if (!ts.isStringLiteralLike(expr.argumentExpression)) return null;
+      members.unshift(expr.argumentExpression.text);
+      expr = expr.expression;
+    } else if (ts.isCallExpression(expr)) expr = expr.expression;
+    else if (ts.isTaggedTemplateExpression(expr)) expr = expr.tag;
+    else break;
+  }
+  return ts.isIdentifier(expr) ? { root: expr.text, members } : null;
+}
+
+// The runner exports that call no assertion: its mock and hook functions.
+const RUNNER_QUIET = new Set(["vi", "vitest", "jest", "mock", "beforeEach", "afterEach", "beforeAll", "afterAll", "before", "after"]);
+// The globals of a runner that call no assertion.
+const RUNNER_QUIET_GLOBALS = new Set(["vi", "jest", "beforeEach", "afterEach", "beforeAll", "afterAll", "before", "after"]);
+// A module specifier of the repository's own code (relative, absolute or an
+// alias), not a package.
+const REPOSITORY_SPEC_RE = /^(?:\.{1,2}\/|\/|@\/|~\/|#)/;
+
+// Whether the gate knows that a call (a call, a `new` or a tagged template)
+// asserts nothing: its callee is the runner's mock or hook function (`vi.fn`,
+// `vi.mock`, `beforeEach`), or a name that the pull request removes from its
+// product scripts (removedName), reached from a name the file binds from the
+// repository's own code that is not test code by its place or name
+// (`removedFeature()`, `panel.removedFeature()`, `new RemovedThing()`). Every
+// other callee (an assertion, a helper of the file or of a test module, a
+// package, a parameter, a global, a computed callee) may assert.
+function quietCall(ts, bindings, node, removedName) {
+  const callee = ts.isTaggedTemplateExpression(node) ? node.tag : node.expression;
+  if (ts.isCallExpression(node) && (callee.kind === ts.SyntaxKind.ImportKeyword || callee.kind === ts.SyntaxKind.SuperKeyword)) return false;
+  const chain = memberChain(ts, callee);
+  if (!chain) return false;
+  const { root, members } = chain;
+  if (bindings.locals.has(root)) return false;
+  if (bindings.runnerAll.has(root)) {
+    const exported = bindings.runnerAll.get(root);
+    return RUNNER_QUIET.has(exported === "*" ? members[0] : exported);
+  }
+  if (bindings.asserts.has(root)) return false;
+  const spec = bindings.imports.get(root);
+  if (spec !== undefined) {
+    return REPOSITORY_SPEC_RE.test(spec) && !TEST_PLACE_RE.test(`${spec}/`) && !TEST_NAME_RE.test(posix.basename(spec)) && [root, ...members].some((name) => removedName(name));
+  }
+  if (bindings.declared.has(root)) return false;
+  return RUNNER_QUIET_GLOBALS.has(root);
+}
+
+// The first part of deleted code (outside a whole test or suite it holds)
+// that may assert: a call quietCall cannot read as quiet, a `throw`, an
+// `await` or `yield` of anything but such a call. A test or suite
+// declaration inside the deleted code (not inside a test) is a deleted test:
+// its own body is not read here. Returns the node, or null.
+function loudPart(ts, bindings, unit, removedName) {
+  const inTest = (node) => {
+    for (let p = node.parent; p; p = p.parent) if (isTestLikeCall(ts, bindings, p, ["test"])) return true;
+    return false;
+  };
+  let found = null;
+  const visit = (node) => {
+    if (found) return;
+    if (node !== unit && ts.isCallExpression(node) && isDeclaration(ts, bindings, node, ["test", "suite"]) && !inTest(node)) return;
+    if (ts.isCallExpression(node) || ts.isNewExpression(node) || ts.isTaggedTemplateExpression(node)) {
+      if (!quietCall(ts, bindings, node, removedName)) {
+        found = node;
+        return;
+      }
+    } else if (ts.isThrowStatement(node) || ts.isYieldExpression(node)) {
+      found = node;
+      return;
+    } else if (ts.isAwaitExpression(node)) {
+      let e = node.expression;
+      while (e && (ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e))) e = e.expression;
+      if (!e || !(ts.isCallExpression(e) || ts.isNewExpression(e) || ts.isTaggedTemplateExpression(e))) {
+        found = node;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(unit);
+  return found;
 }
 
 // What a call's callee is to the runner: "test", "suite" or null, read through
@@ -1521,14 +1654,36 @@ function hasWord(text, word) {
   return false;
 }
 
-// Whether the pull request removes a name from the product code: a line it
-// deletes from a product file holds it, and no product file the pull request
-// changes holds it at the head (a deleted file holds nothing). An identifier
-// is matched as a whole word, a string literal's text as a part of a line.
-// product: [{ path, removed: [lines], head: text | null }].
-function removedByPullRequest(name, word, product) {
-  const has = word ? (text) => hasWord(text, name) : (text) => text.includes(name);
-  return product.some((p) => p.removed.some(has)) && product.every((p) => p.head === null || !has(p.head));
+// The identifiers the pull request deletes from the code of its product
+// scripts: an identifier token (codeTokens; a comment, a blank and the text
+// of a string are no identifier token) on a line the pull request deletes,
+// in the earlier version of a product script that parses cleanly. A script
+// the pull request adds, or one that does not parse, gives none.
+// product: [{ path, base: text | null, hunks, head: text | null }].
+function deletedCodeNames(product) {
+  const out = new Set();
+  for (const p of product) {
+    if (typeof p.base !== "string") continue;
+    const lines = new Set();
+    for (const h of p.hunks) for (let l = h.oldStart; l < h.oldStart + h.oldCount; l += 1) lines.add(l);
+    if (lines.size === 0) continue;
+    const parsed = parse(p.base, p.path);
+    if (parsed.unsure) continue;
+    const ts = parsed.ts;
+    for (const t of codeTokens(ts, parsed.file).tokens) {
+      if (lines.has(t.line) && (ts.isIdentifier(t.node) || ts.isPrivateIdentifier(t.node))) out.add(t.text);
+    }
+  }
+  return out;
+}
+
+// Whether the pull request removes an identifier from the product code: it
+// deletes the identifier from the code of a product script
+// (deletedCodeNames), and no product script the pull request changes holds
+// the word at the head anywhere, a comment included (a deleted script holds
+// nothing). A string's text is never evidence.
+function removedByPullRequest(name, deletedNames, product) {
+  return deletedNames.has(name) && product.every((p) => p.head === null || !hasWord(p.head, name));
 }
 
 // A changed test file whose edit only deletes what the same pull request
@@ -1546,27 +1701,36 @@ function removedByPullRequest(name, word, product) {
 //   - the head's syntax tree is the earlier tree less the deleted nodes (the
 //     parser reads the retained code alike);
 //   - deleted code that asserts (asserts: ASSERTION_RE, with the named Node
-//     assertions, and the names the file binds from an assertion module) is
-//     a whole test or suite, read through the runner's binding (calleeRole),
-//     never a call inside a kept test; no deleted part sits inside an
-//     assertion, in the title or the cases of a test or suite the file keeps,
-//     or in a declaration a kept test or suite reads for its cases
-//     (caseDeclarations);
-//   - every deleted part, and every test it deletes (`test.each(rows)(...)`
-//     is one test), names an identifier or a string that the pull request
-//     removes from the product code (removedByPullRequest), except an import
-//     of a name the head no longer uses; at least one part names one.
+//     assertions, the names the file binds from an assertion module, and the
+//     asserting exports of a runner module bound whole) is a whole test or
+//     suite, read through the runner's binding (calleeRole), never a call
+//     inside a kept test; deleted code outside a whole test or suite calls
+//     nothing that may assert (loudPart, quietCall); no deleted part sits
+//     inside an assertion, in the title or the cases of a test or suite the
+//     file keeps, or in a declaration a kept test or suite reads for its
+//     cases (caseDeclarations);
+//   - every deleted part names an identifier that the pull request deletes
+//     from the code of its product scripts (removedByPullRequest), except an
+//     import of a name the head no longer uses, and every test it deletes
+//     (`test.each(rows)(...)` is one test) names one in its code, not its
+//     title, that is not a name the file declares itself (exercised); at
+//     least one part names one.
+// The dropped tests are judged from the earlier version's run (judgeFile,
+// unaccounted), with keptTitles.
 // file: the test file's path; earlier, source: its merge-base and head texts;
 // hunks: its line diff (parseDiffHunks); product: the pull request's product
-// scripts (removedByPullRequest). Returns { ok: true, parts, tests, names,
-// deletedTitles } (deletedTitles: [{ title, most }], the RegExp of the test
+// scripts (deletedCodeNames). Returns { ok: true, parts, tests, names,
+// deletedTitles, keptTitles } (keptTitles: [{ title, most }], the names a
+// kept declaration may register, title null for any name;
+// deletedTitles: [{ title, most }], the RegExp of the test
 // names a deleted declaration registers, declarationPattern, and how many it
 // registers at most, registrations) or { ok: false, why }.
 export function removalEdit({ file, earlier, source, hunks, product }) {
   const no = (why) => ({ ok: false, why });
   if (typeof earlier !== "string" || typeof source !== "string") return no("a version of the file is not readable");
   if (!Array.isArray(hunks) || hunks.length === 0) return no("the file's diff is not readable");
-  if (!Array.isArray(product) || product.some((p) => !Array.isArray(p.removed))) return no("a product file's diff is not readable");
+  const text0 = (v) => typeof v === "string" || v === null;
+  if (!Array.isArray(product) || product.some((p) => !p || !Array.isArray(p.hunks) || !text0(p.base) || !text0(p.head))) return no("a product file's diff is not readable");
   const before = parse(earlier, file);
   const after = parse(source, file);
   if (before.unsure || after.unsure) return no("a version of the file does not parse cleanly");
@@ -1591,9 +1755,10 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   if (typeof deleted === "string") return no(`the edit is not deletion only (${deleted})`);
   if (!deleted.includes(true)) return no("the edit deletes no code");
   const usedNow = new Set(now.tokens.filter((t) => ts.isIdentifier(t.node)).map((t) => t.text));
-  // The longest name of a part that the pull request removes, or null.
-  const removed = (m) =>
-    [...[...m.words].filter((w) => removedByPullRequest(w, true, product)), ...[...m.texts].filter((s) => removedByPullRequest(s, false, product))].sort((a, b) => b.length - a.length)[0] ?? null;
+  const deletedNames = deletedCodeNames(product);
+  const removedName = (word) => removedByPullRequest(word, deletedNames, product);
+  // The longest identifier of a set that the pull request removes, or null.
+  const removed = (words) => [...words].filter(removedName).sort((a, b) => b.length - a.length)[0] ?? null;
   const tokens = old.tokens;
   const text = (k) => tokens[k].text;
   const units = [];
@@ -1659,6 +1824,30 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   // `.each(cases)`, a kept loop that declares tests): a deletion in one would
   // drop a case, and so a test, of a kept declaration.
   const caseDecls = caseDeclarations(ts, before.file, bindings, kept);
+  // The identifiers a deleted test exercises: those of its code, not of its
+  // title (its body, its other arguments, the cases of its `.each` /
+  // `.for`), and not a name the file declares itself (a local of the same
+  // name is not the product's).
+  const exercised = (call) => {
+    const words = new Set();
+    const add = (node) => {
+      if (node) for (const w of mentions(ts, node).words) if (!bindings.locals.has(w)) words.add(w);
+    };
+    call.arguments.forEach((a, k) => {
+      if (k > 0) add(a);
+    });
+    for (let e = call.expression; e; ) {
+      if (ts.isCallExpression(e)) {
+        e.arguments.forEach(add);
+        e = e.expression;
+      } else if (ts.isTaggedTemplateExpression(e)) {
+        add(e.template);
+        e = e.tag;
+      } else if (ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e) || ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+      else break;
+    }
+    return words;
+  };
   const names = [];
   const deletedTitles = [];
   let parts = 0;
@@ -1672,6 +1861,13 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
     for (let p = unit.parent; p; p = p.parent) if (isTestLikeCall(ts, bindings, p, ["test"])) inKeptTest = true;
     const declaration = !inKeptTest && kind === "statement" && ts.isExpressionStatement(unit) && isDeclaration(ts, bindings, unit.expression, ["test", "suite"]);
     if (!declaration && asserts(codeOf(tokens, before.file, unit), bindings)) return no(`the deleted code at line ${line} removes an assertion from a test the file keeps`);
+    // Deleted code outside a whole test or suite calls only what the gate
+    // knows asserts nothing (quietCall), and throws or awaits nothing else.
+    const loud = declaration ? null : loudPart(ts, bindings, unit, removedName);
+    if (loud) {
+      const at = before.file.getLineAndCharacterOfPosition(loud.getStart(before.file)).line + 1;
+      return no(`the deleted code at line ${at} (${clip(codeOf(tokens, before.file, loud), 80)}) may assert: a deleted part outside a whole test or suite calls only the runner's mock and hook functions or a name the pull request removes from its product scripts, and throws or awaits nothing else`);
+    }
     let inBody = false;
     for (let p = unit.parent; p; p = p.parent) {
       if (isAssertionCall(ts, tokens, before.file, p, bindings)) return no(`the deleted code at line ${line} changes an assertion`);
@@ -1683,7 +1879,7 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
     if (reads) return no(`the deleted code at line ${line} is a part of ${reads.name}, which a kept test or suite reads for its cases (a deletion there drops a case of a kept test)`);
     for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, bindings, n, ["test"]))) {
       tests += 1;
-      if (!removed(mentions(ts, call))) return no(`the test deleted at line ${before.file.getLineAndCharacterOfPosition(call.getStart(before.file)).line + 1} names nothing the pull request removes from the product code`);
+      if (!removed(exercised(call))) return no(`the test deleted at line ${before.file.getLineAndCharacterOfPosition(call.getStart(before.file)).line + 1} exercises nothing the pull request removes from the product code (its code, not its title, names no identifier the pull request deletes from the code of its product scripts)`);
     }
     // Each deleted declaration stands for as many test names as it registers
     // (registrations); a suite's title stands only for the tests inside it
@@ -1700,7 +1896,7 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
       }
       if (most > 0) deletedTitles.push({ title, most });
     }
-    const name = removed(mentions(ts, unit));
+    const name = removed(mentions(ts, unit).words);
     if (name) {
       parts += 1;
       if (!names.includes(name)) names.push(name);
@@ -1709,7 +1905,22 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
     }
   }
   if (parts === 0) return no("no deleted code names something the pull request removes from the product code");
-  return { ok: true, parts, tests, names, deletedTitles };
+  // The test names the code the file keeps may register: every kept test
+  // declaration by the wide reading (a title that is not a literal matches
+  // any name: title null), with how many it registers at most; and a kept
+  // suite whose callback is not written in place (its tests are not read
+  // here: any number under its title).
+  const keptTitles = [];
+  nodesWhere(ts, before.file, (n) => {
+    if (!ts.isCallExpression(n) || !kept(n) || (ts.isCallExpression(n.parent) && n.parent.expression === n)) return false;
+    if (isTestLikeCall(ts, bindings, n, ["test"])) keptTitles.push({ title: declarationPattern(ts, tokens, before.file, n, false), most: registrations(ts, bindings, n) });
+    else if (isTestLikeCall(ts, bindings, n, ["suite"])) {
+      const callback = n.arguments.at(-1);
+      if (n.arguments.length < 2 || !callback || !(ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) keptTitles.push({ title: declarationPattern(ts, tokens, before.file, n, true), most: Infinity });
+    }
+    return false;
+  });
+  return { ok: true, parts, tests, names, deletedTitles, keptTitles };
 }
 
 // Repository paths a missing-module text may mean: an absolute path inside the
@@ -2018,13 +2229,27 @@ function addedTests(tests, earlier) {
   return added;
 }
 
-// The dropped tests that no deleted declaration accounts for: a matching of
-// the dropped tests to the declarations whose title matches their names, each
-// declaration taking at most its `most` tests (a malformed entry takes none).
-// titles: removalEdit's deletedTitles.
-function unaccounted(dropped, titles) {
+// The dropped tests that no deleted declaration accounts for. A dropped test
+// is a name of the earlier version's report that the head no longer reports,
+// so it registered; a deleted declaration accounts for it only when no
+// declaration the file keeps may have registered it: every kept declaration
+// whose title matches its name (keptTitles; a title null matches any name)
+// registers a bounded number of tests, and the head still reports that name
+// at least as often as those kept declarations register at most (they all
+// still run). The rest are matched to the deleted declarations whose title
+// matches their names, each declaration taking at most its `most` tests (a
+// malformed entry takes none). titles, keptTitles: removalEdit's
+// deletedTitles and keptTitles; headTests: the head's report.
+function unaccounted(dropped, titles, keptTitles, headTests) {
+  const keptValid = (k) => (k?.title === null || k?.title instanceof RegExp) && ((Number.isInteger(k.most) && k.most >= 0) || k.most === Infinity);
+  if (!Array.isArray(keptTitles) || !keptTitles.every(keptValid)) return dropped;
+  const keptMay = (name) => {
+    const n = normalizeText(name);
+    const most = keptTitles.filter((k) => k.title === null || k.title.test(n)).reduce((sum, k) => sum + k.most, 0);
+    return most > 0 && !(most !== Infinity && headTests.filter((t) => t.name === name).length >= most);
+  };
   const valid = titles.filter((d) => d?.title instanceof RegExp && ((Number.isInteger(d.most) && d.most > 0) || d.most === Infinity));
-  const fits = dropped.map((t) => valid.map((d, j) => (d.title.test(normalizeText(t.name)) ? j : -1)).filter((j) => j >= 0));
+  const fits = dropped.map((t) => (keptMay(t.name) ? [] : valid.map((d, j) => (d.title.test(normalizeText(t.name)) ? j : -1)).filter((j) => j >= 0)));
   const taken = valid.map(() => []);
   const place = (i, seen) => {
     for (const j of fits[i]) {
@@ -2136,28 +2361,28 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         // not load with the fix: it imports what the fix removes); a refusal
         // is named on the file's reason.
         const removal = status === "A" || !context.removal ? null : context.removal();
-        const notRemoval = removal && !removal.ok ? `; not a removal edit: ${removal.why}` : "";
         // A removal edit keeps every test it does not delete: each test of
         // the earlier version (run with the fix) that the head no longer
-        // reports must be one a deleted declaration registers. When the
-        // earlier version cannot run with the fix (it imports what the fix
-        // removes), the parser's reading stands alone: removalEdit holds the
-        // head's tree to the earlier tree less the deleted nodes.
+        // reports must be one a deleted declaration registers (unaccounted).
+        // What the earlier version registered is read from its run, never
+        // from its syntax: when the earlier version cannot run with the fix
+        // (it imports what the fix removes), the edit is not a removal edit.
         // One for one: a deleted declaration accounts for at most as many
         // dropped tests as it registers (`most`), so a title that is missing
         // more often than it is deleted leaves a dropped test unaccounted.
+        const notRemoval = removal && !removal.ok ? `; not a removal edit: ${removal.why}` : removal?.ok && why ? "; not a removal edit: a removal edit is read against the run of the file's earlier version with the fix, which names the tests it registered" : "";
         const titles = Array.isArray(removal?.deletedTitles) ? removal.deletedTitles : [];
-        const stray = removal?.ok && !why ? unaccounted(dropped, titles) : [];
-        if (removal?.ok && added.length === 0 && pins.length === 0 && stray.length) {
-          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${stray.length} test(s) of the file's earlier version that no deleted test declaration names: ${stray.slice(0, 3).map((t) => t.name).join(" | ")}: not a removal edit (a removal edit keeps every test it does not delete)`);
+        const stray = removal?.ok && !why ? unaccounted(dropped, titles, removal.keptTitles, r.tests) : [];
+        if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})${notRemoval}`);
+        else if (removal?.ok && added.length === 0 && pins.length === 0 && stray.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${stray.length} test(s) of the file's earlier version that no deleted test declaration names: ${stray.slice(0, 3).map((t) => t.name).join(" | ")}: not a removal edit (a removal edit keeps every test it does not delete; a test of a name that a kept declaration may register counts as kept unless the head still reports every one of them)`);
         } else if (removal?.ok && added.length === 0 && pins.length === 0) {
           noClaim = {
             code: "REMOVAL",
             kind: "removal",
             detail: `the edit only deletes code: ${removal.parts} part(s)${removal.tests ? `, ${removal.tests} test(s) among them,` : ""} that name what the pull request removes from the product code (${clip(removal.names.slice(0, 3).join(", "), 160)}); all ${ran.length} test(s) pass before the fix and with it: not proven here`,
           };
-        } else if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})${notRemoval}`);
-        else if (dropped.length) {
+        } else if (dropped.length) {
           add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${dropped.length} test(s) of the file's earlier version: ${dropped.slice(0, 3).map((t) => t.name).join(" | ")} (a collateral edit or a pin keeps every existing test)${notRemoval}`);
         } else if (undeclared.length) {
           const names = undeclared.slice(0, 3).map((t) => t.name).join(" | ");
@@ -2812,7 +3037,7 @@ function rangeReader(repo, plan) {
         const diff = readHunks().get(path);
         product ??= plan.fixSide.filter(evidencePath).map((p) => {
           const entry = readHunks().get(p);
-          return { path: p, removed: entry && !entry.unreadable ? entry.removed : null, head: blob(plan.head, p) };
+          return { path: p, hunks: entry && !entry.unreadable ? entry.hunks : null, base: blob(plan.mergeBase, p), head: blob(plan.head, p) };
         });
         return removalEdit({ file: path, earlier: blob(plan.mergeBase, path), source: blob(plan.head, path), hunks: diff && !diff.unreadable ? diff.hunks : null, product });
       } catch (error) {
