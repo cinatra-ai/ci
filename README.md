@@ -2450,7 +2450,10 @@ codes alone.
   stays exactly as it was, in the same order and in the same place: none is
   added, changed, removed or moved across the first code of the file, and a
   pragma in the file's header, before the first code, keeps its line among
-  the header's comment lines); the deleted tokens are whole statements,
+  the header's comment lines, and a pragma after the first code stays on the
+  code that follows it, such as `/* @vite-ignore */` on its `import(...)`:
+  one that moves to other code, or whose code is deleted while the pragma is
+  kept, is refused); the deleted tokens are whole statements,
   whole elements of an object, an array or an import or export list (with
   their commas), or whole JSX attributes; the head's syntax tree is the
   earlier tree less the deleted nodes, so the parser reads the code it keeps
@@ -2461,7 +2464,11 @@ codes alone.
   `strictEqual(`, `deepStrictEqual(`, `ok(` or `throws(`, an `assert` member
   such as `t.assert.equal(`, and any name the file imports or requires from
   `node:assert`, `node:assert/strict`, `assert`, `chai`, or as `assert` or
-  `expect` from its runner, renamed or not) is a whole test or suite (`it`,
+  `expect` from its runner, renamed or not, also through a member such as
+  `require("node:assert").strict`, through `import x = require(...)` or
+  `await import(...)`, through a name bound from such a name such as
+  `const check = assert.strict`, or read in place such as
+  `require("node:assert").strict.equal(`) is a whole test or suite (`it`,
   `test`, `describe`, ...); a call is a test or suite only through the
   runner's binding (imported from `vitest`, `node:test`, `@jest/globals` or
   `mocha`, renamed or not), or as the bare global when the file neither
@@ -2484,7 +2491,11 @@ codes alone.
   extension, not a declaration file and not test code by its place or name.
   Every test of the head version must pass before the fix and with it, and
   the head reports every test of the earlier version (run in the tree with
-  the fix) except the ones a deleted test or suite declaration registers;
+  the fix) except the ones a deleted test or suite declaration registers,
+  one for one: a deleted test stands for one test of its title (a deleted
+  `.each` over a literal list for one per row, over other cases for any
+  number), a deleted suite only for the tests inside it whose title is not a
+  literal, so a kept test of the same title that no longer runs is refused;
   when the earlier version does not run with the fix (it imports what the
   fix removes), the parser's reading above stands alone. A known gap: a
   deleted element of a collection that a kept test reads in its body (not

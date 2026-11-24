@@ -2683,7 +2683,7 @@ test("removal review 1: a removal edit whose earlier version reports a test that
   const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
   const t = (name) => ({ name, status: "passed", text: null, assertion: false });
   const head = ok([t("kept a")]);
-  const removal = { ok: true, parts: 1, tests: 1, names: ["loadCapturePair"], deletedTitles: [/(?:^| )loadCapturePair pairs a gate$/] };
+  const removal = { ok: true, parts: 1, tests: 1, names: ["loadCapturePair"], deletedTitles: [{ title: /(?:^| )loadCapturePair pairs a gate$/, most: 1 }] };
   const judge = (earlierTests) => judgeFile({ file: "t.test.mjs", status: "M" }, head, head, { earlier: ok(earlierTests), changedTestLine: null, removal: () => removal });
   const accepted = judge([t("kept a"), t("loadCapturePair pairs a gate")]);
   assert.deepEqual([accepted.reasons.length, accepted.kind], [0, "removal"], JSON.stringify(accepted.reasons));
@@ -2723,8 +2723,8 @@ test("removal review 4: a deleted `test.each(cases)(...)` is one test, and a rem
   const rt = await checkRemoval(t, tagged, 'import { test } from "vitest";\ntest("kept", () => {});\n');
   assert.deepEqual([rt.ok, rt.tests], [true, 1], JSON.stringify(rt));
   // the deleted declaration's title matches the names its rows register
-  assert.ok(r.deletedTitles.some((re) => re.test("removed 1")), String(r.deletedTitles));
-  assert.ok(!r.deletedTitles.some((re) => re.test("kept")), String(r.deletedTitles));
+  assert.ok(r.deletedTitles.some((d) => d.title.test("removed 1") && d.most === 2), String(r.deletedTitles.map((d) => d.title)));
+  assert.ok(!r.deletedTitles.some((d) => d.title.test("kept")), String(r.deletedTitles.map((d) => d.title)));
 });
 
 // ---------------------------------------------------------------------------
@@ -2837,4 +2837,94 @@ test("removal: a deleted call of a `$` assertion binding is refused", async (t) 
   const r = await checkRemoval(t, before, after);
   assert.equal(r.ok, false, JSON.stringify(r));
   assert.match(r.why, /removes an assertion from a test the file keeps/);
+});
+
+// ---------------------------------------------------------------------------
+// Removal edits: a deleted declaration stands for as
+// many tests as it registers, an assertion module reached through a member is
+// still an assertion module, and a pragma after the first code stays on the
+// code that follows it.
+// ---------------------------------------------------------------------------
+
+async function judgeRemoval(removal, earlierNames, headNames) {
+  const { judgeFile } = await gateModule();
+  const ok = (names) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests: names.map((name) => ({ name, status: "passed", text: null, assertion: false })) } });
+  return judgeFile({ file: "t.test.mjs", status: "M" }, ok(headNames), ok(headNames), { earlier: ok(earlierNames), changedTestLine: null, removal: () => removal });
+}
+
+test("removal one for one: one deleted declaration accounts for one dropped test of its title, never for a kept test of the same title", async (t) => {
+  const head = 'import { test } from "vitest";\nif (globalThis.flag) test("same", () => {});\ntest("kept", () => {});\n';
+  const imp = 'import { loadCapturePair } from "../src/panel";\n';
+  const one = 'test("same", () => loadCapturePair());\n';
+  const r = await checkRemoval(t, `${head.replace("\n", `\n${imp}`)}${one}`, head);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  // the kept conditional `same` no longer runs, the explicit one is deleted:
+  // two tests of the title are gone, one declaration of it is deleted
+  const lost = await judgeRemoval(r, ["same", "same", "kept"], ["kept"]);
+  assert.deepEqual(lost.reasons.map((x) => x.code), ["NOT-RED-BEFORE"], JSON.stringify(lost));
+  assert.match(lost.reasons[0].detail, /1 test\(s\) of the file's earlier version that no deleted test declaration names: same/);
+  assert.equal(lost.kind, null);
+  // the nearest removal: the kept conditional test still runs (or did not run before)
+  assert.equal((await judgeRemoval(r, ["same", "same", "kept"], ["same", "kept"])).kind, "removal");
+  assert.equal((await judgeRemoval(r, ["same", "kept"], ["kept"])).kind, "removal");
+  // two deleted declarations of the title account for two dropped tests
+  const two = await checkRemoval(t, `${head.replace("\n", `\n${imp}`)}${one}${one}`, head);
+  assert.equal(two.ok, true, JSON.stringify(two));
+  assert.equal((await judgeRemoval(two, ["same", "same", "kept"], ["kept"])).kind, "removal");
+  // a deleted `.each` over a literal list accounts for its rows, no more
+  const rows = 'test.each([[1], [2]])("same %s", (n) => loadCapturePair(n));\n';
+  const each = await checkRemoval(t, `${head.replace("\n", `\n${imp}`)}${rows}`, head);
+  assert.equal(each.ok, true, JSON.stringify(each));
+  assert.equal((await judgeRemoval(each, ["same 1", "same 2", "kept"], ["kept"])).kind, "removal");
+  assert.equal((await judgeRemoval(each, ["same 1", "same 2", "same 3", "kept"], ["kept"])).kind, null);
+  // a deleted suite stands only for the tests inside it that no deleted test
+  // declaration of its own names
+  const suite = 'describe("same", () => {\n  test("loads", () => loadCapturePair());\n});\n';
+  const rs = await checkRemoval(t, `${head.replace("test }", "test, describe }").replace("\n", `\n${imp}`)}${suite}`, head.replace("test }", "test, describe }"));
+  assert.equal(rs.ok, true, JSON.stringify(rs));
+  assert.equal((await judgeRemoval(rs, ["same > loads", "kept"], ["kept"])).kind, "removal");
+  assert.equal((await judgeRemoval(rs, ["same > loads", "same", "kept"], ["kept"])).kind, null);
+});
+
+test("removal assertion module members: a deleted assertion through a member or a dynamic import of an assertion module is refused", async (t) => {
+  const body = (imp, call) => [`${imp}it("x", () => {\n  ${call};\n  expect(1).toBe(1);\n});\n`, `${imp}it("x", () => {\n  expect(1).toBe(1);\n});\n`];
+  for (const [imp, call] of [
+    ['const check = require("node:assert").strict;\n', "check.equal(removedFeature(), 1)"],
+    ['const check = require("assert").default;\n', "check.equal(removedFeature(), 1)"],
+    ['const { equal: same } = require("node:assert").strict;\n', "same(removedFeature(), 1)"],
+    ['const must = require("chai").expect;\n', "must(removedFeature()).to.equal(1)"],
+    ["", 'require("node:assert").strict.equal(removedFeature(), 1)'],
+    ['import check = require("node:assert");\n', "check.equal(removedFeature(), 1)"],
+    ['const check = (await import("node:assert")).strict;\n', "check.equal(removedFeature(), 1)"],
+    ['const { strict: check } = await import("node:assert");\n', "check.equal(removedFeature(), 1)"],
+    ['import assert from "node:assert";\nconst check = assert.strict;\n', "check.equal(removedFeature(), 1)"],
+    ['import { strict as check } from "node:assert";\n', "check.equal(removedFeature(), 1)"],
+    ['import check from "node:assert/strict";\n', "check.equal(removedFeature(), 1)"],
+  ]) {
+    const [before, after] = body(imp, call);
+    const r = await checkRemoval(t, before, after);
+    assert.equal(r.ok, false, `${imp}${call}\n${JSON.stringify(r)}`);
+    assert.match(r.why, /removes an assertion from a test the file keeps/, `${imp}${call}`);
+  }
+  // the nearest removal: a call that does not assert, beside the kept assertion
+  const imp = 'const check = require("node:assert").strict;\n';
+  const keep = `${imp}it("x", () => {\n  loadCapturePair();\n  check.equal(1, 1);\n});\n`;
+  const ok = await checkRemoval(t, keep, keep.replace("  loadCapturePair();\n", ""));
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+});
+
+test("removal pragma on its code: a pragma after the first code that moves to other code is refused", async (t) => {
+  const code = (first, second) => `import { it } from "vitest";\nconst a = "./a.js";\nconst b = "./b.js";\nloadCapturePair();\nexport const load = () => [import(${first}a), import(${second}b)];\nit("x", () => {});\n`;
+  const pragma = "/* @vite-ignore */ ";
+  const moved = await checkRemoval(t, code(pragma, ""), code("", pragma).replace("loadCapturePair();\n", ""));
+  assert.equal(moved.ok, false, JSON.stringify(moved));
+  assert.match(moved.why, /moves the comment pragma \/\* @vite-ignore \*\//);
+  // a pragma left on its line while the code it was on is deleted lands on other code
+  const orphan = 'import { it } from "vitest";\n// @ts-expect-error\nloadCapturePair();\nkept();\nit("x", () => {});\n';
+  const ro = await checkRemoval(t, orphan, orphan.replace("loadCapturePair();\n", ""));
+  assert.equal(ro.ok, false, JSON.stringify(ro));
+  assert.match(ro.why, /moves the comment pragma \/\/ @ts-expect-error/);
+  // the nearest removal: the pragma stays on the code it was on
+  const kept = await checkRemoval(t, code(pragma, ""), code(pragma, "").replace("loadCapturePair();\n", ""));
+  assert.equal(kept.ok, true, JSON.stringify(kept));
 });

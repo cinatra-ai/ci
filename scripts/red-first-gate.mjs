@@ -943,7 +943,7 @@ const ALIGN_MAX_CELLS = 4_000_000;
 
 // The code tokens of a parsed script, comments and blanks apart: [{ text,
 // start, end, line, node, chain }] (chain: the token's ancestors, outermost
-// first), and the text between them (the comments). JSX text counts with its
+// first); the text between them is the comments. JSX text counts with its
 // blanks collapsed; JSX text of blanks only is not a token.
 function codeTokens(ts, file) {
   const tokens = [];
@@ -963,23 +963,7 @@ function codeTokens(ts, file) {
     for (const kid of kids) visit(kid, next);
   };
   visit(file, []);
-  let gaps = "";
-  let at = 0;
-  for (const t of tokens) {
-    gaps += `${file.text.slice(at, t.start)}\n`;
-    at = t.end;
-  }
-  gaps += file.text.slice(at);
-  return { tokens, gaps };
-}
-
-// The comment lines (comment text between code tokens, one per line, blanks
-// trimmed at both ends) that hold a pragma, in file order.
-function pragmaLines(gaps) {
-  return gaps
-    .split(/\r?\n|\r|\u2028|\u2029/)
-    .map((line) => line.trim())
-    .filter((line) => PRAGMA_RE.test(line));
+  return { tokens };
 }
 
 // The shape of a parsed tree: every node's kind in nesting order, and the text
@@ -1150,6 +1134,32 @@ function requiredModule(ts, node) {
   return node && ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "require" && node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0]) ? node.arguments[0].text : null;
 }
 
+// The module an expression reads and the members it takes of it, or null:
+// `require("m")`, `await import("m")` and `import("m")`, through parentheses
+// and member accesses (`require("node:assert").strict` is { mod:
+// "node:assert", members: ["strict"] }).
+function moduleRead(ts, node) {
+  const members = [];
+  let expr = node;
+  for (;;) {
+    if (!expr) return null;
+    if (ts.isParenthesizedExpression(expr) || ts.isAwaitExpression(expr) || ts.isNonNullExpression(expr)) expr = expr.expression;
+    else if (ts.isPropertyAccessExpression(expr)) {
+      members.unshift(expr.name.text);
+      expr = expr.expression;
+    } else if (ts.isElementAccessExpression(expr) && ts.isStringLiteralLike(expr.argumentExpression)) {
+      members.unshift(expr.argumentExpression.text);
+      expr = expr.expression;
+    } else break;
+  }
+  const mod = requiredModule(ts, expr) ?? (ts.isCallExpression(expr) && expr.expression.kind === ts.SyntaxKind.ImportKeyword && expr.arguments.length >= 1 && ts.isStringLiteralLike(expr.arguments[0]) ? expr.arguments[0].text : null);
+  return mod === null ? null : { mod, members };
+}
+
+// The code of a whole assertion module read in place, without a binding:
+// `require("node:assert").strict.equal(...)`.
+const ASSERT_MODULE_READ_RE = new RegExp(String.raw`(?<![.\w$])(?:require|import)\s*\(\s*(["'\x60])(?:${[...ASSERT_MODULES].map((m) => escapeRegExp(m)).join("|")})\1\s*\)`);
+
 // The identifiers a binding name (an identifier or a destructuring pattern)
 // binds.
 function boundNames(ts, name, out = []) {
@@ -1199,18 +1209,48 @@ function fileBindings(ts, file) {
       const named = clause.namedBindings;
       if (named && ts.isNamespaceImport(named)) bind(named.name, mod, "*");
       else if (named) for (const s of named.elements) bind(s.name, mod, (s.propertyName ?? s.name).text);
-    } else if (ts.isVariableDeclaration(n) && requiredModule(ts, n.initializer) !== null) {
-      const mod = requiredModule(ts, n.initializer);
-      if (ts.isIdentifier(n.name)) bind(n.name, mod, mod === "node:test" ? "test" : "*");
+    } else if (ts.isImportEqualsDeclaration(n) && ts.isExternalModuleReference(n.moduleReference) && ts.isStringLiteralLike(n.moduleReference.expression)) {
+      const mod = n.moduleReference.expression.text;
+      bind(n.name, mod, mod === "node:test" ? "test" : "*");
+    } else if (ts.isVariableDeclaration(n) && moduleRead(ts, n.initializer) !== null) {
+      // `require("m")`, `await import("m")`, and a member of either
+      // (`require("node:assert").strict`): every name bound from an
+      // assertion module asserts; a runner export counts by its member.
+      const { mod, members } = moduleRead(ts, n.initializer);
+      const path = members.join(".");
+      if (ASSERT_MODULES.has(mod)) for (const id of boundNames(ts, n.name)) bind(id, mod, "*");
+      else if (ts.isIdentifier(n.name)) bind(n.name, mod, path === "" ? (mod === "node:test" ? "test" : "*") : path);
       else if (ts.isObjectBindingPattern(n.name)) {
         for (const el of n.name.elements) {
           const key = el.propertyName ?? el.name;
-          if (ts.isIdentifier(el.name) && ts.isIdentifier(key) && !el.dotDotDotToken) bind(el.name, mod, key.text);
+          if (ts.isIdentifier(el.name) && ts.isIdentifier(key) && !el.dotDotDotToken) bind(el.name, mod, path === "" ? key.text : `${path}.${key.text}`);
         }
       }
     }
     return false;
   });
+  // A name bound from a name that asserts, or from one of its members
+  // (`const check = assert.strict`, `const { equal } = assert`), asserts too.
+  const aliasRoot = (expr) => {
+    while (expr && (ts.isParenthesizedExpression(expr) || ts.isAwaitExpression(expr) || ts.isNonNullExpression(expr) || ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr))) expr = expr.expression;
+    return expr && ts.isIdentifier(expr) ? expr.text : null;
+  };
+  for (let grown = true; grown; ) {
+    grown = false;
+    nodesWhere(ts, file, (n) => {
+      if (ts.isVariableDeclaration(n) && asserts.has(aliasRoot(n.initializer))) {
+        for (const id of boundNames(ts, n.name)) {
+          if (!asserts.has(id.text)) {
+            asserts.add(id.text);
+            grown = true;
+          }
+          handled.add(id);
+          declared.add(id.text);
+        }
+      }
+      return false;
+    });
+  }
   nodesWhere(ts, file, (n) => {
     let names = [];
     if (ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n)) names = boundNames(ts, n.name);
@@ -1344,14 +1384,22 @@ function caseDeclarations(ts, file, bindings, kept) {
   return out;
 }
 
-// The comment lines that hold a pragma, each with its place: the line's index
-// among the comment lines before the first code token (the header), or
-// "code" after it.
-function pragmaPlaces(file, tokens, gaps) {
-  const header = file.text.slice(0, tokens.length ? tokens[0].start : file.text.length);
-  const headerLines = header.split(/\r?\n|\r|\u2028|\u2029/).map((l) => l.trim()).filter(Boolean);
-  const headerAt = headerLines.map((l, i) => (PRAGMA_RE.test(l) ? i : -1)).filter((i) => i >= 0);
-  return pragmaLines(gaps).map((text, k) => ({ text, place: k < headerAt.length ? `header comment line ${headerAt[k] + 1}` : "code" }));
+// The comment lines that hold a pragma, in file order, each with its place:
+// the line's index among the comment lines before the first code token (the
+// header), or "code" after it; and `next`, the index of the code token that
+// follows it (tokens.length at the end of the file), the code it is on.
+function pragmaPlaces(file, tokens) {
+  const out = [];
+  let at = 0;
+  for (let k = 0; k <= tokens.length; k += 1) {
+    const end = k < tokens.length ? tokens[k].start : file.text.length;
+    const lines = file.text.slice(at, end).split(/\r?\n|\r|\u2028|\u2029/).map((l) => l.trim()).filter(Boolean);
+    lines.forEach((text, i) => {
+      if (PRAGMA_RE.test(text)) out.push({ text, place: k === 0 ? `header comment line ${i + 1}` : "code", next: k });
+    });
+    if (k < tokens.length) at = tokens[k].end;
+  }
+  return out;
 }
 
 // The code of a node from the file's code tokens, comments left out (a blank
@@ -1375,10 +1423,11 @@ function isAssertionCall(ts, tokens, file, node, bindings) {
   return ts.isCallExpression(node) && asserts(`${codeOf(tokens, file, node.expression)}(`, bindings);
 }
 
-// Whether code states an assertion: ASSERTION_RE, or a call of a name the
-// file imports from an assertion module (fileBindings).
+// Whether code states an assertion: ASSERTION_RE, a call of a name the file
+// binds from an assertion module (fileBindings), or an assertion module read
+// in place (ASSERT_MODULE_READ_RE).
 function asserts(code, bindings) {
-  return ASSERTION_RE.test(code) || Boolean(bindings?.assertsRe?.test(code));
+  return ASSERTION_RE.test(code) || ASSERT_MODULE_READ_RE.test(code) || Boolean(bindings?.assertsRe?.test(code));
 }
 
 // The test names a deleted declaration registers, as a RegExp over a runner's
@@ -1408,6 +1457,36 @@ function declarationPattern(ts, tokens, file, call, suite) {
       .join("");
   const body = parts.map((p) => (p === null ? any : literal(p))).join("");
   return new RegExp(`(?:^|[\\s>])${body}${suite ? "(?:[\\s>]|$)" : "$"}`);
+}
+
+// How many tests a test or suite declaration registers at most: the rows of
+// its `.each` / `.for` over a literal list (unbounded over any other cases),
+// times the same for every test or suite whose callback holds it; one inside
+// a loop or inside any other function is unbounded (Infinity).
+function registrations(ts, bindings, call) {
+  const rows = (decl) => {
+    for (let e = decl.expression; e; ) {
+      const each = (x) => ts.isPropertyAccessExpression(x) && (x.name.text === "each" || x.name.text === "for");
+      if (ts.isCallExpression(e) && each(e.expression)) {
+        const list = e.arguments[0];
+        return list && ts.isArrayLiteralExpression(list) && !list.elements.some((x) => ts.isSpreadElement(x) || ts.isOmittedExpression(x)) ? list.elements.length : Infinity;
+      }
+      if (each(e) || (ts.isTaggedTemplateExpression(e) && each(e.tag))) return Infinity;
+      if (ts.isCallExpression(e) || ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e) || ts.isNonNullExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
+      else if (ts.isTaggedTemplateExpression(e)) e = e.tag;
+      else break;
+    }
+    return 1;
+  };
+  let most = rows(call);
+  for (let p = call.parent; p && most !== Infinity; p = p.parent) {
+    if (ts.isIterationStatement(p, false)) most = Infinity;
+    else if (ts.isFunctionLike(p)) {
+      const holder = p.parent;
+      most = holder && ts.isCallExpression(holder) && holder.arguments.includes(p) && isDeclaration(ts, bindings, holder, ["test", "suite"]) ? most * rows(holder) : Infinity;
+    }
+  }
+  return most;
 }
 
 // Every node under (and including) a node that passes `test`.
@@ -1460,8 +1539,8 @@ function removedByPullRequest(name, word, product) {
 //     code is added or changed;
 //   - the comment lines that hold a pragma (an @ pragma, a red-first marker,
 //     a /// line) are the same lines, in the same order and in the same
-//     place (pragmaPlaces: in the header, by line, or after the first code),
-//     in both versions;
+//     place (pragmaPlaces: in the header, by line, or after the first code,
+//     on the same retained code token), in both versions;
 //   - the deleted tokens are whole statements, object, array or import list
 //     elements, or JSX attributes (with the commas between list elements);
 //   - the head's syntax tree is the earlier tree less the deleted nodes (the
@@ -1480,8 +1559,9 @@ function removedByPullRequest(name, word, product) {
 // file: the test file's path; earlier, source: its merge-base and head texts;
 // hunks: its line diff (parseDiffHunks); product: the pull request's product
 // scripts (removedByPullRequest). Returns { ok: true, parts, tests, names,
-// deletedTitles } (deletedTitles: the RegExps of the test names the deleted
-// declarations register, declarationPattern) or { ok: false, why }.
+// deletedTitles } (deletedTitles: [{ title, most }], the RegExp of the test
+// names a deleted declaration registers, declarationPattern, and how many it
+// registers at most, registrations) or { ok: false, why }.
 export function removalEdit({ file, earlier, source, hunks, product }) {
   const no = (why) => ({ ok: false, why });
   if (typeof earlier !== "string" || typeof source !== "string") return no("a version of the file is not readable");
@@ -1493,8 +1573,8 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   const ts = before.ts;
   const old = codeTokens(ts, before.file);
   const now = codeTokens(ts, after.file);
-  const pragmasBefore = pragmaPlaces(before.file, old.tokens, old.gaps);
-  const pragmasAfter = pragmaPlaces(after.file, now.tokens, now.gaps);
+  const pragmasBefore = pragmaPlaces(before.file, old.tokens);
+  const pragmasAfter = pragmaPlaces(after.file, now.tokens);
   const pragmaAt = Array.from({ length: Math.max(pragmasBefore.length, pragmasAfter.length) }, (_, k) => k).find((k) => pragmasBefore[k]?.text !== pragmasAfter[k]?.text);
   if (pragmaAt !== undefined) {
     return no(`the edit changes the comment pragmas (${clip(pragmasBefore[pragmaAt]?.text ?? "nothing", 80)} becomes ${clip(pragmasAfter[pragmaAt]?.text ?? "nothing", 80)}): a comment line with an @ pragma, a red-first marker or a /// line stays exactly as it was`);
@@ -1544,6 +1624,22 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
     units.push(...cover);
     i = at + n;
   }
+  // A pragma after the first code also stays on the code it is on (the code
+  // token after it): `/* @vite-ignore */` acts on the import it precedes,
+  // `// @ts-expect-error` on the line after it. One that moves to other code,
+  // or whose code is deleted while the pragma is kept, is refused.
+  const retainedAt = new Map();
+  for (let k = 0, m = 0; k <= tokens.length; k += 1) {
+    if (k < tokens.length && deleted[k]) continue;
+    retainedAt.set(k, m);
+    m += 1;
+  }
+  const leftAt = pragmasBefore.findIndex((p, k) => p.place === "code" && retainedAt.get(p.next) !== pragmasAfter[k].next);
+  if (leftAt !== -1) {
+    const on = (list, k) => (k < list.length ? `${clip(list[k].text, 40)} at line ${list[k].line}` : "the end of the file");
+    const p = pragmasBefore[leftAt];
+    return no(`the edit moves the comment pragma ${clip(p.text, 80)} from the code it is on (${on(tokens, p.next)} before, ${on(now.tokens, pragmasAfter[leftAt].next)} at the head): a pragma after the first code stays on the code that follows it`);
+  }
   // The token check keeps the retained tokens in order; the parser must also
   // read them alike: the head's tree is the earlier tree less the deleted
   // nodes (a deletion that lets two statements join, as `x` and `[0].f()`
@@ -1589,9 +1685,20 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
       tests += 1;
       if (!removed(mentions(ts, call))) return no(`the test deleted at line ${before.file.getLineAndCharacterOfPosition(call.getStart(before.file)).line + 1} names nothing the pull request removes from the product code`);
     }
+    // Each deleted declaration stands for as many test names as it registers
+    // (registrations); a suite's title stands only for the tests inside it
+    // whose own title is not a literal (a test with a literal title is
+    // counted by its own declaration).
     for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, bindings, n, ["test", "suite"]))) {
-      const pattern = declarationPattern(ts, tokens, before.file, call, calleeRole(ts, bindings, call) === "suite");
-      if (pattern) deletedTitles.push(pattern);
+      const suite = calleeRole(ts, bindings, call) === "suite";
+      const title = declarationPattern(ts, tokens, before.file, call, suite);
+      if (!title) continue;
+      let most = registrations(ts, bindings, call);
+      if (suite) {
+        const inner = nodesWhere(ts, call, (n) => n !== call && isDeclaration(ts, bindings, n, ["test"]) && !declarationPattern(ts, tokens, before.file, n, false));
+        most = inner.reduce((sum, n) => sum + registrations(ts, bindings, n), 0);
+      }
+      if (most > 0) deletedTitles.push({ title, most });
     }
     const name = removed(mentions(ts, unit));
     if (name) {
@@ -1911,6 +2018,34 @@ function addedTests(tests, earlier) {
   return added;
 }
 
+// The dropped tests that no deleted declaration accounts for: a matching of
+// the dropped tests to the declarations whose title matches their names, each
+// declaration taking at most its `most` tests (a malformed entry takes none).
+// titles: removalEdit's deletedTitles.
+function unaccounted(dropped, titles) {
+  const valid = titles.filter((d) => d?.title instanceof RegExp && ((Number.isInteger(d.most) && d.most > 0) || d.most === Infinity));
+  const fits = dropped.map((t) => valid.map((d, j) => (d.title.test(normalizeText(t.name)) ? j : -1)).filter((j) => j >= 0));
+  const taken = valid.map(() => []);
+  const place = (i, seen) => {
+    for (const j of fits[i]) {
+      if (seen.has(j)) continue;
+      seen.add(j);
+      if (taken[j].length < valid[j].most) {
+        taken[j].push(i);
+        return true;
+      }
+      for (let k = 0; k < taken[j].length; k += 1) {
+        if (place(taken[j][k], seen)) {
+          taken[j][k] = i;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  return dropped.filter((_, i) => !place(i, new Set()));
+}
+
 // Why the run of a changed test file's earlier version cannot be compared, or
 // null when its tests were read.
 function earlierUnreadable(earlier) {
@@ -2008,8 +2143,11 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         // earlier version cannot run with the fix (it imports what the fix
         // removes), the parser's reading stands alone: removalEdit holds the
         // head's tree to the earlier tree less the deleted nodes.
+        // One for one: a deleted declaration accounts for at most as many
+        // dropped tests as it registers (`most`), so a title that is missing
+        // more often than it is deleted leaves a dropped test unaccounted.
         const titles = Array.isArray(removal?.deletedTitles) ? removal.deletedTitles : [];
-        const stray = removal?.ok && !why ? dropped.filter((t) => !titles.some((re) => re instanceof RegExp && re.test(normalizeText(t.name)))) : [];
+        const stray = removal?.ok && !why ? unaccounted(dropped, titles) : [];
         if (removal?.ok && added.length === 0 && pins.length === 0 && stray.length) {
           add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${stray.length} test(s) of the file's earlier version that no deleted test declaration names: ${stray.slice(0, 3).map((t) => t.name).join(" | ")}: not a removal edit (a removal edit keeps every test it does not delete)`);
         } else if (removal?.ok && added.length === 0 && pins.length === 0) {
