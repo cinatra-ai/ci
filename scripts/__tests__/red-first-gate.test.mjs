@@ -2510,3 +2510,145 @@ test("fold9 2: the allow-list: a namespace import, a dynamic import(), node:modu
     assert.deepEqual(await freshOf("src/m.mjs", base, head), ["real"], base);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Removal edits (owner entry 1220 A): a changed test file whose edit only
+// deletes what the pull request removes from the product code (a removed
+// test, or a removed mock or prop of something the product code no longer
+// has) is a REMOVAL note, beside a proven new test of the same pull request.
+// Every other edit keeps its refusal.
+// ---------------------------------------------------------------------------
+
+// The panel draws its title upper-case (the bug) and reads a capture pair;
+// the fix frames the title and removes the capture pair.
+const PANEL_BUG =
+  'export function loadCapturePair(gate) {\n  return gate ? { reviewed: gate } : null;\n}\nexport function panel(ports) {\n  const pair = ports.loadCapturePair?.(ports.gate) ?? null;\n  return { title: ports.readTitle().toUpperCase(), pair };\n}\n';
+const PANEL_FIX = "export function panel(ports) {\n  return { title: `[${ports.readTitle()}]` };\n}\n";
+// The fix that keeps loadCapturePair exported (only the panel stops reading it).
+const PANEL_FIX_KEEP = `export function loadCapturePair(gate) {\n  return gate ? { reviewed: gate } : null;\n}\n${PANEL_FIX}`;
+const FRAME_TEST = `${TEST_HEAD}import { panel } from "../src/panel.mjs";\n\ntest("the panel frames its title", () => {\n  assert.equal(panel({ readTitle: () => "a" }).title, "[a]");\n});\n`;
+const PORTS_OLD = 'const ports = {\n  readTitle: () => "a",\n  loadCapturePair: () => null,\n};\n';
+const PORTS_NEW = 'const ports = {\n  readTitle: () => "a",\n};\n';
+const TITLE_TEST = 'test("the panel has a title", () => {\n  assert.equal(typeof panel(ports).title, "string");\n});\n';
+const PAIR_TEST = 'test("loadCapturePair pairs a gate", () => {\n  assert.deepEqual(loadCapturePair("g"), { reviewed: "g" });\n});\n';
+// The existing file with a mock of the pair only, and with a test of it too.
+const MOCK_OLD = `${TEST_HEAD}import { panel } from "../src/panel.mjs";\n\n${PORTS_OLD}\n${TITLE_TEST}`;
+const MOCK_NEW = `${TEST_HEAD}import { panel } from "../src/panel.mjs";\n\n${PORTS_NEW}\n${TITLE_TEST}`;
+const PAIR_OLD = `${TEST_HEAD}import { panel, loadCapturePair } from "../src/panel.mjs";\n\n${PORTS_OLD}\n${TITLE_TEST}\n${PAIR_TEST}`;
+const PAIR_NEW = MOCK_NEW;
+const PANEL_BASE = (file) => ({ "package.json": '{ "type": "module" }\n', "src/panel.mjs": PANEL_BUG, "test/panel.test.mjs": file });
+
+test("removal 1: an edit that only drops the mock of what the fix removes is a REMOVAL note beside the proven new test: PASS", async (t) => {
+  const sc = scenario(t, { base: PANEL_BASE(MOCK_OLD), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": MOCK_NEW, "test/frame.test.mjs": FRAME_TEST } });
+  const summary = path.join(sc.root, "summary.md");
+  const r = runGate(sc, "run", ["--summary", summary]);
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), ["REMOVAL:test/panel.test.mjs"]);
+  assert.deepEqual(r.verdict.files.map((f) => `${f.file}:${f.kind}:${f.proven}`), ["test/frame.test.mjs:proven:true", "test/panel.test.mjs:removal:false"]);
+  assert.match(r.verdict.notes[0].detail, /the edit only deletes code: 1 part\(s\) that name what the pull request removes from the product code \(loadCapturePair\)/);
+  assert.match(r.stdout, /^RED-FIRST: PASS \(1 new test file\(s\) fail before the fix and pass with it; 1 changed test file\(s\) that only delete what the pull request removes, not proven here\)/m);
+  assert.match(fs.readFileSync(summary, "utf8"), /panel\.test\.mjs \| node \| no \(removal\)/);
+});
+
+test("removal 2: a removed test whose subject the pull request removes from the product code is a REMOVAL note: PASS", async (t) => {
+  const sc = scenario(t, { base: PANEL_BASE(PAIR_OLD), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": PAIR_NEW, "test/frame.test.mjs": FRAME_TEST } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(noteCodes(r), ["REMOVAL:test/panel.test.mjs"]);
+  assert.match(r.verdict.notes[0].detail, /the edit only deletes code: 3 part\(s\), 1 test\(s\) among them, that name what the pull request removes/);
+});
+
+test("removal 3: a deletion beside an added assertion is not a removal edit: RED (NOT-RED-BEFORE)", async (t) => {
+  const more = MOCK_NEW.replace('"string");\n', '"string");\n  assert.ok(panel(ports).title);\n');
+  const sc = scenario(t, { base: PANEL_BASE(MOCK_OLD), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": more, "test/frame.test.mjs": FRAME_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.deepEqual(noteCodes(r), []);
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /not a removal edit: the edit is not deletion only/);
+});
+
+test("removal 4: a deleted test whose subject the product code still has is not a removal edit: RED (NOT-RED-BEFORE)", async (t) => {
+  const sc = scenario(t, { base: PANEL_BASE(PAIR_OLD), head: { "src/panel.mjs": PANEL_FIX_KEEP, "test/panel.test.mjs": PAIR_NEW, "test/frame.test.mjs": FRAME_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  const detail = r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail;
+  assert.match(detail, /the edit removes 1 test\(s\) of the file's earlier version: loadCapturePair pairs a gate/);
+  assert.match(detail, /not a removal edit: the (?:deleted code|test deleted) at line \d+ names nothing the pull request removes from the product code/);
+});
+
+test("removal 5: a removal edit without a proven test in the pull request is RED (NOT-RED-BEFORE), never a note", async (t) => {
+  const sc = scenario(t, { base: PANEL_BASE(PAIR_OLD), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": PAIR_NEW } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.deepEqual(codes(r), ["NOT-RED-BEFORE"]);
+  assert.match(r.verdict.reasons[0].detail, /a removal edit is accepted only beside a proven test/);
+  assert.deepEqual(noteCodes(r), []);
+  assert.deepEqual(r.verdict.files.map((f) => `${f.kind}:${f.proven}`), ["null:false"]);
+});
+
+test("removal 6: a deletion that also renames a kept test is not a removal edit: RED (NOT-RED-BEFORE)", async (t) => {
+  const renamed = MOCK_NEW.replace("the panel has a title", "the panel draws a title");
+  const sc = scenario(t, { base: PANEL_BASE(MOCK_OLD), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": renamed, "test/frame.test.mjs": FRAME_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /not a removal edit: the edit is not deletion only/);
+});
+
+// removalEdit read directly: the hunks come from git's own line diff.
+function hunksOf(t, before, after) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "red-first-hunks-")));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "a"), before);
+  fs.writeFileSync(path.join(dir, "b"), after);
+  const r = spawnSync("git", ["diff", "--no-index", "-U0", "--no-color", "a", "b"], { cwd: dir, encoding: "utf8", env: ENV });
+  const hunks = [];
+  for (const m of r.stdout.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) hunks.push({ oldStart: +m[1], oldCount: m[2] === undefined ? 1 : +m[2], newStart: +m[3], newCount: m[4] === undefined ? 1 : +m[4] });
+  return hunks;
+}
+
+test("removalEdit: whole parts only, no assertion touched, every part names what the product code loses, no pragma added", async (t) => {
+  const { removalEdit, parseDiffHunks } = await gateModule();
+  const product = [{ path: "src/panel.tsx", removed: ["  capturePair?: Pair | null;", 'import { ReviewPinnedCapture } from "./review-pinned-capture";'], head: "export function Panel({ title }) { return title; }\n" }];
+  const check = (before, after, file = "src/a.test.tsx") => removalEdit({ file, earlier: before, source: after, hunks: hunksOf(t, before, after), product });
+  const MOCK = 'vi.mock("@/x/review-pinned-capture", () => ({\n  ReviewPinnedCapture: () => null,\n}));\n';
+  // a mock block, a JSX prop and the import of a name the head no longer uses
+  const jsxBefore = `import { describe, expect, it, vi } from "vitest";\n${MOCK}\nit("draws", () => {\n  render(<Panel title="a" capturePair={null} />);\n  expect(1).toBe(1);\n});\n`;
+  const jsxAfter = `import { describe, expect, it } from "vitest";\n\n// the pair is gone\nit("draws", () => {\n  render(<Panel title="a" />);\n  expect(1).toBe(1);\n});\n`;
+  const ok = check(jsxBefore, jsxAfter);
+  assert.deepEqual([ok.ok, ok.parts, ok.names], [true, 2, ["ReviewPinnedCapture", "capturePair"]], JSON.stringify(ok));
+  // two mocks of one shape: the run slides onto the whole deleted statement
+  const twoBefore = 'vi.mock("@/x/keep", () => ({ keep: () => 1 }));\nvi.mock("@/x/review-pinned-capture", () => ({ ReviewPinnedCapture: () => null }));\nvi.mock("@/x/keep2", () => ({ keep: () => 1 }));\n';
+  const twoAfter = 'vi.mock("@/x/keep", () => ({ keep: () => 1 }));\nvi.mock("@/x/keep2", () => ({ keep: () => 1 }));\n';
+  assert.equal(check(twoBefore, twoAfter, "src/a.test.ts").ok, true);
+  // an object element and its comma, on one line
+  assert.equal(check("const m = { a: 1, capturePair: null, b: 2 };\n", "const m = { a: 1, b: 2 };\n", "src/a.test.ts").ok, true);
+  // a comma alone, a part of a statement, a changed string: refused
+  assert.match(check("const m = [1, , 2];\n", "const m = [1, 2];\n", "src/a.test.ts").why, /not whole statements/);
+  assert.match(check("const capturePair = 1, b = 2;\n", "const b = 2;\n", "src/a.test.ts").why, /not whole statements/);
+  assert.match(check('const s = "capturePair";\n', 'const s = "pair";\n', "src/a.test.ts").why, /not deletion only/);
+  // an element of an assertion, an assertion of a kept test, a `.not`
+  assert.match(check("it('x', () => {\n  expect(m).toEqual({ a: 1, capturePair: null });\n});\n", "it('x', () => {\n  expect(m).toEqual({ a: 1 });\n});\n", "src/a.test.ts").why, /changes an assertion/);
+  assert.match(check("it('x', () => {\n  expect(capturePair).toBeNull();\n  expect(1).toBe(1);\n});\n", "it('x', () => {\n  expect(1).toBe(1);\n});\n", "src/a.test.ts").why, /removes an assertion from a test the file keeps/);
+  assert.match(check("it('x', () => {\n  expect(capturePair).not.toBe(1);\n});\n", "it('x', () => {\n  expect(capturePair).toBe(1);\n});\n", "src/a.test.ts").why, /not whole statements/);
+  // a part that names nothing the product code loses, and a name a changed product file still has
+  assert.match(check("const a = 1;\nconst b = 2;\n", "const a = 1;\n", "src/a.test.ts").why, /line 2 names nothing the pull request removes/);
+  assert.match(check("const title = 1;\nconst b = 2;\n", "const b = 2;\n", "src/a.test.ts").why, /names nothing/);
+  // a comment pragma added with the deletion, only comments changed, a version that does not parse
+  assert.match(check(`${MOCK}it("x", () => {});\n`, `// @vitest-environment node\nit("x", () => {});\n`, "src/a.test.ts").why, /adds the comment pragma @vitest-environment/);
+  assert.match(check("// one\nconst a = 1;\n", "// two\nconst a = 1;\n", "src/a.test.ts").why, /deletes no code/);
+  assert.match(check(`${MOCK}const a = (;\n`, "const a = (;\n", "src/a.test.ts").why, /does not parse cleanly/);
+  // fail closed: no diff, no readable product diff, a missing version
+  assert.match(removalEdit({ file: "a.test.ts", earlier: MOCK, source: "", hunks: [], product }).why, /diff is not readable/);
+  assert.match(removalEdit({ file: "a.test.ts", earlier: MOCK, source: "", hunks: hunksOf(t, MOCK, ""), product: [{ path: "p.ts", removed: null, head: "" }] }).why, /a product file's diff is not readable/);
+  assert.match(removalEdit({ file: "a.test.ts", earlier: null, source: "", hunks: [{ oldStart: 1, oldCount: 1, newStart: 0, newCount: 0 }], product }).why, /not readable/);
+  // a deleted product file is read under its old path
+  const deletedFile = parseDiffHunks("diff --git a/src/p.tsx b/src/p.tsx\ndeleted file mode 100644\n--- a/src/p.tsx\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-export const ReviewPinnedCapture = 1;\n-export const two = 2;\n");
+  assert.deepEqual(deletedFile.get("src/p.tsx"), { removed: ["export const ReviewPinnedCapture = 1;", "export const two = 2;"], hunks: [{ oldStart: 1, oldCount: 2, newStart: 0, newCount: 0 }] });
+});
+
+test("README: the red-first section names the REMOVAL note", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const section = readme.slice(readme.indexOf("## red-first-gate"), readme.indexOf("## Developing in this repo"));
+  assert.ok(section.includes("`REMOVAL`"), "the README section does not name `REMOVAL`");
+  assert.match(section, /only beside a proven/);
+});

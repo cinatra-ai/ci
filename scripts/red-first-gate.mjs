@@ -30,7 +30,13 @@
 //   - PIN: every test the pull request adds to the file is named by its own
 //     `red-first-pin:` marker that the pull request adds, names one test
 //     occurrence, and passes before the fix and with it; in a changed file the
-//     edit only adds lines and the earlier version passes with the fix.
+//     edit only adds lines and the earlier version passes with the fix;
+//   - REMOVAL: a changed file whose edit only deletes code (whole tests,
+//     statements, list elements or JSX attributes; no line of code added or
+//     changed, no assertion of a kept test touched), where every deleted part
+//     names an identifier or a string that the pull request removes from its
+//     product scripts, and whose tests pass before the fix and with it; it
+//     stands only beside a proven file of the same pull request.
 // A run is a PASS only with at least one proven file; with notes only it is
 // RED (NOTHING-PROVEN): a green job always has a proven file.
 // Anything it cannot read or prove ends RED with a named reason. A pull request
@@ -872,6 +878,360 @@ export function parseRangeDiff(text) {
   return files;
 }
 
+// ---------------------------------------------------------------------------
+// Removal edits: a changed test file whose edit only deletes what the pull
+// request removes from the product code
+// ---------------------------------------------------------------------------
+
+// A unified diff with no context lines, per path, with its hunks: { removed:
+// [...], hunks: [{ oldStart, oldCount, newStart, newCount }] }. A deleted
+// file (`+++ /dev/null`) is listed under its old path. A path git writes
+// quoted is left out (not read here, so never evidence).
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+export function parseDiffHunks(text) {
+  const files = new Map();
+  let current = null;
+  let header = false;
+  let oldPath = null;
+  for (const line of String(text).split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      header = true;
+      current = null;
+      oldPath = null;
+    } else if (header && line.startsWith("--- ")) {
+      oldPath = line.startsWith("--- a/") ? line.slice(6).replace(/\t$/, "") : null;
+    } else if (header && line.startsWith("+++ ")) {
+      const path = line.startsWith("+++ b/") ? line.slice(6).replace(/\t$/, "") : line.startsWith("+++ /dev/null") ? oldPath : null;
+      current = path === null ? null : { removed: [], hunks: [] };
+      if (current) files.set(path, current);
+    } else if (line.startsWith("@@")) {
+      header = false;
+      const m = HUNK_RE.exec(line);
+      if (current && m) current.hunks.push({ oldStart: Number(m[1]), oldCount: m[2] === undefined ? 1 : Number(m[2]), newStart: Number(m[3]), newCount: m[4] === undefined ? 1 : Number(m[4]) });
+      else if (current) current.unreadable = true;
+    } else if (current && !header && line.startsWith("-")) current.removed.push(line.slice(1));
+  }
+  return files;
+}
+
+// The callee names of a test, a suite and an assertion.
+const TEST_CALLEES = new Set(["it", "test", "specify", "bench"]);
+const SUITE_CALLEES = new Set(["describe", "suite"]);
+const ASSERT_CALLEE_RE = /^(?:expect|assert)/;
+// Comment text a runner or a transform reads: `@vitest-environment`, `@jsx`,
+// a red-first marker, a `/// <reference>` line. A removal edit adds none.
+const PRAGMA_RE = /@[A-Za-z][\w-]*|red-first-(?:expect|pin):|\/\/\/[ \t]*<[A-Za-z]+/g;
+// The largest hunk the token alignment reads (old tokens times new tokens).
+const ALIGN_MAX_CELLS = 4_000_000;
+
+// The code tokens of a parsed script, comments and blanks apart: [{ text,
+// start, end, line, node, chain }] (chain: the token's ancestors, outermost
+// first), and the text between them (the comments). JSX text counts with its
+// blanks collapsed; JSX text of blanks only is not a token.
+function codeTokens(ts, file) {
+  const tokens = [];
+  const visit = (node, chain) => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    const kids = node.getChildren(file);
+    if (kids.length === 0) {
+      if (node.kind === ts.SyntaxKind.EndOfFileToken) return;
+      const start = node.getStart(file);
+      let text = file.text.slice(start, node.end);
+      if (node.kind === ts.SyntaxKind.JsxText) text = text.replace(/\s+/g, " ").trim();
+      if (!text) return;
+      tokens.push({ text, start, end: node.end, line: file.getLineAndCharacterOfPosition(start).line + 1, node, chain });
+      return;
+    }
+    const next = [...chain, node];
+    for (const kid of kids) visit(kid, next);
+  };
+  visit(file, []);
+  let gaps = "";
+  let at = 0;
+  for (const t of tokens) {
+    gaps += `${file.text.slice(at, t.start)}\n`;
+    at = t.end;
+  }
+  gaps += file.text.slice(at);
+  return { tokens, gaps };
+}
+
+function pragmaCounts(text) {
+  const counts = new Map();
+  for (const m of text.matchAll(PRAGMA_RE)) counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
+  return counts;
+}
+
+// The old tokens a deletion-only edit removes, aligned per hunk of the line
+// diff: outside the hunks the token runs must be equal, inside each hunk the
+// new tokens must be a subsequence of the old ones. Returns a boolean array
+// over the old tokens, or a text that says why the edit is not deletion only.
+function deletedTokens(oldTokens, newTokens, hunks) {
+  const deleted = new Array(oldTokens.length).fill(false);
+  let po = 0;
+  let pn = 0;
+  const sameUntil = (oldLine, newLine) => {
+    while (po < oldTokens.length && oldTokens[po].line < oldLine) {
+      if (pn >= newTokens.length || newTokens[pn].line >= newLine || newTokens[pn].text !== oldTokens[po].text) return false;
+      po += 1;
+      pn += 1;
+    }
+    return !(pn < newTokens.length && newTokens[pn].line < newLine);
+  };
+  for (const h of hunks) {
+    const oldFrom = h.oldCount === 0 ? h.oldStart + 1 : h.oldStart;
+    const newFrom = h.newCount === 0 ? h.newStart + 1 : h.newStart;
+    if (!sameUntil(oldFrom, newFrom)) return "the code outside the changed lines differs";
+    const o0 = po;
+    while (po < oldTokens.length && oldTokens[po].line < oldFrom + h.oldCount) po += 1;
+    const n0 = pn;
+    while (pn < newTokens.length && newTokens[pn].line < newFrom + h.newCount) pn += 1;
+    const O = oldTokens.slice(o0, po).map((t) => t.text);
+    const N = newTokens.slice(n0, pn).map((t) => t.text);
+    if (N.length === 0) {
+      for (let k = o0; k < po; k += 1) deleted[k] = true;
+      continue;
+    }
+    if (N.length > O.length) return "the edit adds code";
+    if ((O.length + 1) * (N.length + 1) > ALIGN_MAX_CELLS) return "a changed part is too large to align";
+    // Longest common subsequence; every new token must be in it.
+    const W = N.length + 1;
+    const L = new Uint32Array((O.length + 1) * W);
+    for (let i = O.length - 1; i >= 0; i -= 1) {
+      for (let j = N.length - 1; j >= 0; j -= 1) {
+        L[i * W + j] = O[i] === N[j] ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
+      }
+    }
+    if (L[0] !== N.length) return "the edit adds or changes code";
+    let i = 0;
+    let j = 0;
+    while (i < O.length) {
+      if (j < N.length && O[i] === N[j] && L[i * W + j] === L[(i + 1) * W + j + 1] + 1) {
+        i += 1;
+        j += 1;
+      } else {
+        deleted[o0 + i] = true;
+        i += 1;
+      }
+    }
+  }
+  if (!sameUntil(Infinity, Infinity) || po !== oldTokens.length || pn !== newTokens.length) return "the code outside the changed lines differs";
+  return deleted;
+}
+
+// How a node may be deleted whole: a statement of a block or the file, an
+// element of an object, an array or an import or export list (comma lists),
+// or a JSX attribute. Else null.
+function removableKind(ts, node) {
+  const p = node.parent;
+  if (!p) return null;
+  if ((ts.isSourceFile(p) || ts.isBlock(p) || ts.isModuleBlock(p) || ts.isCaseClause(p) || ts.isDefaultClause(p)) && p.statements.includes(node)) return "statement";
+  if ((ts.isObjectLiteralExpression(p) && p.properties.includes(node)) || (ts.isArrayLiteralExpression(p) && p.elements.includes(node))) return "element";
+  if (ts.isImportSpecifier(node) || ts.isExportSpecifier(node)) return "element";
+  if (ts.isJsxAttributes(p) && p.properties.includes(node)) return "attribute";
+  return null;
+}
+
+// A comma that separates the elements of an object, an array or an import or
+// export list: the node that owns the list, or null.
+function listCommaOwner(ts, token) {
+  if (token.text !== ",") return null;
+  const list = token.chain.at(-1);
+  const owner = token.chain.at(-2);
+  if (!list || list.kind !== ts.SyntaxKind.SyntaxList || !owner) return null;
+  return ts.isObjectLiteralExpression(owner) || ts.isArrayLiteralExpression(owner) || ts.isNamedImports(owner) || ts.isNamedExports(owner) ? owner : null;
+}
+
+// The deleted run of old tokens [i, j) as whole removable nodes and list
+// commas (no more commas in a list than elements deleted from it), or null.
+function coverRun(ts, file, tokens, i, j) {
+  const units = [];
+  const commas = new Map();
+  const end = tokens[j - 1].end;
+  let k = i;
+  while (k < j) {
+    const tok = tokens[k];
+    let best = null;
+    for (const node of [tok.node, ...[...tok.chain].reverse()]) {
+      if (node.kind === ts.SyntaxKind.SyntaxList) continue;
+      if (node.getStart(file) !== tok.start || node.end > end) break;
+      if (removableKind(ts, node)) best = node;
+    }
+    if (best) {
+      units.push(best);
+      while (k < j && tokens[k].start < best.end) k += 1;
+      continue;
+    }
+    const owner = listCommaOwner(ts, tok);
+    if (!owner) return null;
+    commas.set(owner, (commas.get(owner) ?? 0) + 1);
+    k += 1;
+  }
+  for (const [owner, n] of commas) {
+    if (units.filter((u) => removableKind(ts, u) === "element" && u.parent === owner).length < n) return null;
+  }
+  return units;
+}
+
+// The leftmost name of a callee: `it` of `it.each(rows)`, `expect` of
+// `expect(x).not.toBe`.
+function calleeRoot(ts, expr) {
+  for (;;) {
+    if (ts.isCallExpression(expr) || ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr) || ts.isNonNullExpression(expr) || ts.isParenthesizedExpression(expr)) expr = expr.expression;
+    else if (ts.isTaggedTemplateExpression(expr)) expr = expr.tag;
+    else break;
+  }
+  return ts.isIdentifier(expr) ? expr.text : null;
+}
+
+function isCallTo(ts, node, test) {
+  if (!ts.isCallExpression(node)) return false;
+  const root = calleeRoot(ts, node.expression);
+  return root !== null && test(root);
+}
+
+// Every node under (and including) a node that passes `test`.
+function nodesWhere(ts, node, test, out = []) {
+  if (test(node)) out.push(node);
+  ts.forEachChild(node, (child) => {
+    nodesWhere(ts, child, test, out);
+  });
+  return out;
+}
+
+// The names a node mentions: identifiers and the texts of its string literals.
+function mentions(ts, node) {
+  const words = new Set();
+  const texts = new Set();
+  nodesWhere(ts, node, (n) => {
+    if (ts.isIdentifier(n) || ts.isPrivateIdentifier(n)) words.add(n.text);
+    else if (ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n)) {
+      if (n.text.trim()) texts.add(n.text);
+    }
+    return false;
+  });
+  return { words, texts };
+}
+
+function hasWord(text, word) {
+  for (let at = text.indexOf(word); at !== -1; at = text.indexOf(word, at + 1)) {
+    const before = at === 0 ? "" : text[at - 1];
+    const after = text[at + word.length] ?? "";
+    if (!/[\w$]/.test(before) && !/[\w$]/.test(after)) return true;
+  }
+  return false;
+}
+
+// Whether the pull request removes a name from the product code: a line it
+// deletes from a product file holds it, and no product file the pull request
+// changes holds it at the head (a deleted file holds nothing). An identifier
+// is matched as a whole word, a string literal's text as a part of a line.
+// product: [{ path, removed: [lines], head: text | null }].
+function removedByPullRequest(name, word, product) {
+  const has = word ? (text) => hasWord(text, name) : (text) => text.includes(name);
+  return product.some((p) => p.removed.some(has)) && product.every((p) => p.head === null || !has(p.head));
+}
+
+// A changed test file whose edit only deletes what the same pull request
+// removes from the product code (a removed test, or a removed mock or prop of
+// something the product code no longer has). All must hold:
+//   - both versions parse, and the head's code tokens are the earlier
+//     version's with some deleted (comments and blanks apart, and no comment
+//     pragma added): no line of code is added or changed;
+//   - the deleted tokens are whole statements, object, array or import list
+//     elements, or JSX attributes (with the commas between list elements);
+//   - a deleted statement that asserts is a whole test or suite, and no
+//     deleted element sits inside an assertion or asserts itself;
+//   - every deleted part, and every test it deletes, names an identifier or a
+//     string that the pull request removes from the product code
+//     (removedByPullRequest), except an import of a name the head no longer
+//     uses; at least one part names one.
+// file: the test file's path; earlier, source: its merge-base and head texts;
+// hunks: its line diff (parseDiffHunks); product: the pull request's product
+// scripts (removedByPullRequest). Returns { ok: true, parts, tests, names }
+// or { ok: false, why }.
+export function removalEdit({ file, earlier, source, hunks, product }) {
+  const no = (why) => ({ ok: false, why });
+  if (typeof earlier !== "string" || typeof source !== "string") return no("a version of the file is not readable");
+  if (!Array.isArray(hunks) || hunks.length === 0) return no("the file's diff is not readable");
+  if (!Array.isArray(product) || product.some((p) => !Array.isArray(p.removed))) return no("a product file's diff is not readable");
+  const before = parse(earlier, file);
+  const after = parse(source, file);
+  if (before.unsure || after.unsure) return no("a version of the file does not parse cleanly");
+  const ts = before.ts;
+  const old = codeTokens(ts, before.file);
+  const now = codeTokens(ts, after.file);
+  const pragmasBefore = pragmaCounts(old.gaps);
+  for (const [text, n] of pragmaCounts(now.gaps)) {
+    if (n > (pragmasBefore.get(text) ?? 0)) return no(`the edit adds the comment pragma ${text}`);
+  }
+  const deleted = deletedTokens(old.tokens, now.tokens, hunks);
+  if (typeof deleted === "string") return no(`the edit is not deletion only (${deleted})`);
+  if (!deleted.includes(true)) return no("the edit deletes no code");
+  const usedNow = new Set(now.tokens.filter((t) => ts.isIdentifier(t.node)).map((t) => t.text));
+  // The longest name of a part that the pull request removes, or null.
+  const removed = (m) =>
+    [...[...m.words].filter((w) => removedByPullRequest(w, true, product)), ...[...m.texts].filter((s) => removedByPullRequest(s, false, product))].sort((a, b) => b.length - a.length)[0] ?? null;
+  const tokens = old.tokens;
+  const text = (k) => tokens[k].text;
+  const units = [];
+  for (let i = 0; i < tokens.length; ) {
+    if (!deleted[i]) {
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (j < tokens.length && deleted[j]) j += 1;
+    // A run of deleted tokens may slide while the token beside it repeats its
+    // other end (`a, b, c` less `b`: `, b` or `b ,`); the first place that
+    // covers whole nodes is taken.
+    const n = j - i;
+    let left = i;
+    while (left > 0 && !deleted[left - 1] && text(left - 1) === text(left - 1 + n)) left -= 1;
+    let right = i;
+    while (right + n < tokens.length && !deleted[right + n] && text(right) === text(right + n)) right += 1;
+    let cover = null;
+    let at = left;
+    for (; at <= right; at += 1) {
+      cover = coverRun(ts, before.file, tokens, at, at + n);
+      if (cover) break;
+    }
+    if (!cover) return no(`the deleted code at line ${tokens[i].line} is not whole statements, list elements or JSX attributes`);
+    for (let k = i; k < j; k += 1) deleted[k] = false;
+    for (let k = at; k < at + n; k += 1) deleted[k] = true;
+    units.push(...cover);
+    i = at + n;
+  }
+  const names = [];
+  let parts = 0;
+  let tests = 0;
+  for (const unit of units) {
+    const line = before.file.getLineAndCharacterOfPosition(unit.getStart(before.file)).line + 1;
+    const kind = removableKind(ts, unit);
+    const declaration = kind === "statement" && ts.isExpressionStatement(unit) && isCallTo(ts, unit.expression, (r) => TEST_CALLEES.has(r) || SUITE_CALLEES.has(r));
+    const asserts = nodesWhere(ts, unit, (n) => isCallTo(ts, n, (r) => ASSERT_CALLEE_RE.test(r))).length > 0;
+    if (asserts && !declaration) return no(`the deleted code at line ${line} removes an assertion from a test the file keeps`);
+    if (kind !== "statement") {
+      for (let p = unit.parent; p; p = p.parent) {
+        if (isCallTo(ts, p, (r) => ASSERT_CALLEE_RE.test(r))) return no(`the deleted code at line ${line} changes an assertion`);
+      }
+    }
+    for (const call of nodesWhere(ts, unit, (n) => isCallTo(ts, n, (r) => TEST_CALLEES.has(r)))) {
+      tests += 1;
+      if (!removed(mentions(ts, call))) return no(`the test deleted at line ${before.file.getLineAndCharacterOfPosition(call.getStart(before.file)).line + 1} names nothing the pull request removes from the product code`);
+    }
+    const name = removed(mentions(ts, unit));
+    if (name) {
+      parts += 1;
+      if (!names.includes(name)) names.push(name);
+    } else if (!(ts.isImportSpecifier(unit) && !usedNow.has(unit.name.text))) {
+      return no(`the deleted code at line ${line} names nothing the pull request removes from the product code`);
+    }
+  }
+  if (parts === 0) return no("no deleted code names something the pull request removes from the product code");
+  return { ok: true, parts, tests, names };
+}
+
 // Repository paths a missing-module text may mean: an absolute path inside the
 // tree, a path from the repository root or the runner's folder (vite writes
 // `/src/x.ts`), or a relative specifier from its importer or the test file.
@@ -1204,10 +1564,12 @@ function earlierUnreadable(earlier) {
 //                   test or states an assertion, or null;
 //   pureAddition    the file's edit only adds lines (no line removed or
 //                   changed);
-//   addedByFix      (text) => what the text names that the fix side adds.
+//   addedByFix      (text) => what the text names that the fix side adds;
+//   removal         () => removalEdit's reading of the file's edit.
 // Returns the reasons, the notes (a file that makes no red-first claim, or
 // that is red because of what the fix adds), `proven`, and `kind`: "proven",
-// "collateral", "pins" or null (not settled: a reason says why).
+// "collateral", "pins", "removal" or null (not settled: a reason says why).
+// A "removal" file stands only beside a proven file (runGate).
 export function judgeFile({ file, markers = [], pins = [], status = "A" }, before, head, context = {}) {
   const reasons = [];
   const notes = [];
@@ -1261,9 +1623,21 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         // The earlier version's tests that the new version no longer reports
         // (by name and count): a collateral edit and a pin keep every one.
         const dropped = why || status === "A" ? [] : addedTests(context.earlier.result.tests, r.tests);
-        if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})`);
+        // A removal edit (removalEdit) is read from the two versions of a
+        // changed file, so it needs no run of the earlier version (which may
+        // not load with the fix: it imports what the fix removes); a refusal
+        // is named on the file's reason.
+        const removal = status === "A" || !context.removal ? null : context.removal();
+        const notRemoval = removal && !removal.ok ? `; not a removal edit: ${removal.why}` : "";
+        if (removal?.ok && added.length === 0 && pins.length === 0) {
+          noClaim = {
+            code: "REMOVAL",
+            kind: "removal",
+            detail: `the edit only deletes code: ${removal.parts} part(s)${removal.tests ? `, ${removal.tests} test(s) among them,` : ""} that name what the pull request removes from the product code (${clip(removal.names.slice(0, 3).join(", "), 160)}); all ${ran.length} test(s) pass before the fix and with it: not proven here`,
+          };
+        } else if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})${notRemoval}`);
         else if (dropped.length) {
-          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${dropped.length} test(s) of the file's earlier version: ${dropped.slice(0, 3).map((t) => t.name).join(" | ")} (a collateral edit or a pin keeps every existing test)`);
+          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${dropped.length} test(s) of the file's earlier version: ${dropped.slice(0, 3).map((t) => t.name).join(" | ")} (a collateral edit or a pin keeps every existing test)${notRemoval}`);
         } else if (undeclared.length) {
           const names = undeclared.slice(0, 3).map((t) => t.name).join(" | ");
           add("NOT-RED-BEFORE", "before", `${base}; ${undeclared.length} test(s) the pull request adds do not fail first: ${names} (a test that pins behaviour the fix keeps is declared with a red-first-pin: <test name> line)`);
@@ -1277,9 +1651,9 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
             noClaim = { code: "PIN", kind: "pins", detail: `${added.length} test(s) the pull request adds are each declared by a red-first-pin: marker it adds and pass before the fix and with it; the file has no other new or changed test: not proven here` };
           }
         } else if (context.changedTestLine) {
-          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test but changes a test declaration or an assertion (${clip(context.changedTestLine, 120)}): a changed test must fail first`);
+          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test but changes a test declaration or an assertion (${clip(context.changedTestLine, 120)}): a changed test must fail first${notRemoval}`);
         } else if (!brokenByFix.length) {
-          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test and the file's earlier version also passes with the fix, so the fix does not need the edit: a changed test must fail first`);
+          add("NOT-RED-BEFORE", "before", `${base}; the edit adds no test and the file's earlier version also passes with the fix, so the fix does not need the edit: a changed test must fail first${notRemoval}`);
         } else {
           noClaim = {
             code: "COLLATERAL",
@@ -1876,9 +2250,20 @@ async function runEarlier(repo, plan, tree, quiet, opts, work) {
 function rangeReader(repo, plan) {
   let files = null;
   let byFile = null;
+  let text = null;
+  let hunks = null;
+  let product = null;
+  const diffText = () => {
+    text ??= git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout;
+    return text;
+  };
   const read = () => {
-    files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    files ??= parseRangeDiff(diffText());
     return files;
+  };
+  const readHunks = () => {
+    hunks ??= parseDiffHunks(diffText());
+    return hunks;
   };
   const blob = (rev, path) => {
     const r = git(repo, ["cat-file", "blob", `${rev}:${path}`], { allowFail: true });
@@ -1897,6 +2282,22 @@ function rangeReader(repo, plan) {
     pureAddition(path) {
       const diff = read().get(path);
       return Boolean(diff) && diff.removed.every((line) => !line.trim());
+    },
+    // removalEdit of a changed test file: its two versions and line diff, and
+    // the pull request's product scripts (fix side, evidence paths) with the
+    // lines it deletes from them and their head texts.
+    removal(path) {
+      try {
+        const diff = readHunks().get(path);
+        product ??= plan.fixSide.filter(evidencePath).map((p) => {
+          const entry = readHunks().get(p);
+          return { path: p, removed: entry && !entry.unreadable ? entry.removed : null, head: blob(plan.head, p) };
+        });
+        return removalEdit({ file: path, earlier: blob(plan.mergeBase, path), source: blob(plan.head, path), hunks: diff && !diff.unreadable ? diff.hunks : null, product });
+      } catch (error) {
+        if (error instanceof BudgetError) throw error;
+        return { ok: false, why: `the edit could not be read (${clip(error?.message ?? error, 120)})` };
+      }
     },
     // A changed file whose diff is not readable here counts as touched.
     testLine(path) {
@@ -2003,6 +2404,7 @@ async function runGateIn(opts) {
         earlier: earlier?.perFile.get(f.file),
         changedTestLine: quiet.includes(f) ? range.testLine(f.file) : null,
         pureAddition: f.status === "A" || range.pureAddition(f.file),
+        removal: quiet.includes(f) ? () => range.removal(f.file) : undefined,
         addedByFix: (text) => addedByFix(text, f.file, { source: sources.get(f.file), exportsByFile: range.exportsByFile, addedFix, roots, runnerDir: f.runner === "vitest" ? vitestDir(trees.before, f.file) : "" }),
       };
       const judged = judgeFile(f, phases.before?.perFile.get(f.file), phases.head?.perFile.get(f.file), context);
@@ -2020,6 +2422,14 @@ async function runGateIn(opts) {
     for (const f of result.files) {
       if (reasons.some((r) => r.file === f.file || r.file === null)) {
         f.proven = false;
+        f.kind = null;
+      }
+    }
+    // A removal edit stands only beside a proven file: the pull request's own
+    // new test proves the removal it makes.
+    if (!result.files.some((f) => f.proven)) {
+      for (const f of result.files.filter((x) => x.kind === "removal")) {
+        reasons.push({ code: "NOT-RED-BEFORE", phase: "before", file: f.file, detail: "every test already passes before the fix; the edit only deletes code that names what the pull request removes from the product code, but no test file of the pull request is proven red before the fix and green with it: a removal edit is accepted only beside a proven test" });
         f.kind = null;
       }
     }
@@ -2105,6 +2515,7 @@ function emit(result, opts) {
   let notProven = count("EXCLUDED") ? `; ${count("EXCLUDED")} excluded new test file(s) not proven here` : "";
   if (count("COLLATERAL")) notProven += `; ${count("COLLATERAL")} changed test file(s) collateral, not proven here`;
   if (count("PIN")) notProven += `; ${count("PIN")} test file(s) with declared pins only, not proven here`;
+  if (count("REMOVAL")) notProven += `; ${count("REMOVAL")} changed test file(s) that only delete what the pull request removes, not proven here`;
   let headline;
   if (result.mode === "plan") headline = `RED-FIRST PLAN: ${result.verdict}${result.reason ? ` ${result.reason}` : ""}: ${result.detail}`;
   else if (result.verdict === "PASS") headline = `RED-FIRST: PASS (${result.files.filter((f) => f.proven).length} new test file(s) fail before the fix and pass with it${notProven})`;
