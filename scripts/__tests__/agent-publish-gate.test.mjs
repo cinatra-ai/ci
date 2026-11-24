@@ -572,6 +572,18 @@ test("a review-marked step that a root hitlScreens entry or a package renderer s
   assert.deepEqual(checkAgentFlow(reviewBefore(REVIEW_MARK), { fieldRenderers: [{ id: "@x/pack:draft-confirm", midRunHitl: true }] }), []);
 });
 
+test("a review-marked step that only a root hitlScreens entry selects is still its own confirm gate", () => {
+  // No package fieldRenderer here: the root entry alone names the fallback renderer for the step.
+  const listed = reviewBefore(REVIEW_MARK);
+  listed.metadata.cinatra.hitlScreens = [SCHEMA_FIELD_FALLBACK_RENDERER_ID];
+  // The unchanged hitlScreens rule also refuses the entry beside the publishing step; the review step is named too.
+  assert.deepEqual(rulesOf(checkAgentFlow(listed)), ["oas.publish-own-gate review_post", "oas.publish-own-gate publish"]);
+  // A root entry that names another screen does not make the review step a confirm gate (the hitlScreens rule still refuses it).
+  const other = reviewBefore(REVIEW_MARK);
+  other.metadata.cinatra.hitlScreens = ["@x/pack:draft-confirm"];
+  assert.deepEqual(rulesOf(checkAgentFlow(other)), ["oas.publish-own-gate publish"]);
+});
+
 test("an InputMessageNode that reaches the publishing node through an OutputMessageNode and a read_only step is its own confirm gate", () => {
   const f = withConfirmBefore([node("confirm", "InputMessageNode"), node("note", "OutputMessageNode")], [
     ["start", "confirm"],
