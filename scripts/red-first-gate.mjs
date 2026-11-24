@@ -186,6 +186,12 @@ export class BudgetError extends GateError {}
 // Text helpers
 // ---------------------------------------------------------------------------
 
+// Text as a RegExp source that matches it literally: every metacharacter
+// (the backslash included) is escaped.
+export function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+}
+
 export function normalizeText(text) {
   return String(text ?? "").replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/\s+/g, " ").trim();
 }
@@ -1219,7 +1225,7 @@ function fileBindings(ts, file) {
     runnerNs.delete(name);
   }
   let assertsRe = null;
-  if (asserts.size) assertsRe = new RegExp(`(?<![.\\w$])(?:${[...asserts].map((a) => a.replace(/\$/g, "\\$")).join("|")})\\s*[.(]`);
+  if (asserts.size) assertsRe = new RegExp(`(?<![.\\w$])(?:${[...asserts].map((a) => escapeRegExp(a)).join("|")})\\s*[.(]`);
   return { runner, runnerNs, declared, assertsRe };
 }
 
@@ -1397,7 +1403,7 @@ function declarationPattern(ts, tokens, file, call, suite) {
         if (/^\s+$/.test(piece)) return "\\s*";
         if (each && piece === "%%") return "%";
         if (each && piece.length > 1 && (piece[0] === "%" || piece[0] === "$")) return any;
-        return piece.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+        return escapeRegExp(piece);
       })
       .join("");
   const body = parts.map((p) => (p === null ? any : literal(p))).join("");

@@ -2816,3 +2816,25 @@ test("removal review2 4: a pragma that moves out of the file header, or changes 
   const kept = await checkRemoval(t, `// @vitest-environment jsdom\n// a note\n${imp}${MOCK}${body}`, `// @vitest-environment jsdom\n// another note\n${imp}${body}`);
   assert.equal(kept.ok, true, JSON.stringify(kept));
 });
+
+test("escapeRegExp: a marker or name with a backslash and other metacharacters is matched literally", async () => {
+  const { escapeRegExp } = await gateModule();
+  for (const text of ["a\\b", "\\", "\\d+", "a\\.b", "$x", "x(y)|[z]{1}^*?+.", "\\$", "\\\\", "a/b"]) {
+    assert.ok(new RegExp(`^${escapeRegExp(text)}$`).test(text), text);
+    assert.ok(new RegExp(`(?:${escapeRegExp(text)})`).test(`before ${text} after`), text);
+  }
+  // the backslash is not left to act as an escape on the character after it
+  assert.equal(new RegExp(`^${escapeRegExp("a\\d")}$`).test("a1"), false);
+  assert.equal(new RegExp(`^${escapeRegExp("a\\.b")}$`).test("a\\xb"), false);
+  assert.equal(new RegExp(`^${escapeRegExp("a.b")}$`).test("axb"), false);
+  // names built from escaped text sit inside a bigger pattern as literals
+  assert.ok(new RegExp(`(?:${["$a", "b\\c"].map(escapeRegExp).join("|")})\\s*[.(]`).test("b\\c("));
+});
+
+test("removal: a deleted call of a `$` assertion binding is refused", async (t) => {
+  const before = 'import { $ok } from "node:assert";\nit("x", () => {\n  $ok(removedFeature());\n  expect(1).toBe(1);\n});\n';
+  const after = 'import { $ok } from "node:assert";\nit("x", () => {\n  expect(1).toBe(1);\n});\n';
+  const r = await checkRemoval(t, before, after);
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.why, /removes an assertion from a test the file keeps/);
+});
