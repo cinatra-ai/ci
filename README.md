@@ -2445,19 +2445,31 @@ codes alone.
   of the file with the TypeScript parser and holds all of these: both parse;
   the head's code is the earlier version's with tokens deleted and none added
   or changed (comments and blank lines apart; a comment may be reworded, but
-  no `@...` pragma such as `@vitest-environment`, no `red-first-` marker and
-  no `/// <...>` line is added); the deleted tokens are whole statements,
+  every comment line that holds an `@...` pragma such as
+  `@vitest-environment jsdom`, a `red-first-` marker or a `/// <...>` line
+  stays exactly as it was and in the same order: none is added, changed or
+  removed); the deleted tokens are whole statements,
   whole elements of an object, an array or an import or export list (with
-  their commas), or whole JSX attributes; a deleted statement that asserts is
-  a whole test or suite (`it`, `test`, `describe`, ...), and no deleted
-  element sits inside an assertion; and every deleted part, and every test it
-  deletes, names an identifier or a string that the pull request removes from
+  their commas), or whole JSX attributes; the head's syntax tree is the
+  earlier tree less the deleted nodes, so the parser reads the code it keeps
+  alike (a deletion after which two statements join, such as `sink` and
+  `[0].forEach(...)` read as `sink[0].forEach(...)`, is refused); deleted code
+  that asserts (`expect...`, `assert...`, `.should`, `.rejects`, `.resolves`,
+  the matchers such as `.toBe(`) is a whole test or suite (`it`, `test`,
+  `describe`, ...), and no deleted part sits inside an assertion or in the
+  title or the cases of a test or suite the file keeps; every deleted part,
+  and every test it deletes (`test.each(rows)(...)` counts as one test),
+  names an identifier or a string that the pull request removes from
   its product scripts: a line the pull request deletes from a product script
   holds it, and no product script the pull request changes holds it at the
   head (an import of a name the head no longer uses may go with it). A
   product script is a changed path outside the test side, with a script
   extension, not a declaration file and not test code by its place or name.
-  Every test of the head version must pass before the fix and with it. The
+  Every test of the head version must pass before the fix and with it, and
+  the head reports every test of the earlier version (run in the tree with
+  the fix) except the ones a deleted test or suite declaration registers;
+  when the earlier version does not run with the fix (it imports what the
+  fix removes), the parser's reading above stands alone. The
   file stands only beside a proven file of the same pull request: without
   one it is `NOT-RED-BEFORE`. A renamed test, a changed assertion or title,
   a moved line or an added line is not a removal edit and must fail first;

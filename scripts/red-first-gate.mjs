@@ -22,7 +22,7 @@
 //      imports from that module), and with the fix loads, passes, and passes
 //      every occurrence of every test that failed before.
 // A test file with no failing test before the fix makes no red-first claim in
-// two cases only, each a note (not proven here), never a proof:
+// three cases only, each a note (not proven here), never a proof:
 //   - COLLATERAL: a changed file whose earlier version, run in the tree WITH
 //     the fix, reports the same tests and fails (the fix breaks it, the edit
 //     keeps it working), and whose edit touches no test declaration and no
@@ -33,7 +33,8 @@
 //     edit only adds lines and the earlier version passes with the fix;
 //   - REMOVAL: a changed file whose edit only deletes code (whole tests,
 //     statements, list elements or JSX attributes; no line of code added or
-//     changed, no assertion of a kept test touched), where every deleted part
+//     changed, the retained code parsed alike, no pragma line changed, no
+//     assertion of a kept test touched, no kept test lost), where every deleted part
 //     names an identifier or a string that the pull request removes from its
 //     product scripts, and whose tests pass before the fix and with it; it
 //     stands only beside a proven file of the same pull request.
@@ -141,8 +142,12 @@ const NAME_RE = /^[A-Za-z_$][\w$]*$/;
 // .each, .skip, ...), expect..., assert..., .should, .rejects, .resolves and
 // the matcher calls (.toBe(, .not.toEqual(, ...). Read on the changed lines
 // of a test file; a method call such as `re.test(` is not a declaration.
-const TEST_LINE_RE =
-  /(?<![.\w$])(?:it|test|describe|suite|specify|bench)\s*(?:\.\s*[A-Za-z]+\s*)*(?:\(|`)|(?<![.\w$])(?:expect|assert)[A-Za-z]*\s*[.(]|\.\s*(?:should|rejects|resolves)\b|\.\s*(?:not\s*\.\s*)?to(?:Be|Equal|StrictEqual|Have|Contain|Match|Throw|Satisfy|Include)[A-Za-z]*\s*\(/;
+// ASSERTION_RE is its assertion part, the one list of assertion styles the
+// gate knows (the removal reading uses it too).
+const TEST_DECLARATION_SRC = /(?<![.\w$])(?:it|test|describe|suite|specify|bench)\s*(?:\.\s*[A-Za-z]+\s*)*(?:\(|`)/.source;
+const ASSERTION_SRC = /(?<![.\w$])(?:expect|assert)[A-Za-z]*\s*[.(]|\.\s*(?:should|rejects|resolves)\b|\.\s*(?:not\s*\.\s*)?to(?:Be|Equal|StrictEqual|Have|Contain|Match|Throw|Satisfy|Include)[A-Za-z]*\s*\(/.source;
+const TEST_LINE_RE = new RegExp(`${TEST_DECLARATION_SRC}|${ASSERTION_SRC}`);
+const ASSERTION_RE = new RegExp(ASSERTION_SRC);
 const REPORTER = join(dirname(fileURLToPath(import.meta.url)), "red-first-reporter.mjs");
 export const DEFAULT_VITEST = "npx --no-install vitest run";
 // The statuses the vitest JSON report uses; any other value makes the report
@@ -914,13 +919,14 @@ export function parseDiffHunks(text) {
   return files;
 }
 
-// The callee names of a test, a suite and an assertion.
+// The callee names of a test and a suite. An assertion is read with
+// ASSERTION_RE (the gate's one list of assertion styles).
 const TEST_CALLEES = new Set(["it", "test", "specify", "bench"]);
 const SUITE_CALLEES = new Set(["describe", "suite"]);
-const ASSERT_CALLEE_RE = /^(?:expect|assert)/;
 // Comment text a runner or a transform reads: `@vitest-environment`, `@jsx`,
-// a red-first marker, a `/// <reference>` line. A removal edit adds none.
-const PRAGMA_RE = /@[A-Za-z][\w-]*|red-first-(?:expect|pin):|\/\/\/[ \t]*<[A-Za-z]+/g;
+// a red-first marker, a `/// <reference>` line. A removal edit keeps every
+// comment line that holds one exactly as it was, in the same order.
+const PRAGMA_RE = /@[A-Za-z][\w-]*|red-first-(?:expect|pin):|\/\/\/[ \t]*<[A-Za-z]+/;
 // The largest hunk the token alignment reads (old tokens times new tokens).
 const ALIGN_MAX_CELLS = 4_000_000;
 
@@ -956,10 +962,42 @@ function codeTokens(ts, file) {
   return { tokens, gaps };
 }
 
-function pragmaCounts(text) {
-  const counts = new Map();
-  for (const m of text.matchAll(PRAGMA_RE)) counts.set(m[0], (counts.get(m[0]) ?? 0) + 1);
-  return counts;
+// The comment lines (comment text between code tokens, one per line, blanks
+// trimmed at both ends) that hold a pragma, in file order.
+function pragmaLines(gaps) {
+  return gaps
+    .split(/\r?\n|\r|\u2028|\u2029/)
+    .map((line) => line.trim())
+    .filter((line) => PRAGMA_RE.test(line));
+}
+
+// The shape of a parsed tree: every node's kind in nesting order, and the text
+// of every leaf (JSX text with its blanks collapsed, JSX text of blanks only
+// left out), leaving out the nodes of `skip` (with all they hold). Two trees
+// with one shape are read alike by the parser.
+function treeShape(ts, file, skip = new Set()) {
+  const out = [];
+  const visit = (node) => {
+    if (skip.has(node)) return;
+    const kids = [];
+    ts.forEachChild(node, (kid) => {
+      kids.push(kid);
+    });
+    if (kids.length === 0) {
+      let text = node.kind === ts.SyntaxKind.EndOfFileToken ? "" : file.text.slice(node.getStart(file), node.end);
+      if (node.kind === ts.SyntaxKind.JsxText) {
+        text = text.replace(/\s+/g, " ").trim();
+        if (!text) return;
+      }
+      out.push(`${node.kind}:${text}`);
+      return;
+    }
+    out.push(`(${node.kind}`);
+    for (const kid of kids) visit(kid);
+    out.push(")");
+  };
+  visit(file);
+  return out;
 }
 
 // The old tokens a deletion-only edit removes, aligned per hunk of the line
@@ -1090,6 +1128,63 @@ function isCallTo(ts, node, test) {
   return root !== null && test(root);
 }
 
+// A test or suite declaration: a call rooted at a test or suite name that is
+// not itself the callee of a call, so `test.each(rows)("title", fn)` is one
+// declaration (the outer call), not two.
+function isDeclaration(ts, node, callees) {
+  return isCallTo(ts, node, (r) => callees.some((set) => set.has(r))) && !(ts.isCallExpression(node.parent) && node.parent.expression === node);
+}
+
+// The code of a node from the file's code tokens, comments left out (a blank
+// where the source has blanks or a comment between two tokens).
+function codeOf(tokens, file, node) {
+  const start = node.getStart(file);
+  let out = "";
+  let last = null;
+  for (const t of tokens) {
+    if (t.start < start || t.end > node.end) continue;
+    if (last !== null && t.start > last) out += " ";
+    out += t.text;
+    last = t.end;
+  }
+  return out;
+}
+
+// Whether a call states an assertion: its callee read with ASSERTION_RE
+// (`expect(`, `assert.equal(`, `x.should.equal(`, `.toBe(`, ...).
+function isAssertionCall(ts, tokens, file, node) {
+  return ts.isCallExpression(node) && ASSERTION_RE.test(`${codeOf(tokens, file, node.expression)}(`);
+}
+
+// The test names a deleted declaration registers, as a RegExp over a runner's
+// normalized test name, or null when its title is not a literal. A test's
+// name ends with its title; a suite's title is a part of the names of the
+// tests inside it. In a `.each` / `.for` title, the printf placeholders and
+// the `$name` fields match any text, as does a template substitution.
+function declarationPattern(ts, tokens, file, call, suite) {
+  const title = call.arguments[0];
+  if (!title) return null;
+  const each = /\.\s*(?:each|for)\b/.test(codeOf(tokens, file, call.expression));
+  let parts;
+  if (ts.isStringLiteral(title) || ts.isNoSubstitutionTemplateLiteral(title)) parts = [title.text];
+  else if (ts.isTemplateExpression(title)) {
+    parts = [title.head.text];
+    for (const span of title.templateSpans) parts.push(null, span.literal.text);
+  } else return null;
+  const any = "[\\s\\S]*";
+  const literal = (text) =>
+    (text.match(/%%|%[sdifjoOcp#]|\$[A-Za-z_$][\w$]*(?:\.[\w$]+)*|\s+|[\s\S]/g) ?? [])
+      .map((piece) => {
+        if (/^\s+$/.test(piece)) return "\\s*";
+        if (each && piece === "%%") return "%";
+        if (each && piece.length > 1 && (piece[0] === "%" || piece[0] === "$")) return any;
+        return piece.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+      })
+      .join("");
+  const body = parts.map((p) => (p === null ? any : literal(p))).join("");
+  return new RegExp(`(?:^|[\\s>])${body}${suite ? "(?:[\\s>]|$)" : "$"}`);
+}
+
 // Every node under (and including) a node that passes `test`.
 function nodesWhere(ts, node, test, out = []) {
   if (test(node)) out.push(node);
@@ -1136,20 +1231,27 @@ function removedByPullRequest(name, word, product) {
 // removes from the product code (a removed test, or a removed mock or prop of
 // something the product code no longer has). All must hold:
 //   - both versions parse, and the head's code tokens are the earlier
-//     version's with some deleted (comments and blanks apart, and no comment
-//     pragma added): no line of code is added or changed;
+//     version's with some deleted (comments and blanks apart): no line of
+//     code is added or changed;
+//   - the comment lines that hold a pragma (an @ pragma, a red-first marker,
+//     a /// line) are the same lines, in the same order, in both versions;
 //   - the deleted tokens are whole statements, object, array or import list
 //     elements, or JSX attributes (with the commas between list elements);
-//   - a deleted statement that asserts is a whole test or suite, and no
-//     deleted element sits inside an assertion or asserts itself;
-//   - every deleted part, and every test it deletes, names an identifier or a
-//     string that the pull request removes from the product code
-//     (removedByPullRequest), except an import of a name the head no longer
-//     uses; at least one part names one.
+//   - the head's syntax tree is the earlier tree less the deleted nodes (the
+//     parser reads the retained code alike);
+//   - deleted code that asserts (ASSERTION_RE: expect, assert, .should,
+//     .rejects, .resolves, the matchers) is a whole test or suite; no deleted
+//     part sits inside an assertion, or in the title or the cases of a test or
+//     suite the file keeps;
+//   - every deleted part, and every test it deletes (`test.each(rows)(...)`
+//     is one test), names an identifier or a string that the pull request
+//     removes from the product code (removedByPullRequest), except an import
+//     of a name the head no longer uses; at least one part names one.
 // file: the test file's path; earlier, source: its merge-base and head texts;
 // hunks: its line diff (parseDiffHunks); product: the pull request's product
-// scripts (removedByPullRequest). Returns { ok: true, parts, tests, names }
-// or { ok: false, why }.
+// scripts (removedByPullRequest). Returns { ok: true, parts, tests, names,
+// deletedTitles } (deletedTitles: the RegExps of the test names the deleted
+// declarations register, declarationPattern) or { ok: false, why }.
 export function removalEdit({ file, earlier, source, hunks, product }) {
   const no = (why) => ({ ok: false, why });
   if (typeof earlier !== "string" || typeof source !== "string") return no("a version of the file is not readable");
@@ -1161,9 +1263,11 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   const ts = before.ts;
   const old = codeTokens(ts, before.file);
   const now = codeTokens(ts, after.file);
-  const pragmasBefore = pragmaCounts(old.gaps);
-  for (const [text, n] of pragmaCounts(now.gaps)) {
-    if (n > (pragmasBefore.get(text) ?? 0)) return no(`the edit adds the comment pragma ${text}`);
+  const pragmasBefore = pragmaLines(old.gaps);
+  const pragmasAfter = pragmaLines(now.gaps);
+  const pragmaAt = Array.from({ length: Math.max(pragmasBefore.length, pragmasAfter.length) }, (_, k) => k).find((k) => pragmasBefore[k] !== pragmasAfter[k]);
+  if (pragmaAt !== undefined) {
+    return no(`the edit changes the comment pragmas (${clip(pragmasBefore[pragmaAt] ?? "nothing", 80)} becomes ${clip(pragmasAfter[pragmaAt] ?? "nothing", 80)}): a comment line with an @ pragma, a red-first marker or a /// line stays exactly as it was`);
   }
   const deleted = deletedTokens(old.tokens, now.tokens, hunks);
   if (typeof deleted === "string") return no(`the edit is not deletion only (${deleted})`);
@@ -1202,23 +1306,37 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
     units.push(...cover);
     i = at + n;
   }
+  // The token check keeps the retained tokens in order; the parser must also
+  // read them alike: the head's tree is the earlier tree less the deleted
+  // nodes (a deletion that lets two statements join, as `x` and `[0].f()`
+  // become `x[0].f()` without a semicolon between them, is refused).
+  const shapeBefore = treeShape(ts, before.file, new Set(units));
+  const shapeAfter = treeShape(ts, after.file);
+  if (shapeBefore.length !== shapeAfter.length || shapeBefore.some((s, k) => s !== shapeAfter[k])) {
+    return no("the retained code does not keep its structure: without the deleted parts the parser reads the code around them as other statements or expressions");
+  }
   const names = [];
+  const deletedTitles = [];
   let parts = 0;
   let tests = 0;
   for (const unit of units) {
     const line = before.file.getLineAndCharacterOfPosition(unit.getStart(before.file)).line + 1;
     const kind = removableKind(ts, unit);
-    const declaration = kind === "statement" && ts.isExpressionStatement(unit) && isCallTo(ts, unit.expression, (r) => TEST_CALLEES.has(r) || SUITE_CALLEES.has(r));
-    const asserts = nodesWhere(ts, unit, (n) => isCallTo(ts, n, (r) => ASSERT_CALLEE_RE.test(r))).length > 0;
-    if (asserts && !declaration) return no(`the deleted code at line ${line} removes an assertion from a test the file keeps`);
-    if (kind !== "statement") {
-      for (let p = unit.parent; p; p = p.parent) {
-        if (isCallTo(ts, p, (r) => ASSERT_CALLEE_RE.test(r))) return no(`the deleted code at line ${line} changes an assertion`);
-      }
+    const declaration = kind === "statement" && ts.isExpressionStatement(unit) && isDeclaration(ts, unit.expression, [TEST_CALLEES, SUITE_CALLEES]);
+    if (!declaration && ASSERTION_RE.test(codeOf(tokens, before.file, unit))) return no(`the deleted code at line ${line} removes an assertion from a test the file keeps`);
+    let inBody = false;
+    for (let p = unit.parent; p; p = p.parent) {
+      if (isAssertionCall(ts, tokens, before.file, p)) return no(`the deleted code at line ${line} changes an assertion`);
+      if (ts.isFunctionLike(p)) inBody = true;
+      else if (!inBody && isCallTo(ts, p, (r) => TEST_CALLEES.has(r) || SUITE_CALLEES.has(r))) return no(`the deleted code at line ${line} changes the title or the cases of a test or suite the file keeps`);
     }
-    for (const call of nodesWhere(ts, unit, (n) => isCallTo(ts, n, (r) => TEST_CALLEES.has(r)))) {
+    for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, n, [TEST_CALLEES]))) {
       tests += 1;
       if (!removed(mentions(ts, call))) return no(`the test deleted at line ${before.file.getLineAndCharacterOfPosition(call.getStart(before.file)).line + 1} names nothing the pull request removes from the product code`);
+    }
+    for (const call of nodesWhere(ts, unit, (n) => isDeclaration(ts, n, [TEST_CALLEES, SUITE_CALLEES]))) {
+      const pattern = declarationPattern(ts, tokens, before.file, call, isCallTo(ts, call, (r) => SUITE_CALLEES.has(r)));
+      if (pattern) deletedTitles.push(pattern);
     }
     const name = removed(mentions(ts, unit));
     if (name) {
@@ -1229,7 +1347,7 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
     }
   }
   if (parts === 0) return no("no deleted code names something the pull request removes from the product code");
-  return { ok: true, parts, tests, names };
+  return { ok: true, parts, tests, names, deletedTitles };
 }
 
 // Repository paths a missing-module text may mean: an absolute path inside the
@@ -1629,7 +1747,17 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         // is named on the file's reason.
         const removal = status === "A" || !context.removal ? null : context.removal();
         const notRemoval = removal && !removal.ok ? `; not a removal edit: ${removal.why}` : "";
-        if (removal?.ok && added.length === 0 && pins.length === 0) {
+        // A removal edit keeps every test it does not delete: each test of
+        // the earlier version (run with the fix) that the head no longer
+        // reports must be one a deleted declaration registers. When the
+        // earlier version cannot run with the fix (it imports what the fix
+        // removes), the parser's reading stands alone: removalEdit holds the
+        // head's tree to the earlier tree less the deleted nodes.
+        const titles = Array.isArray(removal?.deletedTitles) ? removal.deletedTitles : [];
+        const stray = removal?.ok && !why ? dropped.filter((t) => !titles.some((re) => re instanceof RegExp && re.test(normalizeText(t.name)))) : [];
+        if (removal?.ok && added.length === 0 && pins.length === 0 && stray.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${stray.length} test(s) of the file's earlier version that no deleted test declaration names: ${stray.slice(0, 3).map((t) => t.name).join(" | ")}: not a removal edit (a removal edit keeps every test it does not delete)`);
+        } else if (removal?.ok && added.length === 0 && pins.length === 0) {
           noClaim = {
             code: "REMOVAL",
             kind: "removal",

@@ -2634,7 +2634,7 @@ test("removalEdit: whole parts only, no assertion touched, every part names what
   assert.match(check("const a = 1;\nconst b = 2;\n", "const a = 1;\n", "src/a.test.ts").why, /line 2 names nothing the pull request removes/);
   assert.match(check("const title = 1;\nconst b = 2;\n", "const b = 2;\n", "src/a.test.ts").why, /names nothing/);
   // a comment pragma added with the deletion, only comments changed, a version that does not parse
-  assert.match(check(`${MOCK}it("x", () => {});\n`, `// @vitest-environment node\nit("x", () => {});\n`, "src/a.test.ts").why, /adds the comment pragma @vitest-environment/);
+  assert.match(check(`${MOCK}it("x", () => {});\n`, `// @vitest-environment node\nit("x", () => {});\n`, "src/a.test.ts").why, /changes the comment pragmas/);
   assert.match(check("// one\nconst a = 1;\n", "// two\nconst a = 1;\n", "src/a.test.ts").why, /deletes no code/);
   assert.match(check(`${MOCK}const a = (;\n`, "const a = (;\n", "src/a.test.ts").why, /does not parse cleanly/);
   // fail closed: no diff, no readable product diff, a missing version
@@ -2651,4 +2651,78 @@ test("README: the red-first section names the REMOVAL note", () => {
   const section = readme.slice(readme.indexOf("## red-first-gate"), readme.indexOf("## Developing in this repo"));
   assert.ok(section.includes("`REMOVAL`"), "the README section does not name `REMOVAL`");
   assert.match(section, /only beside a proven/);
+});
+
+// ---------------------------------------------------------------------------
+// Removal edits, review of PR #138: the retained code keeps its structure,
+// pragmas stay as they are, every assertion style counts, and `.each` is one
+// test declaration.
+// ---------------------------------------------------------------------------
+
+const REMOVED_PAIR = [{ path: "src/panel.ts", removed: ["export function loadCapturePair() {}", "export const removedFeature = 1;"], head: "export const kept = 1;\n" }];
+async function checkRemoval(t, before, after, file = "src/a.test.ts") {
+  const { removalEdit } = await gateModule();
+  return removalEdit({ file, earlier: before, source: after, hunks: hunksOf(t, before, after), product: REMOVED_PAIR });
+}
+
+test("removal review 1: a deletion that makes the parser join the retained code into another statement is refused (the structure differs)", async (t) => {
+  // ASI: `sink` and `[0].forEach(...)` are two statements only while the
+  // deleted call stands between them; without it they parse as sink[0]...
+  const before = 'import { test } from "vitest";\nconst sink = [[]];\nsink\nloadCapturePair();\n[0].forEach(() => test("kept", () => {}));\n';
+  const after = 'import { test } from "vitest";\nconst sink = [[]];\nsink\n[0].forEach(() => test("kept", () => {}));\n';
+  const r = await checkRemoval(t, before, after);
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.why, /the retained code does not keep its structure/);
+  // the same deletion with a semicolon after sink keeps the structure
+  const kept = await checkRemoval(t, before.replace("sink\n", "sink;\n"), after.replace("sink\n", "sink;\n"));
+  assert.equal(kept.ok, true, JSON.stringify(kept));
+});
+
+test("removal review 1: a removal edit whose earlier version reports a test that no deleted declaration names is RED (NOT-RED-BEFORE)", async () => {
+  const { judgeFile } = await gateModule();
+  const ok = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests } });
+  const t = (name) => ({ name, status: "passed", text: null, assertion: false });
+  const head = ok([t("kept a")]);
+  const removal = { ok: true, parts: 1, tests: 1, names: ["loadCapturePair"], deletedTitles: [/(?:^| )loadCapturePair pairs a gate$/] };
+  const judge = (earlierTests) => judgeFile({ file: "t.test.mjs", status: "M" }, head, head, { earlier: ok(earlierTests), changedTestLine: null, removal: () => removal });
+  const accepted = judge([t("kept a"), t("loadCapturePair pairs a gate")]);
+  assert.deepEqual([accepted.reasons.length, accepted.kind], [0, "removal"], JSON.stringify(accepted.reasons));
+  const lost = judge([t("kept a"), t("loadCapturePair pairs a gate"), t("kept b")]);
+  assert.deepEqual(lost.reasons.map((r) => r.code), ["NOT-RED-BEFORE"]);
+  assert.match(lost.reasons[0].detail, /1 test\(s\) of the file's earlier version that no deleted test declaration names: kept b/);
+  assert.equal(lost.kind, null);
+});
+
+test("removal review 2: a changed, added or removed pragma beside an eligible deletion is refused", async (t) => {
+  const MOCK = 'vi.mock("@/x/panel", () => ({ loadCapturePair: () => null }));\n';
+  const body = 'it("x", () => {});\n';
+  const changed = await checkRemoval(t, `// @vitest-environment jsdom\n${MOCK}${body}`, `// @vitest-environment node\n${body}`);
+  assert.equal(changed.ok, false, JSON.stringify(changed));
+  assert.match(changed.why, /changes the comment pragmas/);
+  assert.match((await checkRemoval(t, `// @vitest-environment jsdom\n${MOCK}${body}`, body)).why ?? "", /changes the comment pragmas/);
+  assert.equal((await checkRemoval(t, `// @vitest-environment jsdom\n${MOCK}${body}`, `// @vitest-environment jsdom\n${body}`)).ok, true);
+});
+
+test("removal review 3: a deleted `.should` assertion of a kept test is refused like expect and assert", async (t) => {
+  const before = 'it("x", () => {\n  value.should.equal(removedFeature);\n  value.should.be.ok;\n});\n';
+  const after = 'it("x", () => {\n  value.should.be.ok;\n});\n';
+  const r = await checkRemoval(t, before, after);
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.why, /removes an assertion from a test the file keeps/);
+  // an element inside a `.should` call
+  const inside = await checkRemoval(t, 'it("x", () => {\n  value.should.deep.equal({ a: 1, removedFeature: 2 });\n});\n', 'it("x", () => {\n  value.should.deep.equal({ a: 1 });\n});\n');
+  assert.match(inside.why ?? "", /changes an assertion/, JSON.stringify(inside));
+});
+
+test("removal review 4: a deleted `test.each(cases)(...)` is one test, and a removed name in its title or body is evidence for it", async (t) => {
+  const before = 'import { expect, test } from "vitest";\ntest("kept", () => {});\ntest.each([[1], [2]])("removed %s", (n) => {\n  expect(removedFeature).toBe(n);\n});\n';
+  const after = 'import { expect, test } from "vitest";\ntest("kept", () => {});\n';
+  const r = await checkRemoval(t, before, after);
+  assert.deepEqual([r.ok, r.tests], [true, 1], JSON.stringify(r));
+  const tagged = 'import { test } from "vitest";\ntest("kept", () => {});\ntest.each`\n  n\n  ${1}\n`("removed $n", ({ n }) => removedFeature(n));\n';
+  const rt = await checkRemoval(t, tagged, 'import { test } from "vitest";\ntest("kept", () => {});\n');
+  assert.deepEqual([rt.ok, rt.tests], [true, 1], JSON.stringify(rt));
+  // the deleted declaration's title matches the names its rows register
+  assert.ok(r.deletedTitles.some((re) => re.test("removed 1")), String(r.deletedTitles));
+  assert.ok(!r.deletedTitles.some((re) => re.test("kept")), String(r.deletedTitles));
 });
