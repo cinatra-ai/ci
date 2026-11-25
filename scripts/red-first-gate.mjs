@@ -28,8 +28,12 @@
 // marker line that the diff shows as added counts and must match. A renamed
 // test file is read with git's rename detection here (only this read): its
 // unchanged lines, markers included, are not added; everywhere else the gate
-// treats it as a new file. A marker added for a test that already passes
-// before the fix is in no failure text: TEXT-MISMATCH, as before. Markers
+// treats it as a new file. Names git writes C-quoted (non-ASCII, `"`, `\`,
+// control characters) are decoded. A file whose added lines cannot be read
+// (a `-diff` attribute, a name that does not decode) keeps every marker of
+// its head source, the reading before this rule. A marker added for a test
+// that already passes before the fix is in no failure text: TEXT-MISMATCH,
+// as before. Markers
 // are never required: they only let a failure without an assertion count
 // (a failure that matches one) and refuse a file whose failures miss one,
 // so reading fewer of them never turns a run without a proven red-to-green
@@ -861,26 +865,58 @@ export function changedTestLine(lines) {
   return lines.find((line) => !isCommentLine(line) && TEST_LINE_RE.test(line)) ?? null;
 }
 
+// A path as git writes it in a diff header: plain, or C-quoted (core.quotePath
+// quotes non-ASCII bytes, `"`, `\` and control characters) with \a \b \t \n
+// \v \f \r \" \\ and octal byte escapes, decoded as UTF-8. A plain path may
+// end with a tab (a name with a space); a quoted one may be followed by one.
+// Returns null for a quoted path that does not decode (an unknown escape, no
+// closing quote, text after it).
+const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+export function diffPath(raw) {
+  if (!raw.startsWith('"')) return raw.replace(/\t$/, "");
+  const bytes = [];
+  for (let i = 1; i < raw.length; i += 1) {
+    const c = raw[i];
+    if (c === '"') return /^\t?$/.test(raw.slice(i + 1)) ? Buffer.from(bytes).toString("utf8") : null;
+    if (c !== "\\") {
+      bytes.push(...Buffer.from(c, "utf8"));
+      continue;
+    }
+    const next = raw[i + 1];
+    if (next !== undefined && Object.hasOwn(C_ESCAPES, next)) {
+      bytes.push(C_ESCAPES[next]);
+      i += 1;
+    } else if (/^[0-3][0-7]{2}$/.test(raw.slice(i + 1, i + 4))) {
+      bytes.push(parseInt(raw.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else return null;
+  }
+  return null;
+}
+
 // A unified diff with no context lines, per path: { added: [...], removed:
-// [...] }. A path git writes quoted (unusual characters) is left out: what
-// is not read here is never evidence. In a diff with rename detection, a
+// [...] }. A C-quoted path is decoded; a path that does not decode is left
+// out: what is not read here is never evidence, and a caller that needs a
+// file's lines treats it as unreadable. In a diff with rename detection, a
 // renamed path is read under its new name even without a hunk (a pure rename
 // adds no line).
 export function parseRangeDiff(text) {
   const files = new Map();
   let current = null;
   let header = false;
+  const start = (path) => {
+    current = path === null ? null : { added: [], removed: [] };
+    if (current) files.set(path, current);
+  };
   for (const line of String(text).split("\n")) {
     if (line.startsWith("diff --git ")) {
       header = true;
       current = null;
     } else if (header) {
-      if (line.startsWith("rename to ") && !line.startsWith('rename to "')) {
-        current = { added: [], removed: [] };
-        files.set(line.slice(10), current);
-      } else if (line.startsWith("+++ b/")) {
-        current = { added: [], removed: [] };
-        files.set(line.slice(6).replace(/\t$/, ""), current);
+      if (line.startsWith("rename to ")) start(diffPath(line.slice(10)));
+      else if (line.startsWith("+++ ")) {
+        const path = diffPath(line.slice(4));
+        start(path !== null && path.startsWith("b/") ? path.slice(2) : null);
       } else if (line.startsWith("@@")) header = false;
     } else if (current) {
       if (line.startsWith("+")) current.added.push(line.slice(1));
@@ -2002,16 +2038,18 @@ async function runGateIn(opts) {
       const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
       sources.set(file, source);
       // Pins and expect markers only from the lines the pull request adds: a
-      // marker the file already had declares nothing (an unreadable diff
-      // declares nothing). Pins read a renamed file whole (all its tests are
-      // added tests, each needs its pin); expect markers read the diff with
-      // rename detection, so a renamed file's unchanged markers stay unread.
+      // marker the file already had declares nothing. Pins read a renamed
+      // file whole (all its tests are added tests, each needs its pin);
+      // expect markers read the diff with rename detection, so a renamed
+      // file's unchanged markers stay unread. Each fails closed: an
+      // unreadable diff declares no pin (its tests must fail first), and
+      // keeps every expect marker of the head source (each must match).
       const added = range.addedLines(file);
       const markerLines = range.markerLines(file);
       return {
         file,
         runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest",
-        markers: markerLines ? readMarkers(markerLines.join("\n")) : [],
+        markers: readMarkers(markerLines ? markerLines.join("\n") : source),
         pins: added ? readPins(added.join("\n")) : [],
         status: statusOf.get(file) ?? "A",
       };

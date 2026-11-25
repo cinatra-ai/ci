@@ -1630,7 +1630,9 @@ test("evidence: the name a not-a-function text calls, the exports of added lines
   const diff = parseRangeDiff(
     'diff --git a/src/a.mjs b/src/a.mjs\nindex 1..2 100644\n--- a/src/a.mjs\n+++ b/src/a.mjs\n@@ -1 +1,2 @@\n-export function old() {}\n+export function old(x) {}\n+export function fresh() {}\ndiff --git "a/src/q\\"uote.mjs" "b/src/q\\"uote.mjs"\n--- "a/src/q\\"uote.mjs"\n+++ "b/src/q\\"uote.mjs"\n@@ -0,0 +1 @@\n+export function hidden() {}\n',
   );
-  assert.deepEqual([...diff.keys()], ["src/a.mjs"]);
+  // a quoted path is decoded (the gate reads exports from blobs, never from this diff)
+  assert.deepEqual([...diff.keys()], ["src/a.mjs", 'src/q"uote.mjs']);
+  assert.deepEqual(diff.get('src/q"uote.mjs').added, ["export function hidden() {}"]);
   assert.deepEqual(diff.get("src/a.mjs"), { added: ["export function old(x) {}", "export function fresh() {}"], removed: ["export function old() {}"] });
   // changed lines of a test file: declarations and assertions count, comments and other calls do not
   assert.equal(changedTestLine(["// expect(a).toBe(1) in a comment", ' * it("x")', "  compile: vi.fn(async () => ({ ok: true })),", "const hit = /x/.test(name);"]), null);
