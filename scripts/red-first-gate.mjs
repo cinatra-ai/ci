@@ -880,7 +880,8 @@ export function changedTestLine(lines) {
 // may be followed by one. Returns null for a quoted path that does not
 // decode (an unknown escape, no closing quote, text after it, invalid UTF-8).
 const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
-const UTF8 = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM: a path may start with U+FEFF; the default decoder would drop it.
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 export function diffPath(raw) {
   if (!raw.startsWith('"')) return raw.replace(/\t$/, "");
   const bytes = [];
@@ -1453,6 +1454,9 @@ const GIT_READ_CONFIG = [
   "color.diff=never",
   "diff.noprefix=false",
   "diff.mnemonicPrefix=false",
+  "diff.srcPrefix=a/",
+  "diff.dstPrefix=b/",
+  "diff.submodule=short",
   "diff.relative=false",
   "diff.renames=false",
   "diff.algorithm=myers",

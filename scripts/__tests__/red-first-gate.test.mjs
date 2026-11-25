@@ -2132,6 +2132,28 @@ test("configuration: diff.noprefix, diff.mnemonicPrefix, color.ui=always and an 
   assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[["Expected values to be strictly equal"], []]]);
 });
 
+test("configuration: diff.srcPrefix and diff.dstPrefix cannot move a fix-side file's lines onto a test file", async (t) => {
+  // with dstPrefix "b/test/foo." the root file test.mjs would print as +++ b/test/foo.test.mjs
+  const sc = scenario(t, {
+    base: { ...BASE, "test/foo.test.mjs": PLAIN_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test.mjs": "// red-first-expect: add gives the wrong sum\nexport {};\n", "test/foo.test.mjs": `${PLAIN_OLD}\n${WRONG_SUM}` },
+  });
+  git(sc.repo, "config", "diff.srcPrefix", "a/x.");
+  git(sc.repo, "config", "diff.dstPrefix", "b/test/foo.");
+  const r = runGate(sc, "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.files.map((f) => [f.file, f.markers, f.unknownMarkers]), [["test/foo.test.mjs", [], []]]);
+});
+
+test("expect markers: a pure rename to a name that starts with U+FEFF keeps that character and adds no line", async (t) => {
+  const root = `${TEST_HEAD}// red-first-expect: mul is not a function\nimport { mul } from "./src/calc.mjs";\n\ntest("mul multiplies two numbers", () => {\n  assert.equal(mul(2, 3), 6);\n});\n`;
+  const sc = scenario(t, { base: { ...BASE, "old.test.mjs": root }, head: { "src/calc.mjs": CALC_FIX, "old.test.mjs": null, "﻿calc.test.mjs": root } });
+  const r = runGate(sc, "run");
+  assert.deepEqual(r.verdict.files.map((f) => [f.file, f.markers, f.unknownMarkers]), [["﻿calc.test.mjs", [], []]]);
+  const { diffPath } = await gateModule();
+  assert.equal(diffPath('"\\357\\273\\277calc.test.mjs"'), "﻿calc.test.mjs");
+});
+
 test("diffPath: literal characters are read by code point, the bytes decoded once; invalid UTF-8 does not decode", async () => {
   const { diffPath } = await gateModule();
   assert.equal(diffPath('"b/test/\u{1F600}\\"x.mjs"'), 'b/test/\u{1F600}"x.mjs');
