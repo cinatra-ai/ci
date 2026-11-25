@@ -21,6 +21,19 @@
 //      an export or a module the fix side adds and the test file itself
 //      imports from that module), and with the fix loads, passes, and passes
 //      every occurrence of every test that failed before.
+// A `red-first-expect:` marker counts only on a line the pull request adds
+// (relative to the merge base; a file it adds is added whole), as pins do: a
+// marker the file already had declares nothing, so a merged pull request's
+// marker, whose test now passes, never refuses a later one. An edited or moved
+// marker line that the diff shows as added counts and must match. A renamed
+// test file is read with git's rename detection here (only this read): its
+// unchanged lines, markers included, are not added; everywhere else the gate
+// treats it as a new file. A marker added for a test that already passes
+// before the fix is in no failure text: TEXT-MISMATCH, as before. Markers
+// are never required: they only let a failure without an assertion count
+// (a failure that matches one) and refuse a file whose failures miss one,
+// so reading fewer of them never turns a run without a proven red-to-green
+// test into a pass.
 // A test file with no failing test before the fix makes no red-first claim in
 // two cases only, each a note (not proven here), never a proof:
 //   - COLLATERAL: a changed file whose earlier version, run in the tree WITH
@@ -850,7 +863,9 @@ export function changedTestLine(lines) {
 
 // A unified diff with no context lines, per path: { added: [...], removed:
 // [...] }. A path git writes quoted (unusual characters) is left out: what
-// is not read here is never evidence.
+// is not read here is never evidence. In a diff with rename detection, a
+// renamed path is read under its new name even without a hunk (a pure rename
+// adds no line).
 export function parseRangeDiff(text) {
   const files = new Map();
   let current = null;
@@ -860,7 +875,10 @@ export function parseRangeDiff(text) {
       header = true;
       current = null;
     } else if (header) {
-      if (line.startsWith("+++ b/")) {
+      if (line.startsWith("rename to ") && !line.startsWith('rename to "')) {
+        current = { added: [], removed: [] };
+        files.set(line.slice(10), current);
+      } else if (line.startsWith("+++ b/")) {
         current = { added: [], removed: [] };
         files.set(line.slice(6).replace(/\t$/, ""), current);
       } else if (line.startsWith("@@")) header = false;
@@ -1872,13 +1890,23 @@ async function runEarlier(repo, plan, tree, quiet, opts, work) {
 // script, the names its whole head version exports (code only) that no
 // fix-side script exported at the merge base (so a moved or reworded export
 // is not new); per changed test file, the first changed line that declares a
-// test or states an assertion, its added lines and whether it only adds.
+// test or states an assertion, its added lines and whether it only adds; and
+// per test file the lines the pull request adds when a rename counts as one
+// (where its `red-first-expect:` markers are read).
 function rangeReader(repo, plan) {
   let files = null;
+  let moved = null;
   let byFile = null;
   const read = () => {
     files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
     return files;
+  };
+  // The same range with rename detection (git's default similarity, 50%):
+  // a renamed file's unchanged lines are not added there. Used for markers
+  // only; everything else treats a renamed file as a new file.
+  const readMoved = () => {
+    moved ??= parseRangeDiff(git(repo, ["diff", "-U0", "--find-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    return moved;
   };
   const blob = (rev, path) => {
     const r = git(repo, ["cat-file", "blob", `${rev}:${path}`], { allowFail: true });
@@ -1893,6 +1921,11 @@ function rangeReader(repo, plan) {
     // The added lines of a file's edit, or null when its diff is not readable.
     addedLines(path) {
       return read().get(path)?.added ?? null;
+    },
+    // The added lines of a file's edit when a rename is not an addition, or
+    // null when its diff is not readable.
+    markerLines(path) {
+      return readMoved().get(path)?.added ?? null;
     },
     pureAddition(path) {
       const diff = read().get(path);
@@ -1968,10 +2001,20 @@ async function runGateIn(opts) {
     const files = plan.newTests.map((file) => {
       const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
       sources.set(file, source);
-      // Pins only from the lines the pull request adds: a marker the file
-      // already had declares nothing (an unreadable diff declares nothing).
+      // Pins and expect markers only from the lines the pull request adds: a
+      // marker the file already had declares nothing (an unreadable diff
+      // declares nothing). Pins read a renamed file whole (all its tests are
+      // added tests, each needs its pin); expect markers read the diff with
+      // rename detection, so a renamed file's unchanged markers stay unread.
       const added = range.addedLines(file);
-      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source), pins: added ? readPins(added.join("\n")) : [], status: statusOf.get(file) ?? "A" };
+      const markerLines = range.markerLines(file);
+      return {
+        file,
+        runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest",
+        markers: markerLines ? readMarkers(markerLines.join("\n")) : [],
+        pins: added ? readPins(added.join("\n")) : [],
+        status: statusOf.get(file) ?? "A",
+      };
     });
     const phases = {};
     for (const phase of ["before", "head"]) {

@@ -2357,7 +2357,10 @@ codes alone.
   least one test and fail at least one test by an assertion (`AssertionError`),
   or by the text of a `red-first-expect: <text>` marker line in the file. A
   marker text must appear in a test failure of that file (ANSI and whitespace
-  normalized, case-sensitive).
+  normalized, case-sensitive). Only marker lines the pull request adds count
+  (a new file counts whole; a renamed file's unchanged lines do not, read with
+  git's rename detection): a marker the file already had declares nothing, so
+  markers of merged pull requests never need a sweep.
 - **What the fix adds**: a failure before the fix is also the right reason,
   without a marker, when its text names something only the fix side provides:
   a `TypeError: ... <name> is not a function` (or `is not a constructor`) or
@@ -2438,7 +2441,8 @@ codes alone.
   is `NOT-RED-BEFORE`. Added lines can still weaken an existing test without
   removing it (an early `return`, for example): the gate does not see that,
   so review added lines beside pins as a change to an existing test. Markers
-  are part of the diff: review them as you review `red-first-expect:`.
+  are part of the diff: review them as you review `red-first-expect:`, which
+  also counts only on the lines the pull request adds.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit
