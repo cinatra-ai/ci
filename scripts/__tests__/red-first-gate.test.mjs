@@ -1987,6 +1987,30 @@ test("expect markers: a test file whose diff is not readable keeps every marker 
   assert.match(r.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH").detail, /marker "mul is not a function" is in no failure text/);
 });
 
+// A test file at the base whose old marker would match a later failure; `-diff` hides its added lines.
+const UNREAD_BASE = (marker) => ({
+  ...BASE,
+  ".gitattributes": "test/calc.test.mjs -diff\n",
+  "test/calc.test.mjs": MUL_OLD.replace("mul is not a function", marker),
+});
+
+test("expect markers: in a file whose diff is not readable, a marker of unknown origin never proves a failure without an assertion (WRONG-REASON)", async (t) => {
+  const base = UNREAD_BASE("add gives the wrong sum");
+  const sc = scenario(t, { base, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": `${base["test/calc.test.mjs"]}\n${WRONG_SUM}` } });
+  const r = runGate(sc, "run");
+  assertRed(r, "WRONG-REASON");
+  const reason = r.verdict.reasons.find((x) => x.code === "WRONG-REASON");
+  assert.match(reason.detail, /added lines cannot be read/);
+  assert.match(reason.detail, /add gives the wrong sum/);
+  assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[[], ["add gives the wrong sum"]]]);
+});
+
+test("expect markers: in a file whose diff is not readable, an assertion failure is judged as usual; a marker of unknown origin that matches it does not refuse it", async (t) => {
+  const base = UNREAD_BASE("!== 3");
+  const sc = scenario(t, { base, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": `${base["test/calc.test.mjs"]}\n${ADD_CASE}` } });
+  assertPass(runGate(sc, "run"));
+});
+
 test("parseRangeDiff: C-quoted paths are decoded (octal bytes, \\\", \\\\, \\t, \\n); a malformed one is left out", async () => {
   const { parseRangeDiff } = await gateModule();
   const diff = parseRangeDiff(
