@@ -27,9 +27,11 @@
 // marker, whose test now passes, never refuses a later one. An edited or moved
 // marker line that the diff shows as added counts and must match. A renamed
 // test file is read with git's rename detection here (only this read): its
-// unchanged lines, markers included, are not added; everywhere else the gate
-// treats it as a new file. Names git writes C-quoted (non-ASCII, `"`, `\`,
-// control characters) are decoded. A file whose added lines cannot be read
+// unchanged lines, markers included, are not added (a rename without a
+// readable hunk adds no line only at similarity 100%; otherwise its added
+// lines cannot be read); everywhere else the gate treats it as a new file.
+// Names git writes C-quoted (non-ASCII, `"`, `\`, control characters) are
+// decoded, under either core.quotePath. A file whose added lines cannot be read
 // (a `-diff` attribute, a name that does not decode) keeps every marker of
 // its head source, but of unknown origin: each must match a failure
 // (TEXT-MISMATCH), none counts as the right reason for a failure without an
@@ -868,19 +870,30 @@ export function changedTestLine(lines) {
 
 // A path as git writes it in a diff header: plain, or C-quoted (core.quotePath
 // quotes non-ASCII bytes, `"`, `\` and control characters) with \a \b \t \n
-// \v \f \r \" \\ and octal byte escapes, decoded as UTF-8. A plain path may
-// end with a tab (a name with a space); a quoted one may be followed by one.
-// Returns null for a quoted path that does not decode (an unknown escape, no
-// closing quote, text after it).
+// \v \f \r \" \\ and octal byte escapes. Its bytes (escapes as bytes,
+// literal characters as the UTF-8 of each code point, so an astral character
+// that core.quotePath=false leaves literal stays whole) are decoded as UTF-8
+// once. A plain path may end with a tab (a name with a space); a quoted one
+// may be followed by one. Returns null for a quoted path that does not
+// decode (an unknown escape, no closing quote, text after it, invalid UTF-8).
 const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
 export function diffPath(raw) {
   if (!raw.startsWith('"')) return raw.replace(/\t$/, "");
   const bytes = [];
   for (let i = 1; i < raw.length; i += 1) {
-    const c = raw[i];
-    if (c === '"') return /^\t?$/.test(raw.slice(i + 1)) ? Buffer.from(bytes).toString("utf8") : null;
+    const c = String.fromCodePoint(raw.codePointAt(i));
+    if (c === '"') {
+      if (!/^\t?$/.test(raw.slice(i + 1))) return null;
+      try {
+        return UTF8.decode(Uint8Array.from(bytes));
+      } catch {
+        return null;
+      }
+    }
     if (c !== "\\") {
       bytes.push(...Buffer.from(c, "utf8"));
+      i += c.length - 1;
       continue;
     }
     const next = raw[i + 1];
@@ -899,12 +912,15 @@ export function diffPath(raw) {
 // [...] }. A C-quoted path is decoded; a path that does not decode is left
 // out: what is not read here is never evidence, and a caller that needs a
 // file's lines treats it as unreadable. In a diff with rename detection, a
-// renamed path is read under its new name even without a hunk (a pure rename
-// adds no line).
+// rename git reports at similarity 100% (the same bytes: a pure rename) is
+// read under its new name with no added line; any other rename is read only
+// from its hunk, so one whose hunk git does not print (a `-diff` attribute:
+// "Binary files ... differ") stays unreadable.
 export function parseRangeDiff(text) {
   const files = new Map();
   let current = null;
   let header = false;
+  let pure = false;
   const start = (path) => {
     current = path === null ? null : { added: [], removed: [] };
     if (current) files.set(path, current);
@@ -913,9 +929,12 @@ export function parseRangeDiff(text) {
     if (line.startsWith("diff --git ")) {
       header = true;
       current = null;
+      pure = false;
     } else if (header) {
-      if (line.startsWith("rename to ")) start(diffPath(line.slice(10)));
-      else if (line.startsWith("+++ ")) {
+      if (line === "similarity index 100%") pure = true;
+      else if (line.startsWith("rename to ")) {
+        if (pure) start(diffPath(line.slice(10)));
+      } else if (line.startsWith("+++ ")) {
         const path = diffPath(line.slice(4));
         start(path !== null && path.startsWith("b/") ? path.slice(2) : null);
       } else if (line.startsWith("@@")) header = false;
