@@ -1939,6 +1939,86 @@ test("expect markers: every marker of a file the pull request adds is read", asy
   assert.match(r.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH").detail, /marker "mul is not a function" is in no failure text/);
 });
 
+// A failure without an assertion: only a matching marker (or what the fix adds) proves it.
+const WRONG_SUM = 'test("add sums two numbers", () => {\n  if (add(1, 2) !== 3) throw new Error("add gives the wrong sum");\n});\n';
+const WRONG_SUM_FILE = (marker) => `${TEST_HEAD}// red-first-expect: ${marker}\nimport { add } from "../src/calc.mjs";\n\n${WRONG_SUM}`;
+
+test("expect markers: a renamed file's added marker is read and must match; its unchanged old marker is not", async (t) => {
+  const renamed = (marker) => ({
+    base: { ...BASE, "test/old.test.mjs": MUL_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/old.test.mjs": null, "test/calc.test.mjs": `${MUL_OLD}\n// red-first-expect: ${marker}\n${WRONG_SUM}` },
+  });
+  const good = runGate(scenario(t, renamed("add gives the wrong sum")), "run");
+  assertPass(good);
+  assert.deepEqual(good.verdict.files.map((f) => f.markers), [["add gives the wrong sum"]]);
+  const bad = runGate(scenario(t, renamed("add is not a function")), "run");
+  assertRed(bad, "TEXT-MISMATCH");
+  const reason = bad.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH");
+  assert.match(reason.detail, /marker "add is not a function" is in no failure text/);
+  assert.doesNotMatch(reason.detail, /mul is not a function/);
+});
+
+test("expect markers: a new test file with a non-ASCII name: a matching marker proves a failure without an assertion", async (t) => {
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/wörk.test.mjs": WRONG_SUM_FILE("add gives the wrong sum") } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.files.map((f) => f.markers), [["add gives the wrong sum"]]);
+});
+
+test("expect markers: names git writes quoted (non-ASCII, a double quote) and a name with a space: a marker that matches nothing is TEXT-MISMATCH", async (t) => {
+  const marked = ADD_TEST.replace(TEST_HEAD, `${TEST_HEAD}// red-first-expect: nothing like this\n`);
+  for (const name of ["test/wörk.test.mjs", 'test/say "hi".test.mjs', "test/my calc.test.mjs"]) {
+    const r = runGate(scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, [name]: marked } }), "run");
+    assertRed(r, "TEXT-MISMATCH");
+    assert.match(r.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH").detail, /marker "nothing like this" is in no failure text/, name);
+  }
+});
+
+test("expect markers: a test file whose diff is not readable keeps every marker of its head source (fail closed)", async (t) => {
+  // `-diff` makes git print no hunk for the file: its added lines cannot be read.
+  const sc = scenario(t, {
+    base: { ...BASE, ".gitattributes": "test/calc.test.mjs -diff\n", "test/calc.test.mjs": MUL_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": `${MUL_OLD}\n${ADD_CASE}` },
+  });
+  const r = runGate(sc, "run");
+  assertRed(r, "TEXT-MISMATCH");
+  assert.match(r.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH").detail, /marker "mul is not a function" is in no failure text/);
+});
+
+test("parseRangeDiff: C-quoted paths are decoded (octal bytes, \\\", \\\\, \\t, \\n); a malformed one is left out", async () => {
+  const { parseRangeDiff } = await gateModule();
+  const diff = parseRangeDiff(
+    [
+      'diff --git "a/w\\303\\266rk.mjs" "b/w\\303\\266rk.mjs"',
+      '--- "a/w\\303\\266rk.mjs"',
+      '+++ "b/w\\303\\266rk.mjs"',
+      "@@ -0,0 +1 @@",
+      "+one",
+      'diff --git "a/say \\"hi\\" \\\\ x\\ty\\nz.mjs" "b/say \\"hi\\" \\\\ x\\ty\\nz.mjs"',
+      '+++ "b/say \\"hi\\" \\\\ x\\ty\\nz.mjs"\t',
+      "@@ -0,0 +1 @@",
+      "+two",
+      'diff --git "a/old \\"q\\".mjs" "b/new \\"q\\".mjs"',
+      "similarity index 100%",
+      'rename from "old \\"q\\".mjs"',
+      'rename to "new \\"q\\".mjs"',
+      'diff --git "a/bad.mjs" "b/bad.mjs"',
+      '+++ "b/bad\\q.mjs"',
+      "@@ -0,0 +1 @@",
+      "+three",
+      'diff --git "a/open.mjs" "b/open.mjs"',
+      '+++ "b/open.mjs',
+      "@@ -0,0 +1 @@",
+      "+four",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual([...diff.keys()].sort(), ["new \"q\".mjs", 'say "hi" \\ x\ty\nz.mjs', "wörk.mjs"].sort());
+  assert.deepEqual(diff.get("wörk.mjs").added, ["one"]);
+  assert.deepEqual(diff.get('say "hi" \\ x\ty\nz.mjs').added, ["two"]);
+  assert.deepEqual(diff.get('new "q".mjs'), { added: [], removed: [] });
+});
+
 test("finding 3: a tests-only pull request whose new helper the range lists on the fix side is not proven by its load error (LOAD-ERROR)", async (t) => {
   const helperTest = `${TEST_HEAD}import { two } from "./support.mjs";\n\ntest("two is two", () => {\n  assert.equal(two(), 2);\n});\n`;
   const sc = scenario(t, { base: PUB_BASE, head: { "test/a.test.mjs": helperTest, "test/support.mjs": "export const two = () => 2;\n" } });
