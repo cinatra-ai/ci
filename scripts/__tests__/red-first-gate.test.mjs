@@ -1885,6 +1885,60 @@ test("finding 2: pins added only by inserted lines to a file whose earlier versi
   assert.match(r.verdict.reasons[0].detail, /earlier version fails with the fix .* pins are declared only beside existing tests that pass with the fix unchanged/);
 });
 
+// Expect markers, like pins, are read only from the lines the pull request
+// adds: a marker a merged pull request left in the file declares nothing.
+// MUL_OLD: a test file at the base whose test passes, with a marker an earlier
+// pull request left behind.
+const MUL_OLD = `${TEST_HEAD}// red-first-expect: mul is not a function\nimport { add, mul } from "../src/calc.mjs";\n\ntest("mul multiplies two numbers", () => {\n  assert.equal(mul(2, 3), 6);\n});\n`;
+const ADD_CASE = 'test("add sums two numbers", () => {\n  assert.equal(add(1, 2), 3);\n});\n';
+
+test("expect markers: a marker the file already had declares nothing; a new failing test with its own added marker passes", async (t) => {
+  const head = `${MUL_OLD}\n// red-first-expect: Expected values to be strictly equal\n${ADD_CASE}`;
+  const sc = scenario(t, { base: { ...BASE, "test/calc.test.mjs": MUL_OLD }, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": head } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.files.map((f) => f.markers), [["Expected values to be strictly equal"]]);
+});
+
+test("expect markers: a changed file with only a base marker and a new failing test is judged as a file without markers", async (t) => {
+  const sc = scenario(t, { base: { ...BASE, "test/calc.test.mjs": MUL_OLD }, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": `${MUL_OLD}\n${ADD_CASE}` } });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.files.map((f) => f.markers), [[]]);
+});
+
+test("expect markers: an added marker that matches no failure is still TEXT-MISMATCH, named; the base marker is not", async (t) => {
+  const head = `${MUL_OLD}\n// red-first-expect: add is not a function\n${ADD_CASE}`;
+  const sc = scenario(t, { base: { ...BASE, "test/calc.test.mjs": MUL_OLD }, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": head } });
+  const r = runGate(sc, "run");
+  assertRed(r, "TEXT-MISMATCH");
+  const reason = r.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH");
+  assert.match(reason.detail, /marker "add is not a function" is in no failure text/);
+  assert.doesNotMatch(reason.detail, /mul is not a function/);
+});
+
+test("expect markers: a renamed test file's unchanged markers are not added lines; its edit's markers are", async (t) => {
+  const sc = scenario(t, {
+    base: { ...BASE, "test/old.test.mjs": MUL_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/old.test.mjs": null, "test/calc.test.mjs": `${MUL_OLD}\n${ADD_CASE}` },
+  });
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.files.map((f) => `${f.file}:${f.markers.length}`), ["test/calc.test.mjs:0"]);
+  // A pure rename (no hunk) is read as a file with no added line, not as an unreadable diff.
+  const { parseRangeDiff } = await gateModule();
+  const moved = parseRangeDiff("diff --git a/test/old.test.mjs b/test/new.test.mjs\nsimilarity index 100%\nrename from test/old.test.mjs\nrename to test/new.test.mjs\n");
+  assert.deepEqual(moved.get("test/new.test.mjs"), { added: [], removed: [] });
+});
+
+test("expect markers: every marker of a file the pull request adds is read", async (t) => {
+  const head = `${MUL_OLD}\n${ADD_CASE}`;
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": head } });
+  const r = runGate(sc, "run");
+  assertRed(r, "TEXT-MISMATCH");
+  assert.match(r.verdict.reasons.find((x) => x.code === "TEXT-MISMATCH").detail, /marker "mul is not a function" is in no failure text/);
+});
+
 test("finding 3: a tests-only pull request whose new helper the range lists on the fix side is not proven by its load error (LOAD-ERROR)", async (t) => {
   const helperTest = `${TEST_HEAD}import { two } from "./support.mjs";\n\ntest("two is two", () => {\n  assert.equal(two(), 2);\n});\n`;
   const sc = scenario(t, { base: PUB_BASE, head: { "test/a.test.mjs": helperTest, "test/support.mjs": "export const two = () => 2;\n" } });
