@@ -31,7 +31,10 @@
 // readable hunk adds no line only at similarity 100%; otherwise its added
 // lines cannot be read); everywhere else the gate treats it as a new file.
 // Names git writes C-quoted (non-ASCII, `"`, `\`, control characters) are
-// decoded, under either core.quotePath. A file whose added lines cannot be read
+// decoded. The range is read with git configuration that cannot change it
+// (no textconv, no external diff, fixed prefixes, quoting and rename limit);
+// when git skips rename detection, every new file's markers are of unknown
+// origin. A file whose added lines cannot be read
 // (a `-diff` attribute, a name that does not decode) keeps every marker of
 // its head source, but of unknown origin: each must match a failure
 // (TEXT-MISMATCH), none counts as the right reason for a failure without an
@@ -1425,11 +1428,43 @@ export function judgeFile({ file, markers = [], unknownMarkers = [], pins = [], 
 // git, processes and trees
 // ---------------------------------------------------------------------------
 
+// The gate reads the repository the same way whatever the caller's or the
+// repository's configuration says. Environment: C messages (the rename
+// warning is read), no replace objects, no system attributes file, and none
+// of the variables that inject configuration or an external diff.
+// The configuration and attribute files themselves stay (a CI checkout keeps
+// safe.directory there); every setting that changes what the gate reads is
+// overridden on the command line (GIT_READ_CONFIG), which wins over every
+// file, and every diff call names its own options (DIFF_READ).
 function gitEnv(extra = {}) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", ...extra };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"]) delete env[key];
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C", GIT_NO_REPLACE_OBJECTS: "1", GIT_ATTR_NOSYSTEM: "1", ...extra };
+  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"]) delete env[key];
+  for (const key of Object.keys(env)) if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
   return env;
 }
+
+const GIT_READ_CONFIG = [
+  "core.hooksPath=/dev/null",
+  "core.fsmonitor=false",
+  "core.quotePath=true",
+  "core.attributesFile=/dev/null",
+  "core.autocrlf=false",
+  "color.ui=never",
+  "color.diff=never",
+  "diff.noprefix=false",
+  "diff.mnemonicPrefix=false",
+  "diff.relative=false",
+  "diff.renames=false",
+  "diff.algorithm=myers",
+  "diff.indentHeuristic=true",
+  "diff.interHunkContext=0",
+  "diff.suppressBlankEmpty=false",
+].flatMap((kv) => ["-c", kv]);
+// Every diff the gate reads: no textconv driver, no external diff, no color.
+const DIFF_READ = ["--no-textconv", "--no-ext-diff", "--no-color"];
+// The rename-detecting diff: an explicit threshold and limit; when git skips
+// the detection (more candidates than the limit) it says so on stderr.
+const RENAME_READ = ["-M50%", "-l1000"];
 
 // The deadline of the run's git calls (the job's budget less the reserve), or
 // null when the run has no job budget. The cleanup's git calls run inside the
@@ -1445,7 +1480,7 @@ function gitTimeout(cleanup) {
 function git(repo, args, { allowFail = false, env = {}, cleanup = false } = {}) {
   const timeout = gitTimeout(cleanup);
   if (timeout !== undefined && timeout <= 0) throw new BudgetError(`the job's time budget was spent before git ${args[0]}`);
-  const r = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "--literal-pathspecs", "-C", repo, ...args], {
+  const r = spawnSync("git", [...GIT_READ_CONFIG, "--literal-pathspecs", "-C", repo, ...args], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
     env: gitEnv(env),
@@ -1599,7 +1634,7 @@ function endGroup() {
 function changedTestSide(tree, plan) {
   const onTestSide = testSideOf(plan);
   const listed = new Set(plan.testSide.map((e) => e.path));
-  return nulList(git(tree, ["diff", "--name-only", "--no-renames", "-z", plan.head]).stdout)
+  return nulList(git(tree, ["diff", ...DIFF_READ, "--name-only", "--no-renames", "-z", plan.head]).stdout)
     .filter((p) => listed.has(p) || onTestSide(p))
     .sort(byPath);
 }
@@ -1652,7 +1687,7 @@ export function planRange({ repo = process.cwd(), base, head, exclude = "", test
   for (const sha of [base, head]) git(repo, ["cat-file", "-e", `${sha}^{commit}`]);
   const mergeBase = git(repo, ["merge-base", base, head]).stdout.trim();
   if (!SHA_RE.test(mergeBase)) throw new GateError(`no merge base of ${base} and ${head}`);
-  const parts = nulList(git(repo, ["diff", "--name-status", "--no-renames", "-z", mergeBase, head]).stdout);
+  const parts = nulList(git(repo, ["diff", ...DIFF_READ, "--name-status", "--no-renames", "-z", mergeBase, head]).stdout);
   if (parts.length % 2) throw new GateError("the range's name-status list is not readable");
   const entries = [];
   for (let i = 0; i < parts.length; i += 2) entries.push({ status: parts[i].charAt(0), path: parts[i + 1] });
@@ -1735,9 +1770,9 @@ function buildBeforeTree(repo, plan, tree, work) {
   if (drop.length) {
     git(tree, ["rm", "-q", `--pathspec-from-file=${writePathspec(join(work, "drop.lst"), drop)}`, "--pathspec-file-nul"]);
   }
-  const vsBase = nulList(git(tree, ["diff", "--cached", "--name-only", "--no-renames", "-z", plan.mergeBase]).stdout).sort(byPath);
-  const vsHead = nulList(git(tree, ["diff", "--cached", "--name-only", "--no-renames", "-z", plan.head]).stdout).sort(byPath);
-  const unstaged = nulList(git(tree, ["diff", "--name-only", "-z"]).stdout);
+  const vsBase = nulList(git(tree, ["diff", ...DIFF_READ, "--cached", "--name-only", "--no-renames", "-z", plan.mergeBase]).stdout).sort(byPath);
+  const vsHead = nulList(git(tree, ["diff", ...DIFF_READ, "--cached", "--name-only", "--no-renames", "-z", plan.head]).stdout).sort(byPath);
+  const unstaged = nulList(git(tree, ["diff", ...DIFF_READ, "--name-only", "--no-renames", "-z"]).stdout);
   const wantBase = plan.testSide.map((e) => e.path);
   if (JSON.stringify(vsBase) !== JSON.stringify(wantBase)) return `the tree before the fix differs from the merge base in ${vsBase.length} path(s), expected the ${wantBase.length} test-side path(s)`;
   if (JSON.stringify(vsHead) !== JSON.stringify(plan.fixSide)) return `the tree before the fix differs from the head in ${vsHead.length} path(s), expected the ${plan.fixSide.length} fix-side path(s)`;
@@ -1906,7 +1941,7 @@ async function runPhase(phase, tree, files, plan, opts, reportDir, { skipInstall
   }
   // A swapped file differs from the head on purpose: it must still be the
   // merge base's version after the run.
-  const moved = swapped.length ? nulList(git(tree, ["diff", "--name-only", "--no-renames", "-z", plan.mergeBase, "--", ...swapped]).stdout) : [];
+  const moved = swapped.length ? nulList(git(tree, ["diff", ...DIFF_READ, "--name-only", "--no-renames", "-z", plan.mergeBase, "--", ...swapped]).stdout) : [];
   for (const file of [...new Set([...changedTestSide(tree, plan).filter((p) => !swapped.includes(p)), ...moved])].sort(byPath)) {
     reasons.push({ code: "TEST-CHANGED", phase, file, detail: "the test run changed this tracked test-side file" });
   }
@@ -1962,14 +1997,20 @@ function rangeReader(repo, plan) {
   let moved = null;
   let byFile = null;
   const read = () => {
-    files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    files ??= parseRangeDiff(git(repo, ["diff", ...DIFF_READ, "-U0", "--no-renames", plan.mergeBase, plan.head]).stdout);
     return files;
   };
-  // The same range with rename detection (git's default similarity, 50%):
-  // a renamed file's unchanged lines are not added there. Used for markers
-  // only; everything else treats a renamed file as a new file.
+  // The same range with rename detection (similarity 50%, at most 1000
+  // candidates): a renamed file's unchanged lines are not added there. Used
+  // for markers only; everything else treats a renamed file as a new file.
+  // Any stderr (git skipped the detection, or warned otherwise) makes the
+  // provenance of every file that is not a plain modification unknown.
+  const status = new Map(plan.testSide.map((e) => [e.path, e.status]));
   const readMoved = () => {
-    moved ??= parseRangeDiff(git(repo, ["diff", "-U0", "--find-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    if (!moved) {
+      const r = git(repo, ["diff", ...DIFF_READ, ...RENAME_READ, "-U0", plan.mergeBase, plan.head]);
+      moved = { files: parseRangeDiff(r.stdout), unsure: r.stderr.trim() !== "" };
+    }
     return moved;
   };
   const blob = (rev, path) => {
@@ -1989,7 +2030,9 @@ function rangeReader(repo, plan) {
     // The added lines of a file's edit when a rename is not an addition, or
     // null when its diff is not readable.
     markerLines(path) {
-      return readMoved().get(path)?.added ?? null;
+      const m = readMoved();
+      if (m.unsure && status.get(path) !== "M") return null;
+      return m.files.get(path)?.added ?? null;
     },
     pureAddition(path) {
       const diff = read().get(path);

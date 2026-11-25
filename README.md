@@ -2351,6 +2351,12 @@ codes alone.
 - **Regular files only**: a test-side path of the head that is a symlink or a
   submodule fails the job (`NOT-A-FILE`): its target could be fix side, so the
   test that runs would not be the file of the pull request.
+- **Reading the repository**: the gate's git calls do not depend on the
+  caller's or the repository's git configuration: settings that change a
+  diff (prefixes, quoting, color, rename and algorithm settings, an
+  attributes file, an external diff, textconv drivers) are overridden on the
+  command line, and when git skips rename detection (more than 1000
+  candidates) the markers of a new file are of unknown origin.
 - **Before the fix**: the merge base with the pull request's test side applied.
   The gate checks that this tree and the head differ by exactly the fix side.
 - **Right reason**: before the fix, each new test file must load, collect at
