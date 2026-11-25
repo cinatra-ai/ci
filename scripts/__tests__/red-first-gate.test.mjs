@@ -2062,6 +2062,76 @@ for (const quotePath of ["true", "false"]) {
   });
 }
 
+// The gate reads the repository the same way whatever its configuration says.
+const PLAIN_OLD = `${TEST_HEAD}import { add, mul } from "../src/calc.mjs";\n\ntest("mul multiplies two numbers", () => {\n  assert.equal(mul(2, 3), 6);\n});\n`;
+
+test("configuration: a textconv driver that injects a marker does not declare it: the gate reads the blob's own lines (WRONG-REASON)", async (t) => {
+  const sc = scenario(t, {
+    base: { ...BASE, ".gitattributes": "test/*.test.mjs diff=inj\n", "test/calc.test.mjs": PLAIN_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": `${PLAIN_OLD}\n// INJECT\n${WRONG_SUM}` },
+  });
+  git(sc.repo, "config", "diff.inj.textconv", "sed 's|INJECT|red-first-expect: add gives the wrong sum|'");
+  const r = runGate(sc, "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[[], []]]);
+});
+
+test("configuration: a textconv driver that strips a marker does not hide it: the added marker still has to match (TEXT-MISMATCH)", async (t) => {
+  const sc = scenario(t, {
+    base: { ...BASE, ".gitattributes": "test/*.test.mjs diff=strip\n", "test/calc.test.mjs": PLAIN_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": `${PLAIN_OLD}\n// red-first-expect: nothing like this\n${ADD_CASE}` },
+  });
+  git(sc.repo, "config", "diff.strip.textconv", "sed '/red-first-expect/d'");
+  const r = runGate(sc, "run");
+  assertRed(r, "TEXT-MISMATCH");
+  assert.deepEqual(r.verdict.files.map((f) => f.markers), [["nothing like this"]]);
+});
+
+test("configuration: a rename limit of 1 in the repository does not turn an edited rename's old marker into an added one", async (t) => {
+  const data = (n) => Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n") + `\n${n}\n`;
+  const sc = scenario(t, {
+    base: { ...BASE, "test/old.test.mjs": MUL_OLD.replace("mul is not a function", "add gives the wrong sum"), "notes/one.txt": data("a") },
+    head: {
+      "src/calc.mjs": CALC_FIX,
+      "test/old.test.mjs": null,
+      "test/calc.test.mjs": `${MUL_OLD.replace("mul is not a function", "add gives the wrong sum")}\n${WRONG_SUM}`,
+      "notes/one.txt": null,
+      "notes/two.txt": data("b"),
+    },
+  });
+  git(sc.repo, "config", "diff.renameLimit", "1");
+  const r = runGate(sc, "run");
+  assertRed(r, "WRONG-REASON");
+  assert.deepEqual(r.verdict.files.map((f) => f.markers), [[]]);
+});
+
+test("configuration: when git skips rename detection (more renames than the gate's limit), a new file's markers are of unknown origin (WRONG-REASON)", async (t) => {
+  const marked = MUL_OLD.replace("mul is not a function", "add gives the wrong sum");
+  const base = { ...BASE, "test/old.test.mjs": marked };
+  const head = { "src/calc.mjs": CALC_FIX, "test/old.test.mjs": null, "test/calc.test.mjs": `${marked}\n${WRONG_SUM}` };
+  // 1001 edited renames with other names: more than the limit of 1000 on both sides
+  for (let i = 0; i < 1001; i += 1) {
+    base[`notes/a${i}.txt`] = `note ${i}\nkeep this line\nand this one\n`;
+    head[`notes/a${i}.txt`] = null;
+    head[`notes/b${i}.txt`] = `note ${i}\nkeep this line\nand this one\nedited\n`;
+  }
+  const r = runGate(scenario(t, { base, head }), "run");
+  assertRed(r, "WRONG-REASON");
+  assert.match(r.verdict.reasons.find((x) => x.code === "WRONG-REASON").detail, /added lines cannot be read/);
+  assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[[], ["add gives the wrong sum"]]]);
+});
+
+test("configuration: diff.noprefix, diff.mnemonicPrefix, color.ui=always and an external diff leave the result unchanged", async (t) => {
+  const head = `${MUL_OLD}\n// red-first-expect: Expected values to be strictly equal\n${ADD_CASE}`;
+  const sc = scenario(t, { base: { ...BASE, "test/calc.test.mjs": MUL_OLD }, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": head } });
+  for (const [key, value] of [["diff.noprefix", "true"], ["diff.mnemonicPrefix", "true"], ["color.ui", "always"], ["color.diff", "always"], ["diff.external", "false"], ["diff.relative", "true"]]) {
+    git(sc.repo, "config", key, value);
+  }
+  const r = runGate(sc, "run");
+  assertPass(r);
+  assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[["Expected values to be strictly equal"], []]]);
+});
+
 test("diffPath: literal characters are read by code point, the bytes decoded once; invalid UTF-8 does not decode", async () => {
   const { diffPath } = await gateModule();
   assert.equal(diffPath('"b/test/\u{1F600}\\"x.mjs"'), 'b/test/\u{1F600}"x.mjs');
