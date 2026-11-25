@@ -2362,7 +2362,9 @@ codes alone.
   git's rename detection): a marker the file already had declares nothing, so
   markers of merged pull requests never need a sweep. A file whose added lines
   cannot be read (a `-diff` attribute, for example) keeps every marker of the
-  file.
+  file, but such a marker can only refuse: each must match a failure, and
+  none makes a failure without an assertion the right reason (`WRONG-REASON`;
+  remove the attribute or rename the file).
 - **What the fix adds**: a failure before the fix is also the right reason,
   without a marker, when its text names something only the fix side provides:
   a `TypeError: ... <name> is not a function` (or `is not a constructor`) or

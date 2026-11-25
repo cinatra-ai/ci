@@ -31,13 +31,14 @@
 // treats it as a new file. Names git writes C-quoted (non-ASCII, `"`, `\`,
 // control characters) are decoded. A file whose added lines cannot be read
 // (a `-diff` attribute, a name that does not decode) keeps every marker of
-// its head source, the reading before this rule. A marker added for a test
+// its head source, but of unknown origin: each must match a failure
+// (TEXT-MISMATCH), none counts as the right reason for a failure without an
+// assertion (WRONG-REASON, naming the unread diff). A marker added for a test
 // that already passes before the fix is in no failure text: TEXT-MISMATCH,
-// as before. Markers
-// are never required: they only let a failure without an assertion count
-// (a failure that matches one) and refuse a file whose failures miss one,
-// so reading fewer of them never turns a run without a proven red-to-green
-// test into a pass.
+// as before. Markers are never required: they only let a failure without an
+// assertion count (a failure that matches one) and refuse a file whose
+// failures miss one, so reading fewer of them never turns a run without a
+// proven red-to-green test into a pass.
 // A test file with no failing test before the fix makes no red-first claim in
 // two cases only, each a note (not proven here), never a proof:
 //   - COLLATERAL: a changed file whose earlier version, run in the tree WITH
@@ -1262,7 +1263,11 @@ function earlierUnreadable(earlier) {
 // Returns the reasons, the notes (a file that makes no red-first claim, or
 // that is red because of what the fix adds), `proven`, and `kind`: "proven",
 // "collateral", "pins" or null (not settled: a reason says why).
-export function judgeFile({ file, markers = [], pins = [], status = "A" }, before, head, context = {}) {
+// markers are the expect markers this pull request declares (on lines it
+// adds); unknownMarkers are markers of a file whose added lines cannot be
+// read, so their origin is unknown: they refuse (TEXT-MISMATCH) but never
+// prove a failure without an assertion.
+export function judgeFile({ file, markers = [], unknownMarkers = [], pins = [], status = "A" }, before, head, context = {}) {
   const reasons = [];
   const notes = [];
   const add = (code, phase, detail) => reasons.push({ code, phase, file, detail: clip(detail, 400) });
@@ -1350,7 +1355,9 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         beforeTests = r.tests;
         const texts = failed.map((t) => normalizeText(t.text));
         const wanted = markers.map((m) => normalizeText(m));
-        const unmatched = markers.filter((m, i) => !texts.some((x) => x.includes(wanted[i])));
+        const present = [...markers, ...unknownMarkers];
+        const unmatched = present.filter((m) => !texts.some((x) => x.includes(normalizeText(m))));
+        // Only a marker this pull request declares names the right reason.
         const stated = failed.filter((t, i) => t.assertion || wanted.some((m) => texts[i].includes(m)));
         if (unmatched.length) add("TEXT-MISMATCH", "before", `marker "${unmatched[0]}" is in no failure text; actual: ${actual(failed)}`);
         else if (stated.length) beforeOk = true;
@@ -1359,7 +1366,9 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
           // when a failure names an export or a module the fix side adds.
           evidence = failed.map((t) => fromFix(t.text)).find(Boolean) ?? null;
           if (evidence) beforeOk = true;
-          else add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
+          else if (unknownMarkers.length) {
+            add("WRONG-REASON", "before", `no assertion failure, and the file's added lines cannot be read (a -diff attribute, or a name git does not print readably), so its red-first-expect: markers (${clip(unknownMarkers.join(" | "), 120)}) are not shown to be this pull request's: they can refuse but never prove; remove the -diff attribute or rename the file; actual: ${actual(failed)}`);
+          } else add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
         }
       }
     }
@@ -2043,13 +2052,15 @@ async function runGateIn(opts) {
       // expect markers read the diff with rename detection, so a renamed
       // file's unchanged markers stay unread. Each fails closed: an
       // unreadable diff declares no pin (its tests must fail first), and
-      // keeps every expect marker of the head source (each must match).
+      // keeps every expect marker of the head source as of unknown origin
+      // (each must match, none proves).
       const added = range.addedLines(file);
       const markerLines = range.markerLines(file);
       return {
         file,
         runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest",
-        markers: readMarkers(markerLines ? markerLines.join("\n") : source),
+        markers: markerLines ? readMarkers(markerLines.join("\n")) : [],
+        unknownMarkers: markerLines ? [] : readMarkers(source),
         pins: added ? readPins(added.join("\n")) : [],
         status: statusOf.get(file) ?? "A",
       };
@@ -2090,7 +2101,7 @@ async function runGateIn(opts) {
       reasons.push(...judged.reasons);
       fileNotes.push(...judged.notes);
       for (const r of judged.reasons) if (r.phase === "head") headReasonFiles.add(f.file);
-      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, pins: f.pins, proven: judged.proven, kind: judged.kind });
+      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, unknownMarkers: f.unknownMarkers, pins: f.pins, proven: judged.proven, kind: judged.kind });
     }
     for (const inv of phases.head?.invocations ?? []) {
       if ((inv.res.status !== 0 || inv.reportFailed) && !inv.files.some((file) => headReasonFiles.has(file))) {
