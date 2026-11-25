@@ -2154,6 +2154,36 @@ test("expect markers: a pure rename to a name that starts with U+FEFF keeps that
   assert.equal(diffPath('"\\357\\273\\277calc.test.mjs"'), "﻿calc.test.mjs");
 });
 
+test("configuration: other stderr of a successful git call (a trace) leaves a new file's markers declared", async (t) => {
+  const sc = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": WRONG_SUM_FILE("add gives the wrong sum") } });
+  const r = runGate(sc, "run", [], { GIT_TRACE: "1" });
+  assertPass(r);
+  assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[["add gives the wrong sum"], []]]);
+});
+
+test("configuration: a changed gitlink under a fixture folder is seen although the repository ignores submodules (NOT-A-FILE)", async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "red-first-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  git(repo, "init", "-q", "-b", "main");
+  writeFiles(repo, BASE);
+  git(repo, "add", "-A");
+  git(repo, "update-index", "--add", "--cacheinfo", `160000,${"1".repeat(40)},test/__fixtures__/sub`);
+  git(repo, "commit", "-q", "-m", "base");
+  const base = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "-q", "-b", "pr");
+  writeFiles(repo, { "src/calc.mjs": CALC_FIX, "test/calc.test.mjs": ADD_TEST });
+  git(repo, "add", "src", "test/calc.test.mjs");
+  git(repo, "update-index", "--cacheinfo", `160000,${"2".repeat(40)},test/__fixtures__/sub`);
+  git(repo, "commit", "-q", "-m", "head");
+  const head = git(repo, "rev-parse", "HEAD");
+  git(repo, "config", "diff.ignoreSubmodules", "all");
+  const r = runGate({ root, repo, base, head, runs: 0 }, "run");
+  assertRed(r, "NOT-A-FILE");
+  assert.equal(r.verdict.reasons.find((x) => x.code === "NOT-A-FILE").file, "test/__fixtures__/sub");
+});
+
 test("diffPath: literal characters are read by code point, the bytes decoded once; invalid UTF-8 does not decode", async () => {
   const { diffPath } = await gateModule();
   assert.equal(diffPath('"b/test/\u{1F600}\\"x.mjs"'), 'b/test/\u{1F600}"x.mjs');

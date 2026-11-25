@@ -2353,10 +2353,11 @@ codes alone.
   test that runs would not be the file of the pull request.
 - **Reading the repository**: the gate's git calls do not depend on the
   caller's or the repository's git configuration: settings that change a
-  diff (prefixes, quoting, color, rename and algorithm settings, an
-  attributes file, an external diff, textconv drivers) are overridden on the
-  command line, and when git skips rename detection (more than 1000
-  candidates) the markers of a new file are of unknown origin.
+  diff (prefixes, quoting, ignored submodules, color, rename and algorithm
+  settings, an attributes file, an external diff, textconv drivers) are
+  overridden on the command line, and when git warns that it skipped rename
+  detection (more than 1000 candidates) the markers of a new file are of
+  unknown origin.
 - **Before the fix**: the merge base with the pull request's test side applied.
   The gate checks that this tree and the head differ by exactly the fix side.
 - **Right reason**: before the fix, each new test file must load, collect at

@@ -1438,8 +1438,8 @@ export function judgeFile({ file, markers = [], unknownMarkers = [], pins = [], 
 // overridden on the command line (GIT_READ_CONFIG), which wins over every
 // file, and every diff call names its own options (DIFF_READ).
 function gitEnv(extra = {}) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C", GIT_NO_REPLACE_OBJECTS: "1", GIT_ATTR_NOSYSTEM: "1", ...extra };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"]) delete env[key];
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C", LANG: "C", GIT_NO_REPLACE_OBJECTS: "1", GIT_ATTR_NOSYSTEM: "1", ...extra };
+  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "LANGUAGE"]) delete env[key];
   for (const key of Object.keys(env)) if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
   return env;
 }
@@ -1457,6 +1457,7 @@ const GIT_READ_CONFIG = [
   "diff.srcPrefix=a/",
   "diff.dstPrefix=b/",
   "diff.submodule=short",
+  "diff.ignoreSubmodules=none",
   "diff.relative=false",
   "diff.renames=false",
   "diff.algorithm=myers",
@@ -1464,8 +1465,12 @@ const GIT_READ_CONFIG = [
   "diff.interHunkContext=0",
   "diff.suppressBlankEmpty=false",
 ].flatMap((kv) => ["-c", kv]);
-// Every diff the gate reads: no textconv driver, no external diff, no color.
-const DIFF_READ = ["--no-textconv", "--no-ext-diff", "--no-color"];
+// Every diff the gate reads: no textconv driver, no external diff, no color,
+// and every changed gitlink shown (also one that submodule.<name>.ignore or
+// diff.ignoreSubmodules would hide).
+const DIFF_READ = ["--no-textconv", "--no-ext-diff", "--no-color", "--ignore-submodules=none"];
+// git's own words (in the C locale) when it skips rename detection.
+const RENAME_SKIPPED_RE = /^warning: (?:exhaustive|inexact) rename detection was skipped due to too many files\.$|^warning: you may want to set your diff\.renameLimit variable to at least \d+ and retry the command\.$/m;
 // The rename-detecting diff: an explicit threshold and limit; when git skips
 // the detection (more candidates than the limit) it says so on stderr.
 const RENAME_READ = ["-M50%", "-l1000"];
@@ -2007,13 +2012,13 @@ function rangeReader(repo, plan) {
   // The same range with rename detection (similarity 50%, at most 1000
   // candidates): a renamed file's unchanged lines are not added there. Used
   // for markers only; everything else treats a renamed file as a new file.
-  // Any stderr (git skipped the detection, or warned otherwise) makes the
-  // provenance of every file that is not a plain modification unknown.
+  // git's warning that it skipped the detection makes the provenance of every
+  // file that is not a plain modification unknown; other stderr does not.
   const status = new Map(plan.testSide.map((e) => [e.path, e.status]));
   const readMoved = () => {
     if (!moved) {
       const r = git(repo, ["diff", ...DIFF_READ, ...RENAME_READ, "-U0", plan.mergeBase, plan.head]);
-      moved = { files: parseRangeDiff(r.stdout), unsure: r.stderr.trim() !== "" };
+      moved = { files: parseRangeDiff(r.stdout), unsure: RENAME_SKIPPED_RE.test(r.stderr) };
     }
     return moved;
   };
