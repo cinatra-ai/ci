@@ -2407,7 +2407,7 @@ codes alone.
   before the fix is proven; any other load error stays `LOAD-ERROR`, and any
   other failure without an assertion stays `WRONG-REASON`.
 - **No red-first claim** (a notice, not a proof): a test file in which no test
-  fails before the fix is `NOT-RED-BEFORE`, except in two cases.
+  fails before the fix is `NOT-RED-BEFORE`, except in three cases.
   `COLLATERAL`: a changed file that the fix breaks and the edit keeps
   working. The gate runs the file's earlier version (the merge base's) in the
   tree WITH the fix; the edit is collateral only when that earlier version
@@ -2439,6 +2439,75 @@ codes alone.
   removing it (an early `return`, for example): the gate does not see that,
   so review added lines beside pins as a change to an existing test. Markers
   are part of the diff: review them as you review `red-first-expect:`.
+  `REMOVAL`: a changed file whose edit only deletes what the same pull request
+  removes from the product code (a removed test, or a removed mock or prop of
+  something the product code no longer has). The gate reads the two versions
+  of the file with the TypeScript parser and accepts the edit only when all
+  of these hold.
+  (1) Shape: both versions parse; the head's code is the earlier code with
+  whole statements, whole elements of an object, array, import or export list
+  (with their commas) or whole JSX attributes deleted, and nothing added,
+  changed or moved; the parser reads the kept code alike (a deletion after
+  which `sink` and `[0].forEach(...)` join is refused); comments may change,
+  but a comment line with an `@...` pragma, a `red-first-` marker or a
+  `/// <...>` line stays exactly as it was and where it was (its header line,
+  or the code it precedes).
+  (2) Nothing that asserts goes, except with a whole test or suite: deleted
+  code that asserts (`expect`, `assert`, `.should`, the matchers, the named
+  Node assertions, any name bound from an assertion module, and the
+  asserting exports of the runner however they are reached: named, renamed,
+  aliased, as members such as `require("node:assert").strict` or through a
+  whole-module binding such as `v.expect.assertions(...)`) is refused; and
+  every call, `new` or tagged template in deleted code outside a whole test
+  or suite must be one the gate knows asserts nothing: the runner's mock and
+  hook functions (`vi.*`, `jest.*`, node's `mock`, `beforeEach`, ...), or a
+  name the pull request removes from its product scripts reached from a
+  binding of the repository's own code (a relative or alias import that is
+  not test code by its place or name). Any other call (a helper, a package
+  function such as `screen.getByText`, a parameter, a global), a `throw`, or
+  an `await` of anything but such a call is refused. No deleted part sits in
+  an assertion, in the title or cases of a kept test or suite, or in a
+  declaration a kept test or suite reads for its cases (followed by name in
+  the file).
+  (3) Evidence: every deleted part names an identifier that the pull request
+  deletes from the code of a product script (an identifier token on a deleted
+  line of a product script's earlier version; a comment, a blank line or the
+  text of a string is not evidence) and that no changed product script still
+  holds at the head; an import of a name the head no longer uses may go with
+  it. Identifiers are compared by value, not spelling (`rx` is `rx`): a
+  changed product script still holds a name when its head has it as an
+  identifier, as a word of a string or template (a key `o["x"]`, an export
+  name `export { a as "x" }`), or as a word of its text (a comment too); a
+  head the parser cannot read holds every name. A test file that writes an
+  identifier with an escape is not a removal edit. Every deleted test names
+  such an identifier in its code (body, other
+  arguments, `.each` cases), not in its title, and not a name the file
+  declares itself. A product script is a changed path outside the test side,
+  with a script extension, not a declaration file and not test code by its
+  place or name.
+  (4) Runs: every test of the head passes before the fix and with it; the
+  earlier version runs with the fix (when it does not, for example because
+  it imports what the fix removes, the edit is not a removal edit); every
+  test the earlier version reports as passed is reported as passed by the
+  head too, by full name and count, so a kept test that the edit leaves
+  skipped, todo or failed is refused by name (a test the earlier version
+  already skipped may stay skipped or pass); and each
+  test its report lists that the head no longer reports is matched one for
+  one to a deleted declaration of that title (a deleted test for one, a
+  `.each` over a literal list for one per row), but only when no kept
+  declaration may register that name, or the head still reports that name
+  as often as the kept declarations of it register at most (a kept title that
+  is not a literal, or a kept declaration in a loop or a helper, may register
+  any number, so a dropped test of a name it may match is refused).
+  A known gap: a deleted element of a collection that a kept test reads in
+  its body (a mock object it hands to the code) is accepted when the element
+  names what the pull request removes; and a test registered from outside
+  the file (an imported helper, a setup global) that shares its name with a
+  deleted declaration is not told apart from it. Review such deletions as you
+  review a removed assertion. The file stands only beside a proven file of
+  the same pull request: without one it is `NOT-RED-BEFORE`. Anything else is
+  not a removal edit and must fail first; a refused file's `NOT-RED-BEFORE`
+  reason says why. There is no input that widens this rule.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit
@@ -2476,14 +2545,15 @@ of the `red-first` job at the head proves at least one new test file outside
 are not proven, and the `EXCLUDED` notices (or the plan output) name the
 rest.
 
-`COLLATERAL` and `PIN` files are notices too: they are not proven, the job's
+`COLLATERAL`, `PIN` and `REMOVAL` files are notices too: they are not proven, the job's
 headline counts them as not proven, and they do not fail the job beside a
 proven file. When every changed test file is such a notice, nothing is
 proven: the job fails with `NOTHING-PROVEN` (the notices stay listed). So the
 `red-first` job is green only when at least one new test file is proven red
 before the fix and green with it, and every other new or changed test file is
 either proven or listed as a notice that makes no red-first claim
-(`EXCLUDED`, `COLLATERAL`, `PIN`); the headline
+(`EXCLUDED`, `COLLATERAL`, `PIN`, `REMOVAL`; a `REMOVAL` file stands only beside a proven
+file); the headline
 (`RED-FIRST: PASS (<n> new test file(s) ...)`), the summary table and the
 notices say which files are proven.
 
