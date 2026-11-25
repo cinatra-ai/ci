@@ -2011,6 +2011,65 @@ test("expect markers: in a file whose diff is not readable, an assertion failure
   assertPass(runGate(sc, "run"));
 });
 
+test("expect markers: an edited rename whose diff is not readable keeps every marker as of unknown origin; only a proven pure rename adds no line", async (t) => {
+  const attrs = { ".gitattributes": "test/*.test.mjs -diff\n" };
+  // renamed and edited: git prints the similarity and "Binary files ... differ", no hunk
+  const edited = scenario(t, {
+    base: { ...BASE, ...attrs, "test/old.test.mjs": MUL_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/old.test.mjs": null, "test/calc.test.mjs": `${MUL_OLD}\n// red-first-expect: add is not a function\n${ADD_CASE}` },
+  });
+  const r = runGate(edited, "run");
+  assertRed(r, "TEXT-MISMATCH");
+  assert.deepEqual(r.verdict.files.map((f) => [f.markers, f.unknownMarkers]), [[[], ["mul is not a function", "add is not a function"]]]);
+  // a pure rename (similarity 100%) adds no line, also under -diff
+  const pure = scenario(t, {
+    base: { ...BASE, ...attrs, "test/old.test.mjs": MUL_OLD },
+    head: { "src/calc.mjs": CALC_FIX, "test/old.test.mjs": null, "test/calc.test.mjs": MUL_OLD },
+  });
+  assert.deepEqual(runGate(pure, "run").verdict.files.map((f) => [f.file, f.markers, f.unknownMarkers]), [["test/calc.test.mjs", [], []]]);
+  const { parseRangeDiff } = await gateModule();
+  const diff = parseRangeDiff(
+    [
+      "diff --git a/p.mjs b/b.mjs",
+      "similarity index 93%",
+      "rename from p.mjs",
+      "rename to b.mjs",
+      "index e8823e1..cf868e2 100644",
+      "Binary files a/p.mjs and b/b.mjs differ",
+      "diff --git a/a.mjs b/q.mjs",
+      "similarity index 100%",
+      "rename from a.mjs",
+      "rename to q.mjs",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual([...diff.keys()], ["q.mjs"]);
+});
+
+for (const quotePath of ["true", "false"]) {
+  test(`expect markers: a quoted name with an astral character and a double quote (core.quotePath=${quotePath}): its added markers are read`, async (t) => {
+    const name = 'test/\u{1F600}"x.test.mjs';
+    const good = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, [name]: WRONG_SUM_FILE("add gives the wrong sum") } });
+    git(good.repo, "config", "core.quotePath", quotePath);
+    const r = runGate(good, "run");
+    assertPass(r);
+    assert.deepEqual(r.verdict.files.map((f) => f.markers), [["add gives the wrong sum"]]);
+    const bad = scenario(t, { base: BASE, head: { "src/calc.mjs": CALC_FIX, [name]: ADD_TEST.replace(TEST_HEAD, `${TEST_HEAD}// red-first-expect: nothing like this\n`) } });
+    git(bad.repo, "config", "core.quotePath", quotePath);
+    const b = runGate(bad, "run");
+    assertRed(b, "TEXT-MISMATCH");
+    assert.deepEqual(b.verdict.files.map((f) => f.markers), [["nothing like this"]]);
+  });
+}
+
+test("diffPath: literal characters are read by code point, the bytes decoded once; invalid UTF-8 does not decode", async () => {
+  const { diffPath } = await gateModule();
+  assert.equal(diffPath('"b/test/\u{1F600}\\"x.mjs"'), 'b/test/\u{1F600}"x.mjs');
+  assert.equal(diffPath('"b/\\360\\237\\230\\200\\"x.mjs"'), 'b/\u{1F600}"x.mjs');
+  assert.equal(diffPath('"b/\\377.mjs"'), null);
+  assert.equal(diffPath('"b/\\360\\237.mjs"'), null);
+});
+
 test("parseRangeDiff: C-quoted paths are decoded (octal bytes, \\\", \\\\, \\t, \\n); a malformed one is left out", async () => {
   const { parseRangeDiff } = await gateModule();
   const diff = parseRangeDiff(
