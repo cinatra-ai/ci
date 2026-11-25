@@ -3087,3 +3087,72 @@ test("removal credit: the earlier version must run with the fix; a removal edit 
     assert.equal(j.kind, null);
   }
 });
+
+test("removal identifier values: a product name kept under an escaped spelling, a string key or a string export name is still held; a head that does not parse holds every name", async (t) => {
+  const head = 'import { expect, test } from "vitest";\nimport { kept } from "../src/panel";\ntest("kept", () => expect(kept).toBe(1));\n';
+  const before = `${head}import { removedFeature } from "../src/panel";\ntest("old", () => expect(removedFeature).toBe(1));\n`;
+  const BASE_P = "export const removedFeature = 1;\nexport const kept = 1;\n";
+  for (const kept of [
+    // the exact case: the same export, its name written with an escape
+    "export const \\u0072emovedFeature = 1;\nexport const kept = 1;\n",
+    "export const \\u{72}emovedFeature = 1;\nexport const kept = 1;\n",
+    // the name as a string key, or as a string export name, escaped
+    'const impl = 1;\nexports["\\u0072emovedFeature"] = impl;\nexport const kept = 1;\n',
+    'const impl = 1;\nexport { impl as "\\u0072emovedFeature" };\nexport const kept = 1;\n',
+    // a head the parser cannot read
+    "export const removedFeature = (;\nexport const kept = 1;\n",
+  ]) {
+    const r = await checkRemoval(t, before, head, "src/a.test.ts", [productOf(t, "src/panel.ts", BASE_P, kept)]);
+    assert.equal(r.ok, false, `${kept}\n${JSON.stringify(r)}`);
+    assert.match(r.why, /exercises nothing|names nothing/, kept);
+  }
+  // the evidence is read as a value too: a product name deleted in its escaped spelling is the plain name
+  const escapedBase = "export const \\u0072emovedFeature = 1;\nexport const kept = 1;\n";
+  const ok = await checkRemoval(t, before, head, "src/a.test.ts", [productOf(t, "src/panel.ts", escapedBase, "export const kept = 1;\n")]);
+  assert.deepEqual([ok.ok, ok.names], [true, ["removedFeature"]], JSON.stringify(ok));
+  // the nearest removal: the plain name removed from the product code
+  const plain = await checkRemoval(t, before, head, "src/a.test.ts", [productOf(t, "src/panel.ts", BASE_P, "export const kept = 1;\n")]);
+  assert.deepEqual([plain.ok, plain.names], [true, ["removedFeature"]], JSON.stringify(plain));
+  // a test file that writes an identifier with an escape is not read as a removal edit
+  const esc = await checkRemoval(t, 'import { test } from "vitest";\nimport { kept, removedFeature } from "../src/panel";\ntest("kept", () => \\u006bept);\ntest("old", () => removedFeature());\n', 'import { test } from "vitest";\nimport { } from "../src/panel";\ntest("kept", () => \\u006bept);\n');
+  assert.equal(esc.ok, false, JSON.stringify(esc));
+  assert.match(esc.why, /escape/);
+});
+
+test("removal runs: a kept test that passed in the earlier version must pass at the head by file, name and count; one skipped, todo or missing there is refused by name", async () => {
+  const { judgeFile } = await gateModule();
+  const res = (tests) => ({ run: "ok", result: { loaded: true, loadError: null, fileError: null, tests: tests.map(([name, status]) => ({ name, status, text: null, assertion: false })) } });
+  const removal = { ok: true, parts: 1, tests: 1, names: ["removedFeature"], deletedTitles: [{ title: /(?:^| )old$/, most: 1 }], keptTitles: [{ title: /(?:^| )kept a$/, most: 1 }, { title: /(?:^| )kept b$/, most: 1 }, { title: /(?:^| )dup$/, most: 2 }] };
+  const judge = (earlier, head) => judgeFile({ file: "t.test.mjs", status: "M" }, res(head), res(head), { earlier: res(earlier), changedTestLine: null, removal: () => removal });
+  // the exact case: kept b passed in the earlier version and is skipped at the head
+  const skipped = judge([["kept a", "passed"], ["kept b", "passed"], ["old", "passed"]], [["kept a", "passed"], ["kept b", "skipped"]]);
+  assert.deepEqual(skipped.reasons.map((r) => r.code), ["NOT-RED-BEFORE"], JSON.stringify(skipped));
+  assert.match(skipped.reasons[0].detail, /kept b/);
+  assert.match(skipped.reasons[0].detail, /no longer pass at the head/);
+  assert.equal(skipped.kind, null);
+  // one of two tests of one name no longer runs
+  const dup = judge([["kept a", "passed"], ["dup", "passed"], ["dup", "passed"], ["old", "passed"]], [["kept a", "passed"], ["dup", "passed"], ["dup", "skipped"]]);
+  assert.equal(dup.kind, null, JSON.stringify(dup));
+  assert.match(dup.reasons[0].detail, /dup/);
+  // the nearest removals: every kept test still passes; a test skipped before stays skipped; a skipped one now passes
+  assert.equal(judge([["kept a", "passed"], ["kept b", "passed"], ["old", "passed"]], [["kept a", "passed"], ["kept b", "passed"]]).kind, "removal");
+  assert.equal(judge([["kept a", "passed"], ["kept b", "skipped"], ["old", "passed"]], [["kept a", "passed"], ["kept b", "skipped"]]).kind, "removal");
+  assert.equal(judge([["kept a", "passed"], ["kept b", "skipped"], ["old", "passed"]], [["kept a", "passed"], ["kept b", "passed"]]).kind, "removal");
+});
+
+test("removal runs: deleting what un-skips a kept node:test test is RED (NOT-RED-BEFORE), the plain removal beside it is a REMOVAL note", async (t) => {
+  const head = (opts) => `${TEST_HEAD}import * as product from "../src/panel.mjs";\n\nconst opts = {\n  skip: true,\n${opts}};\ntest("the panel has a title", () => {\n  assert.equal(typeof product.panel({ readTitle: () => "a" }).title, "string");\n});\ntest("the panel keeps its pair off", opts, () => {\n  assert.equal(product.panel({ readTitle: () => "a" }).pair ?? null, null);\n});\n`;
+  const old = head("  skip: product.loadCapturePair && false,\n");
+  const sc = scenario(t, { base: PANEL_BASE(old), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": head(""), "test/frame.test.mjs": FRAME_TEST } });
+  const r = runGate(sc, "run");
+  assertRed(r, "NOT-RED-BEFORE");
+  assert.deepEqual(noteCodes(r), []);
+  assert.match(r.verdict.reasons.find((x) => x.code === "NOT-RED-BEFORE").detail, /the panel keeps its pair off/);
+  // the nearest removal: the deleted test is of the removed name, the kept tests all still pass
+  const keep = `${TEST_HEAD}import * as product from "../src/panel.mjs";\n\ntest("the panel has a title", () => {\n  assert.equal(typeof product.panel({ readTitle: () => "a" }).title, "string");\n});\n`;
+  const plainOld = `${keep}test("the pair is gone", () => {\n  assert.equal(product.loadCapturePair, undefined);\n});\n`;
+  const sc2 = scenario(t, { base: PANEL_BASE(plainOld), head: { "src/panel.mjs": PANEL_FIX, "test/panel.test.mjs": keep, "test/frame.test.mjs": FRAME_TEST } });
+  const r2 = runGate(sc2, "run");
+  assertPass(r2);
+  assert.deepEqual(noteCodes(r2), ["REMOVAL:test/panel.test.mjs"]);
+});

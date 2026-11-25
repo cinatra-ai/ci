@@ -1670,20 +1670,48 @@ function deletedCodeNames(product) {
     const parsed = parse(p.base, p.path);
     if (parsed.unsure) continue;
     const ts = parsed.ts;
+    // An identifier by its value (the parser's text: `rx` is `rx`), never its spelling.
     for (const t of codeTokens(ts, parsed.file).tokens) {
-      if (lines.has(t.line) && (ts.isIdentifier(t.node) || ts.isPrivateIdentifier(t.node))) out.add(t.text);
+      if (lines.has(t.line) && (ts.isIdentifier(t.node) || ts.isPrivateIdentifier(t.node))) out.add(t.node.text);
     }
   }
   return out;
 }
 
+// What the head of each changed product script may still hold of a name:
+// null for a deleted script; { unsure: true } for one the parser cannot read
+// (it may hold any name); else its identifiers by value, the values of its
+// string and template literals (a string key `o["x"]` and a string export
+// name `export { a as "x" }` hold x, also when written with escapes), and
+// its source text (a word in a comment or in any other spelling the text
+// shows holds the name too).
+function productHeads(product) {
+  return product.map((p) => {
+    if (p.head === null) return null;
+    const parsed = parse(p.head, p.path);
+    if (parsed.unsure) return { unsure: true };
+    const ts = parsed.ts;
+    const ids = new Set();
+    const texts = [];
+    nodesWhere(ts, parsed.file, (n) => {
+      if (ts.isIdentifier(n) || ts.isPrivateIdentifier(n)) ids.add(n.text);
+      else if (ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n) || ts.isJsxText(n)) texts.push(n.text);
+      return false;
+    });
+    return { unsure: false, ids, texts, source: p.head };
+  });
+}
+
 // Whether the pull request removes an identifier from the product code: it
 // deletes the identifier from the code of a product script
-// (deletedCodeNames), and no product script the pull request changes holds
-// the word at the head anywhere, a comment included (a deleted script holds
-// nothing). A string's text is never evidence.
-function removedByPullRequest(name, deletedNames, product) {
-  return deletedNames.has(name) && product.every((p) => p.head === null || !hasWord(p.head, name));
+// (deletedCodeNames), and no product script the pull request changes may
+// still hold it at the head (productHeads: by value as an identifier or a
+// word of a literal, or as a word of its text, a comment included; a script
+// the parser cannot read holds every name; a deleted script holds nothing).
+// A string's text is never evidence.
+function removedByPullRequest(name, deletedNames, heads) {
+  if (!deletedNames.has(name)) return false;
+  return heads.every((h) => h === null || (!h.unsure && !h.ids.has(name) && !hasWord(h.source, name) && !h.texts.some((x) => hasWord(x, name))));
 }
 
 // A changed test file whose edit only deletes what the same pull request
@@ -1754,9 +1782,16 @@ export function removalEdit({ file, earlier, source, hunks, product }) {
   const deleted = deletedTokens(old.tokens, now.tokens, hunks);
   if (typeof deleted === "string") return no(`the edit is not deletion only (${deleted})`);
   if (!deleted.includes(true)) return no("the edit deletes no code");
-  const usedNow = new Set(now.tokens.filter((t) => ts.isIdentifier(t.node)).map((t) => t.text));
+  // The file's code is read by its spelling in places (the assertion and
+  // `.each` patterns over its code text): an identifier written with an
+  // escape (`expect`) would read as another word there, so a file that
+  // writes one in either version is not read as a removal edit.
+  const escaped = [...old.tokens, ...now.tokens].find((t) => (ts.isIdentifier(t.node) || ts.isPrivateIdentifier(t.node)) && t.text !== t.node.text);
+  if (escaped) return no(`the file writes the identifier ${clip(escaped.node.text, 60)} with an escape (${clip(escaped.text, 60)} at line ${escaped.line}): a removal edit is read only from plainly written identifiers`);
+  const usedNow = new Set(now.tokens.filter((t) => ts.isIdentifier(t.node)).map((t) => t.node.text));
   const deletedNames = deletedCodeNames(product);
-  const removedName = (word) => removedByPullRequest(word, deletedNames, product);
+  const heads = productHeads(product);
+  const removedName = (word) => removedByPullRequest(word, deletedNames, heads);
   // The longest identifier of a set that the pull request removes, or null.
   const removed = (words) => [...words].filter(removedName).sort((a, b) => b.length - a.length)[0] ?? null;
   const tokens = old.tokens;
@@ -2373,8 +2408,22 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         const notRemoval = removal && !removal.ok ? `; not a removal edit: ${removal.why}` : removal?.ok && why ? "; not a removal edit: a removal edit is read against the run of the file's earlier version with the fix, which names the tests it registered" : "";
         const titles = Array.isArray(removal?.deletedTitles) ? removal.deletedTitles : [];
         const stray = removal?.ok && !why ? unaccounted(dropped, titles, removal.keptTitles, r.tests) : [];
+        // A kept test still runs: each test the earlier version (run with
+        // the fix) reports as passed is reported as passed by the head too,
+        // by full name (suite path and title) and count. A name the head
+        // reports as passed fewer times than the earlier version did, and
+        // also as skipped, todo or failed, may be a kept test that no longer
+        // runs (a deleted line that kept it running): refused by name. A name
+        // the head reports only as passed, fewer times, lost whole tests: they
+        // are dropped tests (above), each matched to a deleted declaration. A
+        // test the earlier version already skipped loses nothing, also when
+        // it passes at the head.
+        const passedOf = (list) => list.filter((t) => t.status === "passed");
+        const stopped = removal?.ok && !why ? addedTests(passedOf(context.earlier.result.tests), passedOf(r.tests)).filter((t) => r.tests.some((h) => h.name === t.name && h.status !== "passed")) : [];
         if (why) add("NOT-RED-BEFORE", "before", `${base}; the tests of the file's earlier version could not be read to compare them (${why})${notRemoval}`);
-        else if (removal?.ok && added.length === 0 && pins.length === 0 && stray.length) {
+        else if (removal?.ok && added.length === 0 && pins.length === 0 && stopped.length) {
+          add("NOT-RED-BEFORE", "before", `${base}; ${stopped.length} test(s) that pass in the file's earlier version no longer pass at the head (skipped, todo or failed there): ${stopped.slice(0, 3).map((t) => t.name).join(" | ")}: not a removal edit (a removal edit keeps every test it does not delete running and passing)`);
+        } else if (removal?.ok && added.length === 0 && pins.length === 0 && stray.length) {
           add("NOT-RED-BEFORE", "before", `${base}; the edit removes ${stray.length} test(s) of the file's earlier version that no deleted test declaration names: ${stray.slice(0, 3).map((t) => t.name).join(" | ")}: not a removal edit (a removal edit keeps every test it does not delete; a test of a name that a kept declaration may register counts as kept unless the head still reports every one of them)`);
         } else if (removal?.ok && added.length === 0 && pins.length === 0) {
           noClaim = {

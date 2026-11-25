@@ -2474,14 +2474,24 @@ codes alone.
   line of a product script's earlier version; a comment, a blank line or the
   text of a string is not evidence) and that no changed product script still
   holds at the head; an import of a name the head no longer uses may go with
-  it. Every deleted test names such an identifier in its code (body, other
+  it. Identifiers are compared by value, not spelling (`rx` is `rx`): a
+  changed product script still holds a name when its head has it as an
+  identifier, as a word of a string or template (a key `o["x"]`, an export
+  name `export { a as "x" }`), or as a word of its text (a comment too); a
+  head the parser cannot read holds every name. A test file that writes an
+  identifier with an escape is not a removal edit. Every deleted test names
+  such an identifier in its code (body, other
   arguments, `.each` cases), not in its title, and not a name the file
   declares itself. A product script is a changed path outside the test side,
   with a script extension, not a declaration file and not test code by its
   place or name.
   (4) Runs: every test of the head passes before the fix and with it; the
   earlier version runs with the fix (when it does not, for example because
-  it imports what the fix removes, the edit is not a removal edit); and each
+  it imports what the fix removes, the edit is not a removal edit); every
+  test the earlier version reports as passed is reported as passed by the
+  head too, by full name and count, so a kept test that the edit leaves
+  skipped, todo or failed is refused by name (a test the earlier version
+  already skipped may stay skipped or pass); and each
   test its report lists that the head no longer reports is matched one for
   one to a deleted declaration of that title (a deleted test for one, a
   `.each` over a literal list for one per row), but only when no kept
