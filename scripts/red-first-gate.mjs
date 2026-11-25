@@ -21,6 +21,29 @@
 //      an export or a module the fix side adds and the test file itself
 //      imports from that module), and with the fix loads, passes, and passes
 //      every occurrence of every test that failed before.
+// A `red-first-expect:` marker counts only on a line the pull request adds
+// (relative to the merge base; a file it adds is added whole), as pins do: a
+// marker the file already had declares nothing, so a merged pull request's
+// marker, whose test now passes, never refuses a later one. An edited or moved
+// marker line that the diff shows as added counts and must match. A renamed
+// test file is read with git's rename detection here (only this read): its
+// unchanged lines, markers included, are not added (a rename without a
+// readable hunk adds no line only at similarity 100%; otherwise its added
+// lines cannot be read); everywhere else the gate treats it as a new file.
+// Names git writes C-quoted (non-ASCII, `"`, `\`, control characters) are
+// decoded. The range is read with git configuration that cannot change it
+// (no textconv, no external diff, fixed prefixes, quoting and rename limit);
+// when git skips rename detection, every new file's markers are of unknown
+// origin. A file whose added lines cannot be read
+// (a `-diff` attribute, a name that does not decode) keeps every marker of
+// its head source, but of unknown origin: each must match a failure
+// (TEXT-MISMATCH), none counts as the right reason for a failure without an
+// assertion (WRONG-REASON, naming the unread diff). A marker added for a test
+// that already passes before the fix is in no failure text: TEXT-MISMATCH,
+// as before. Markers are never required: they only let a failure without an
+// assertion count (a failure that matches one) and refuse a file whose
+// failures miss one, so reading fewer of them never turns a run without a
+// proven red-to-green test into a pass.
 // A test file with no failing test before the fix makes no red-first claim in
 // two cases only, each a note (not proven here), never a proof:
 //   - COLLATERAL: a changed file whose earlier version, run in the tree WITH
@@ -848,21 +871,76 @@ export function changedTestLine(lines) {
   return lines.find((line) => !isCommentLine(line) && TEST_LINE_RE.test(line)) ?? null;
 }
 
+// A path as git writes it in a diff header: plain, or C-quoted (core.quotePath
+// quotes non-ASCII bytes, `"`, `\` and control characters) with \a \b \t \n
+// \v \f \r \" \\ and octal byte escapes. Its bytes (escapes as bytes,
+// literal characters as the UTF-8 of each code point, so an astral character
+// that core.quotePath=false leaves literal stays whole) are decoded as UTF-8
+// once. A plain path may end with a tab (a name with a space); a quoted one
+// may be followed by one. Returns null for a quoted path that does not
+// decode (an unknown escape, no closing quote, text after it, invalid UTF-8).
+const C_ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+// ignoreBOM: a path may start with U+FEFF; the default decoder would drop it.
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+export function diffPath(raw) {
+  if (!raw.startsWith('"')) return raw.replace(/\t$/, "");
+  const bytes = [];
+  for (let i = 1; i < raw.length; i += 1) {
+    const c = String.fromCodePoint(raw.codePointAt(i));
+    if (c === '"') {
+      if (!/^\t?$/.test(raw.slice(i + 1))) return null;
+      try {
+        return UTF8.decode(Uint8Array.from(bytes));
+      } catch {
+        return null;
+      }
+    }
+    if (c !== "\\") {
+      bytes.push(...Buffer.from(c, "utf8"));
+      i += c.length - 1;
+      continue;
+    }
+    const next = raw[i + 1];
+    if (next !== undefined && Object.hasOwn(C_ESCAPES, next)) {
+      bytes.push(C_ESCAPES[next]);
+      i += 1;
+    } else if (/^[0-3][0-7]{2}$/.test(raw.slice(i + 1, i + 4))) {
+      bytes.push(parseInt(raw.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else return null;
+  }
+  return null;
+}
+
 // A unified diff with no context lines, per path: { added: [...], removed:
-// [...] }. A path git writes quoted (unusual characters) is left out: what
-// is not read here is never evidence.
+// [...] }. A C-quoted path is decoded; a path that does not decode is left
+// out: what is not read here is never evidence, and a caller that needs a
+// file's lines treats it as unreadable. In a diff with rename detection, a
+// rename git reports at similarity 100% (the same bytes: a pure rename) is
+// read under its new name with no added line; any other rename is read only
+// from its hunk, so one whose hunk git does not print (a `-diff` attribute:
+// "Binary files ... differ") stays unreadable.
 export function parseRangeDiff(text) {
   const files = new Map();
   let current = null;
   let header = false;
+  let pure = false;
+  const start = (path) => {
+    current = path === null ? null : { added: [], removed: [] };
+    if (current) files.set(path, current);
+  };
   for (const line of String(text).split("\n")) {
     if (line.startsWith("diff --git ")) {
       header = true;
       current = null;
+      pure = false;
     } else if (header) {
-      if (line.startsWith("+++ b/")) {
-        current = { added: [], removed: [] };
-        files.set(line.slice(6).replace(/\t$/, ""), current);
+      if (line === "similarity index 100%") pure = true;
+      else if (line.startsWith("rename to ")) {
+        if (pure) start(diffPath(line.slice(10)));
+      } else if (line.startsWith("+++ ")) {
+        const path = diffPath(line.slice(4));
+        start(path !== null && path.startsWith("b/") ? path.slice(2) : null);
       } else if (line.startsWith("@@")) header = false;
     } else if (current) {
       if (line.startsWith("+")) current.added.push(line.slice(1));
@@ -1208,7 +1286,11 @@ function earlierUnreadable(earlier) {
 // Returns the reasons, the notes (a file that makes no red-first claim, or
 // that is red because of what the fix adds), `proven`, and `kind`: "proven",
 // "collateral", "pins" or null (not settled: a reason says why).
-export function judgeFile({ file, markers = [], pins = [], status = "A" }, before, head, context = {}) {
+// markers are the expect markers this pull request declares (on lines it
+// adds); unknownMarkers are markers of a file whose added lines cannot be
+// read, so their origin is unknown: they refuse (TEXT-MISMATCH) but never
+// prove a failure without an assertion.
+export function judgeFile({ file, markers = [], unknownMarkers = [], pins = [], status = "A" }, before, head, context = {}) {
   const reasons = [];
   const notes = [];
   const add = (code, phase, detail) => reasons.push({ code, phase, file, detail: clip(detail, 400) });
@@ -1296,7 +1378,9 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
         beforeTests = r.tests;
         const texts = failed.map((t) => normalizeText(t.text));
         const wanted = markers.map((m) => normalizeText(m));
-        const unmatched = markers.filter((m, i) => !texts.some((x) => x.includes(wanted[i])));
+        const present = [...markers, ...unknownMarkers];
+        const unmatched = present.filter((m) => !texts.some((x) => x.includes(normalizeText(m))));
+        // Only a marker this pull request declares names the right reason.
         const stated = failed.filter((t, i) => t.assertion || wanted.some((m) => texts[i].includes(m)));
         if (unmatched.length) add("TEXT-MISMATCH", "before", `marker "${unmatched[0]}" is in no failure text; actual: ${actual(failed)}`);
         else if (stated.length) beforeOk = true;
@@ -1305,7 +1389,9 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
           // when a failure names an export or a module the fix side adds.
           evidence = failed.map((t) => fromFix(t.text)).find(Boolean) ?? null;
           if (evidence) beforeOk = true;
-          else add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
+          else if (unknownMarkers.length) {
+            add("WRONG-REASON", "before", `no assertion failure, and the file's added lines cannot be read (a -diff attribute, or a name git does not print readably), so its red-first-expect: markers (${clip(unknownMarkers.join(" | "), 120)}) are not shown to be this pull request's: they can refuse but never prove; remove the -diff attribute or rename the file; actual: ${actual(failed)}`);
+          } else add("WRONG-REASON", "before", `no assertion failure (a red-first-expect: marker can name the expected text); actual: ${actual(failed)}`);
         }
       }
     }
@@ -1343,11 +1429,51 @@ export function judgeFile({ file, markers = [], pins = [], status = "A" }, befor
 // git, processes and trees
 // ---------------------------------------------------------------------------
 
+// The gate reads the repository the same way whatever the caller's or the
+// repository's configuration says. Environment: C messages (the rename
+// warning is read), no replace objects, no system attributes file, and none
+// of the variables that inject configuration or an external diff.
+// The configuration and attribute files themselves stay (a CI checkout keeps
+// safe.directory there); every setting that changes what the gate reads is
+// overridden on the command line (GIT_READ_CONFIG), which wins over every
+// file, and every diff call names its own options (DIFF_READ).
 function gitEnv(extra = {}) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", ...extra };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"]) delete env[key];
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", LC_ALL: "C", LANG: "C", GIT_NO_REPLACE_OBJECTS: "1", GIT_ATTR_NOSYSTEM: "1", ...extra };
+  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "LANGUAGE"]) delete env[key];
+  for (const key of Object.keys(env)) if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
   return env;
 }
+
+const GIT_READ_CONFIG = [
+  "core.hooksPath=/dev/null",
+  "core.fsmonitor=false",
+  "core.quotePath=true",
+  "core.attributesFile=/dev/null",
+  "core.autocrlf=false",
+  "color.ui=never",
+  "color.diff=never",
+  "diff.noprefix=false",
+  "diff.mnemonicPrefix=false",
+  "diff.srcPrefix=a/",
+  "diff.dstPrefix=b/",
+  "diff.submodule=short",
+  "diff.ignoreSubmodules=none",
+  "diff.relative=false",
+  "diff.renames=false",
+  "diff.algorithm=myers",
+  "diff.indentHeuristic=true",
+  "diff.interHunkContext=0",
+  "diff.suppressBlankEmpty=false",
+].flatMap((kv) => ["-c", kv]);
+// Every diff the gate reads: no textconv driver, no external diff, no color,
+// and every changed gitlink shown (also one that submodule.<name>.ignore or
+// diff.ignoreSubmodules would hide).
+const DIFF_READ = ["--no-textconv", "--no-ext-diff", "--no-color", "--ignore-submodules=none"];
+// git's own words (in the C locale) when it skips rename detection.
+const RENAME_SKIPPED_RE = /^warning: (?:exhaustive|inexact) rename detection was skipped due to too many files\.$|^warning: you may want to set your diff\.renameLimit variable to at least \d+ and retry the command\.$/m;
+// The rename-detecting diff: an explicit threshold and limit; when git skips
+// the detection (more candidates than the limit) it says so on stderr.
+const RENAME_READ = ["-M50%", "-l1000"];
 
 // The deadline of the run's git calls (the job's budget less the reserve), or
 // null when the run has no job budget. The cleanup's git calls run inside the
@@ -1363,7 +1489,7 @@ function gitTimeout(cleanup) {
 function git(repo, args, { allowFail = false, env = {}, cleanup = false } = {}) {
   const timeout = gitTimeout(cleanup);
   if (timeout !== undefined && timeout <= 0) throw new BudgetError(`the job's time budget was spent before git ${args[0]}`);
-  const r = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "--literal-pathspecs", "-C", repo, ...args], {
+  const r = spawnSync("git", [...GIT_READ_CONFIG, "--literal-pathspecs", "-C", repo, ...args], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
     env: gitEnv(env),
@@ -1517,7 +1643,7 @@ function endGroup() {
 function changedTestSide(tree, plan) {
   const onTestSide = testSideOf(plan);
   const listed = new Set(plan.testSide.map((e) => e.path));
-  return nulList(git(tree, ["diff", "--name-only", "--no-renames", "-z", plan.head]).stdout)
+  return nulList(git(tree, ["diff", ...DIFF_READ, "--name-only", "--no-renames", "-z", plan.head]).stdout)
     .filter((p) => listed.has(p) || onTestSide(p))
     .sort(byPath);
 }
@@ -1570,7 +1696,7 @@ export function planRange({ repo = process.cwd(), base, head, exclude = "", test
   for (const sha of [base, head]) git(repo, ["cat-file", "-e", `${sha}^{commit}`]);
   const mergeBase = git(repo, ["merge-base", base, head]).stdout.trim();
   if (!SHA_RE.test(mergeBase)) throw new GateError(`no merge base of ${base} and ${head}`);
-  const parts = nulList(git(repo, ["diff", "--name-status", "--no-renames", "-z", mergeBase, head]).stdout);
+  const parts = nulList(git(repo, ["diff", ...DIFF_READ, "--name-status", "--no-renames", "-z", mergeBase, head]).stdout);
   if (parts.length % 2) throw new GateError("the range's name-status list is not readable");
   const entries = [];
   for (let i = 0; i < parts.length; i += 2) entries.push({ status: parts[i].charAt(0), path: parts[i + 1] });
@@ -1653,9 +1779,9 @@ function buildBeforeTree(repo, plan, tree, work) {
   if (drop.length) {
     git(tree, ["rm", "-q", `--pathspec-from-file=${writePathspec(join(work, "drop.lst"), drop)}`, "--pathspec-file-nul"]);
   }
-  const vsBase = nulList(git(tree, ["diff", "--cached", "--name-only", "--no-renames", "-z", plan.mergeBase]).stdout).sort(byPath);
-  const vsHead = nulList(git(tree, ["diff", "--cached", "--name-only", "--no-renames", "-z", plan.head]).stdout).sort(byPath);
-  const unstaged = nulList(git(tree, ["diff", "--name-only", "-z"]).stdout);
+  const vsBase = nulList(git(tree, ["diff", ...DIFF_READ, "--cached", "--name-only", "--no-renames", "-z", plan.mergeBase]).stdout).sort(byPath);
+  const vsHead = nulList(git(tree, ["diff", ...DIFF_READ, "--cached", "--name-only", "--no-renames", "-z", plan.head]).stdout).sort(byPath);
+  const unstaged = nulList(git(tree, ["diff", ...DIFF_READ, "--name-only", "--no-renames", "-z"]).stdout);
   const wantBase = plan.testSide.map((e) => e.path);
   if (JSON.stringify(vsBase) !== JSON.stringify(wantBase)) return `the tree before the fix differs from the merge base in ${vsBase.length} path(s), expected the ${wantBase.length} test-side path(s)`;
   if (JSON.stringify(vsHead) !== JSON.stringify(plan.fixSide)) return `the tree before the fix differs from the head in ${vsHead.length} path(s), expected the ${plan.fixSide.length} fix-side path(s)`;
@@ -1824,7 +1950,7 @@ async function runPhase(phase, tree, files, plan, opts, reportDir, { skipInstall
   }
   // A swapped file differs from the head on purpose: it must still be the
   // merge base's version after the run.
-  const moved = swapped.length ? nulList(git(tree, ["diff", "--name-only", "--no-renames", "-z", plan.mergeBase, "--", ...swapped]).stdout) : [];
+  const moved = swapped.length ? nulList(git(tree, ["diff", ...DIFF_READ, "--name-only", "--no-renames", "-z", plan.mergeBase, "--", ...swapped]).stdout) : [];
   for (const file of [...new Set([...changedTestSide(tree, plan).filter((p) => !swapped.includes(p)), ...moved])].sort(byPath)) {
     reasons.push({ code: "TEST-CHANGED", phase, file, detail: "the test run changed this tracked test-side file" });
   }
@@ -1872,13 +1998,29 @@ async function runEarlier(repo, plan, tree, quiet, opts, work) {
 // script, the names its whole head version exports (code only) that no
 // fix-side script exported at the merge base (so a moved or reworded export
 // is not new); per changed test file, the first changed line that declares a
-// test or states an assertion, its added lines and whether it only adds.
+// test or states an assertion, its added lines and whether it only adds; and
+// per test file the lines the pull request adds when a rename counts as one
+// (where its `red-first-expect:` markers are read).
 function rangeReader(repo, plan) {
   let files = null;
+  let moved = null;
   let byFile = null;
   const read = () => {
-    files ??= parseRangeDiff(git(repo, ["diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", plan.mergeBase, plan.head]).stdout);
+    files ??= parseRangeDiff(git(repo, ["diff", ...DIFF_READ, "-U0", "--no-renames", plan.mergeBase, plan.head]).stdout);
     return files;
+  };
+  // The same range with rename detection (similarity 50%, at most 1000
+  // candidates): a renamed file's unchanged lines are not added there. Used
+  // for markers only; everything else treats a renamed file as a new file.
+  // git's warning that it skipped the detection makes the provenance of every
+  // file that is not a plain modification unknown; other stderr does not.
+  const status = new Map(plan.testSide.map((e) => [e.path, e.status]));
+  const readMoved = () => {
+    if (!moved) {
+      const r = git(repo, ["diff", ...DIFF_READ, ...RENAME_READ, "-U0", plan.mergeBase, plan.head]);
+      moved = { files: parseRangeDiff(r.stdout), unsure: RENAME_SKIPPED_RE.test(r.stderr) };
+    }
+    return moved;
   };
   const blob = (rev, path) => {
     const r = git(repo, ["cat-file", "blob", `${rev}:${path}`], { allowFail: true });
@@ -1893,6 +2035,13 @@ function rangeReader(repo, plan) {
     // The added lines of a file's edit, or null when its diff is not readable.
     addedLines(path) {
       return read().get(path)?.added ?? null;
+    },
+    // The added lines of a file's edit when a rename is not an addition, or
+    // null when its diff is not readable.
+    markerLines(path) {
+      const m = readMoved();
+      if (m.unsure && status.get(path) !== "M") return null;
+      return m.files.get(path)?.added ?? null;
     },
     pureAddition(path) {
       const diff = read().get(path);
@@ -1968,10 +2117,24 @@ async function runGateIn(opts) {
     const files = plan.newTests.map((file) => {
       const source = git(repo, ["cat-file", "blob", `${plan.head}:${file}`]).stdout;
       sources.set(file, source);
-      // Pins only from the lines the pull request adds: a marker the file
-      // already had declares nothing (an unreadable diff declares nothing).
+      // Pins and expect markers only from the lines the pull request adds: a
+      // marker the file already had declares nothing. Pins read a renamed
+      // file whole (all its tests are added tests, each needs its pin);
+      // expect markers read the diff with rename detection, so a renamed
+      // file's unchanged markers stay unread. Each fails closed: an
+      // unreadable diff declares no pin (its tests must fail first), and
+      // keeps every expect marker of the head source as of unknown origin
+      // (each must match, none proves).
       const added = range.addedLines(file);
-      return { file, runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest", markers: readMarkers(source), pins: added ? readPins(added.join("\n")) : [], status: statusOf.get(file) ?? "A" };
+      const markerLines = range.markerLines(file);
+      return {
+        file,
+        runner: NODE_TEST_IMPORT_RE.test(source) ? "node" : "vitest",
+        markers: markerLines ? readMarkers(markerLines.join("\n")) : [],
+        unknownMarkers: markerLines ? [] : readMarkers(source),
+        pins: added ? readPins(added.join("\n")) : [],
+        status: statusOf.get(file) ?? "A",
+      };
     });
     const phases = {};
     for (const phase of ["before", "head"]) {
@@ -2009,7 +2172,7 @@ async function runGateIn(opts) {
       reasons.push(...judged.reasons);
       fileNotes.push(...judged.notes);
       for (const r of judged.reasons) if (r.phase === "head") headReasonFiles.add(f.file);
-      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, pins: f.pins, proven: judged.proven, kind: judged.kind });
+      result.files.push({ file: f.file, runner: f.runner, markers: f.markers, unknownMarkers: f.unknownMarkers, pins: f.pins, proven: judged.proven, kind: judged.kind });
     }
     for (const inv of phases.head?.invocations ?? []) {
       if ((inv.res.status !== 0 || inv.reportFailed) && !inv.files.some((file) => headReasonFiles.has(file))) {

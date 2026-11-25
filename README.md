@@ -2351,13 +2351,28 @@ codes alone.
 - **Regular files only**: a test-side path of the head that is a symlink or a
   submodule fails the job (`NOT-A-FILE`): its target could be fix side, so the
   test that runs would not be the file of the pull request.
+- **Reading the repository**: the gate's git calls do not depend on the
+  caller's or the repository's git configuration: settings that change a
+  diff (prefixes, quoting, ignored submodules, color, rename and algorithm
+  settings, an attributes file, an external diff, textconv drivers) are
+  overridden on the command line, and when git warns that it skipped rename
+  detection (more than 1000 candidates) the markers of a new file are of
+  unknown origin.
 - **Before the fix**: the merge base with the pull request's test side applied.
   The gate checks that this tree and the head differ by exactly the fix side.
 - **Right reason**: before the fix, each new test file must load, collect at
   least one test and fail at least one test by an assertion (`AssertionError`),
   or by the text of a `red-first-expect: <text>` marker line in the file. A
   marker text must appear in a test failure of that file (ANSI and whitespace
-  normalized, case-sensitive).
+  normalized, case-sensitive). Only marker lines the pull request adds count
+  (a new file counts whole; a renamed file's unchanged lines do not, read with
+  git's rename detection): a marker the file already had declares nothing, so
+  markers of merged pull requests never need a sweep. A file whose added lines
+  cannot be read (a `-diff` attribute, for example, also on an edited rename;
+  only a rename git reports at similarity 100% adds no line) keeps every
+  marker of the file, but such a marker can only refuse: each must match a failure, and
+  none makes a failure without an assertion the right reason (`WRONG-REASON`;
+  remove the attribute or rename the file).
 - **What the fix adds**: a failure before the fix is also the right reason,
   without a marker, when its text names something only the fix side provides:
   a `TypeError: ... <name> is not a function` (or `is not a constructor`) or
@@ -2438,7 +2453,8 @@ codes alone.
   is `NOT-RED-BEFORE`. Added lines can still weaken an existing test without
   removing it (an early `return`, for example): the gate does not see that,
   so review added lines beside pins as a change to an existing test. Markers
-  are part of the diff: review them as you review `red-first-expect:`.
+  are part of the diff: review them as you review `red-first-expect:`, which
+  also counts only on the lines the pull request adds.
 - **With the fix**: each new test file must load and pass, at least one test
   must pass, every test that failed before must pass (each occurrence: a test
   name reported twice before needs two passing results), the runner must exit
